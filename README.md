@@ -83,6 +83,16 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 | `-Apply` | Console: turn on these setting ids (see `-List`). A setting with options takes one as `id=option`. |
 | `-Undo` | Console: turn these setting ids back off. |
 
+## Switching a setting off
+
+Switching a setting off puts the Windows default back for everything that setting changed: registry values (deleted where Windows sets none), service start types, scheduled tasks, firewall rules (as Windows ships them), adapter bindings and driver options (the driver's own default), the power plan (Balanced) and the boot setting for the hypervisor. It does not put back what your PC had before Headroom changed it, so a value that another tool had set earlier also ends up at the Windows default.
+
+A few settings are handled differently:
+
+- Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
+- Settings whose Windows default is already the on state (Game Mode on, Optimizations for windowed games on) are switched off by writing an explicit 0, because deleting the value would leave them on.
+- Settings that remove apps cannot be undone from Headroom.
+
 ## Where things are kept
 
 | What | Where |
