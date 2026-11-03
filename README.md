@@ -22,7 +22,7 @@ Headroom does not install on the device.
 irm https://raw.githubusercontent.com/zpphtp4nvm-ai/Headroom/main/Headroom.ps1 | iex
 ```
 
-Closing Headroom ends that PowerShell window, so use the first command if you want to keep the window.
+Closing Headroom ends that PowerShell window. To keep your window open, run Headroom in a separate PowerShell as shown below.
 
 ### Command-line options through irm
 

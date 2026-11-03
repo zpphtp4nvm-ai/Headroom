@@ -4018,7 +4018,7 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys short
 # are not settings. Windows has no switch that forces a refresh rate: Settings > System > Display > Advanced display sets it, and the
 # card on the page says what else keeps a game at the full rate. The two switches below are real: they are the "Optimizations for windowed
 # games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
-# keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
+# keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal above).
 Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -Name 'Optimizations for windowed games on' `
     -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here writes an explicit 0 on those builds (on older builds the entry is removed, which Windows reads as off).' `
     -Parts @(
@@ -5074,6 +5074,20 @@ $script:LatPlans = @{
     'a1841308-3541-4fab-bc81-f71556f20b4a' = 'Power saver'
     'e9a42b02-d5df-448d-aa00-03f14749eb61' = 'Ultimate Performance'
 }
+# DDR type from the SMBIOS memory type code, and the clock-instead-of-rate correction: the same two rules as Sys-RamType / Sys-FixMT, copied
+# here because the latency worker loads only this engine and not the Home page code. Keep the two in step.
+function Lat-RamType {
+    param([int]$Code)
+    switch ($Code) { 34 { return 'DDR5' } 26 { return 'DDR4' } 24 { return 'DDR3' } 35 { return 'LPDDR5' } 29 { return 'LPDDR3' } 30 { return 'LPDDR4' } }
+    return ''
+}
+function Lat-FixMT {
+    param([string]$Type, [int]$MT)
+    if ($MT -le 0) { return $MT }
+    if ($Type -eq 'DDR5' -and $MT -lt 3200) { return ($MT * 2) }
+    if ($Type -eq 'DDR4' -and $MT -lt 1600) { return ($MT * 2) }
+    return $MT
+}
 # The hardware that the ratings are tied to. Every field is optional: what cannot be read stays empty / 0.
 function Get-LatSpecs {
     $s = @{ Cpu = ''; Cores = 0; Threads = 0; RamGB = 0.0; RamSpeed = 0; RamRated = 0; RamType = ''; RamModules = 0; Gpu = ''; RefreshHz = 0; ResW = 0; ResH = 0; Plan = ''; Os = '' }
@@ -5088,10 +5102,16 @@ function Get-LatSpecs {
         $s.RamModules = $m.Count
         $bytes = 0.0; foreach ($x in $m) { $bytes += [double]$x.Capacity }
         $s.RamGB = [Math]::Round($bytes / 1GB, 0)
-        $s.RamRated = [int](($m | ForEach-Object { [int]$_.Speed } | Measure-Object -Maximum).Maximum)
-        $s.RamSpeed = [int](($m | ForEach-Object { [int]$_.ConfiguredClockSpeed } | Measure-Object -Maximum).Maximum)
-        $t = [int]$m[0].SMBIOSMemoryType
-        if ($t -eq 34) { $s.RamType = 'DDR5' } elseif ($t -eq 26) { $s.RamType = 'DDR4' } elseif ($t -eq 24) { $s.RamType = 'DDR3' }
+        # the same reading as the Home page (Get-SysRam): a firmware that writes the clock instead of the rate is corrected, per module
+        $rated = 0; $conf = 0
+        foreach ($x in $m) {
+            $ty = Lat-RamType ([int]$x.SMBIOSMemoryType)
+            $r = Lat-FixMT $ty ([int]$x.Speed); if ($r -gt $rated) { $rated = $r }
+            $c = Lat-FixMT $ty ([int]$x.ConfiguredClockSpeed); if ($c -gt $conf) { $conf = $c }
+        }
+        $s.RamRated = $rated
+        $s.RamSpeed = $conf
+        if ($m.Count) { $s.RamType = Lat-RamType ([int]$m[0].SMBIOSMemoryType) }
     } catch { }
     try {
         $v = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
@@ -8737,7 +8757,7 @@ function Ui-Ask {
 #         (Choices = $null, or for a setting with options the list of @{ Key; Short; Label }; Pick = the key that is picked on the card,
 #          Now = the key of the option that is in force, '' when not known. Such a card has a row of option buttons instead of a switch.)
 #   head: Kind='head' Key Cat Title CountText Y H Idx Open
-#   info: Kind='info' Key Cat Title Sub Lines Note Chip ChipKey Span Y H Idx  (a read-out card, see u6-sys.ps1; it has no switch and cannot be
+#   info: Kind='info' Key Cat Title Sub Lines Note Chip ChipKey Span Y H Idx  (a read-out card, see the Home page below; it has no switch and cannot be
 #         selected. Its height depends on what it says, so a line of the list is as tall as its tallest card.)
 # Each row is drawn as a card: its id in small grey letters, the title, a few tags, the description (two lines), then a risk badge,
 # a small status chip and the switch. Cards sit in one column, or in two when the list is wide enough (X and W of an entry say where).
@@ -11341,7 +11361,7 @@ function Show-Window {
 
 # =============================================================================
 # THE WINDOW, part 6: the "Latency tests" window (opened from the side menu).
-# It is a window of its own, like "View description". The measuring code is in e4-latency.ps1; this file only runs it and shows it:
+# It is a window of its own, like "View description". The measuring code is in $latEngine (above); this part only runs it and shows it:
 #   - the PC latency test runs in a background worker (a runspace, like the settings check) and reports through a queue
 # Names used here start with Lat / Ui-Lat. $script:LatWin holds the controls of the open window ($null when it is closed).
 # =============================================================================
@@ -11484,6 +11504,9 @@ function Ui-LatTick {
 # ----------------------------------------------------------- the tests ----
 function Ui-LatStartSpecs {
     if ($script:LatMode -ne 'idle') { return }
+    # a worker that has already said it is done may not have been collected yet: collect it now, while the mode is still idle
+    # (Finish-LatJob would otherwise reset the mode of the job that is about to start)
+    if ($script:LatJob) { try { Finish-LatJob } catch { } }
     $script:LatMode = 'specs'
     Ui-LatStatus 'Reading your PC''s hardware...' 0
     Ui-LatButtons
@@ -11498,6 +11521,9 @@ function Ui-LatStartSpecs {
 
 function Ui-LatStartPc {
     if ($script:LatMode -ne 'idle') { return }
+    # a worker that has already said it is done may not have been collected yet: collect it now, while the mode is still idle
+    # (Finish-LatJob would otherwise reset the mode of the job that is about to start, and the buttons would be live during the test)
+    if ($script:LatJob) { try { Finish-LatJob } catch { } }
     $script:LatMode = 'pc'
     Ui-LatStatus 'Starting the PC latency test. Keep the mouse still and leave other windows alone...' 0
     Ui-LatButtons
@@ -11662,8 +11688,8 @@ function Ui-ShowLatency {
 # =============================================================================
 # THE WINDOW, part 6: the Home page and the live cards on the Display page.
 # These pages show read-outs, not settings. A read-out is an "info card": one entry of the list (Kind = 'info') that is drawn
-# like a settings card but has no switch and cannot be selected. What the cards say comes from a background reader ($sysEngine in
-# e5-sys.ps1) that fills $script:SysShared; this file only turns that data into cards and draws them.
+# like a settings card but has no switch and cannot be selected. What the cards say comes from a background reader ($sysEngine,
+# above) that fills $script:SysShared; this part only turns that data into cards and draws them.
 #   info card:  Kind='info'  Key Cat Title Sub Lines NoteLines Note Chip ChipKey Span Top X W Y H Idx
 #               Lines = list of @{ L = label; V = value; K = colour name; Bar = $null or 0..100 }
 # Names used for local variables here: $Th = colours, $M = sizes, $TF = text flags, $d = the data (static, live).
@@ -13928,6 +13954,16 @@ function Ui-ShowPresets {
 if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
     Write-Host 'This is a 32-bit PowerShell. Start the 64-bit one ("Windows PowerShell", not "(x86)") as administrator, or double-click Start-Headroom.bat.' -ForegroundColor Red
     exit 1
+}
+
+# "#Requires -RunAsAdministrator" at the top is only enforced when this .ps1 file itself is run. Started with  irm ... | iex  (or as a
+# script block) it is ignored, and without administrator rights every machine-wide switch would fail halfway through a run while the
+# per-user ones still applied. So ask again here. (return, not exit: with iex an exit would close the PowerShell window, and the message with it.)
+$isAdmin = $true
+try { $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) } catch { }
+if (-not $isAdmin) {
+    Write-Host 'Headroom needs administrator rights. Open PowerShell with "Run as administrator" (or double-click Start-Headroom.bat, which asks Windows for permission) and start it again.' -ForegroundColor Red
+    return
 }
 
 . $engine      # the catalog and the engine, in this process too
