@@ -16,16 +16,6 @@ Headroom does not install on the device.
 
 ## Run it
 
-Replace `zpphtp4nvm-ai` with the GitHub user or organization that hosts this repository.
-
-### One line (asks for administrator permission)
-
-Paste this into any PowerShell window. Windows shows the permission box, then the Headroom window opens.
-
-```powershell
-Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/zpphtp4nvm-ai/Headroom/main/Headroom.ps1 | iex"'
-```
-
 ### From an administrator PowerShell
 
 ```powershell
