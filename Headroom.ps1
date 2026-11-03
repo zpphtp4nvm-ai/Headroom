@@ -1,0 +1,13972 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    Headroom: a Windows 11 debloat and gaming tune-up tool in which every setting is its own switch.
+
+.DESCRIPTION
+    Opens a window with about 160 settings in 20 groups. Each setting shows what it does and exactly which registry values,
+    services, tasks, features or apps it touches, and reads its current state from this PC. Nothing changes until you switch
+    a setting on and apply it. Before the first change a restore point is created and the old values are saved, so switching
+    a setting off puts your own values back. Settings that remove apps cannot be undone from here.
+
+    The window opens on a welcome screen and then on Home, which shows the PC as it is right now: Windows, processor, graphics
+    card, memory, motherboard, displays and drives. Windows does not report CPU temperature, CPU power or memory timings, so
+    those come from HWiNFO or LibreHardwareMonitor. The Start HWiNFO button turns on HWiNFO's sensor sharing for you, after
+    asking, and keeps a copy of its settings file. Headroom installs no driver and downloads nothing.
+
+    Select Optimization Preset offers three presets, and each one lists what it will change before anything is applied:
+      Recommended Debloat   a set of gaming-oriented settings that removes no app
+      Advanced Debloat      for PCs used mainly for gaming; it may remove services that other uses need
+      Custom Preset         your own saved configuration, which can be applied again after a clean install of Windows
+
+    Preview only lists what would happen and changes nothing. Latency tests measures how responsive the PC is and changes
+    nothing. Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines ask first.
+
+    Where things are kept:
+      undo record   %ProgramData%\Win11GamingDebloat\undo-record.xml
+      log           debloat-log.txt on the Desktop (or in %TEMP% if there is no Desktop)
+
+.NOTES
+    Needs an administrator PowerShell, or double-click Start-Headroom.bat, which asks Windows for permission and opens the window.
+
+.PARAMETER NoGui
+    Do not open the window; work in this console. Without -List, -Preset, -Apply or -Undo it shows the state of every setting.
+
+.PARAMETER DryRun
+    Window: starts with Preview only switched on. Console: shows what would happen and changes nothing.
+
+.PARAMETER List
+    Console: print every setting with its id and whether it is applied.
+
+.PARAMETER Preset
+    Console: turn on the Recommended preset. A setting that asks a question first asks it when the console is interactive,
+    and is skipped with a warning when it is not.
+
+.PARAMETER Apply
+    Console: turn on these setting ids (see -List). Naming an id is your answer to its question. A setting with options takes
+    one as id=option (for example mpo=full); without an option the first one is used. id=default is the same as -Undo id.
+
+.PARAMETER Undo
+    Console: turn these setting ids back off (a setting with options goes back to the Windows default).
+
+.EXAMPLE
+    .\Headroom.ps1                                    # opens the window
+    .\Headroom.ps1 -NoGui -List                       # which settings are applied?
+    .\Headroom.ps1 -NoGui -Preset -DryRun             # preview the Recommended preset
+    .\Headroom.ps1 -NoGui -Apply mouse,gamedvr        # just those two
+    .\Headroom.ps1 -NoGui -Apply mpo=full             # Multiplane Overlay: Fully disabled
+    .\Headroom.ps1 -NoGui -Undo mpo                   # and back to Enabled (the Windows default)
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$NoGui,
+    [switch]$DryRun,
+    [switch]$List,
+    [switch]$Preset,
+    [string[]]$Apply,
+    [string[]]$Undo
+)
+
+# The log goes to the real Desktop folder (it may be redirected), or %TEMP% if that is not writable
+$desk = [Environment]::GetFolderPath('Desktop')
+if (-not $desk -or -not (Test-Path $desk)) { $desk = [IO.Path]::GetTempPath() }
+$log = Join-Path $desk 'debloat-log.txt'
+$pd = $env:ProgramData; if (-not $pd) { $pd = [IO.Path]::GetTempPath() }
+$StorePath = Join-Path (Join-Path $pd 'Win11GamingDebloat') 'undo-record.xml'
+$Q = $null   # event queue for the window; stays $null when running in the console
+
+$engine = {
+# =============================================================================
+# ENGINE: the catalog of settings and the code that detects, applies and undoes them.
+# It is loaded into the window's process (to build the list) and into a background
+# thread (to scan and apply), so the window never freezes.
+# Needs these variables from whoever loads it:  $DryRun  $log  $StorePath  $Q (or $null)
+# =============================================================================
+$script:Cache  = @{}
+$script:Why    = ''
+$script:Now    = ''       # what the part that was just checked read from this PC (set by Get-PartState; custom checks set it themselves)
+$script:RunResult = ''    # what a run-once action (Add-Tweak -Once) says it did; Invoke-Plan shows it on the card
+$script:InRdp  = ($env:SESSIONNAME -like 'RDP-*')
+$script:CurTweak = $null
+$script:Catalog = New-Object System.Collections.ArrayList
+$script:ById    = @{}
+$script:ScanMode = $false     # true while the check of the PC runs: read-only look-ups may then be remembered
+$script:NoValue = New-Object System.Object
+$script:RegRoot = @{}
+try {
+    $script:RegRoot['HKLM'] = [Microsoft.Win32.Registry]::LocalMachine
+    $script:RegRoot['HKCU'] = [Microsoft.Win32.Registry]::CurrentUser
+} catch { }
+
+# ---------------------------------------------------------------- messages --
+function Say {
+    param($msg, [string]$color = 'Gray')
+    $text = ([string]$msg).TrimEnd()
+    if ($log) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    if ($null -ne $Q) {
+        $Q.Enqueue([pscustomobject]@{ Kind = 'log'; Id = ''; State = ''; Detail = ''; Text = $text; Color = $color; A = 0; B = 0 })
+    } else {
+        Write-Host $text -ForegroundColor $color
+    }
+}
+function Emit {
+    # Choice: for a setting with several options (see Add-Tweak -Choices), the key of the option that is in force ('' for the others)
+    # Read:   what the check actually read from this PC, one line per value (see Get-PartState)
+    # Mine:   'yes' = this app has an undo record for the setting (it changed it), 'no' = it was already like this, '' = not known / not applied
+    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '')
+    if ($null -eq $Q) { return }
+    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine })
+}
+
+# --------------------------------------------------- the undo record (store) --
+# Before a setting is changed for the first time, what it was is saved here, so that
+# switching it off again puts back YOUR old values instead of guessing Windows' defaults.
+function Get-Store {
+    $s = @{}
+    try {
+        if ($StorePath -and (Test-Path -LiteralPath $StorePath)) {
+            $x = Import-Clixml -LiteralPath $StorePath -ErrorAction Stop
+            if ($x -is [hashtable]) { $s = $x }
+        }
+    } catch { }
+    try { Import-SplitRecords $s } catch { }
+    return $s
+}
+# A setting that was later split into smaller ones keeps its old undo record under the old id. Each new setting is handed the part
+# of that record that is its own (and the old record loses it), so switching the new setting off still puts back the values that
+# were there before the old setting changed them. Nothing is written here; the next Save-Store keeps the result.
+#   new id -> old id
+$script:SplitFrom = @{ 'sysresp' = 'netthrottle'; 'gamesched' = 'netthrottle' }
+function Import-SplitRecords {
+    param($s)
+    foreach ($newId in @($script:SplitFrom.Keys)) {
+        $t = $script:ById[$newId]
+        $old = $s[[string]$script:SplitFrom[$newId]]
+        if (-not $t -or -not $old -or $s.ContainsKey($newId) -or -not $old.Reg) { continue }
+        $reg = @{}
+        foreach ($p in $t.Parts) {
+            if ($p.T -ne 'reg') { continue }
+            $k = "$($p.Path)|$($p.Name)"
+            $v = $old.Reg[$k]
+            if ($null -ne $v) { $reg[$k] = $v; $old.Reg.Remove($k) }
+        }
+        if ($reg.Count -eq 0) { continue }
+        $s[$newId] = @{ When = $old.When; Reg = $reg; Svc = @{}; Fw = @{}; Bind = @{}; Feat = @{}; Cap = @{}; Custom = @{} }
+    }
+}
+function Save-Store($s) {
+    if ($DryRun -or -not $StorePath) { return }
+    try {
+        $dir = [IO.Path]::GetDirectoryName($StorePath)
+        if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        Export-Clixml -InputObject $s -LiteralPath $StorePath -Depth 8 -Force -ErrorAction Stop
+    } catch { Say "  ! could not save the undo record: $($_.Exception.Message)" 'Yellow' }
+}
+
+# ------------------------------------------------------------ registry -------
+function Reg-Read {
+    param([string]$Path, [string]$Name)
+    $r = @{ Exists = $false; Value = $null; Kind = '' }
+    # Fast path: ask the registry directly for HKLM:\ and HKCU:\ paths (about 50 times quicker than the
+    # provider, and a check reads hundreds of values). Anything unexpected falls through to the provider below.
+    if ($Path.Length -gt 6 -and $Path[4] -eq ':' -and $Path[5] -eq '\') {
+        $root = $script:RegRoot[$Path.Substring(0, 4).ToUpperInvariant()]
+        if ($root) {
+            $k = $null
+            $done = $false
+            try {
+                $k = $root.OpenSubKey($Path.Substring(6))
+                if ($k) {
+                    $v = $k.GetValue($Name, $script:NoValue, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                    if (-not [object]::ReferenceEquals($v, $script:NoValue)) {
+                        $r.Exists = $true
+                        $r.Value  = $v
+                        $r.Kind   = [string]$k.GetValueKind($Name)
+                    }
+                }
+                $done = $true
+            } catch {
+                $r = @{ Exists = $false; Value = $null; Kind = '' }
+            } finally {
+                if ($k) { try { $k.Close() } catch { } }
+            }
+            if ($done) { return $r }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path)) { return $r }
+    $k = Get-Item -LiteralPath $Path -ErrorAction Ignore
+    if (-not $k) { return $r }
+    if ($k.GetValueNames() -contains $Name) {
+        $r.Exists = $true
+        $r.Value  = $k.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $r.Kind   = [string]$k.GetValueKind($Name)
+    }
+    return $r
+}
+function Reg-SubKeys {
+    param([string]$Path)
+    $o = @()
+    foreach ($k in @(Get-ChildItem -LiteralPath $Path -ErrorAction Ignore)) { $o += [string]$k.PSPath }
+    return $o
+}
+function Reg-Equal {
+    param($a, $b, [string]$Kind)
+    if ($null -eq $a -or $null -eq $b) { return ($null -eq $a -and $null -eq $b) }
+    switch ($Kind) {
+        'DWord'       { return ([uint32](([long]$a) -band 4294967295L) -eq [uint32](([long]$b) -band 4294967295L)) }
+        'QWord'       { return ([int64]$a -eq [int64]$b) }
+        'Binary'      { return ((@($a) -join ',') -eq (@($b) -join ',')) }
+        'MultiString' { return ((@($a) -join "`n") -eq (@($b) -join "`n")) }
+        default       { return ([string]$a -eq [string]$b) }
+    }
+}
+# Takes an error that was caught on purpose out of $Error, so the run does not list it afterwards as a problem
+function Drop-Error {
+    param($rec)
+    try {
+        $n = [Math]::Min($Error.Count, 6)
+        for ($i = 0; $i -lt $n; $i++) {
+            if ([object]::ReferenceEquals($Error[$i].Exception, $rec.Exception) -or $Error[$i].Exception.Message -eq $rec.Exception.Message) { $Error.RemoveAt($i); return }
+        }
+    } catch { }
+}
+# -Soft: a switch that newer Windows 11 builds protect (programs get "Attempted to perform an unauthorized operation").
+# A refusal is then only noted, not reported as a failure.
+function Reg-Write {
+    param([string]$Path, [string]$Name, $Value, [string]$Kind = 'DWord', [switch]$Quiet, [switch]$Soft)
+    if ($DryRun) { if (-not $Quiet) { Say "  [dry] set $Path\$Name = $Value" 'DarkGray' }; return $true }
+    # A DWord is stored as 32 bits, but Windows PowerShell hands it to .NET as a signed number: a value above 2147483647
+    # (0xFFFFFFFF, say) is refused unless it is passed as the same 32 bits read as a negative number.
+    $data = $Value
+    if ($Kind -eq 'DWord' -and $null -ne $Value) {
+        $wide = 0L
+        if ([long]::TryParse([string]$Value, [ref]$wide) -and $wide -gt 2147483647L -and $wide -le 4294967295L) { $data = [int]($wide - 4294967296L) }
+    }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -LiteralPath $Path -Name $Name -Value $data -PropertyType $Kind -Force -ErrorAction Stop | Out-Null
+        if (-not $Quiet) { Say "  set $Path\$Name = $Value" 'DarkGray' }
+        return $true
+    } catch {
+        if ($Soft) {
+            Drop-Error $_
+            Say "  note: Windows protects $Path\$Name and did not let it be changed; it was left as it is (the other parts of this setting still apply)" 'DarkGray'
+        } else {
+            Say "  ! could not set $Path\$Name  ($($_.Exception.Message))" 'Yellow'
+        }
+        return $false
+    }
+}
+function Reg-Remove {
+    param([string]$Path, [string]$Name, [switch]$Quiet, [switch]$Soft)
+    if (-not (Reg-Read $Path $Name).Exists) { return $true }
+    if ($DryRun) { if (-not $Quiet) { Say "  [dry] remove $Path\$Name" 'DarkGray' }; return $true }
+    try {
+        Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction Stop
+        if (-not $Quiet) { Say "  removed $Path\$Name" 'DarkGray' }
+        return $true
+    } catch {
+        if ($Soft) {
+            Drop-Error $_
+            Say "  note: Windows protects $Path\$Name and did not let it be changed; it was left as it is" 'DarkGray'
+        } else {
+            Say "  ! could not remove $Path\$Name  ($($_.Exception.Message))" 'Yellow'
+        }
+        return $false
+    }
+}
+# Whole registry keys (some switches are just "this key exists")
+function Reg-KeyExists { param([string]$Path) return (Test-Path -LiteralPath $Path) }
+function Reg-KeyAdd {
+    param([string]$Path)
+    if (Reg-KeyExists $Path) { return $true }
+    if ($DryRun) { Say "  [dry] create registry key $Path" 'DarkGray'; return $true }
+    try {
+        New-Item -Path $Path -Force -Value '' -ErrorAction Stop | Out-Null
+        Say "  created registry key $Path" 'DarkGray'
+        return $true
+    } catch {
+        Say "  ! could not create $Path  ($($_.Exception.Message))" 'Yellow'
+        return $false
+    }
+}
+function Reg-KeyRemove {
+    param([string]$Path)
+    if (-not (Reg-KeyExists $Path)) { return $true }
+    if ($DryRun) { Say "  [dry] delete registry key $Path" 'DarkGray'; return $true }
+    try {
+        Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
+        Say "  deleted registry key $Path" 'DarkGray'
+        return $true
+    } catch {
+        Say "  ! could not delete $Path  ($($_.Exception.Message))" 'Yellow'
+        return $false
+    }
+}
+# Every named value in a key:  @{ Name; Value; Kind }  (the unnamed default value is left out)
+function Reg-Values {
+    param([string]$Path)
+    $o = @()
+    if (-not (Test-Path -LiteralPath $Path)) { return $o }
+    $k = Get-Item -LiteralPath $Path -ErrorAction Ignore
+    if (-not $k) { return $o }
+    foreach ($n in $k.GetValueNames()) {
+        if (-not $n) { continue }
+        $o += ,@{ Name = [string]$n
+                  Value = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+                  Kind = [string]$k.GetValueKind($n) }
+    }
+    return $o
+}
+
+# --------------------------------------- look-ups that are remembered during a check --
+# While the PC is being checked ($script:ScanMode) a read-only question that several settings ask is
+# put to Windows once and the answer is reused. Outside a check every call asks Windows afresh.
+# Whatever the question printed is returned exactly as the plain call would have returned it.
+function Scan-Memo {
+    param([string]$MemoKey, [scriptblock]$MemoMake)
+    if (-not $script:ScanMode) { return (& $MemoMake) }
+    if (-not $script:Cache.ContainsKey($MemoKey)) { $script:Cache[$MemoKey] = @(& $MemoMake) }
+    return $script:Cache[$MemoKey]
+}
+
+# --------------------------------------- slow questions asked in the background --
+# Windows answers some questions slowly (optional features, capabilities, apps, firewall rules, scheduled
+# tasks, adapter bindings, USB devices). A check starts them all at once in the background and carries on with
+# the fast settings meanwhile; a setting that needs an answer waits for it. The three that use DISM
+# (features, apps' provisioned packages, capabilities) run one after the other, never side by side.
+# If a background question fails or comes back empty, the very same question is asked again in place, so
+# the result never depends on the background work.
+$script:Pre = $null
+$script:PreOff = $false       # true: always ask in place (the tests do this)
+$script:PreWait = 300         # most seconds Pre-Wait itself waits for one background answer
+$script:PreStall = 60         # seconds in which nothing at all moves forward before the check stops waiting for a background answer and asks in place
+$script:PreStallDism = 240    # the same for the three DISM questions (asking those twice side by side only makes both slower)
+$script:PreGiven = @{}        # background answers the check has stopped waiting for (they are asked in place instead)
+$script:PreSeen = @{}         # background answers the log has already mentioned
+$script:PreLabels = @{ feat = 'optional features'; prov = 'installed apps'; appx = 'installed apps'; cap = 'Windows capabilities'; tasks = 'scheduled tasks'
+                       fw = 'firewall rules'; bind = 'network adapter settings'; net = 'network adapters'; usb = 'USB devices' }
+$script:PreInit = ''          # extra text run first in every background script (the tests put stand-in commands here)
+# Started in this order, at most $script:PreSlots at a time: the long ones first, the quick ones as soon as a place is free.
+# (Asking everything of Windows at once makes every question slower.)
+$script:PreSlots = 4
+$script:PreGroups = @(@('prov', 'feat', 'cap'), @('tasks'), @('fw'), @('appx'), @('bind'), @('net'), @('usb'))
+$script:PreScripts = @{
+    feat = @'
+Get-WindowsOptionalFeature -Online -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ N = [string]$_.FeatureName; S = [string]$_.State } }
+'@
+    prov = @'
+Get-AppxProvisionedPackage -Online -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ N = [string]$_.DisplayName; P = [string]$_.PackageName } }
+'@
+    cap = @'
+Get-WindowsCapability -Online -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ N = [string]$_.Name; S = [string]$_.State } }
+'@
+    appx = @'
+Get-AppxPackage -AllUsers -ErrorAction Ignore | ForEach-Object {
+    # L: is the app installed for at least one user? A package that is only "Staged" (what stays behind when the app was uninstalled
+    # from Start or Settings: the copy kept for new accounts) is not. When Windows does not say, it counts as installed.
+    $live = $true
+    try {
+        $ui = @($_.PackageUserInformation)
+        if ($ui.Count -gt 0) {
+            $live = $false
+            foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged') { $live = $true } }
+        }
+    } catch { $live = $true }
+    [pscustomobject]@{ N = [string]$_.Name; F = [string]$_.PackageFullName; R = [bool]$_.NonRemovable; L = $live }
+}
+'@
+    tasks = @'
+Get-ScheduledTask -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ P = [string]$_.TaskPath; N = [string]$_.TaskName; S = [string]$_.State } }
+'@
+    fw = @'
+Get-NetFirewallRule -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ N = [string]$_.Name; G = [string]$_.DisplayGroup; E = [string]$_.Enabled } }
+'@
+    bind = @'
+Get-NetAdapterBinding -ErrorAction Ignore | ForEach-Object { [pscustomobject]@{ N = [string]$_.Name; C = [string]$_.ComponentID; E = [bool]$_.Enabled } }
+'@
+    net = @'
+$nics = @(Get-NetAdapter -Physical -ErrorAction Ignore)
+foreach ($n in $nics) { [pscustomobject]@{ K = 'nic'; A = [string]$n.Name; D = [string]$n.InterfaceDescription; G = [string]$n.InterfaceGuid; P = [string]$n.PnPDeviceID } }
+foreach ($i in @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Ignore)) { [pscustomobject]@{ K = 'pm'; I = [string]$i.InstanceName; E = [bool]$i.Enable } }
+foreach ($n in $nics) {
+    foreach ($a in @(Get-NetAdapterAdvancedProperty -Name $n.Name -ErrorAction Ignore)) {
+        $valid = @(); foreach ($v in @($a.ValidDisplayValues)) { $valid += [string]$v }
+        [pscustomobject]@{ K = 'adv'; A = [string]$n.Name; N = [string]$a.DisplayName; V = [string]$a.DisplayValue; W = [string]$a.RegistryKeyword; R = [string](@($a.RegistryValue)[0]); L = $valid }
+    }
+    $r = Get-NetAdapterPowerManagement -Name $n.Name -ErrorAction Ignore
+    if ($r) { [pscustomobject]@{ K = 'npm'; A = [string]$n.Name; S = [string]$r.SelectiveSuspend; D = [string]$r.DeviceSleepOnDisconnect } }
+}
+'@
+    usb = @'
+$all = @(Get-PnpDevice -Class USB -ErrorAction Ignore) + @(Get-PnpDevice -ErrorAction Ignore | Where-Object { $_.InstanceId -like 'USB\*' })
+$seen = @{}
+foreach ($d in $all) {
+    $id = [string]$d.InstanceId
+    if ($id -and -not $seen.ContainsKey($id)) { $seen[$id] = 1; [pscustomobject]@{ I = $id; N = [string]$d.FriendlyName } }
+}
+'@
+}
+$script:PreRunner = @'
+param($Data, $Init, $Names, $Scripts)
+$ErrorActionPreference = 'SilentlyContinue'
+$ProgressPreference = 'SilentlyContinue'
+if ($Init) { . ([scriptblock]::Create($Init)) }
+foreach ($n in $Names) {
+    $ok = $true
+    $items = @()
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $items = @(& ([scriptblock]::Create([string]$Scripts[$n]))) } catch { $ok = $false }
+    $Data[$n] = @{ Ok = $ok; Items = $items; Secs = $sw.Elapsed.TotalSeconds }
+}
+'@
+function Start-Prefetch {
+    $script:Pre = $null
+    $script:PreGiven = @{}
+    $script:PreSeen = @{}
+    if ($script:PreOff) { return }
+    $pool = $null
+    $handles = @()
+    $map = @{}
+    try {
+        # Same rule as the worker: modules may load whatever the machine's script policy says (the pool only runs our own text).
+        # If this PowerShell does not accept that, the plain pool is used.
+        try {
+            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass
+            $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $script:PreSlots, $iss, $Host)
+            $pool.Open()
+        } catch {
+            if ($pool) { try { $pool.Dispose() } catch { } }
+            $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1, $script:PreSlots)
+            $pool.Open()
+        }
+        $data = [hashtable]::Synchronized(@{})
+        foreach ($names in $script:PreGroups) {
+            $ps = [System.Management.Automation.PowerShell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($script:PreRunner).AddArgument($data).AddArgument($script:PreInit).AddArgument($names).AddArgument($script:PreScripts)
+            $h = @{ PS = $ps; Async = $ps.BeginInvoke() }
+            $handles += ,$h
+            foreach ($nm in $names) { $map[[string]$nm] = $h }
+        }
+        $script:Pre = @{ Pool = $pool; Data = $data; Handles = $handles; Map = $map }
+    } catch {
+        foreach ($h in $handles) { try { $h.PS.Dispose() } catch { } }
+        if ($pool) { try { $pool.Dispose() } catch { } }
+        $script:Pre = $null
+    }
+}
+function Stop-Prefetch {
+    $p = $script:Pre
+    $script:Pre = $null
+    if (-not $p) { return }
+    $running = $false
+    foreach ($h in @($p.Handles)) {
+        if (-not $h.Async.IsCompleted) { $running = $true; try { [void]$h.PS.BeginStop($null, $null) } catch { } }
+    }
+    if ($running) {
+        try { [void]$p.Pool.CloseAsync() } catch { }          # do not wait for a query that cannot be interrupted
+    } else {
+        foreach ($h in @($p.Handles)) { try { $h.PS.Dispose() } catch { } }
+        try { $p.Pool.Close() } catch { }
+        try { $p.Pool.Dispose() } catch { }
+    }
+}
+# Is the background answer called $Name there (or its work finished, or given up on)? True when there is no background work at all.
+function Pre-Done {
+    param([string]$Name)
+    $p = $script:Pre
+    if (-not $p) { return $true }
+    if ($p.Data.ContainsKey($Name)) { return $true }
+    if ($script:PreGiven.ContainsKey($Name)) { return $true }
+    $h = $p.Map[$Name]
+    if (-not $h) { return $true }
+    return [bool]$h.Async.IsCompleted
+}
+# The background answer called $Name as an array of objects, or $null when there is none (ask in place then)
+function Pre-Wait {
+    param([string]$Name)
+    $p = $script:Pre
+    if (-not $p) { return $null }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while (-not (Pre-Done $Name)) {
+        if ($sw.Elapsed.TotalSeconds -gt $script:PreWait) { return $null }
+        Start-Sleep -Milliseconds 30
+    }
+    if (-not $p.Data.ContainsKey($Name)) { return $null }
+    $r = $p.Data[$Name]
+    if (-not $r -or -not $r.Ok) { return $null }
+    $items = @($r.Items)
+    if ($items.Count -eq 0) { return $null }
+    return ,$items
+}
+# Which background answers a setting's check asks for (so the check can leave it until they have arrived).
+# Settings that use a slow question without saying so in their parts are listed here; the tests compare this list with
+# what the checks really ask for.
+$script:CustomNeeds = @{ UsbPower = @('usb', 'net'); NicTurnOff = @('net'); NicEee = @('net'); NicSuspend = @('net'); AiCore = @('appx', 'prov') }
+$script:NeedsMemo = @{}
+function Get-TweakNeeds {
+    param($t)
+    $id = [string]$t.Id
+    if ($script:NeedsMemo.ContainsKey($id)) { return $script:NeedsMemo[$id] }
+    $n = @{}
+    foreach ($p in $t.Parts) {
+        switch ([string]$p.T) {
+            'task'   { $n['tasks'] = 1 }
+            'taskdyn' { $n['tasks'] = 1 }
+            'fw'     { $n['fw'] = 1 }
+            'bind'   { $n['bind'] = 1 }
+            'feat'   { $n['feat'] = 1 }
+            'cap'    { $n['cap'] = 1 }
+            'appx'   { $n['appx'] = 1; $n['prov'] = 1 }
+            'svc'    { if ([string]$p.SkipIf -match 'Test-UsesVirtualization') { $n['feat'] = 1 } }
+            'custom' { foreach ($x in @($script:CustomNeeds[[string]$p.Name])) { if ($x) { $n[[string]$x] = 1 } } }
+        }
+    }
+    $r = @($n.Keys | Sort-Object)
+    $script:NeedsMemo[$id] = $r
+    return $r
+}
+function Pre-Ready {
+    param($needs)
+    foreach ($nm in @($needs)) { if (-not (Pre-Done ([string]$nm))) { return $false } }
+    return $true
+}
+# Writes a line to the log for every background answer that has arrived since the last call. True when there was a new one.
+function Pre-Note {
+    $p = $script:Pre
+    if (-not $p) { return $false }
+    $any = $false
+    foreach ($nm in @($p.Map.Keys)) {
+        if ($script:PreSeen.ContainsKey($nm) -or -not $p.Data.ContainsKey($nm)) { continue }
+        $script:PreSeen[$nm] = 1
+        $any = $true
+        if ($null -eq $Q) { continue }          # in the console the list is the output; the timings go to the window's log only
+        $r = $p.Data[$nm]
+        if ($r.Ok) { Say ('  Windows answered: {0} ({1} found, {2:N1} s)' -f $script:PreLabels[$nm], @($r.Items).Count, [double]$r.Secs) 'DarkGray' }
+        else { Say ('  Windows could not answer in the background: {0} (it is asked again directly)' -f $script:PreLabels[$nm]) 'DarkGray' }
+    }
+    return $any
+}
+# The background answers that the settings still waiting need and that have not arrived
+function Pre-Missing {
+    param($pending)
+    $m = @{}
+    foreach ($t in $pending) { foreach ($nm in @(Get-TweakNeeds $t)) { if (-not (Pre-Done ([string]$nm))) { $m[[string]$nm] = 1 } } }
+    return @($m.Keys | Sort-Object)
+}
+
+# ------------------------------------------------------------ services -------
+# Start type is read and written through the registry (Start + DelayedAutostart), which also
+# works for services that Set-Service refuses to touch.
+$script:SvcRoot = 'HKLM:\SYSTEM\CurrentControlSet\Services'
+function Svc-Read {
+    param([string]$Name)
+    $s = Reg-Read "$script:SvcRoot\$Name" 'Start'
+    if (-not $s.Exists) { return $null }
+    $d = Reg-Read "$script:SvcRoot\$Name" 'DelayedAutostart'
+    $delayed = 0; if ($d.Exists) { $delayed = [int]$d.Value }
+    return @{ Start = [int]$s.Value; Delayed = $delayed }
+}
+function Svc-Decode {
+    param([string]$s)
+    switch ($s) {
+        'Automatic'        { return @{ Start = 2; Delayed = 0 } }
+        'AutomaticDelayed' { return @{ Start = 2; Delayed = 1 } }
+        'Manual'           { return @{ Start = 3; Delayed = 0 } }
+        default            { return @{ Start = 4; Delayed = 0 } }
+    }
+}
+function Svc-Label {
+    param($cur)
+    if ($null -eq $cur) { return 'missing' }
+    switch ($cur.Start) {
+        2 { if ($cur.Delayed) { return 'Automatic (delayed)' } else { return 'Automatic' } }
+        3 { return 'Manual' }
+        4 { return 'Disabled' }
+        default { return "start=$($cur.Start)" }
+    }
+}
+function Svc-IsApplied {
+    param($cur, $p)
+    if ($p.Set -eq 'Manual') { return ($cur.Start -eq 3 -or $cur.Start -eq 4) }
+    return ($cur.Start -eq 4)
+}
+function Svc-Write {
+    param([string]$Name, $Want)
+    $type = @{ 2 = 'Automatic'; 3 = 'Manual'; 4 = 'Disabled' }[[int]$Want.Start]
+    if ($DryRun) { Say ("  [dry] service {0} -> {1}" -f $Name, (Svc-Label $Want)) 'DarkGray'; return }
+    # Remote Desktop services are not stopped while you are connected through Remote Desktop
+    $keepRunning = ($script:InRdp -and ('TermService', 'UmRdpService', 'SessionEnv') -contains $Name)
+    if ($Want.Start -eq 4 -and -not $keepRunning) { Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue }
+    Set-Service -Name $Name -StartupType $type -ErrorAction SilentlyContinue
+    [void](Reg-Write "$script:SvcRoot\$Name" 'Start' ([int]$Want.Start) 'DWord' -Quiet)
+    if ($Want.Delayed) { [void](Reg-Write "$script:SvcRoot\$Name" 'DelayedAutostart' 1 'DWord' -Quiet) }
+    else               { [void](Reg-Remove "$script:SvcRoot\$Name" 'DelayedAutostart' -Quiet) }
+    if ($Want.Start -eq 2) { Start-Service -Name $Name -ErrorAction SilentlyContinue }
+    Say ("  service {0} -> {1}" -f $Name, (Svc-Label $Want)) 'DarkGray'
+}
+
+# ------------------------------------------------------ scheduled tasks ------
+function Task-Split { param([string]$full) $i = $full.LastIndexOf('\'); return @{ Path = $full.Substring(0, $i + 1); Name = $full.Substring($i + 1) } }
+# All scheduled tasks at once (path + name, lower case -> enabled). Asking for every task one by one is slow.
+function Task-All {
+    if (-not $script:Cache.ContainsKey('tasks')) {
+        $m = @{}
+        $pre = Pre-Wait 'tasks'
+        if ($null -ne $pre) {
+            foreach ($x in $pre) { $m[(([string]$x.P + [string]$x.N).ToLowerInvariant())] = ([string]$x.S -ne 'Disabled') }
+        } else {
+            foreach ($t in @(Get-ScheduledTask -ErrorAction Ignore)) { $m[(([string]$t.TaskPath + [string]$t.TaskName).ToLowerInvariant())] = ([string]$t.State -ne 'Disabled') }
+        }
+        $script:Cache['tasks'] = $m
+    }
+    return $script:Cache['tasks']
+}
+function Task-Read {
+    param([string]$full)
+    $s = Task-Split $full
+    if ($script:ScanMode) {
+        $m = Task-All
+        if ($m.Count -ge 20) {       # a real list; a short or empty one means the question failed, so ask for this task alone
+            $k = ($s.Path + $s.Name).ToLowerInvariant()
+            if ($m.ContainsKey($k)) { return @{ Enabled = $m[$k] } }
+            return $null
+        }
+    }
+    $t = Get-ScheduledTask -TaskPath $s.Path -TaskName $s.Name -ErrorAction Ignore
+    if (-not $t) { return $null }
+    return @{ Enabled = ([string]$t.State -ne 'Disabled') }
+}
+# The full names of the scheduled tasks in one folder whose name starts with a prefix.
+# While scanning they come from the one list of all tasks (names in lower case); otherwise Windows is asked for that folder.
+function Task-Match {
+    param([string]$Folder, [string]$Prefix)
+    $out = @()
+    $m = $null
+    if ($script:ScanMode) { $m = Task-All; if ($m.Count -lt 20) { $m = $null } }
+    if ($null -ne $m) {
+        $f = ($Folder + $Prefix).ToLowerInvariant()
+        foreach ($k in $m.Keys) { if ($k.StartsWith($f) -and $k.IndexOf('\', $Folder.Length) -lt 0) { $out += [string]$k } }
+    } else {
+        foreach ($t in @(Get-ScheduledTask -TaskPath $Folder -ErrorAction Ignore)) {
+            if ([string]$t.TaskName -like ($Prefix + '*')) { $out += ([string]$t.TaskPath + [string]$t.TaskName) }
+        }
+    }
+    return @($out | Sort-Object)
+}
+function Task-Write {
+    param([string]$full, [bool]$enable)
+    $s = Task-Split $full
+    if ($DryRun) { Say ("  [dry] task {0} -> {1}" -f $s.Name, $(if ($enable) { 'enabled' } else { 'disabled' })) 'DarkGray'; return }
+    if ($enable) { Enable-ScheduledTask  -TaskPath $s.Path -TaskName $s.Name -ErrorAction SilentlyContinue | Out-Null }
+    else         { Disable-ScheduledTask -TaskPath $s.Path -TaskName $s.Name -ErrorAction SilentlyContinue | Out-Null }
+    Say ("  task {0} -> {1}" -f $s.Name, $(if ($enable) { 'enabled' } else { 'disabled' })) 'DarkGray'
+}
+
+# --------------------------------------------------------- firewall ----------
+# Every firewall rule at once, sorted into groups (group name in lower case -> rules)
+function Fw-Index {
+    if (-not $script:Cache.ContainsKey('fw')) {
+        $idx = @{}
+        $count = 0
+        $pre = Pre-Wait 'fw'
+        $rules = @()
+        if ($null -ne $pre) {
+            foreach ($x in $pre) { $rules += ,@{ Name = [string]$x.N; Group = [string]$x.G; Enabled = ([string]$x.E -eq 'True') } }
+        } else {
+            foreach ($r in @(Get-NetFirewallRule -ErrorAction Ignore)) { $rules += ,@{ Name = [string]$r.Name; Group = [string]$r.DisplayGroup; Enabled = ([string]$r.Enabled -eq 'True') } }
+        }
+        foreach ($r in $rules) {
+            $g = $r.Group.ToLowerInvariant()
+            if (-not $idx.ContainsKey($g)) { $idx[$g] = New-Object System.Collections.ArrayList }
+            [void]$idx[$g].Add(@{ Name = $r.Name; Enabled = $r.Enabled })
+            $count++
+        }
+        $script:Cache['fw'] = @{ Groups = $idx; Count = $count }
+    }
+    return $script:Cache['fw']
+}
+function Fw-Rules {
+    param([string]$group)
+    $out = @()
+    if ($script:ScanMode -and $group -notmatch '[\*\?\[]') {
+        $ix = Fw-Index
+        if ($ix.Count -ge 20) {      # a real list; a short or empty one means the question failed, so ask for this group alone
+            $k = $group.ToLowerInvariant()
+            if ($ix.Groups.ContainsKey($k)) { foreach ($r in $ix.Groups[$k]) { $out += ,@{ Name = $r.Name; Enabled = $r.Enabled } } }
+            return $out
+        }
+    }
+    foreach ($r in @(Get-NetFirewallRule -DisplayGroup $group -ErrorAction Ignore)) {
+        $out += ,@{ Name = [string]$r.Name; Enabled = ([string]$r.Enabled -eq 'True') }
+    }
+    return $out
+}
+function Fw-DisableGroup {
+    param([string]$group)
+    if ($DryRun) { Say "  [dry] firewall rules off: $group" 'DarkGray'; return }
+    Disable-NetFirewallRule -DisplayGroup $group -ErrorAction SilentlyContinue
+    Say "  firewall rules off: $group" 'DarkGray'
+}
+function Fw-EnableNames {
+    param([string]$group, [string[]]$names)
+    if ($DryRun) { Say "  [dry] firewall rules back on: $group ($($names.Count) rule(s))" 'DarkGray'; return }
+    Enable-NetFirewallRule -Name $names -ErrorAction SilentlyContinue
+    Say "  firewall rules back on: $group ($($names.Count) rule(s))" 'DarkGray'
+}
+
+# ------------------------------------------------------ adapter bindings -----
+# Every adapter binding at once (component id in lower case -> bindings)
+function Bind-Index {
+    if (-not $script:Cache.ContainsKey('bind')) {
+        $idx = @{}
+        $count = 0
+        $pre = Pre-Wait 'bind'
+        $list = @()
+        if ($null -ne $pre) {
+            foreach ($x in $pre) { $list += ,@{ Comp = [string]$x.C; Name = [string]$x.N; Enabled = [bool]$x.E } }
+        } else {
+            foreach ($b in @(Get-NetAdapterBinding -ErrorAction Ignore)) { $list += ,@{ Comp = [string]$b.ComponentID; Name = [string]$b.Name; Enabled = [bool]$b.Enabled } }
+        }
+        foreach ($b in $list) {
+            $c = $b.Comp.ToLowerInvariant()
+            if (-not $idx.ContainsKey($c)) { $idx[$c] = New-Object System.Collections.ArrayList }
+            [void]$idx[$c].Add(@{ Name = $b.Name; Enabled = $b.Enabled })
+            $count++
+        }
+        $script:Cache['bind'] = @{ Comps = $idx; Count = $count }
+    }
+    return $script:Cache['bind']
+}
+function Bind-Read {
+    param([string]$comp)
+    $out = @()
+    if ($script:ScanMode) {
+        $ix = Bind-Index
+        if ($ix.Count -gt 0) {       # an empty list may mean the question failed, so ask for this component alone
+            $k = $comp.ToLowerInvariant()
+            if ($ix.Comps.ContainsKey($k)) { foreach ($b in $ix.Comps[$k]) { $out += ,@{ Name = $b.Name; Enabled = $b.Enabled } } }
+            return $out
+        }
+    }
+    foreach ($b in @(Get-NetAdapterBinding -ComponentID $comp -ErrorAction Ignore)) {
+        $out += ,@{ Name = [string]$b.Name; Enabled = [bool]$b.Enabled }
+    }
+    return $out
+}
+function Bind-Set {
+    param([string]$adapter, [string]$comp, [bool]$enable)
+    $word = 'off'; if ($enable) { $word = 'on' }
+    if ($DryRun) { Say "  [dry] adapter $adapter : $comp $word" 'DarkGray'; return }
+    if ($enable) { Enable-NetAdapterBinding  -Name $adapter -ComponentID $comp -ErrorAction SilentlyContinue }
+    else         { Disable-NetAdapterBinding -Name $adapter -ComponentID $comp -ErrorAction SilentlyContinue }
+    Say "  adapter $adapter : $comp $word" 'DarkGray'
+}
+
+# ------------------------------------------- optional features, capabilities --
+function Feat-State {
+    param([string]$name)
+    if (-not $script:Cache.ContainsKey('feat')) {
+        $m = @{}
+        $pre = Pre-Wait 'feat'
+        if ($null -ne $pre) {
+            foreach ($f in $pre) { $m[[string]$f.N] = [string]$f.S }
+        } else {
+            foreach ($f in @(Get-WindowsOptionalFeature -Online -ErrorAction Ignore)) { $m[[string]$f.FeatureName] = [string]$f.State }
+        }
+        $script:Cache['feat'] = $m
+    }
+    return $script:Cache['feat'][$name]
+}
+function Feat-Set {
+    param([string]$name, [bool]$enable)
+    $word = 'removed'; if ($enable) { $word = 'added back' }
+    if ($DryRun) { Say "  [dry] Windows feature $name $word" 'DarkGray'; return }
+    Say "  Windows feature $name : $word (this can take a minute)..." 'Gray'
+    if ($enable) { Enable-WindowsOptionalFeature  -Online -FeatureName $name -All -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+    else         { Disable-WindowsOptionalFeature -Online -FeatureName $name -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+}
+function Cap-List {
+    param([string]$pattern)
+    if (-not $script:Cache.ContainsKey('cap')) {
+        $l = @()
+        $pre = Pre-Wait 'cap'
+        if ($null -ne $pre) {
+            foreach ($c in $pre) { $l += ,@{ Name = [string]$c.N; State = [string]$c.S } }
+        } else {
+            foreach ($c in @(Get-WindowsCapability -Online -ErrorAction Ignore)) { $l += ,@{ Name = [string]$c.Name; State = [string]$c.State } }
+        }
+        $script:Cache['cap'] = $l
+    }
+    $hit = @()
+    foreach ($c in $script:Cache['cap']) { if ($c.Name -like $pattern) { $hit += ,$c } }
+    return $hit
+}
+function Cap-Set {
+    param([string]$name, [bool]$install)
+    $word = 'removed'; if ($install) { $word = 'added back' }
+    if ($DryRun) { Say "  [dry] Windows capability $name $word" 'DarkGray'; return }
+    Say "  Windows capability $name : $word..." 'Gray'
+    if ($install) { Add-WindowsCapability    -Online -Name $name -ErrorAction SilentlyContinue | Out-Null }
+    else          { Remove-WindowsCapability -Online -Name $name -ErrorAction SilentlyContinue | Out-Null }
+}
+
+# ------------------------------------------------------------ apps -----------
+# Never removed, even when a wildcard in the catalog matches them (a setting that names one of them exactly can still remove it:
+# Camera, Paint, Snipping Tool and Sound Recorder have settings of their own; Calculator, Photos, Notepad and the rest have none)
+$script:Protect = @('Microsoft.DesktopAppInstaller',
+    'Microsoft.WindowsCalculator', 'Microsoft.Windows.Photos', 'Microsoft.WindowsTerminal',
+    'Microsoft.WindowsNotepad', 'Microsoft.Paint', 'Microsoft.WindowsCamera',
+    'Microsoft.WindowsSoundRecorder', 'Microsoft.ScreenSketch', 'Microsoft.HEVCVideoExtension',
+    'Microsoft.VP9VideoExtensions', 'Microsoft.WebMediaExtensions', 'Microsoft.WebpImageExtension',
+    'Microsoft.HEIFImageExtension', 'Microsoft.RawImageExtension', 'Microsoft.SecHealthUI',
+    'Microsoft.UI.Xaml*', 'Microsoft.VCLibs*', 'Microsoft.NET.Native*', 'Microsoft.WindowsAppRuntime*',
+    'Microsoft.AV1VideoExtension', 'NVIDIACorp.NVIDIAControlPanel', 'AdvancedMicroDevicesInc*',
+    'RealtekSemiconductorCorp*')
+function Test-Protected { param([string]$name) foreach ($p in $script:Protect) { if ($name -like $p) { return $true } } return $false }
+# A protected app is only touched when a setting names it exactly (no wildcard in the pattern); a wildcard never reaches it
+function Appx-Allowed {
+    param([string]$name, [string]$pat)
+    if (-not (Test-Protected $name)) { return $true }
+    return ($pat -notmatch '[*?]' -and $pat -ieq $name)
+}
+# Is a package (from Get-AppxPackage -AllUsers) installed for at least one user? "Staged" for every user = only the copy kept for new
+# accounts is left. Anything unclear counts as installed.
+function Appx-IsLive {
+    param($p)
+    try {
+        $ui = @($p.PackageUserInformation)
+        if ($ui.Count -eq 0) { return $true }
+        foreach ($u in $ui) { if (([string]$u.InstallState + ' ' + [string]$u) -notmatch 'Staged') { return $true } }
+        return $false
+    } catch { return $true }
+}
+function Appx-Data {
+    if (-not $script:Cache.ContainsKey('appx')) {
+        $pk = @(); $pv = @()
+        $preA = Pre-Wait 'appx'
+        if ($null -ne $preA) {
+            foreach ($p in $preA) { $pk += ,@{ Name = [string]$p.N; Full = [string]$p.F; NonRemovable = [bool]$p.R; Live = ($null -eq $p.L -or [bool]$p.L) } }
+        } else {
+            foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction Ignore)) { $pk += ,@{ Name = [string]$p.Name; Full = [string]$p.PackageFullName; NonRemovable = [bool]$p.NonRemovable; Live = (Appx-IsLive $p) } }
+        }
+        $preP = Pre-Wait 'prov'
+        if ($null -ne $preP) {
+            foreach ($p in $preP) { $pv += ,@{ Name = [string]$p.N; Pkg = [string]$p.P } }
+        } else {
+            foreach ($p in @(Get-AppxProvisionedPackage -Online -ErrorAction Ignore)) { $pv += ,@{ Name = [string]$p.DisplayName; Pkg = [string]$p.PackageName } }
+        }
+        $script:Cache['appx'] = @{ Pkgs = $pk; Prov = $pv }
+    }
+    return $script:Cache['appx']
+}
+function Appx-Matches {
+    param([string[]]$patterns)
+    $d = Appx-Data
+    $pk = @{}; $pv = @{}; $lv = @{}
+    foreach ($pat in $patterns) {
+        foreach ($p in $d.Pkgs) {
+            if ($p.Name -like $pat -and -not $p.NonRemovable -and (Appx-Allowed $p.Name $pat)) { $pk[$p.Full] = $p.Name; $lv[$p.Full] = ($null -eq $p.Live -or [bool]$p.Live) }
+        }
+        foreach ($p in $d.Prov) { if ($p.Name -like $pat -and (Appx-Allowed $p.Name $pat)) { $pv[$p.Pkg] = $p.Name } }
+    }
+    return @{ Pkgs = $pk; Prov = $pv; Live = $lv }
+}
+
+# -------------------------------------------------------- small helpers ------
+function Fs-Exists { param([string]$p) return (Test-Path -LiteralPath $p) }
+function Pwr { $o = & powercfg @args 2>&1; return (($o | Out-String).TrimEnd()) }
+function Battery-Present { Scan-Memo 'battery' { [bool](Get-CimInstance -ClassName Win32_Battery -ErrorAction Ignore) } }
+# Files in one folder:  @{ Name; Path }  (desktop.ini left out)
+function Fs-Files {
+    param([string]$Dir)
+    $o = @()
+    if (-not $Dir -or -not (Test-Path -LiteralPath $Dir)) { return $o }
+    foreach ($f in @(Get-ChildItem -LiteralPath $Dir -File -Force -ErrorAction Ignore)) {
+        if ($f.Name -ieq 'desktop.ini') { continue }
+        $o += ,@{ Name = [string]$f.Name; Path = [string]$f.FullName }
+    }
+    return $o
+}
+# Where a shortcut points ('' if it is not a shortcut or cannot be read)
+function Lnk-Target {
+    param([string]$Path)
+    if ($Path -notmatch '\.lnk$') { return '' }
+    try {
+        $l = (New-Object -ComObject WScript.Shell).CreateShortcut($Path)
+        return (([string]$l.TargetPath + ' ' + [string]$l.Arguments).Trim())
+    } catch { return '' }
+}
+# The two Startup folders:  User / Common  ('' if Windows does not say)
+function Startup-Dirs {
+    $u = ''; $c = ''
+    try { $u = [string][Environment]::GetFolderPath('Startup') } catch { }
+    try { $c = [string][Environment]::GetFolderPath('CommonStartup') } catch { }
+    return @{ User = $u; Common = $c }
+}
+# bcdedit (the boot configuration). $null when the boot store cannot be read.
+function Bcd {
+    try { $o = & bcdedit @args 2>&1 } catch { return $null }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (($o | Out-String).TrimEnd())
+}
+# Windows Security (Defender) scan preferences. $null when it is not there / not usable.
+function Mp-Read {
+    $m = $null
+    try { $m = Get-MpPreference -ErrorAction Stop } catch { return $null }
+    if (-not $m) { return $null }
+    return @{ Idle = [bool]$m.ScanOnlyIfIdleEnabled; LowPri = [bool]$m.EnableLowCpuPriority; Cpu = [int]$m.ScanAvgCPULoadFactor }
+}
+function Mp-Write {
+    param([bool]$Idle, [bool]$LowPri, [int]$Cpu)
+    if ($DryRun) { return $true }
+    try {
+        Set-MpPreference -ScanOnlyIfIdleEnabled $Idle -EnableLowCpuPriority $LowPri -ScanAvgCPULoadFactor $Cpu -ErrorAction Stop
+        return $true
+    } catch {
+        Say "  ! Windows Security did not accept the change: $($_.Exception.Message)" 'Yellow'
+        return $false
+    }
+}
+# BitLocker drive encryption. Bl-State: Ok = $false when BitLocker cannot be asked about on this PC (some editions of Windows have no BitLocker),
+# else Ok = $true and Vols = one entry per drive letter: Mount, Type (OperatingSystem | Data | ...), Status (FullyEncrypted, FullyDecrypted, ...), Lock (Locked | Unlocked), Pct.
+# Via says which tool answered ('Get-BitLockerVolume' or 'manage-bde').
+function Bl-State {
+    $v = $null
+    if (Get-Command Get-BitLockerVolume -ErrorAction Ignore) {
+        try { $v = @(Get-BitLockerVolume -ErrorAction Stop) } catch { $v = $null }
+    }
+    if ($null -ne $v) {
+        $out = @()
+        foreach ($x in $v) {
+            $m = [string]$x.MountPoint
+            if (-not $m) { continue }
+            $out += ,@{ Mount = $m; Type = [string]$x.VolumeType; Status = [string]$x.VolumeStatus; Lock = [string]$x.LockStatus; Pct = [int]$x.EncryptionPercentage }
+        }
+        return @{ Ok = $true; Vols = $out; Via = 'Get-BitLockerVolume' }
+    }
+    # Windows Home has the "Device encryption" switch (the same encryption as BitLocker) and manage-bde.exe, but not always the PowerShell
+    # BitLocker commands: ask manage-bde instead. Its text is read as English only; in any other language nothing is found and the
+    # setting reads "not available" rather than guessing.
+    $t = Bde '-status'
+    if ($null -ne $t) {
+        $vols = Bl-ParseManageBde $t
+        if ($null -ne $vols) { return @{ Ok = $true; Vols = @($vols); Via = 'manage-bde' } }
+    }
+    return @{ Ok = $false; Vols = @(); Via = '' }
+}
+# manage-bde.exe. $null when it is not there or refuses.
+function Bde {
+    try { $o = & manage-bde @args 2>&1 } catch { return $null }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (($o | Out-String).TrimEnd())
+}
+# The text of "manage-bde -status" (English) as the same list Bl-State makes, or $null when no drive can be found in it.
+# Status is written the way Get-BitLockerVolume writes it: "Fully Encrypted" = FullyEncrypted, "Decryption in Progress" = DecryptionInProgress, ...
+function Bl-ParseManageBde {
+    param([string]$Text)
+    $vols = @(); $cur = $null
+    foreach ($line in (([string]$Text) -split "`r?`n")) {
+        $m = [regex]::Match($line, '^\s*Volume\s+(\S+)')
+        if ($m.Success) {
+            if ($cur) { $vols += ,$cur }
+            $cur = $null
+            # only drives with a letter are listed (one without a letter is skipped, and its lines must not land on the drive before it)
+            if ($m.Groups[1].Value -match '^[A-Za-z]:$') { $cur = @{ Mount = $m.Groups[1].Value.ToUpper(); Type = 'Data'; Status = ''; Lock = 'Unlocked'; Pct = 0 } }
+            continue
+        }
+        if (-not $cur) { continue }
+        if ($line -match '^\s*\[OS Volume\]') { $cur.Type = 'OperatingSystem'; continue }
+        if ($line -match '^\s*\[Data Volume\]') { $cur.Type = 'Data'; continue }
+        $kv = [regex]::Match($line, '^\s*([^:]+?):\s*(.*?)\s*$')
+        if (-not $kv.Success) { continue }
+        $k = $kv.Groups[1].Value.Trim(); $val = $kv.Groups[2].Value.Trim()
+        if ($k -eq 'Conversion Status') { $cur.Status = ($val -replace '\s+', '') }
+        elseif ($k -eq 'Percentage Encrypted') { $n = 0.0; if ([double]::TryParse(($val -replace '[%\s]', '' -replace ',', '.'), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { $cur.Pct = [int][Math]::Round($n) } }
+        elseif ($k -eq 'Lock Status') { if ($val -match '^Locked') { $cur.Lock = 'Locked' } else { $cur.Lock = 'Unlocked' } }
+    }
+    if ($cur) { $vols += ,$cur }
+    $good = @($vols | Where-Object { $_.Status })
+    if ($good.Count -eq 0) { return $null }
+    return $good
+}
+# Start decrypting one drive. It carries on in the background and the drive stays usable. $true when it was started.
+function Bl-Decrypt {
+    param([string]$Mount)
+    if ($DryRun) { return $true }
+    if (Get-Command Disable-BitLocker -ErrorAction Ignore) {
+        try { Disable-BitLocker -MountPoint $Mount -ErrorAction Stop | Out-Null; return $true }
+        catch { Say "  ! $Mount could not be decrypted: $($_.Exception.Message)" 'Yellow'; return $false }
+    }
+    if ($null -ne (Bde '-off' $Mount)) { return $true }
+    Say "  ! $Mount could not be decrypted (manage-bde -off was refused)" 'Yellow'
+    return $false
+}
+function Test-UsesVirtualization {
+    foreach ($f in 'VirtualMachinePlatform', 'Microsoft-Hyper-V-All', 'Containers-DisposableClientVM') { if ((Feat-State $f) -eq 'Enabled') { return $true } }
+    return $false
+}
+function Ensure-Win32Ui {
+    if ('Win32Ui' -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class Win32Ui {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ANIMATIONINFO { public uint cbSize; public int iMinAnimate; }
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiPtr(uint action, uint param, IntPtr vparam, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern bool SpiStr(uint action, uint param, string vparam, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiAnim(uint action, uint param, ref ANIMATIONINFO vparam, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiInts(uint action, uint param, int[] vparam, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiGetInt(uint action, uint param, ref int vparam, uint flags);
+    [DllImport("user32.dll")]
+    public static extern bool SetSysColors(int count, int[] elements, int[] colors);
+    [StructLayout(LayoutKind.Sequential)]
+    public struct KEYFLAGS { public uint cbSize; public uint dwFlags; }
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FILTERFLAGS { public uint cbSize; public uint dwFlags; public uint iWaitMSec; public uint iDelayMSec; public uint iRepeatMSec; public uint iBounceMSec; }
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiKeys(uint action, uint param, ref KEYFLAGS vparam, uint flags);
+    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
+    public static extern bool SpiFilter(uint action, uint param, ref FILTERFLAGS vparam, uint flags);
+}
+"@
+}
+
+# ------------------------------------------------------- catalog builders ----
+# A setting ("tweak") is made of parts. Each part knows how to be detected, applied and undone.
+function pReg    { param($Path, $Name, $Value, $Default = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type } }
+# A registry value that Windows protects on some builds: tried, but a refusal is not a failure and it never counts as "not applied"
+function pRegSoft { param($Path, $Name, $Value, $Default = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type; Soft = $true } }
+function pRegDyn { param([scriptblock]$Gen, [string]$Info) @{ T = 'regdyn'; Gen = $Gen; Info = $Info } }
+function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '') @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy } }
+function pTask   { param([string]$Path) @{ T = 'task'; Path = $Path } }
+# Scheduled tasks whose name starts with $Like inside one folder (for tasks that carry a changing id in their name).
+# Turns into one pTask per task found, so it is a no-op on a PC that has none.
+function pTaskDyn { param([string]$Folder, [string]$Like, [string]$Info) @{ T = 'taskdyn'; Folder = $Folder; Like = $Like; Info = $Info } }
+function pFw     { param([string]$Group) @{ T = 'fw'; Group = $Group } }
+function pBind   { param([string]$Comp) @{ T = 'bind'; Comp = $Comp } }
+function pFeat   { param([string]$Name) @{ T = 'feat'; Name = $Name } }
+function pCap    { param([string]$Pattern) @{ T = 'cap'; Pattern = $Pattern } }
+function pAppx   { param([string[]]$Patterns) @{ T = 'appx'; Patterns = $Patterns } }
+function pCustom { param([string]$Name, [string]$Info = '', $Data = $null) @{ T = 'custom'; Name = $Name; Info = $Info; Data = $Data } }
+# "This registry key exists" = applied.  Undo deletes $Root (default: the key itself) with everything below it.
+function pKey    { param([string]$Path, [string]$Root = '') @{ T = 'key'; Path = $Path; Root = $(if ($Root) { $Root } else { $Path }) } }
+# Marks a part as one that is used only on some editions of Windows: pEd 'Ent' (pReg ...) is used on Enterprise and Education only,
+# pEd 'Home,Pro' (pReg ...) on Home and Pro only. Classes: Home (Windows Home), Pro (Windows Pro) and Ent (Enterprise, Education and
+# every other edition, and also a PC whose edition cannot be read, so that nothing is left out by mistake). On an edition that is not
+# in the list the part is left out of everything: it is not read, not set and not undone. Use it only where Microsoft documents that
+# an edition ignores the value; a value nobody has documented is left as it is.
+function pEd     { param([string]$Only, $Part) $Part['Ed'] = @(($Only -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }); return $Part }
+
+function Add-Tweak {
+    # -Ask: a question the window (and an interactive console) puts to the user before this is turned on; if the answer is no
+    # the setting is left alone. -AskTitle is its heading; settings with the same -AskGroup are asked about together.
+    # -Unproven: the setting is harmless as far as is known, but it may not change anything on a PC (the description says why);
+    # the card carries a "May do nothing" tag (on the "Placebo Tweaks - Not Recommended" page the page name says it, so the tag is not repeated).
+    # -NotRec: a short reason why this script does not recommend switching the setting on. The card then shows "Not recommended" next
+    # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
+    param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
+          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [string]$Risk = '', [int]$At = -1,
+          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '')
+    # -Once: an action that is run when asked (a clean-up), not a switch. It is never "applied": it reads Off (Ready to run) every time,
+    # keeps no undo record, has nothing to undo, and is never part of the Recommended preset, "Apply all" or "Turn all on".
+    # Its custom part's Apply says what it did by setting $script:RunResult.
+    # -Choices: instead of one on/off switch the setting offers options, shown as a selector on the card. The first entry is the
+    # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
+    # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
+    $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
+            OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Risk = $Risk
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim() }
+    if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
+    if ($NotRec -and $Unproven) { throw "setting ${Id}: an unproven setting already counts as not recommended, so it takes no reason of its own" }
+    if ($NotRec -and $Once) { throw "setting ${Id}: a run-once action is not a switch, so it cannot be marked not recommended" }
+    if ($Once -and ($Preset -or $OneWay -or $Choices.Count -gt 0)) { throw "setting ${Id}: a run-once action cannot be in the Recommended preset, one-way or have options" }
+    if ($Choices.Count -gt 0) {
+        if ($Choices.Count -lt 2 -or [string]$Choices[0].Key -ne 'default' -or @($Choices[0].Parts).Count -ne 0) { throw "setting ${Id}: the first option must be the Windows default (Key 'default', no parts) and there must be one more" }
+        if ($Preset -or $OneWay) { throw "setting ${Id}: a setting with options cannot be part of the Recommended preset or one-way" }
+        $union = @{}; $parts = @(); $keys = @{}
+        foreach ($c in $Choices) {
+            $k = [string]$c.Key
+            if (-not $k -or $keys.ContainsKey($k.ToLowerInvariant())) { throw "setting ${Id}: option key '$k' is empty or used twice" }
+            $keys[$k.ToLowerInvariant()] = 1
+            if (-not [string]$c.Label -or -not [string]$c.Short) { throw "setting ${Id}: option '$k' needs a Label and a Short label" }
+            foreach ($p in @($c.Parts)) {
+                if ([string]$p.T -ne 'reg') { throw "setting ${Id}: options are made of registry values only" }
+                $vid = [string]$p.Path + '|' + [string]$p.Name
+                if ($union.ContainsKey($vid)) {
+                    if (-not (Reg-Equal $union[$vid].Value $p.Value $p.Type)) { throw "setting ${Id}: $vid has two different values in two options" }
+                } else { $union[$vid] = $p; $parts += ,$p }
+            }
+        }
+        $t.Choices = @($Choices)
+        $t.Parts = @($parts)
+    }
+    foreach ($p in @($t.Parts)) {
+        if ($null -eq $p.Ed) { continue }
+        if ($t.Choices) { throw "setting ${Id}: options cannot be limited to an edition" }
+        $eds = @($p.Ed)
+        if ($eds.Count -eq 0 -or @($eds | Where-Object { $_ -notin 'Home', 'Pro', 'Ent' }).Count -gt 0) { throw "setting ${Id}: an edition list can only hold Home, Pro and Ent" }
+    }
+    $byVal = @{}
+    foreach ($p in @($t.Parts)) {
+        if ([string]$p.T -ne 'reg') { continue }
+        $vid = [string]$p.Path + '|' + [string]$p.Name
+        if ($byVal.ContainsKey($vid)) {
+            $a = $byVal[$vid]
+            $overlap = ($null -eq $a.Ed -or $null -eq $p.Ed -or @(@($a.Ed) | Where-Object { @($p.Ed) -contains $_ }).Count -gt 0)
+            if ($overlap -and -not $t.Choices) { throw "setting ${Id}: $vid is set twice for the same edition" }
+        } else { $byVal[$vid] = $p }
+    }
+    if ($script:ById.ContainsKey($Id)) { throw "duplicate setting id: $Id" }
+    if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
+    $script:ById[$Id] = $t
+}
+# ---- the edition of Windows ----
+# Home / Pro / Ent (see pEd). Read once from the registry (EditionID: "Core" is Home, "Professional" is Pro).
+function Get-WinEdition {
+    $m = $script:Cache['edition']
+    if ($m) { return $m }
+    $id = ''
+    try { $r = Reg-Read 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'EditionID'; if ($r.Exists) { $id = ([string]$r.Value).Trim() } } catch { }
+    $cls = 'Ent'
+    if ($id -match '^core') { $cls = 'Home' }
+    elseif ($id -match '^professional(n|workstation|workstationn)?$') { $cls = 'Pro' }
+    $o = @{ Id = $id; Class = $cls }
+    $script:Cache['edition'] = $o
+    return $o
+}
+function Ed-Allows { param($Ed) return (@($Ed) -contains [string](Get-WinEdition).Class) }
+function Ed-ClassName { param([string]$Class) switch ($Class) { 'Home' { return 'Windows Home' } 'Pro' { return 'Windows Pro' } default { return 'this edition of Windows' } } }
+# why a part is left out on an edition that is not in its list
+function Ed-Reason {
+    param($Ed)
+    $e = @($Ed)
+    if ($e -contains 'Ent' -and $e -contains 'Pro') { return 'Windows only obeys it on Pro, Enterprise and Education' }
+    if ($e -contains 'Ent') { return 'Windows only obeys it on Enterprise and Education' }
+    if ($e -contains 'Pro' -and $e -contains 'Home') { return 'this value is for Windows Home and Pro; this edition uses the other one' }
+    return 'it is not used on this edition'
+}
+# The parts of a setting that this edition leaves out, except those that have another part for the same value that this edition uses
+function Get-GatedParts {
+    param($t)
+    $out = @()
+    $used = @{}
+    foreach ($p in $t.Parts) {
+        if ([string]$p.T -eq 'reg' -and (-not $p.Ed -or (Ed-Allows $p.Ed))) { $used[[string]$p.Path + '|' + [string]$p.Name] = $true }
+    }
+    foreach ($p in $t.Parts) {
+        if (-not $p.Ed -or (Ed-Allows $p.Ed)) { continue }
+        if ([string]$p.T -eq 'reg' -and $used.ContainsKey([string]$p.Path + '|' + [string]$p.Name)) { continue }
+        $out += ,$p
+    }
+    return $out
+}
+function Expand-Parts {
+    param($t)
+    $out = @()
+    foreach ($p in $t.Parts) {
+        if ($p.Ed -and -not (Ed-Allows $p.Ed)) { continue }
+        if ($p.T -eq 'regdyn') { foreach ($e in @(& $p.Gen)) { $out += ,$e } }
+        elseif ($p.T -eq 'taskdyn') { foreach ($full in @(Task-Match ([string]$p.Folder) ([string]$p.Like))) { $out += ,(pTask $full) } }
+        else { $out += ,$p }
+    }
+    return $out
+}
+
+# --------------------------------------------------------------- detect ------
+# What a check read from the PC, as short plain text (shown to the person as "Read from your PC")
+function Now-Clip { param([string]$s, [int]$n = 70) if ($s.Length -gt $n) { return ($s.Substring(0, $n - 3) + '...') }; return $s }
+function Now-RegText {
+    param($c)
+    if (-not $c.Exists) { return 'not set' }
+    $v = $c.Value
+    try {
+        switch ([string]$c.Kind) {
+            'DWord'       { return ('{0} (DWord)' -f ([uint32](([long]$v) -band 4294967295L))) }
+            'QWord'       { return ('{0} (QWord)' -f [int64]$v) }
+            'Binary'      {
+                $b = @($v)
+                $t = ((@($b | Select-Object -First 8 | ForEach-Object { '{0:X2}' -f [int]$_ })) -join ' ')
+                if ($b.Count -gt 8) { $t += ' ...' }
+                return ('{0} (Binary, {1} bytes)' -f $t, $b.Count)
+            }
+            'MultiString' { return ('"' + (Now-Clip ((@($v) -join ' | '))) + '" (MultiString)') }
+            default       { return ('"' + (Now-Clip ([string]$v)) + '" (' + [string]$c.Kind + ')') }
+        }
+    } catch { return ('"' + (Now-Clip ([string]$v)) + '"') }
+}
+# Returns 'On' | 'Off' | 'Partial' | 'NA' (not applicable on this PC) | 'Skip' (no state of its own)
+# and leaves in $script:Now what it read ("<where>: <what is there>, wanted <what the setting sets>")
+function Get-PartState {
+    param($p)
+    $script:Now = ''
+    switch ($p.T) {
+        'reg' {
+            $c = Reg-Read $p.Path $p.Name
+            $script:Now = ('{0}\{1}: {2}, wanted {3}' -f $p.Path, $p.Name, (Now-RegText $c), (Now-RegText @{ Exists = $true; Value = $p.Value; Kind = [string]$p.Type }))
+            if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
+            if ($p.Soft) { return 'Skip' }          # a protected switch can show that a setting is on, never that it is off
+            return 'Off'
+        }
+        'key' {
+            $e = Reg-KeyExists $p.Path
+            $script:Now = ('Key {0}: {1}' -f $p.Path, $(if ($e) { 'exists' } else { 'not there' }))
+            if ($e) { return 'On' }
+            return 'Off'
+        }
+        'svc' {
+            if ($p.SkipIf -and (& $p.SkipIf)) { $script:Why = $p.SkipWhy; $script:Now = ('Service {0}: left alone ({1})' -f $p.Name, $p.SkipWhy); return 'NA' }
+            $c = Svc-Read $p.Name
+            if ($null -eq $c) { $script:Now = ('Service {0}: not on this PC' -f $p.Name); return 'NA' }
+            $script:Now = ('Service {0}: {1}, wanted {2}' -f $p.Name, (Svc-Label $c), $p.Set)
+            if (Svc-IsApplied $c $p) { return 'On' }
+            return 'Off'
+        }
+        'task' {
+            $c = Task-Read $p.Path
+            if ($null -eq $c) { $script:Now = ('Task {0}: not on this PC' -f $p.Path); return 'NA' }
+            $script:Now = ('Task {0}: {1}, wanted disabled' -f $p.Path, $(if ($c.Enabled) { 'enabled' } else { 'disabled' }))
+            if ($c.Enabled) { return 'Off' }
+            return 'On'
+        }
+        'fw' {
+            $r = @(Fw-Rules $p.Group)
+            if ($r.Count -eq 0) { $script:Now = ('Firewall rules "{0}": none on this PC' -f $p.Group); return 'NA' }
+            $n = 0; foreach ($x in $r) { if ($x.Enabled) { $n++ } }
+            $script:Now = ('Firewall rules "{0}": {1} of {2} switched on, wanted all off' -f $p.Group, $n, $r.Count)
+            if ($n -gt 0) { return 'Off' }
+            return 'On'
+        }
+        'bind' {
+            $r = @(Bind-Read $p.Comp)
+            if ($r.Count -eq 0) { $script:Now = ('Network adapter item {0}: no adapter has it' -f $p.Comp); return 'NA' }
+            $n = 0; foreach ($x in $r) { if ($x.Enabled) { $n++ } }
+            $script:Now = ('Network adapter item {0}: on for {1} of {2} adapter(s), wanted off' -f $p.Comp, $n, $r.Count)
+            if ($n -gt 0) { return 'Off' }
+            return 'On'
+        }
+        'feat' {
+            $s = Feat-State $p.Name
+            if (-not $s) { $script:Now = ('Windows feature {0}: not on this PC' -f $p.Name); return 'NA' }
+            $script:Now = ('Windows feature {0}: {1}, wanted removed' -f $p.Name, $s)
+            if ($s -eq 'Enabled') { return 'Off' }
+            return 'On'
+        }
+        'cap' {
+            $r = @(Cap-List $p.Pattern)
+            if ($r.Count -eq 0) { $script:Now = ('Windows capability {0}: not on this PC' -f $p.Pattern); return 'NA' }
+            $n = 0; foreach ($x in $r) { if ($x.State -eq 'Installed') { $n++ } }
+            $script:Now = ('Windows capability {0}: {1} of {2} installed, wanted removed' -f $p.Pattern, $n, $r.Count)
+            if ($n -gt 0) { return 'Off' }
+            return 'On'
+        }
+        'appx' {
+            $m = Appx-Matches $p.Patterns
+            # Removed = installed for nobody. What stays behind after an uninstall from Start or Settings (the copy kept for new accounts) is not an
+            # installed app: it is mentioned in the reading, and the setting counts as done.
+            $inst = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } }
+            $left = ($m.Pkgs.Count - $inst) + $m.Prov.Count
+            $script:Now = ('Apps {0}: {1} installed' -f ((@($p.Patterns) | ForEach-Object { [string]$_ }) -join ', '), $inst)
+            if ($left -gt 0) { $script:Now += (', {0} only kept for new accounts (not installed for anyone)' -f $left) }
+            $script:Now += ', wanted none installed'
+            if ($inst -gt 0) { return 'Off' }
+            return 'On'
+        }
+        'custom' {
+            $res = @(& "Custom-$($p.Name)-Detect" $p)
+            if ($res.Count -eq 0) { return 'Skip' }
+            return [string]$res[$res.Count - 1]
+        }
+    }
+    return 'Skip'
+}
+# ------------------------------------------------------------- choices -------
+# A setting made with -Choices (see Add-Tweak). The options in order: the Windows default first, then the others.
+function Get-ChoiceList { param($t) return @($t.Choices) }
+function Get-ChoiceLabel {
+    param($t, [string]$key)
+    foreach ($c in @($t.Choices)) { if ([string]$c.Key -eq $key) { return [string]$c.Label } }
+    return $key
+}
+# The option for a key; no key = the first option that changes something (the one -Apply without a choice means). Throws for an unknown key.
+function Resolve-Choice {
+    param($t, [string]$key = '')
+    $list = @($t.Choices)
+    if (-not $key) { return $list[1] }
+    foreach ($c in $list) { if ([string]$c.Key -ieq $key) { return $c } }
+    throw ("'{0}' is not an option of {1} (options: {2})" -f $key, $t.Id, ((@($list | ForEach-Object { [string]$_.Key })) -join ', '))
+}
+function Get-PartId { param($p) return ([string]$p.Path + '|' + [string]$p.Name) }
+# Which option is in force: State 'On' + Choice = its key (an option that changes something), 'Off' + Choice 'default' (no value set), or
+# 'Partial' (values that match no option, e.g. only one of the two set by hand)
+function Get-ChoiceState {
+    param($t)
+    $script:CurTweak = $t
+    $st = @{}
+    $reads = New-Object System.Collections.ArrayList
+    foreach ($p in (Expand-Parts $t)) {
+        $script:Why = ''
+        $st[(Get-PartId $p)] = (Get-PartState $p)
+        if ($script:Now) { [void]$reads.Add([string]$script:Now) }
+    }
+    $rd = Join-Reads $reads
+    $anyOn = $false
+    foreach ($k in @($st.Keys)) { if ($st[$k] -eq 'On') { $anyOn = $true } }
+    if (-not $anyOn) { return @{ State = 'Off'; Choice = 'default'; Read = $rd; Detail = 'Not applied (' + (Get-ChoiceLabel $t 'default') + ')' } }
+    foreach ($c in @($t.Choices)) {
+        if ([string]$c.Key -eq 'default') { continue }
+        $mine = @{}
+        foreach ($p in @($c.Parts)) { $mine[(Get-PartId $p)] = $true }
+        $ok = $true
+        foreach ($k in @($st.Keys)) {
+            $on = ($st[$k] -eq 'On')
+            if ($mine.ContainsKey($k)) { if (-not $on) { $ok = $false } } elseif ($on) { $ok = $false }
+        }
+        if ($ok) { return @{ State = 'On'; Choice = [string]$c.Key; Read = $rd; Detail = 'Applied: ' + [string]$c.Label } }
+    }
+    $n = 0; foreach ($k in @($st.Keys)) { if ($st[$k] -eq 'On') { $n++ } }
+    return @{ State = 'Partial'; Choice = ''; Read = $rd; Detail = "Partly applied: $n of $($st.Count) values (they match none of the options)" }
+}
+# The lines a check read, as one text (one line per value; a long list is cut after 14 lines and says how many were left out)
+function Join-Reads {
+    param($lines)
+    $l = @($lines | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($l.Count -gt 14) { $l = @($l | Select-Object -First 14) + ('... and {0} more value(s)' -f ($lines.Count - 14)) }
+    return ($l -join "`n")
+}
+# A unit counts as evidence that the setting was applied only if applying it really changes something
+# from Windows' own default (a service that is Disabled out of the box, or firewall rules that are off
+# out of the box, say nothing). Without this a brand-new PC would show half the list as "partly applied".
+function Test-Informative {
+    param($p)
+    switch ($p.T) {
+        'reg'   { if ($null -eq $p.Default) { return $true }; return (-not (Reg-Equal $p.Default $p.Value $p.Type)) }
+        'svc'   { return ($p.Set -ne $p.Default) }
+        'fw'    { return $false }
+        'feat'  { return $false }
+        'cap'   { return $false }
+        'appx'  { return $false }
+        default { return $true }
+    }
+}
+function Get-TweakState {
+    param($t)
+    $script:CurTweak = $t
+    if ($t.Choices) { return (Get-ChoiceState $t) }
+    $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
+    $reads = New-Object System.Collections.ArrayList
+    foreach ($p in (Expand-Parts $t)) {
+        $script:Why = ''
+        $r = Get-PartState $p
+        if ($script:Now) { [void]$reads.Add([string]$script:Now) }
+        switch ($r) {
+            'On'      { $on++; if (Test-Informative $p) { $onI++ } }
+            'Off'     { $off++ }
+            'Partial' { $on++; $off++; $onI++ }
+            'NA'      { $na++; if ($script:Why) { $why += $script:Why } }
+        }
+    }
+    $note = ''; if ($why.Count) { $note = ' (' + (($why | Select-Object -Unique) -join '; ') + ')' }
+    $gated = @(Get-GatedParts $t)
+    $rd = Join-Reads $reads
+    if ($on + $off -eq 0) {
+        $d = 'Nothing to change on this PC'; if ($why.Count) { $d = ($why | Select-Object -First 1) }
+        elseif ($gated.Count) { $d = (Ed-ClassName (Get-WinEdition).Class) + ' ignores this setting: ' + (Ed-Reason $gated[0].Ed) }
+        if (-not $rd) { $rd = $d }          # nothing was read (every value is one this edition ignores): the reason is the reading
+        return @{ State = 'NA'; Read = $rd; Detail = $d }
+    }
+    if ($gated.Count) {
+        $note += (' ({0} value{1} left out on {2}: {3})' -f $gated.Count, $(if ($gated.Count -gt 1) { 's' } else { '' }), (Ed-ClassName (Get-WinEdition).Class), (Ed-Reason $gated[0].Ed))
+    }
+    if ($off -eq 0)  { return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note } }
+    if ($onI -eq 0)  { return @{ State = 'Off'; Read = $rd; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note } }
+    return @{ State = 'Partial'; Read = $rd; Detail = "Partly applied: $on of $($on + $off) parts" + $note }
+}
+
+# ------------------------------------------------------------ snapshot -------
+function Take-Snapshot {
+    param($t)
+    $script:CurTweak = $t
+    $snap = @{ When = (Get-Date -Format 's'); Reg = @{}; Svc = @{}; Task = @{}; Fw = @{}; Bind = @{}; Feat = @{}; Cap = @{}; Custom = @{} }
+    foreach ($p in (Expand-Parts $t)) {
+        switch ($p.T) {
+            'reg' {
+                $c = Reg-Read $p.Path $p.Name
+                $already = ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type))
+                $snap.Reg["$($p.Path)|$($p.Name)"] = @{ Exists = $c.Exists; Value = $c.Value; Kind = $c.Kind; Unknown = $already }
+            }
+            'svc' {
+                $c = Svc-Read $p.Name
+                if ($null -ne $c) { $snap.Svc[$p.Name] = @{ Start = $c.Start; Delayed = $c.Delayed; Unknown = (Svc-IsApplied $c $p) } }
+            }
+            'task' {
+                $c = Task-Read $p.Path
+                if ($null -ne $c) { $snap.Task[$p.Path] = @{ Enabled = [bool]$c.Enabled } }
+            }
+            'fw' {
+                $names = @(); foreach ($r in @(Fw-Rules $p.Group)) { if ($r.Enabled) { $names += $r.Name } }
+                $snap.Fw[$p.Group] = $names
+            }
+            'bind' {
+                $names = @(); foreach ($r in @(Bind-Read $p.Comp)) { if ($r.Enabled) { $names += $r.Name } }
+                $snap.Bind[$p.Comp] = $names
+            }
+            'feat' { $snap.Feat[$p.Name] = [string](Feat-State $p.Name) }
+            'cap'  { foreach ($c in @(Cap-List $p.Pattern)) { $snap.Cap[$c.Name] = $c.State } }
+            'custom' {
+                if (Get-Command "Custom-$($p.Name)-Snapshot" -ErrorAction Ignore) { $snap.Custom[$p.Name] = (& "Custom-$($p.Name)-Snapshot" $p) }
+            }
+        }
+    }
+    return $snap
+}
+
+# --------------------------------------------------------------- apply -------
+function Apply-Part {
+    param($p, $snap)
+    switch ($p.T) {
+        'reg' {
+            $c = Reg-Read $p.Path $p.Name
+            if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return }
+            [void](Reg-Write $p.Path $p.Name $p.Value $p.Type -Soft:([bool]$p.Soft))
+        }
+        'key' { [void](Reg-KeyAdd $p.Path) }
+        'svc' {
+            if ($p.SkipIf -and (& $p.SkipIf)) { Say ("  service {0} left alone ({1})" -f $p.Name, $p.SkipWhy) 'Yellow'; return }
+            $c = Svc-Read $p.Name
+            if ($null -eq $c) { return }
+            if (Svc-IsApplied $c $p) { return }
+            Svc-Write $p.Name (Svc-Decode $p.Set)
+        }
+        'task' {
+            $c = Task-Read $p.Path
+            if ($null -eq $c -or -not $c.Enabled) { return }
+            Task-Write $p.Path $false
+        }
+        'fw' {
+            $r = @(Fw-Rules $p.Group)
+            if ($r.Count -eq 0) { return }
+            Fw-DisableGroup $p.Group
+        }
+        'bind' {
+            foreach ($b in @(Bind-Read $p.Comp)) { if ($b.Enabled) { Bind-Set $b.Name $p.Comp $false } }
+        }
+        'feat' {
+            if ((Feat-State $p.Name) -eq 'Enabled') { Feat-Set $p.Name $false }
+        }
+        'cap' {
+            foreach ($c in @(Cap-List $p.Pattern)) { if ($c.State -eq 'Installed') { Cap-Set $c.Name $false } }
+        }
+        'appx' {
+            $m = Appx-Matches $p.Patterns
+            foreach ($k in $m.Pkgs.Keys) {
+                Say "  removing app $($m.Pkgs[$k])" 'Gray'
+                if (-not $DryRun) { Remove-AppxPackage -Package $k -AllUsers -ErrorAction SilentlyContinue }
+            }
+            foreach ($k in $m.Prov.Keys) {
+                if (-not $DryRun) { Remove-AppxProvisionedPackage -Online -PackageName $k -ErrorAction SilentlyContinue | Out-Null }
+            }
+            if ($DryRun -and ($m.Pkgs.Count + $m.Prov.Count) -eq 0) { Say '  (no matching apps installed)' 'DarkGray' }
+        }
+        'custom' {
+            $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom[$p.Name] }
+            & "Custom-$($p.Name)-Apply" $p $mine
+        }
+    }
+}
+# Puts one value of a setting with options back: the saved original, except when that original is itself one of the option values
+# (the option was already set before this app saw the PC), because then "back" would just set the option again: the Windows default is used.
+function Revert-ChoicePart {
+    param($t, $p, $snap)
+    $s = $null; if ($snap -and $snap.Reg) { $s = $snap.Reg[(Get-PartId $p)] }
+    if ($s -and -not $s.Unknown -and $s.Exists) {
+        foreach ($c in @($t.Choices)) {
+            foreach ($cp in @($c.Parts)) {
+                if ((Get-PartId $cp) -eq (Get-PartId $p) -and (Reg-Equal $s.Value $cp.Value $cp.Type)) { $s = $null }
+            }
+        }
+    }
+    if ($null -eq $s) { Revert-Part $p $null } else { Revert-Part $p $snap }
+}
+function Invoke-TweakApply {
+    # $Choice: for a setting with options, the key of the option to set ('' = the first one that changes something)
+    param($t, [string]$Choice = '')
+    $script:CurTweak = $t
+    if ($t.Once) {
+        # an action, not a switch: it runs, and there is no snapshot or undo record
+        foreach ($p in (Expand-Parts $t)) { Apply-Part $p $null }
+        return
+    }
+    $c = $null
+    if ($t.Choices) {
+        $c = Resolve-Choice $t $Choice
+        if ([string]$c.Key -eq 'default') { Invoke-TweakRevert $t; return }
+    }
+    $store = Get-Store
+    $snap = $store[$t.Id]
+    if (-not $snap) { $snap = Take-Snapshot $t; $store[$t.Id] = $snap; Save-Store $store }
+    if ($c) {
+        # this option's values are set; the values that only another option sets go back to what they were before (the saved record)
+        $mine = @{}
+        foreach ($p in @($c.Parts)) { $mine[(Get-PartId $p)] = $true }
+        foreach ($p in (Expand-Parts $t)) {
+            if ($mine.ContainsKey((Get-PartId $p))) { Apply-Part $p $snap } else { Revert-ChoicePart $t $p $snap }
+        }
+    } else {
+        foreach ($p in (Expand-Parts $t)) { Apply-Part $p $snap }
+    }
+    $store[$t.Id] = $snap
+    Save-Store $store
+}
+
+# --------------------------------------------------------------- revert ------
+function Revert-Part {
+    param($p, $snap)
+    switch ($p.T) {
+        'reg' {
+            $s = $null; if ($snap -and $snap.Reg) { $s = $snap.Reg["$($p.Path)|$($p.Name)"] }
+            if ($s -and -not $s.Unknown) {
+                if ($s.Exists) { [void](Reg-Write $p.Path $p.Name $s.Value $s.Kind -Soft:([bool]$p.Soft)) } else { [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft)) }
+            } elseif ($null -eq $p.Default) {
+                [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft))
+            } else {
+                [void](Reg-Write $p.Path $p.Name $p.Default $p.Type -Soft:([bool]$p.Soft))
+            }
+        }
+        'key' { [void](Reg-KeyRemove $p.Root) }
+        'svc' {
+            if ($null -eq (Svc-Read $p.Name)) { return }
+            $s = $null; if ($snap -and $snap.Svc) { $s = $snap.Svc[$p.Name] }
+            if ($s -and -not $s.Unknown) { Svc-Write $p.Name @{ Start = [int]$s.Start; Delayed = [int]$s.Delayed } }
+            else { Svc-Write $p.Name (Svc-Decode $p.Default) }
+        }
+        'task' {
+            $c = Task-Read $p.Path
+            if ($null -eq $c -or $c.Enabled) { return }
+            # a task that was already off before this setting was applied stays off (a record from an older version has no task list: then every task is switched back on)
+            $s = $null; if ($snap -and $snap.Task) { $s = $snap.Task[$p.Path] }
+            if ($s -and -not [bool]$s.Enabled) { return }
+            Task-Write $p.Path $true
+        }
+        'fw' {
+            if ($snap -and $snap.Fw -and $snap.Fw.ContainsKey($p.Group)) {
+                $names = @($snap.Fw[$p.Group])
+                if ($names.Count) { Fw-EnableNames $p.Group $names } else { Say "  firewall group '$($p.Group)': its rules were already off before, so they stay off" 'DarkGray' }
+            } else {
+                Say "  firewall group '$($p.Group)': no record of which rules were on, so none were switched back on (Windows Security > Firewall can do it)" 'Yellow'
+            }
+        }
+        'bind' {
+            if ($snap -and $snap.Bind -and $snap.Bind.ContainsKey($p.Comp)) {
+                foreach ($n in @($snap.Bind[$p.Comp])) { Bind-Set $n $p.Comp $true }
+            } else {
+                foreach ($b in @(Bind-Read $p.Comp)) { if (-not $b.Enabled) { Bind-Set $b.Name $p.Comp $true } }
+            }
+        }
+        'feat' {
+            $s = Feat-State $p.Name
+            $was = ''; if ($snap -and $snap.Feat -and $snap.Feat.ContainsKey($p.Name)) { $was = [string]$snap.Feat[$p.Name] }
+            # only add back what was really there before (a feature that was already off stays off)
+            if ($s -and $s -ne 'Enabled' -and (-not $was -or $was -eq 'Enabled')) { Feat-Set $p.Name $true }
+        }
+        'cap' {
+            foreach ($c in @(Cap-List $p.Pattern)) {
+                if ($c.State -eq 'Installed') { continue }
+                if ($snap -and $snap.Cap -and $snap.Cap.ContainsKey($c.Name) -and $snap.Cap[$c.Name] -ne 'Installed') { continue }
+                Cap-Set $c.Name $true
+            }
+        }
+        'appx' { Say '  (removed apps cannot be put back from here)' 'Yellow' }
+        'custom' {
+            $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom[$p.Name] }
+            & "Custom-$($p.Name)-Revert" $p $mine
+        }
+    }
+}
+function Invoke-TweakRevert {
+    param($t)
+    $script:CurTweak = $t
+    $store = Get-Store
+    $snap = $store[$t.Id]
+    if (-not $snap) { Say "  (no saved record for this one - it was applied outside this app, so Windows' default values are used where they are known)" 'Yellow' }
+    foreach ($p in (Expand-Parts $t)) { if ($t.Choices) { Revert-ChoicePart $t $p $snap } else { Revert-Part $p $snap } }
+}
+function Remove-Snapshot {
+    param([string]$id)
+    $store = Get-Store
+    if ($store.ContainsKey($id)) { $store.Remove($id); Save-Store $store }
+}
+function Clear-CacheFor {
+    param($t)
+    foreach ($p in $t.Parts) {
+        switch ($p.T) { 'appx' { $script:Cache.Remove('appx') } 'feat' { $script:Cache.Remove('feat') } 'cap' { $script:Cache.Remove('cap') } 'custom' { $script:Cache.Remove('usb'); $script:Cache.Remove('bl') } }
+    }
+}
+
+# --------------------------------------------------------- describe ----------
+# The "what exactly does this change" lines shown next to each setting.
+function Describe-Tweak {
+    param($t)
+    $lines = @()
+    if ($t.Choices) {
+        $lines += ((Get-ChoiceLabel $t 'default') + ': none of the values below is set    (choosing it puts back the values you had, or removes a value that already was one of the options below)')
+        foreach ($c in @($t.Choices)) {
+            if ([string]$c.Key -eq 'default') { continue }
+            $lines += ([string]$c.Label + ':')
+            foreach ($p in @($c.Parts)) { $lines += ("  {0}\{1} = {2}" -f $p.Path, $p.Name, $p.Value) }
+        }
+        return $lines
+    }
+    foreach ($p in $t.Parts) {
+        if ($p.Ed -and -not (Ed-Allows $p.Ed)) {
+            if ([string]$p.T -eq 'reg') { $lines += ("{0}\{1} = {2}    [left out on {3}: {4}]" -f $p.Path, $p.Name, $p.Value, (Ed-ClassName (Get-WinEdition).Class), (Ed-Reason $p.Ed)) }
+            continue
+        }
+        switch ($p.T) {
+            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
+            'regdyn' { $lines += $p.Info }
+            'key'    { $lines += ("registry key {0}: created    (undo: {1} deleted)" -f $p.Path, $p.Root) }
+            'svc'    { $lines += ("service {0}: {1}    (undo: {2})" -f $p.Name, $p.Set, $p.Default) }
+            'task'   { $lines += ("scheduled task {0}: off" -f $p.Path) }
+            'taskdyn' { $lines += $p.Info }
+            'fw'     { $lines += ("firewall rules '{0}': off" -f $p.Group) }
+            'bind'   { $lines += ("network adapter component {0}: unbound" -f $p.Comp) }
+            'feat'   { $lines += ("Windows feature {0}: removed" -f $p.Name) }
+            'cap'    { $lines += ("Windows capability {0}: removed" -f $p.Pattern) }
+            'appx'   { foreach ($x in $p.Patterns) { $lines += ("app {0}: removed" -f $x) } }
+            'custom' { if ($p.Info) { $lines += $p.Info } }
+        }
+    }
+    return $lines
+}
+
+# ---------------------------------------------------------- restore point ----
+# The highest restore point number Windows has, 0 when it has none, $null when it cannot be asked
+function Rp-Last {
+    try {
+        $m = 0
+        foreach ($x in @(Get-ComputerRestorePoint -ErrorAction Stop)) { if ([int]$x.SequenceNumber -gt $m) { $m = [int]$x.SequenceNumber } }
+        return $m
+    } catch { return $null }
+}
+function New-RestorePoint {
+    if ($DryRun) { Say 'Restore point: [dry] would create "Before Headroom changes"' 'DarkGray'; return }
+    Say 'Creating a restore point first (can take a minute)...' 'Gray'
+    $k = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\SystemRestore'
+    $old = Reg-Read $k 'SystemRestorePointCreationFrequency'
+    Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue | Out-Null
+    # Windows allows one restore point per 24 h by default; lift that for this moment only
+    [void](Reg-Write $k 'SystemRestorePointCreationFrequency' 0 'DWord' -Quiet)
+    $before = Rp-Last
+    Checkpoint-Computer -Description 'Before Headroom changes' -RestorePointType MODIFY_SETTINGS -ErrorAction SilentlyContinue
+    $after = Rp-Last
+    if ($old.Exists) { [void](Reg-Write $k 'SystemRestorePointCreationFrequency' $old.Value 'DWord' -Quiet) }
+    else { [void](Reg-Remove $k 'SystemRestorePointCreationFrequency' -Quiet) }
+    # Windows says nothing when it declines (System Restore switched off by a policy or by other software): look, and tell
+    if ($null -ne $before -and $null -ne $after) {
+        if ($after -gt $before) { Say '  restore point created' 'DarkGray' }
+        else { Say '  ! Windows did not create a restore point (System Restore may be switched off by a policy or by other software). The changes go ahead; every setting still keeps its own undo record.' 'Yellow' }
+    }
+}
+
+# ---------------------------------------------------------------- scan -------
+# How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
+# slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
+# 3 apps and USB,  4 optional features,  5 capabilities
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2 }
+function Get-ScanWeight {
+    param($t)
+    $w = 0
+    foreach ($p in $t.Parts) {
+        $x = 0
+        switch ($p.T) {
+            'regdyn' { $x = 1 }
+            'custom' { $x = 1; if ($script:ScanHeavyCustom.ContainsKey([string]$p.Name)) { $x = $script:ScanHeavyCustom[[string]$p.Name] } }
+            'task'   { $x = 2 }
+            'taskdyn' { $x = 2 }
+            'fw'     { $x = 2 }
+            'bind'   { $x = 2 }
+            'appx'   { $x = 3 }
+            'feat'   { $x = 4 }
+            'cap'    { $x = 5 }
+        }
+        if ($x -gt $w) { $w = $x }
+    }
+    return $w
+}
+function Get-ScanOrder {
+    $w = @{}
+    foreach ($t in $script:Catalog) { $w[$t.Id] = Get-ScanWeight $t }
+    $order = New-Object System.Collections.ArrayList
+    for ($k = 0; $k -le 5; $k++) {
+        foreach ($t in $script:Catalog) { if ($w[$t.Id] -eq $k) { [void]$order.Add($t) } }
+    }
+    return $order
+}
+# 'yes' when the setting is applied and this app has an undo record for it (the app changed it), 'no' when it is applied but there is
+# no record (it was already like this when the app first looked, or it was set by hand), '' for any other state
+function Get-MineText {
+    param([string]$State, $Store, [string]$Id)
+    if ($State -ne 'On') { return '' }
+    if ($Store -and $Store.ContainsKey($Id)) { return 'yes' }
+    return 'no'
+}
+function Invoke-Scan {
+    $ErrorActionPreference = 'SilentlyContinue'
+    $ProgressPreference = 'SilentlyContinue'
+    $script:Cache = @{}
+    $n = $script:Catalog.Count; $i = 0
+    $store = Get-Store          # once: it is read from disk on every call; tells which settings this app has changed itself
+    $script:ScanMode = $true
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastWait = ''
+    try {
+        Start-Prefetch
+        # The settings are taken in quick-first order, but one whose slow answer has not arrived yet is left for later:
+        # nothing waits behind a slow question that it does not need itself.
+        $pending = New-Object System.Collections.ArrayList
+        foreach ($t in (Get-ScanOrder)) { [void]$pending.Add($t) }
+        $moved = 0.0
+        while ($pending.Count -gt 0) {
+            if (Pre-Note) { $moved = $clock.Elapsed.TotalSeconds }
+            $pick = -1
+            for ($k = 0; $k -lt $pending.Count; $k++) {
+                if (Pre-Ready @(Get-TweakNeeds $pending[$k])) { $pick = $k; break }
+            }
+            if ($pick -lt 0) {
+                $missing = @(Pre-Missing $pending)
+                if ($missing.Count -eq 0) { $pick = 0 }
+                else {
+                    $text = (@($missing | ForEach-Object { $script:PreLabels[[string]$_] } | Select-Object -Unique) -join ', ')
+                    if ($text -ne $lastWait) { $lastWait = $text; Emit 'wait' '' '' '' $text 'Gray' 0 0 }
+                    $idle = $clock.Elapsed.TotalSeconds - $moved
+                    $gave = $false
+                    foreach ($nm in $missing) {
+                        $limit = $script:PreStall
+                        if (@('feat', 'prov', 'cap') -contains $nm) { $limit = $script:PreStallDism }
+                        if ($idle -gt $limit) {
+                            $script:PreGiven[$nm] = 1
+                            $gave = $true
+                            Say ('  Windows has not answered for {0:N0} s: {1}. Asking it directly instead.' -f $idle, $script:PreLabels[$nm]) 'Yellow'
+                        }
+                    }
+                    if (-not $gave) { Start-Sleep -Milliseconds 40 }
+                    continue
+                }
+            }
+            if ($lastWait) { $lastWait = ''; Emit 'wait' '' '' '' '' 'Gray' 0 0 }
+            $t = $pending[$pick]
+            $pending.RemoveAt($pick)
+            $i++
+            $r = $null
+            try { $r = Get-TweakState $t } catch { $r = @{ State = 'Unknown'; Detail = "Could not check: $($_.Exception.Message)" } }
+            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id)
+            $moved = $clock.Elapsed.TotalSeconds
+        }
+        [void](Pre-Note)
+        if ($null -ne $Q) { Say ('  Check of the PC finished in {0:N1} s' -f $clock.Elapsed.TotalSeconds) 'DarkGray' }
+    } finally {
+        $script:ScanMode = $false
+        Stop-Prefetch
+    }
+    if ($lastWait) { Emit 'wait' '' '' '' '' 'Gray' 0 0 }
+    Emit 'scandone' '' '' '' '' 'Gray' $n $n
+}
+
+# ---------------------------------------------------------------- plan -------
+# $Plan = array of @{ Id = '...'; Action = 'Apply' | 'Undo' }
+function Invoke-Plan {
+    param($Plan)
+    $ErrorActionPreference = 'SilentlyContinue'
+    $ProgressPreference = 'SilentlyContinue'
+    $Plan = @($Plan)
+    $total = $Plan.Count
+    $mode = 'for real'; if ($DryRun) { $mode = 'DRY RUN - nothing is changed' }
+    Say ("`n=== {0}: {1} change(s), {2} ===" -f (Get-Date -Format 'HH:mm:ss'), $total, $mode) 'Cyan'
+    if ($script:InRdp) { Say 'You are connected through Remote Desktop: its services are switched off for the next boot but not stopped now.' 'Yellow' }
+    # a restore point is for changes that can be undone: a plan of clean-up actions only does not get one
+    $needRp = $false; foreach ($pi in $Plan) { $pt = $script:ById[[string]$pi.Id]; if ($pt -and -not $pt.Once) { $needRp = $true } }
+    if (-not $DryRun -and $total -gt 0 -and $needRp) { New-RestorePoint }
+    $i = 0; $good = 0; $bad = 0; $reboot = @(); $explorer = $false
+    foreach ($item in $Plan) {
+        $i++
+        $t = $script:ById[[string]$item.Id]
+        if (-not $t) { Say "  unknown setting '$($item.Id)'" 'Red'; $bad++; continue }
+        $undo = ($item.Action -eq 'Undo')
+        $verb = 'Turning on'; if ($undo) { $verb = 'Turning off' }
+        $failed = $null
+        # a setting with options: the one to set (the plan item names it; none named = the first that changes something)
+        $choiceKey = ''
+        $shown = [string]$t.Name
+        if ($t.Choices -and -not $undo) {
+            try {
+                $cc = Resolve-Choice $t ([string]$item.Choice)
+                $choiceKey = [string]$cc.Key
+                $verb = 'Setting'; $shown = ('{0} to {1}' -f $t.Name, $cc.Label)
+            } catch { $failed = $_.Exception.Message }
+        }
+        Emit 'item' $t.Id 'running' '' '' 'Cyan' $i $total
+        Say ("`n[{0}/{1}] {2}: {3}" -f $i, $total, $verb, $shown) 'Cyan'
+        $Error.Clear()
+        if ($failed) {
+            # nothing to do: the failure is reported below
+        } elseif ($undo -and $t.Once) {
+            $failed = 'it is a one-time action: there is nothing to undo'
+        } elseif ($t.Once -and (Get-TweakState $t).State -eq 'NA') {
+            $failed = ('not available on this PC: ' + [string](Get-TweakState $t).Detail)
+        } elseif ($undo -and $t.OneWay) {
+            $failed = 'cannot be undone from here'
+        } elseif ($undo -and -not (Get-Store).ContainsKey([string]$t.Id) -and (Get-TweakState $t).State -eq 'Off') {
+            # not applied by this app and not applied now (switched off by hand since the list was made): nothing to put back, and writing
+            # Windows' defaults over your own values would only do harm.  (With an undo record the setting always goes through the undo.)
+            Say '  not applied - nothing to put back' 'DarkGray'
+        } else {
+            try {
+                $script:RunResult = ''
+                if ($undo) { Invoke-TweakRevert $t } else { Invoke-TweakApply $t $choiceKey }
+            } catch { $failed = $_.Exception.Message }
+        }
+        $errs = @($Error | ForEach-Object { $_.Exception.Message } | Select-Object -Unique | Select-Object -First 5)
+        $Error.Clear()
+        foreach ($m in $errs) { Say "  ! $m" 'Yellow' }
+        Clear-CacheFor $t
+        $after = Get-TweakState $t
+        if ($failed) {
+            Say "  FAILED: $failed" 'Red'; $bad++
+            Emit 'item' $t.Id 'failed' $failed '' 'Red' $i $total
+        } elseif ($DryRun) {
+            Emit 'item' $t.Id 'dry' 'Preview only' '' 'Gray' $i $total
+            $good++
+        } elseif ($t.Once) {
+            # a run-once action reads "ready to run" before and after: it succeeded when nothing went wrong, and says what it did
+            $res = [string]$script:RunResult
+            if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
+            $good++
+            Emit 'item' $t.Id 'done' $res '' 'Green' $i $total
+        } elseif ($after.State -eq 'NA' -or ($undo -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
+            Say '  done' 'Green'; $good++
+            if ($undo) { Remove-Snapshot $t.Id }
+            if ($t.Reboot) { $reboot += $t.Name }
+            if ($t.Explorer) { $explorer = $true }
+            Emit 'item' $t.Id 'done' $after.Detail '' 'Green' $i $total
+        } else {
+            Say ("  finished, but Windows still reports it as: {0}" -f $after.Detail) 'Yellow'; $bad++
+            if ($t.Reboot) { $reboot += $t.Name }
+            Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
+        }
+        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id)
+    }
+    if ($explorer -and -not $DryRun) {
+        Say "`nRestarting Explorer so the taskbar and theme changes show up..." 'Gray'
+        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+    }
+    $tail = "{0} done, {1} need attention." -f $good, $bad
+    if ($DryRun) { $tail = "Preview finished - nothing was changed. ($total setting(s) checked)" }
+    $col = 'Green'; if ($bad) { $col = 'Yellow' }
+    Say "`n$tail" $col
+    if ($reboot.Count -and -not $DryRun) { Say ('Restart the PC for these to fully apply: ' + ((($reboot | Select-Object -Unique)) -join ', ')) 'Yellow' }
+    Say "Log: $log" 'DarkGray'
+    Emit 'finished' '' '' $tail ((($reboot | Select-Object -Unique)) -join ', ') $col $good $bad
+    return [pscustomobject]@{ Good = $good; Bad = $bad }
+}
+
+# =============================================================================
+# Parts that need their own code. Each has  Custom-<Name>-Detect / -Snapshot / -Apply / -Revert.
+# (Snapshot is optional. 'Skip' from Detect means "no state of its own".)
+# =============================================================================
+function Count-State {
+    param([int]$on, [int]$off)
+    if ($on + $off -eq 0) { return 'NA' }
+    if ($off -eq 0) { return 'On' }
+    if ($on -eq 0)  { return 'Off' }
+    return 'Partial'
+}
+
+# ------------------------------------------------------------- OneDrive ------
+function Custom-OneDrive-Detect {
+    param($p)
+    foreach ($f in @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe", "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe")) {
+        if (Fs-Exists $f) { $script:Now = ('OneDrive program found at {0}, wanted uninstalled' -f $f); return 'Off' }
+    }
+    $script:Now = 'OneDrive program: not found where it is normally installed, wanted uninstalled'
+    return 'On'
+}
+function Custom-OneDrive-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] stop OneDrive, run OneDriveSetup /uninstall, delete leftovers' 'DarkGray'; return }
+    Say '  stopping and uninstalling OneDrive...' 'Gray'
+    Stop-Process -Name OneDrive -Force -ErrorAction Ignore
+    Stop-Process -Name OneDriveSetup -Force -ErrorAction Ignore
+    $setup = $null
+    foreach ($f in @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")) { if (-not $setup -and (Fs-Exists $f)) { $setup = $f } }
+    if ($setup) { Start-Process $setup -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
+    # Leftovers
+    Remove-Item "$env:LOCALAPPDATA\Microsoft\OneDrive" -Recurse -Force -ErrorAction Ignore
+    Remove-Item "$env:ProgramData\Microsoft OneDrive" -Recurse -Force -ErrorAction Ignore
+    Remove-Item "$env:SystemDrive\OneDriveTemp" -Recurse -Force -ErrorAction Ignore
+    $od = "$env:USERPROFILE\OneDrive"
+    if (Fs-Exists $od) {
+        if (-not (Get-ChildItem -LiteralPath $od -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { Remove-Item -LiteralPath $od -Force -ErrorAction SilentlyContinue }
+        else { Say "  NOTE: $od still has files in it - left alone. Move them out and delete it yourself." 'Yellow' }
+    }
+    [void](Reg-Remove 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' 'OneDrive')
+}
+
+# --------------------------------------------------------- power plans -------
+$script:GuidRx = '[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}'
+$script:UltimateTemplate = 'e9a42b02-d5df-448d-aa00-03f14749eb61'
+$script:HighPerfTemplate = '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c'
+$script:BalancedTemplate = '381b4222-f694-41f0-9685-ff5bb260df2e'
+$script:SaverTemplate    = 'a1841308-3541-4fab-bc81-f71556f20b4a'
+function Pwr-Active {
+    $o = Pwr '/getactivescheme'
+    $g = [regex]::Match($o, $script:GuidRx).Value.ToLower()
+    $n = ''; $m = [regex]::Match($o, '\((.+)\)'); if ($m.Success) { $n = $m.Groups[1].Value }
+    return @{ Guid = $g; Name = $n }
+}
+function Pwr-Plans {
+    $out = @()
+    foreach ($line in ((Pwr '/list') -split "`r?`n")) {
+        $g = [regex]::Match($line, $script:GuidRx).Value
+        if (-not $g) { continue }
+        $n = ''; $m = [regex]::Match($line, '\((.+?)\)'); if ($m.Success) { $n = $m.Groups[1].Value }
+        $out += ,@{ Guid = $g.ToLower(); Name = $n; Active = ($line.TrimEnd() -match '\*$') }
+    }
+    return $out
+}
+function Pwr-NewFrom {
+    param([string]$template)
+    $out = Pwr '/duplicatescheme' $template
+    return [regex]::Match($out, $script:GuidRx).Value.ToLower()
+}
+
+function Custom-Ultimate-Detect {
+    param($p)
+    $a = Pwr-Active
+    if (-not $a.Guid) { $script:Now = 'Active power plan: could not be read'; return 'NA' }
+    $script:Now = ('Active power plan: {0}, wanted Ultimate Performance' -f $a.Name)
+    if ($a.Name -match 'Ultimate') { return 'On' }
+    $snap = (Get-Store)[$script:CurTweak.Id]
+    if ($snap -and $snap.Custom -and $snap.Custom['Ultimate'] -and $snap.Custom['Ultimate'].New -and ($snap.Custom['Ultimate'].New -eq $a.Guid)) { $script:Now += ' (the plan this app made)'; return 'On' }
+    return 'Off'
+}
+function Custom-Ultimate-Snapshot {
+    param($p)
+    $a = Pwr-Active
+    return @{ Orig = $a.Guid; New = '' }
+}
+function Custom-Ultimate-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] create the Ultimate Performance plan, turn USB / Wi-Fi power saving off inside it, make it active' 'DarkGray'; return }
+    $new = ''
+    if ($mine -and $mine.New) { foreach ($x in @(Pwr-Plans)) { if ($x.Guid -eq $mine.New) { $new = $mine.New } } }
+    if (-not $new) {
+        $new = Pwr-NewFrom $script:UltimateTemplate
+        if (-not $new) {
+            # Some systems (e.g. Modern Standby) hide Ultimate Performance; fall back to High Performance
+            Say '  Ultimate Performance is not available on this PC; using High Performance instead.' 'Yellow'
+            $new = Pwr-NewFrom $script:HighPerfTemplate
+        }
+    }
+    if (-not $new) { Say '  ! could not create a power plan - nothing changed' 'Red'; return }
+    foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
+        # USB selective suspend = Disabled, USB 3 link power management = Off, wireless adapter = Maximum Performance
+        [void](Pwr $mode $new '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' '0')
+        [void](Pwr $mode $new '2a737441-1930-4402-8d77-b2bebba308a3' 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' '0')
+        [void](Pwr $mode $new '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a' '0')
+    }
+    [void](Pwr '/setactive' $new)
+    if ($mine) { $mine.New = $new }
+    Say "  power plan $new is now the active one" 'DarkGray'
+}
+function Custom-Ultimate-Revert {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] switch back to the plan you had before (or Balanced)' 'DarkGray'; return }
+    $plans = @(Pwr-Plans)
+    $target = ''
+    if ($mine -and $mine.Orig) { foreach ($x in $plans) { if ($x.Guid -eq $mine.Orig) { $target = $x.Guid } } }
+    if (-not $target) {
+        foreach ($x in $plans) { if ($x.Guid -eq $script:BalancedTemplate) { $target = $x.Guid } }
+        if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
+    }
+    if ($target) {
+        [void](Pwr '/setactive' $target); Say "  power plan $target is the active one again" 'DarkGray'
+        # The plan this app made is not kept: once another plan is the active one it is deleted, so the list of plans is as it was.
+        # (Only that plan, and only when the switch worked; Windows refuses to delete the active plan anyway.)
+        if ($mine -and $mine.New -and [string]$mine.New -ne $target -and (Pwr-Active).Guid -eq $target) {
+            foreach ($x in $plans) {
+                if ($x.Guid -eq [string]$mine.New) { [void](Pwr '/delete' $x.Guid); Say "  the power plan this app made ($($x.Name)) was deleted" 'DarkGray' }
+            }
+        }
+    }
+    else { Say '  ! could not find or create a Balanced plan' 'Red' }
+}
+
+function Custom-PlansDelete-Detect {
+    param($p)
+    if (Battery-Present) { $script:Why = 'battery detected - the other plans are kept for when you unplug'; $script:Now = 'Battery: found, so the other power plans are left alone'; return 'NA' }
+    $n = @(Pwr-Plans).Count
+    if ($n -eq 0) { $script:Now = 'Power plans: none could be listed'; return 'NA' }
+    $script:Now = ('Power plans: {0} on this PC, wanted only the active one' -f $n)
+    if ($n -le 1) { return 'On' }
+    return 'Off'
+}
+function Custom-PlansDelete-Snapshot {
+    param($p)
+    $l = @(); foreach ($x in @(Pwr-Plans)) { $l += "$($x.Guid) $($x.Name)" }
+    return @{ Plans = $l }
+}
+function Custom-PlansDelete-Apply {
+    param($p, $mine)
+    $a = Pwr-Active
+    foreach ($x in @(Pwr-Plans)) {
+        if ($x.Guid -eq $a.Guid) { continue }
+        if ($DryRun) { Say "  [dry] delete power plan $($x.Name)" 'DarkGray' }
+        else { [void](Pwr '/delete' $x.Guid); Say "  deleted power plan $($x.Name)" 'DarkGray' }
+    }
+}
+function Custom-PlansDelete-Revert {
+    param($p, $mine)
+    $have = @(); foreach ($x in @(Pwr-Plans)) { $have += $x.Guid; $have += $x.Name }
+    foreach ($t in @(@('Balanced', $script:BalancedTemplate), @('High performance', $script:HighPerfTemplate), @('Power saver', $script:SaverTemplate))) {
+        if ($have -contains $t[1] -or $have -contains $t[0]) { continue }
+        if ($DryRun) { Say "  [dry] recreate the $($t[0]) plan" 'DarkGray'; continue }
+        $g = Pwr-NewFrom $t[1]
+        if ($g) { Say "  recreated the $($t[0]) plan" 'DarkGray' } else { Say "  ! could not recreate the $($t[0]) plan" 'Yellow' }
+    }
+}
+
+function Custom-Hibernate-Detect { param($p) return 'Skip' }
+function Custom-Hibernate-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] powercfg /h off' 'DarkGray'; return }
+    [void](Pwr '/h' 'off'); Say '  powercfg /h off  (hibernation and Fast Startup)' 'DarkGray'
+}
+function Custom-Hibernate-Revert {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] powercfg /h on' 'DarkGray'; return }
+    [void](Pwr '/h' 'on'); Say '  powercfg /h on  (hibernation back)' 'DarkGray'
+}
+
+# -------------------------------------------------------- USB devices --------
+function Usb-Devices {
+    if (-not $script:Cache.ContainsKey('usb')) {
+        $seen = @{}; $l = @()
+        $pre = Pre-Wait 'usb'
+        if ($null -ne $pre) {
+            foreach ($d in $pre) {
+                $id = [string]$d.I
+                if ($id -and -not $seen.ContainsKey($id)) { $seen[$id] = 1; $l += ,@{ Id = $id; Name = [string]$d.N } }
+            }
+        } else {
+            $all = @(Get-PnpDevice -Class USB -ErrorAction Ignore) + @(Get-PnpDevice -ErrorAction Ignore | Where-Object { $_.InstanceId -like 'USB\*' })
+            foreach ($d in $all) {
+                $id = [string]$d.InstanceId
+                if ($id -and -not $seen.ContainsKey($id)) { $seen[$id] = 1; $l += ,@{ Id = $id; Name = [string]$d.FriendlyName } }
+            }
+        }
+        $script:Cache['usb'] = $l
+    }
+    return $script:Cache['usb']
+}
+# "Allow the computer to turn off this device to save power" (the live switch behind the Device Manager checkbox)
+function Pm-List {
+    if ($script:ScanMode) { $x = Net-Pre; if ($x -and $x.Pm.Count -gt 0) { return $x.Pm } }
+    Scan-Memo 'pm' {
+        $out = @()
+        foreach ($i in @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Ignore)) {
+            $out += ,@{ Id = ([string]$i.InstanceName -replace '_\d+$', ''); Enable = [bool]$i.Enable }
+        }
+        return $out
+    }
+}
+function Pm-Set {
+    param([string]$id, [bool]$enable)
+    if ($DryRun) { return }
+    foreach ($i in @(Get-CimInstance -Namespace root\wmi -ClassName MSPower_DeviceEnable -ErrorAction Ignore)) {
+        if (([string]$i.InstanceName -replace '_\d+$', '') -eq $id) { $i.Enable = $enable; Set-CimInstance -InputObject $i -ErrorAction SilentlyContinue }
+    }
+}
+$script:UsbRegNames = 'EnhancedPowerManagementEnabled', 'AllowIdleIrpInD3', 'SelectiveSuspendEnabled'
+function Custom-UsbPower-Detect {
+    param($p)
+    $ids = @{}; foreach ($d in @(Usb-Devices)) { $ids[$d.Id] = 1 }
+    $on = 0; $off = 0
+    foreach ($i in @(Pm-List)) { if ($ids.ContainsKey($i.Id)) { if ($i.Enable) { $off++ } else { $on++ } } }
+    if ($on + $off -eq 0) { $script:Why = 'no USB devices with power management found'; $script:Now = 'USB devices with a power saving switch: none found'; return 'NA' }
+    $script:Now = ('USB devices: {0} of {1} have "allow the computer to turn off this device" switched off, wanted all' -f $on, ($on + $off))
+    return (Count-State $on $off)
+}
+function Custom-UsbPower-Snapshot {
+    param($p)
+    $ids = @{}; foreach ($d in @(Usb-Devices)) { $ids[$d.Id] = 1 }
+    $dev = @{}
+    foreach ($i in @(Pm-List)) {
+        if (-not $ids.ContainsKey($i.Id)) { continue }
+        $e = @{ Enable = $i.Enable; Reg = @{} }
+        foreach ($n in $script:UsbRegNames) {
+            $c = Reg-Read "HKLM:\SYSTEM\CurrentControlSet\Enum\$($i.Id)\Device Parameters" $n
+            $e.Reg[$n] = @{ Exists = $c.Exists; Value = $c.Value }
+        }
+        $dev[$i.Id] = $e
+    }
+    return @{ Dev = $dev }
+}
+function Custom-UsbPower-Apply {
+    param($p, $mine)
+    $ids = @{}; foreach ($d in @(Usb-Devices)) { $ids[$d.Id] = $d.Name }
+    $n = 0
+    foreach ($i in @(Pm-List)) {
+        if (-not $ids.ContainsKey($i.Id)) { continue }
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($i.Id)\Device Parameters"
+        if ($DryRun) { Say ("  [dry] {0}  [{1}]" -f $ids[$i.Id], $i.Id) 'DarkGray'; $n++; continue }
+        Pm-Set $i.Id $false
+        if (Fs-Exists $key) { foreach ($rn in $script:UsbRegNames) { [void](Reg-Write $key $rn 0 'DWord' -Quiet) } }
+        Say ("  {0}  [{1}]" -f $ids[$i.Id], $i.Id) 'DarkGray'
+        $n++
+    }
+    Say "  ($n USB device(s). Devices plugged in later get Windows' defaults - switch this on again after adding new ones.)" 'DarkGray'
+}
+function Custom-UsbPower-Revert {
+    param($p, $mine)
+    $ids = @{}; foreach ($d in @(Usb-Devices)) { $ids[$d.Id] = $d.Name }
+    foreach ($i in @(Pm-List)) {
+        if (-not $ids.ContainsKey($i.Id)) { continue }
+        $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($i.Id)\Device Parameters"
+        $s = $null; if ($mine -and $mine.Dev) { $s = $mine.Dev[$i.Id] }
+        if ($DryRun) { Say ("  [dry] {0} : power saving back on" -f $ids[$i.Id]) 'DarkGray'; continue }
+        $want = $true; if ($s -and $null -ne $s.Enable) { $want = [bool]$s.Enable }
+        Pm-Set $i.Id $want
+        if (Fs-Exists $key) {
+            foreach ($rn in $script:UsbRegNames) {
+                if ($s -and $s.Reg -and $s.Reg[$rn] -and $s.Reg[$rn].Exists) { [void](Reg-Write $key $rn $s.Reg[$rn].Value 'DWord' -Quiet) }
+                else { [void](Reg-Remove $key $rn -Quiet) }
+            }
+        }
+        Say ("  {0} : power saving restored" -f $ids[$i.Id]) 'DarkGray'
+    }
+}
+
+# ------------------------------------------------- network adapters ---------
+# What the background work found out about the network adapters (see Start-Prefetch), or $null: then every
+# question is asked in place.
+function Net-Pre {
+    if (-not $script:Cache.ContainsKey('netpre')) {
+        $r = $null
+        $pre = Pre-Wait 'net'
+        if ($null -ne $pre) {
+            $nic = @(); $pm = @(); $adv = @{}; $npm = @{}
+            foreach ($x in $pre) {
+                switch ([string]$x.K) {
+                    'nic' { $nic += ,@{ Name = [string]$x.A; Desc = [string]$x.D; Guid = [string]$x.G; PnpId = [string]$x.P } }
+                    'pm'  { $pm += ,@{ Id = ([string]$x.I -replace '_\d+$', ''); Enable = [bool]$x.E } }
+                    'adv' {
+                        $an = [string]$x.A
+                        if (-not $adv.ContainsKey($an)) { $adv[$an] = @() }
+                        $adv[$an] += ,@{ DisplayName = [string]$x.N; DisplayValue = [string]$x.V; Keyword = [string]$x.W; RegValue = [string]$x.R; Valid = @($x.L) }
+                    }
+                    'npm' { $npm[[string]$x.A] = @{ SelectiveSuspend = [string]$x.S; DeviceSleepOnDisconnect = [string]$x.D } }
+                }
+            }
+            $r = @{ Nic = $nic; Pm = $pm; Adv = $adv; Npm = $npm }
+        }
+        $script:Cache['netpre'] = $r
+    }
+    return $script:Cache['netpre']
+}
+function Nic-List {
+    if ($script:ScanMode) { $x = Net-Pre; if ($x -and $x.Nic.Count -gt 0) { return $x.Nic } }
+    Scan-Memo 'nic' {
+        $out = @()
+        foreach ($n in @(Get-NetAdapter -Physical -ErrorAction Ignore)) {
+            $out += ,@{ Name = [string]$n.Name; Desc = [string]$n.InterfaceDescription; Guid = [string]$n.InterfaceGuid; PnpId = [string]$n.PnPDeviceID }
+        }
+        return $out
+    }
+}
+function Nic-ClassKey {
+    param([string]$guid)
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}'
+    foreach ($k in @(Reg-SubKeys $root)) {
+        $v = Reg-Read $k 'NetCfgInstanceId'
+        if ($v.Exists -and [string]$v.Value -eq $guid) { return $k }
+    }
+    return ''
+}
+function Nic-PmRead {
+    param([string]$name)
+    if ($script:ScanMode) { $x = Net-Pre; if ($x -and $x.Npm.ContainsKey($name)) { return $x.Npm[$name] } }
+    $r = Get-NetAdapterPowerManagement -Name $name -ErrorAction Ignore
+    if (-not $r) { return $null }
+    return @{ SelectiveSuspend = [string]$r.SelectiveSuspend; DeviceSleepOnDisconnect = [string]$r.DeviceSleepOnDisconnect }
+}
+function Nic-PmWrite {
+    param([string]$name, [string]$setting, [string]$value)
+    if ($DryRun) { return }
+    $pm = @{ Name = $name; NoRestart = $true; $setting = $value }   # one setting per call: an unsupported one cannot block the other
+    Set-NetAdapterPowerManagement @pm -ErrorAction SilentlyContinue
+}
+function Nic-AdvList {
+    param([string]$name)
+    if ($script:ScanMode) { $x = Net-Pre; if ($x -and $x.Adv.ContainsKey($name)) { return $x.Adv[$name] } }
+    Scan-Memo ('nicadv:' + $name) {
+        $out = @()
+        foreach ($a in @(Get-NetAdapterAdvancedProperty -Name $name -ErrorAction Ignore)) {
+            $valid = @(); foreach ($v in @($a.ValidDisplayValues)) { $valid += [string]$v }
+            $out += ,@{ DisplayName = [string]$a.DisplayName; DisplayValue = [string]$a.DisplayValue; Keyword = [string]$a.RegistryKeyword; RegValue = [string](@($a.RegistryValue)[0]); Valid = $valid }
+        }
+        return $out
+    }
+}
+function Nic-AdvWrite {
+    param([string]$name, [string]$kind, [string]$key, [string]$value)
+    if ($DryRun) { return }
+    if ($kind -eq 'kw') { Set-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $key -RegistryValue $value -NoRestart -ErrorAction SilentlyContinue }
+    else                { Set-NetAdapterAdvancedProperty -Name $name -DisplayName $key -DisplayValue $value -NoRestart -ErrorAction SilentlyContinue }
+}
+$script:NicPowerRx = 'Energy.?Efficient|Green Ethernet|Power Sav|\bEEE\b|Ultra Low Power|Gigabit Lite|Reduce Speed|Auto Disable|Link Speed Battery'
+$script:OffValueRx = '^(Disabled|Off|Maximum Performance|No|Never)$'
+
+# 1) the "Allow the computer to turn off this device to save power" box
+function Custom-NicTurnOff-Detect {
+    param($p)
+    $pm = @(Pm-List)
+    $on = 0; $off = 0
+    foreach ($n in @(Nic-List)) {
+        $ok = $true
+        $ck = Nic-ClassKey $n.Guid
+        if ($ck) {
+            $c = Reg-Read $ck 'PnPCapabilities'
+            if (-not ($c.Exists -and (([int]$c.Value -band 0x10) -ne 0))) { $ok = $false }
+        }
+        foreach ($i in $pm) { if ($i.Id -eq $n.PnpId -and $i.Enable) { $ok = $false } }
+        if ($ok) { $on++ } else { $off++ }
+    }
+    if ($on + $off -eq 0) { $script:Why = 'no physical network adapters found'; $script:Now = 'Network adapters: no physical adapter found'; return 'NA' }
+    $script:Now = ('Network adapters: {0} of {1} have "allow the computer to turn off this device" switched off, wanted all' -f $on, ($on + $off))
+    return (Count-State $on $off)
+}
+function Custom-NicTurnOff-Snapshot {
+    param($p)
+    $nic = @{}
+    $pm = @(Pm-List)
+    foreach ($n in @(Nic-List)) {
+        $e = @{ ClassKey = ''; PnPExists = $false; PnPValue = 0; Enable = $null }
+        $ck = Nic-ClassKey $n.Guid
+        if ($ck) { $e.ClassKey = $ck; $c = Reg-Read $ck 'PnPCapabilities'; $e.PnPExists = $c.Exists; if ($c.Exists) { $e.PnPValue = [int]$c.Value } }
+        foreach ($i in $pm) { if ($i.Id -eq $n.PnpId) { $e.Enable = $i.Enable } }
+        $nic[$n.Guid] = $e
+    }
+    return @{ Nic = $nic }
+}
+function Custom-NicTurnOff-Apply {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        if ($DryRun) { Say '    [dry] power-saving box off' 'DarkGray'; continue }
+        Pm-Set $n.PnpId $false
+        # PnPCapabilities 24 (0x18) is the value Microsoft documents (KB 2740020) for "Allow the computer to turn off this device" cleared;
+        # 280 (0x118) is the same with the wake options greyed. It is OR-ed in, so a wake setting you chose (0x100) is kept.
+        $ck = Nic-ClassKey $n.Guid
+        if ($ck) {
+            $c = Reg-Read $ck 'PnPCapabilities'
+            $cur = 0; if ($c.Exists) { $cur = [int]$c.Value }
+            [void](Reg-Write $ck 'PnPCapabilities' ($cur -bor 0x18) 'DWord' -Quiet)
+        }
+        Say '    "Allow the computer to turn off this device" is now off' 'DarkGray'
+    }
+}
+function Custom-NicTurnOff-Revert {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        if ($DryRun) { Say '    [dry] power-saving box back as before' 'DarkGray'; continue }
+        $s = $null; if ($mine -and $mine.Nic) { $s = $mine.Nic[$n.Guid] }
+        $ck = Nic-ClassKey $n.Guid
+        if ($ck) {
+            if ($s) {
+                if ($s.PnPExists) { [void](Reg-Write $ck 'PnPCapabilities' ([int]$s.PnPValue) 'DWord' -Quiet) } else { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) }
+            } else {
+                $c = Reg-Read $ck 'PnPCapabilities'
+                if ($c.Exists) {
+                    $v = [int]$c.Value -band (-bnot 0x18)
+                    if ($v -eq 0) { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) } else { [void](Reg-Write $ck 'PnPCapabilities' $v 'DWord' -Quiet) }
+                }
+            }
+        }
+        $want = $true; if ($s -and $null -ne $s.Enable) { $want = [bool]$s.Enable }
+        Pm-Set $n.PnpId $want
+        Say '    "Allow the computer to turn off this device" restored' 'DarkGray'
+    }
+}
+
+# 2) Energy-Efficient Ethernet / Green Ethernet / Wi-Fi power save (driver "Advanced" tab)
+function Nic-EeeProps {
+    param([string]$name)
+    $out = @()
+    foreach ($a in @(Nic-AdvList $name)) {
+        if ($a.Keyword -eq '*EEE') { $out += ,@{ Kind = 'kw'; Key = '*EEE'; Cur = $a.RegValue; Off = '0'; IsOff = ($a.RegValue -eq '0') }; continue }
+        if ($a.Keyword -eq '*SelectiveSuspend' -or $a.Keyword -eq '*DeviceSleepOnDisconnect') { continue }
+        if ($a.DisplayName -match $script:NicPowerRx -and $a.DisplayName -notmatch 'Selective Suspend') {
+            $isOff = ($a.DisplayValue -match $script:OffValueRx)
+            $target = ''; foreach ($v in $a.Valid) { if (-not $target -and $v -match $script:OffValueRx) { $target = $v } }
+            if ($isOff -or $target) { $out += ,@{ Kind = 'dn'; Key = $a.DisplayName; Cur = $a.DisplayValue; Off = $target; IsOff = $isOff } }
+        }
+    }
+    return $out
+}
+function Custom-NicEee-Detect {
+    param($p)
+    $on = 0; $off = 0
+    foreach ($n in @(Nic-List)) {
+        $props = @(Nic-EeeProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        $bad = $false; foreach ($x in $props) { if (-not $x.IsOff) { $bad = $true } }
+        if ($bad) { $off++ } else { $on++ }
+    }
+    if ($on + $off -eq 0) { $script:Why = 'your adapters have no such driver setting'; $script:Now = 'Network adapter driver power-saving settings: none found'; return 'NA' }
+    $script:Now = ('Network adapters with an energy-saving driver setting: {0} have it off, {1} have it on, wanted off' -f $on, $off)
+    if ($off -gt 0) { return 'Off' }     # some drivers already default to "off", so a mixed result is not shown as partly applied
+    return 'On'
+}
+function Custom-NicEee-Snapshot {
+    param($p)
+    $nic = @{}
+    foreach ($n in @(Nic-List)) {
+        $l = @(); foreach ($x in @(Nic-EeeProps $n.Name)) { if (-not $x.IsOff) { $l += ,@{ Kind = $x.Kind; Key = $x.Key; Cur = $x.Cur } } }
+        $nic[$n.Guid] = $l
+    }
+    return @{ Nic = $nic }
+}
+function Custom-NicEee-Apply {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        $props = @(Nic-EeeProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        foreach ($x in $props) {
+            if ($x.IsOff) { continue }
+            Say "    $($x.Key) -> $($x.Off)" 'DarkGray'
+            Nic-AdvWrite $n.Name $x.Kind $x.Key $x.Off
+        }
+    }
+    Say '  (driver settings take effect after the restart)' 'DarkGray'
+}
+function Custom-NicEee-Revert {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        $saved = $null; if ($mine -and $mine.Nic) { $saved = $mine.Nic[$n.Guid] }
+        if (-not $saved) {
+            if (@(Nic-EeeProps $n.Name).Count) { Say "  $($n.Name): no record of the old driver values - set them on the adapter's Advanced tab if you want them back" 'Yellow' }
+            continue
+        }
+        foreach ($x in @($saved)) {
+            Say "    $($x.Key) -> $($x.Cur)" 'DarkGray'
+            Nic-AdvWrite $n.Name $x.Kind $x.Key $x.Cur
+        }
+    }
+}
+
+# 3) USB adapter selective suspend + sleep-on-disconnect
+function Nic-SuspendProps {
+    param([string]$name)
+    $out = @()
+    $pm = Nic-PmRead $name
+    if ($pm) {
+        foreach ($s in 'SelectiveSuspend', 'DeviceSleepOnDisconnect') {
+            $v = $pm[$s]
+            if ($v -eq 'Enabled')  { $out += ,@{ Kind = 'pm'; Key = $s; Cur = 'Enabled'; Off = 'Disabled'; IsOff = $false } }
+            if ($v -eq 'Disabled') { $out += ,@{ Kind = 'pm'; Key = $s; Cur = 'Disabled'; Off = 'Disabled'; IsOff = $true } }
+        }
+    }
+    foreach ($a in @(Nic-AdvList $name)) {
+        if ($a.Keyword -eq '*SelectiveSuspend' -or $a.Keyword -eq '*DeviceSleepOnDisconnect') {
+            $out += ,@{ Kind = 'kw'; Key = $a.Keyword; Cur = $a.RegValue; Off = '0'; IsOff = ($a.RegValue -eq '0') }
+        } elseif ($a.DisplayName -match 'Selective Suspend') {
+            $isOff = ($a.DisplayValue -match $script:OffValueRx)
+            $target = ''; foreach ($v in $a.Valid) { if (-not $target -and $v -match $script:OffValueRx) { $target = $v } }
+            if ($isOff -or $target) { $out += ,@{ Kind = 'dn'; Key = $a.DisplayName; Cur = $a.DisplayValue; Off = $target; IsOff = $isOff } }
+        }
+    }
+    return $out
+}
+function Nic-PropWrite {
+    param([string]$name, $x, [string]$value)
+    if ($x.Kind -eq 'pm') { Nic-PmWrite $name $x.Key $value } else { Nic-AdvWrite $name $x.Kind $x.Key $value }
+}
+function Custom-NicSuspend-Detect {
+    param($p)
+    $on = 0; $off = 0
+    foreach ($n in @(Nic-List)) {
+        $props = @(Nic-SuspendProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        $bad = $false; foreach ($x in $props) { if (-not $x.IsOff) { $bad = $true } }
+        if ($bad) { $off++ } else { $on++ }
+    }
+    if ($on + $off -eq 0) { $script:Why = 'your adapters do not expose selective suspend'; $script:Now = 'Network adapter selective suspend: not offered by any adapter'; return 'NA' }
+    $script:Now = ('Network adapters with selective suspend: {0} have it off, {1} have it on, wanted off' -f $on, $off)
+    if ($off -gt 0) { return 'Off' }
+    return 'On'
+}
+function Custom-NicSuspend-Snapshot {
+    param($p)
+    $nic = @{}
+    foreach ($n in @(Nic-List)) {
+        $l = @(); foreach ($x in @(Nic-SuspendProps $n.Name)) { if (-not $x.IsOff) { $l += ,@{ Kind = $x.Kind; Key = $x.Key; Cur = $x.Cur } } }
+        $nic[$n.Guid] = $l
+    }
+    return @{ Nic = $nic }
+}
+function Custom-NicSuspend-Apply {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        $props = @(Nic-SuspendProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        foreach ($x in $props) {
+            if ($x.IsOff) { continue }
+            Say "    $($x.Key) -> $($x.Off)" 'DarkGray'
+            Nic-PropWrite $n.Name $x $x.Off
+        }
+    }
+}
+function Custom-NicSuspend-Revert {
+    param($p, $mine)
+    foreach ($n in @(Nic-List)) {
+        $saved = $null; if ($mine -and $mine.Nic) { $saved = $mine.Nic[$n.Guid] }
+        if (-not $saved) {
+            if (@(Nic-SuspendProps $n.Name).Count) { Say "  $($n.Name): no record of the old values - set them on the adapter's Advanced / Power Management tab if you want them back" 'Yellow' }
+            continue
+        }
+        foreach ($x in @($saved)) {
+            Say "    $($x.Key) -> $($x.Cur)" 'DarkGray'
+            Nic-PropWrite $n.Name $x $x.Cur
+        }
+    }
+}
+
+# ---------------------------------------- push registry changes to the live desktop --
+function Custom-DesktopLive-Detect { param($p) return 'Skip' }
+function Custom-DesktopLive-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] apply the wallpaper / background colour to the running desktop' 'DarkGray'; return }
+    Ensure-Win32Ui
+    $wp = Reg-Read 'HKCU:\Control Panel\Desktop' 'WallPaper'
+    $path = ''; if ($wp.Exists) { $path = [string]$wp.Value }
+    [void][Win32Ui]::SpiStr(0x0014, 0, $path, 3)
+    $bg = Reg-Read 'HKCU:\Control Panel\Colors' 'Background'
+    $rgb = @(0, 0, 0)
+    if ($bg.Exists -and ([string]$bg.Value) -match '^\s*(\d+)\s+(\d+)\s+(\d+)') { $rgb = @([int]$Matches[1], [int]$Matches[2], [int]$Matches[3]) }
+    $ref = $rgb[0] -bor ($rgb[1] -shl 8) -bor ($rgb[2] -shl 16)
+    [void][Win32Ui]::SetSysColors(1, [int[]]@(1), [int[]]@($ref))
+    Say '  desktop updated in the running session' 'DarkGray'
+}
+function Custom-DesktopLive-Revert { param($p, $mine) Custom-DesktopLive-Apply $p $mine }
+
+# The animation switches the running session understands (the SPI_SET code of each; its SPI_GET code is one less)
+#   client-area, menu, combo box, list box smooth scrolling, menu fade, selection fade, tooltip, cursor shadow, shadows under windows
+$script:AnimFlags = 0x1043, 0x1003, 0x1005, 0x1007, 0x1013, 0x1015, 0x1017, 0x101B, 0x1025
+# What the running session has now: SET code (as text) -> 0 / 1, 'Min' = minimise / maximise animation, 'Drag' = show window contents
+# while dragging, 'Font' = smooth font edges, 'FontType' = their kind (2 = ClearType). $null when Windows cannot be asked.
+function Anim-Read {
+    Ensure-Win32Ui
+    $o = @{}
+    foreach ($a in $script:AnimFlags) {
+        $v = 0
+        if ([Win32Ui]::SpiGetInt([uint32]($a - 1), 0, [ref]$v, 0)) { $o[[string]$a] = [int]$v }
+    }
+    $ai = New-Object Win32Ui+ANIMATIONINFO
+    $ai.cbSize = 8
+    if ([Win32Ui]::SpiAnim(0x0048, 8, [ref]$ai, 0)) { $o['Min'] = [int]$ai.iMinAnimate }          # SPI_GETANIMATION
+    $dg = 0; if ([Win32Ui]::SpiGetInt(0x0026, 0, [ref]$dg, 0)) { $o['Drag'] = [int]$dg }           # SPI_GETDRAGFULLWINDOWS
+    $f = 0; if ([Win32Ui]::SpiGetInt(0x004A, 0, [ref]$f, 0)) { $o['Font'] = [int]$f }              # SPI_GETFONTSMOOTHING
+    $ft = 0; if ([Win32Ui]::SpiGetInt(0x200A, 0, [ref]$ft, 0)) { $o['FontType'] = [int]$ft }       # SPI_GETFONTSMOOTHINGTYPE
+    if ($o.Count -eq 0) { return $null }
+    return $o
+}
+# $values: SET code (text) -> 0 / 1, 'Min', 'Drag', 'Font', 'FontType' (anything missing is left as it is)
+function Live-AnimationValues {
+    param($values)
+    Ensure-Win32Ui
+    $flags = 3   # SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+    foreach ($a in $script:AnimFlags) {
+        $k = [string]$a
+        if (-not $values.ContainsKey($k)) { continue }
+        $v = [IntPtr]::Zero; if ([int]$values[$k]) { $v = [IntPtr]1 }
+        [void][Win32Ui]::SpiPtr([uint32]$a, 0, $v, $flags)
+    }
+    if ($values.ContainsKey('Min')) {
+        $ai = New-Object Win32Ui+ANIMATIONINFO
+        $ai.cbSize = 8; $ai.iMinAnimate = [int]$values['Min']
+        [void][Win32Ui]::SpiAnim(0x0049, 8, [ref]$ai, $flags)                                      # SPI_SETANIMATION: minimize / maximize animation
+    }
+    if ($values.ContainsKey('Drag')) { [void][Win32Ui]::SpiPtr(0x0025, [uint32][int]$values['Drag'], [IntPtr]::Zero, $flags) }                  # SPI_SETDRAGFULLWINDOWS (the flag is the second argument)
+    if ($values.ContainsKey('Font')) { [void][Win32Ui]::SpiPtr(0x004B, [uint32][int]$values['Font'], [IntPtr]::Zero, $flags) }                  # SPI_SETFONTSMOOTHING
+    if ($values.ContainsKey('FontType')) { [void][Win32Ui]::SpiPtr(0x200B, 0, [IntPtr][int]$values['FontType'], $flags) }                        # SPI_SETFONTSMOOTHINGTYPE
+}
+function Live-Animations {
+    param([bool]$enable)
+    if ($DryRun) { Say '  [dry] apply animation settings to the running session' 'DarkGray'; return }
+    $v = 0; if ($enable) { $v = 1 }
+    $all = @{ Min = $v; Drag = $v; Font = 1; FontType = 2 }       # smooth font edges stay ON, using ClearType
+    foreach ($a in $script:AnimFlags) { $all[[string]$a] = $v }
+    Live-AnimationValues $all
+    Say '  animation settings updated in the running session' 'DarkGray'
+}
+function Live-AnimationsRestore {
+    param($saved)
+    if ($DryRun) { Say '  [dry] put the animation settings of the running session back as they were' 'DarkGray'; return }
+    Live-AnimationValues $saved
+    Say '  animation settings of the running session put back as they were' 'DarkGray'
+}
+function Custom-AnimLive-Detect { param($p) return 'Skip' }
+# What the running session had before: undo hands exactly that back (a setting that was already off stays off)
+function Custom-AnimLive-Snapshot {
+    param($p)
+    $saved = $null
+    try { $saved = Anim-Read } catch { }
+    if (-not $saved) { return $null }
+    $allOff = $true
+    foreach ($a in $script:AnimFlags) { if ($saved.ContainsKey([string]$a) -and [int]$saved[[string]$a] -ne 0) { $allOff = $false } }
+    if ($saved.ContainsKey('Min') -and [int]$saved['Min'] -ne 0) { $allOff = $false }
+    if ($saved.ContainsKey('Drag') -and [int]$saved['Drag'] -ne 0) { $allOff = $false }
+    return @{ Saved = $saved; Unknown = $allOff }
+}
+function Custom-AnimLive-Apply  { param($p, $mine) Live-Animations $false }
+function Custom-AnimLive-Revert {
+    param($p, $mine)
+    if ($mine -and -not $mine.Unknown -and $mine.Saved) {
+        # a record from before shadows under windows and window dragging were part of this setting does not know them: Windows' own default (on)
+        $vals = @{}
+        foreach ($k in @($mine.Saved.Keys)) { $vals[[string]$k] = $mine.Saved[$k] }
+        foreach ($k in '4133', 'Drag') { if (-not $vals.ContainsKey($k)) { $vals[$k] = 1 } }
+        Live-AnimationsRestore $vals
+    } else { Live-Animations $true }
+}
+
+function Custom-MouseLive-Detect { param($p) return 'Skip' }
+function Custom-MouseLive-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] apply the mouse settings to the running session' 'DarkGray'; return }
+    Ensure-Win32Ui
+    $m = 'HKCU:\Control Panel\Mouse'
+    $vals = @{}
+    foreach ($pair in @(@('MouseThreshold1', 6), @('MouseThreshold2', 10), @('MouseSpeed', 1), @('MouseSensitivity', 10))) {
+        $c = Reg-Read $m $pair[0]; $n = $pair[1]
+        $parsed = 0; if ($c.Exists -and [int]::TryParse([string]$c.Value, [ref]$parsed)) { $n = $parsed }
+        $vals[$pair[0]] = $n
+    }
+    [void][Win32Ui]::SpiInts(0x0004, 0, [int[]]@($vals['MouseThreshold1'], $vals['MouseThreshold2'], $vals['MouseSpeed']), 3)   # SPI_SETMOUSE
+    [void][Win32Ui]::SpiPtr(0x0071, 0, [IntPtr]([int]$vals['MouseSensitivity']), 3)                                              # SPI_SETMOUSESPEED
+    Say '  mouse settings updated in the running session' 'DarkGray'
+}
+function Custom-MouseLive-Revert { param($p, $mine) Custom-MouseLive-Apply $p $mine }
+
+# ------------------------------- Sticky / Filter / Toggle Keys: push to the running session --
+# The registry values are written by the setting's own parts; this makes the running desktop pick them up
+# without signing out. $which = Sticky | Filter | Toggle
+function Live-Access {
+    param([string]$which)
+    if ($DryRun) { Say '  [dry] apply the keyboard shortcut setting to the running session' 'DarkGray'; return }
+    $reg = ''
+    switch ($which) {
+        'Sticky' { $reg = 'HKCU:\Control Panel\Accessibility\StickyKeys' }
+        'Filter' { $reg = 'HKCU:\Control Panel\Accessibility\Keyboard Response' }
+        'Toggle' { $reg = 'HKCU:\Control Panel\Accessibility\ToggleKeys' }
+    }
+    if (-not $reg) { return }
+    $c = Reg-Read $reg 'Flags'
+    $f = [uint32]0
+    if (-not ($c.Exists -and [uint32]::TryParse([string]$c.Value, [ref]$f))) { return }
+    Ensure-Win32Ui
+    if ($which -eq 'Filter') {
+        $k = New-Object Win32Ui+FILTERFLAGS
+        $k.cbSize = 24
+        [void][Win32Ui]::SpiFilter(0x0032, 24, [ref]$k, 0)             # SPI_GETFILTERKEYS: keep the delay / repeat / bounce times
+        $k.cbSize = 24; $k.dwFlags = $f
+        [void][Win32Ui]::SpiFilter(0x0033, 24, [ref]$k, 3)             # SPI_SETFILTERKEYS
+    } else {
+        $action = 0x003B; if ($which -eq 'Toggle') { $action = 0x0035 }   # SPI_SETSTICKYKEYS / SPI_SETTOGGLEKEYS
+        $k = New-Object Win32Ui+KEYFLAGS
+        $k.cbSize = 8; $k.dwFlags = $f
+        [void][Win32Ui]::SpiKeys($action, 8, [ref]$k, 3)
+    }
+    Say '  keyboard shortcut setting updated in the running session' 'DarkGray'
+}
+function Custom-AccessLive-Detect { param($p) return 'Skip' }
+function Custom-AccessLive-Apply  { param($p, $mine) Live-Access ([string]$p.Data) }
+function Custom-AccessLive-Revert { param($p, $mine) Live-Access ([string]$p.Data) }
+
+# ------------------------------------------------ hypervisor launch (bcdedit) --
+# 'off', 'auto', ... or '' when the value is not set; $null when the boot settings cannot be read
+function Hv-Type {
+    $o = Bcd '/enum' '{current}'
+    if ($null -eq $o) { return $null }
+    $m = [regex]::Match($o, '(?im)^\s*hypervisorlaunchtype\s+(\S+)')
+    if ($m.Success) { return $m.Groups[1].Value.ToLower() }
+    return ''
+}
+function Custom-Hypervisor-Detect {
+    param($p)
+    $t = Hv-Type
+    if ($null -eq $t) { $script:Why = 'the boot settings cannot be read on this PC'; $script:Now = 'Boot setting hypervisorlaunchtype: could not be read'; return 'NA' }
+    $shown = $t; if (-not $shown) { $shown = 'not set (Windows decides)' }
+    $script:Now = ('Boot setting hypervisorlaunchtype: {0}, wanted off' -f $shown)
+    if ($t -eq 'off') { return 'On' }
+    return 'Off'
+}
+function Custom-Hypervisor-Snapshot {
+    param($p)
+    $t = Hv-Type
+    return @{ Was = [string]$t; Unknown = ($t -eq 'off') }
+}
+function Custom-Hypervisor-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] bcdedit /set hypervisorlaunchtype off' 'DarkGray'; return }
+    if (Test-UsesVirtualization) { Say '  NOTE: WSL2, Hyper-V, Windows Sandbox or Virtual Machine Platform is turned on here. They will not start while this is switched on.' 'Yellow' }
+    [void](Bcd '/set' 'hypervisorlaunchtype' 'off')
+    Say '  bcdedit /set hypervisorlaunchtype off   (takes effect after a restart)' 'DarkGray'
+}
+function Custom-Hypervisor-Revert {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] put the hypervisor launch setting back' 'DarkGray'; return }
+    $was = ''; if ($mine -and -not $mine.Unknown) { $was = [string]$mine.Was }
+    if ($was) {
+        [void](Bcd '/set' 'hypervisorlaunchtype' $was)
+        Say "  bcdedit /set hypervisorlaunchtype $was" 'DarkGray'
+    } else {
+        [void](Bcd '/deletevalue' 'hypervisorlaunchtype')
+        Say '  bcdedit /deletevalue hypervisorlaunchtype   (Windows decides again)' 'DarkGray'
+    }
+}
+
+# ----------------------------------------- Windows Security scans: idle only -----
+$script:MpIdleCpu = 20
+function Mp-IsQuiet { param($m) return ($m.Idle -and $m.LowPri -and $m.Cpu -le $script:MpIdleCpu) }
+function Custom-DefenderIdle-Detect {
+    param($p)
+    $m = Mp-Read
+    if (-not $m) { $script:Why = 'Windows Security (Defender) is not available on this PC'; $script:Now = 'Windows Security scan settings: could not be read'; return 'NA' }
+    $script:Now = ('Windows Security scans: only when idle = {0}, low priority = {1}, CPU limit {2}%, wanted idle only, low priority, at most {3}%' -f $m.Idle, $m.LowPri, $m.Cpu, $script:MpIdleCpu)
+    if (Mp-IsQuiet $m) { return 'On' }
+    return 'Off'
+}
+function Custom-DefenderIdle-Snapshot {
+    param($p)
+    $m = Mp-Read
+    if (-not $m) { return $null }
+    return @{ Idle = $m.Idle; LowPri = $m.LowPri; Cpu = $m.Cpu; Unknown = (Mp-IsQuiet $m) }
+}
+function Custom-DefenderIdle-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say ('  [dry] Windows Security: scan only when idle, low CPU priority, at most {0}% CPU' -f $script:MpIdleCpu) 'DarkGray'; return }
+    if (Mp-Write $true $true $script:MpIdleCpu) { Say ('  Windows Security scans: only when idle, low priority, at most {0}% CPU' -f $script:MpIdleCpu) 'DarkGray' }
+}
+function Custom-DefenderIdle-Revert {
+    param($p, $mine)
+    $idle = $true; $low = $false; $cpu = 50          # Windows' own defaults
+    if ($mine -and -not $mine.Unknown) { $idle = [bool]$mine.Idle; $low = [bool]$mine.LowPri; $cpu = [int]$mine.Cpu }
+    if ($DryRun) { Say '  [dry] Windows Security scan settings back as they were' 'DarkGray'; return }
+    if (Mp-Write $idle $low $cpu) { Say ('  Windows Security scans: idle only = {0}, low priority = {1}, CPU limit {2}%' -f $idle, $low, $cpu) 'DarkGray' }
+}
+
+# ------------------------------- Display: graphics switches that share one text -----
+# Settings > System > Display > Graphics > Default graphics settings keeps its switches in ONE text value, a list of NAME=value;
+# pairs (for example "SwapEffectUpgradeEnable=1;VRROptimizeEnable=0;"). Each switch here changes only its own pair and leaves every
+# other pair in the text exactly as it was, whoever wrote it.
+$script:DxPath = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
+$script:DxName = 'DirectXUserGlobalSettings'
+# the pieces of the text: whole "NAME=value" parts without the semicolons, empty parts dropped
+function Dx-Parts { param([string]$Text) return @(([string]$Text -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+# the value of one name, or $null when the text has no such name
+function Dx-Get {
+    param([string]$Text, [string]$Key)
+    foreach ($part in (Dx-Parts $Text)) {
+        $i = $part.IndexOf('=')
+        if ($i -gt 0 -and $part.Substring(0, $i).Trim() -ieq $Key) { return $part.Substring($i + 1).Trim() }
+    }
+    return $null
+}
+# the text with one name set to $Value (added at the end when it is not there yet), or removed when $Value is $null
+function Dx-Set {
+    param([string]$Text, [string]$Key, $Value)
+    $out = @()
+    $done = $false
+    foreach ($part in (Dx-Parts $Text)) {
+        $i = $part.IndexOf('=')
+        if ($i -gt 0 -and $part.Substring(0, $i).Trim() -ieq $Key) {
+            if (-not $done -and $null -ne $Value) { $out += ($Key + '=' + [string]$Value) }
+            $done = $true
+        } else { $out += $part }
+    }
+    if (-not $done -and $null -ne $Value) { $out += ($Key + '=' + [string]$Value) }
+    if ($out.Count -eq 0) { return '' }
+    return (($out -join ';') + ';')
+}
+function Dx-ReadText {
+    $r = Reg-Read $script:DxPath $script:DxName
+    if ($r.Exists) { return [string]$r.Value }
+    return ''
+}
+# Writes the text; an empty text removes the value (an empty list and no list mean the same to Windows)
+function Dx-WriteText {
+    param([string]$Text)
+    if ($Text) { return (Reg-Write $script:DxPath $script:DxName $Text 'String') }
+    return (Reg-Remove $script:DxPath $script:DxName)
+}
+# The lowest Windows build that has the switch, as the build number is known: an unknown build counts as supported
+$script:DxMinBuild = @{ 'SwapEffectUpgradeEnable' = 22621; 'VRROptimizeEnable' = 19041 }
+# The value each setting writes into its own pair. The two switches go in opposite directions: "Optimizations for windowed games" is
+# turned ON (1) and "Variable refresh rate" is turned OFF (0), so for the second one "applied" means the entry reads 0 and a missing
+# entry (Windows' own default, which Settings may show as on) means it is not applied yet. Windows shows the variable refresh rate
+# switch in Settings only where the monitor and the graphics driver support it, so on a PC where no screen can do it (Vrr-Check) the
+# setting reads "not available" and is never written.
+$script:DxWant = @{ 'SwapEffectUpgradeEnable' = '1'; 'VRROptimizeEnable' = '0' }
+function Dx-Want {
+    param([string]$Key)
+    $w = [string]$script:DxWant[$Key]
+    if ($w) { return $w }
+    return '1'
+}
+function Dx-Build {
+    $r = Reg-Read 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'CurrentBuildNumber'
+    $n = 0
+    if ($r.Exists) { [void][int]::TryParse([string]$r.Value, [ref]$n) }
+    return $n
+}
+# From this build on (Windows 11 24H2) a clean Windows has no entry for these two switches and Settings shows them ON, so a missing
+# entry is read as On there. Older builds, and a PC whose build cannot be read, keep reading a missing entry as Off.
+$script:DxDefaultOnBuild = 26100
+function Dx-DefaultOn {
+    $b = Dx-Build
+    return ($b -ge $script:DxDefaultOnBuild)
+}
+# False on a Windows build that is older than the one that has the switch (an unknown build counts as supported)
+function Dx-Supported {
+    param([string]$Key)
+    $min = [int]$script:DxMinBuild[$Key]
+    $b = Dx-Build
+    return (-not ($b -gt 0 -and $min -gt 0 -and $b -lt $min))
+}
+
+# ---- Is there a variable refresh rate switch on this PC? ----
+# Windows shows the "Variable refresh rate" switch in Settings only when all three are there: Windows 10 2004 or newer, a screen that can do
+# variable refresh rate (G-SYNC Compatible, FreeSync, Adaptive-Sync, HDMI VRR) and a graphics driver that supports it. Windows has no question
+# that returns "is the switch shown", so this reads what can be read: how each connected screen is attached (a VGA or DVI cable cannot carry
+# it) and what the screen says about itself (its EDID: a FreeSync block or an HDMI VRR block means it can; for DisplayPort the range of
+# refresh rates the screen accepts, which a fixed-rate screen does not have or has very narrow). The switch counts as missing only when every
+# connected screen plainly cannot do it. Whatever cannot be read, or is unclear, counts as "the switch may be there" and the setting stays usable.
+# Connection types (D3DKMDT_VIDEO_OUTPUT_TECHNOLOGY) that cannot carry variable refresh rate at all, with a plain name
+$script:VrrNoLink = @{ 0 = 'a VGA cable'; 1 = 'an analog cable'; 2 = 'an analog cable'; 3 = 'an analog cable'; 4 = 'a DVI cable'; 6 = 'an LVDS panel'
+                       8 = 'an analog cable'; 9 = 'an SDI cable'; 14 = 'an analog adapter'; 15 = 'a wireless display link' }
+# a range of refresh rates this much wider than 10 Hz is what a screen with variable refresh rate reports (the Linux AMD driver draws the same line)
+$script:VrrMinSpan = 10
+# The connection type as a plain number: -1 when it is not known; the "internal" flag (0x80000000) is taken off, and a bare "internal" is an embedded panel (11)
+function Vrr-LinkKind {
+    param($Tech)
+    $t = 4294967295L
+    if ($null -ne $Tech) { try { $t = ([int64]$Tech) -band 4294967295L } catch { $t = 4294967295L } }
+    if ($t -eq 4294967295L) { return -1 }
+    $internal = (($t -band 2147483648L) -ne 0)
+    $base = [int]($t -band 2147483647L)
+    if ($internal -and $base -eq 0) { return 11 }
+    return $base
+}
+# What the EDID bytes of one screen say about variable refresh rate: the refresh rate range of the base block (descriptor 0xFD, with the
+# EDID 1.4 offsets), the AMD FreeSync block and the HDMI Forum block of the CTA extension, and whether a DisplayID extension is there.
+function Vrr-ParseEdid {
+    param($Edid)
+    $r = @{ Ok = $false; HasRange = $false; Min = 0; Max = 0; Amd = $false; Hdmi = $false; DispId = $false }
+    $b = @()
+    foreach ($x in @($Edid)) { $b += [int]$x }
+    if ($b.Count -lt 128) { return $r }
+    $head = @(0, 255, 255, 255, 255, 255, 255, 0)
+    for ($i = 0; $i -lt 8; $i++) { if ($b[$i] -ne $head[$i]) { return $r } }
+    $r.Ok = $true
+    foreach ($o in @(54, 72, 90, 108)) {
+        if ($b[$o] -eq 0 -and $b[$o + 1] -eq 0 -and $b[$o + 3] -eq 253) {
+            $lo = $b[$o + 5]; $hi = $b[$o + 6]
+            if ($b[19] -ge 4 -and ($b[$o + 4] -band 2) -ne 0) { $hi += 255; if (($b[$o + 4] -band 1) -ne 0) { $lo += 255 } }
+            if ($hi -gt 0) { $r.HasRange = $true; $r.Min = $lo; $r.Max = $hi }
+        }
+    }
+    $n = $b[126]
+    for ($e = 1; $e -le $n; $e++) {
+        $s = 128 * $e
+        if ($b.Count -lt $s + 128) { break }
+        if ($b[$s] -eq 112) { $r.DispId = $true }
+        if ($b[$s] -ne 2) { continue }
+        $d = $b[$s + 2]
+        if ($d -lt 4) { continue }
+        $p = $s + 4
+        $end = [Math]::Min($s + $d, $s + 127)
+        while ($p -lt $end) {
+            $len = $b[$p] -band 31
+            if ($p + $len -gt $s + 127) { break }
+            if (($b[$p] -shr 5) -eq 3 -and $len -ge 3) {
+                $oui = ('{0:X2}{1:X2}{2:X2}' -f $b[$p + 3], $b[$p + 2], $b[$p + 1])
+                if ($oui -eq '00001A') { if ($len -lt 5 -or ($b[$p + 5] -band 1) -ne 0) { $r.Amd = $true } }
+                elseif ($oui -eq 'C45DD8' -and $len -ge 8) { $r.Hdmi = $true }
+            }
+            $p += 1 + $len
+        }
+    }
+    return $r
+}
+# One screen: @{ State = yes | no | unknown; Why } from @{ Tech; Edid }
+function Vrr-Judge {
+    param($Screen)
+    $kind = Vrr-LinkKind $Screen.Tech
+    if ($script:VrrNoLink.ContainsKey($kind)) { return @{ State = 'no'; Why = ('connected by {0}, which cannot carry variable refresh rate' -f $script:VrrNoLink[$kind]) } }
+    $e = $null
+    if ($Screen.Edid) { $e = Vrr-ParseEdid $Screen.Edid }
+    if (-not $e -or -not $e.Ok) { return @{ State = 'unknown'; Why = 'its display information could not be read' } }
+    if ($e.Amd) { return @{ State = 'yes'; Why = 'announces FreeSync' } }
+    if ($e.Hdmi) { return @{ State = 'yes'; Why = 'announces HDMI variable refresh rate' } }
+    if ($kind -eq 5) { return @{ State = 'no'; Why = 'connected by HDMI and announces neither FreeSync nor HDMI variable refresh rate' } }
+    if ($e.HasRange) {
+        if (($e.Max - $e.Min) -gt $script:VrrMinSpan) { return @{ State = 'yes'; Why = ('accepts refresh rates from {0} to {1} Hz' -f $e.Min, $e.Max) } }
+        return @{ State = 'no'; Why = ('refresh rate range {0}-{1} Hz is too narrow for variable refresh rate' -f $e.Min, $e.Max) }
+    }
+    if ($e.DispId) { return @{ State = 'unknown'; Why = 'its refresh rate range is not in the part of its display information that could be read' } }
+    return @{ State = 'no'; Why = 'does not report a range of refresh rates' }
+}
+# The screens that are connected now: name, connection type and the raw EDID bytes that Windows keeps in the registry
+function Vrr-Screens {
+    $out = @()
+    try {
+        $conn = @{}
+        foreach ($c in @(Get-CimInstance -Namespace 'root\wmi' -ClassName WmiMonitorConnectionParams -ErrorAction Stop)) { $conn[([string]$c.InstanceName).ToUpperInvariant()] = $c.VideoOutputTechnology }
+        foreach ($m in @(Get-CimInstance -Namespace 'root\wmi' -ClassName WmiMonitorID -ErrorAction Stop)) {
+            if ($null -ne $m.Active -and -not [bool]$m.Active) { continue }
+            $inst = [string]$m.InstanceName
+            $edid = $null
+            $reg = Reg-Read ('HKLM:\SYSTEM\CurrentControlSet\Enum\' + ($inst -replace '_\d+$', '') + '\Device Parameters') 'EDID'
+            if ($reg.Exists -and $reg.Value -is [byte[]]) { $edid = $reg.Value }
+            $code = ''
+            $q = @($inst -split '\\')
+            if ($q.Count -ge 2) { $code = $q[1] }
+            $name = ''
+            $fn = @($m.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [byte]$_ })
+            if ($fn.Count) { $name = ([System.Text.Encoding]::ASCII.GetString([byte[]]$fn)).Trim() }
+            if (-not $name) { $name = $code }
+            if (-not $name) { $name = 'a screen' }
+            $out += ,@{ Name = $name; Tech = $conn[$inst.ToUpperInvariant()]; Edid = $edid }
+        }
+    } catch { }
+    return $out
+}
+# All connected screens together: State = yes (at least one can), no (every one plainly cannot) or unknown (anything else, also no screen found);
+# Seen = one short sentence per screen. A check asks once and the answer is reused; call it as @(Vrr-Check)[0].
+function Vrr-Check {
+    Scan-Memo 'vrr' {
+        $seen = @(); $yes = 0; $no = 0; $unk = 0
+        foreach ($s in @(Vrr-Screens)) {
+            $j = Vrr-Judge $s
+            $seen += ('{0}: {1}' -f $s.Name, $j.Why)
+            switch ($j.State) { 'yes' { $yes++ } 'no' { $no++ } default { $unk++ } }
+        }
+        $state = 'unknown'
+        if ($yes -gt 0) { $state = 'yes' } elseif ($unk -eq 0 -and $no -gt 0) { $state = 'no' }
+        return @{ State = $state; Seen = $seen }
+    }
+}
+# True when the variable refresh rate switch is missing on this PC (a Windows build without it, or no screen that can do it)
+function Vrr-Missing {
+    param([string]$Key)
+    if ($Key -ne 'VRROptimizeEnable') { return $false }
+    return ((@(Vrr-Check)[0]).State -eq 'no')
+}
+function Custom-DxGlobal-Detect {
+    param($p)
+    $key = [string]$p.Data
+    $min = [int]$script:DxMinBuild[$key]
+    $b = Dx-Build
+    if (-not (Dx-Supported $key)) {
+        if ($min -ge 22000) { $script:Why = 'this switch exists on Windows 11 22H2 and newer' } else { $script:Why = 'this switch exists on Windows 10 version 2004 and newer' }
+        $script:Now = ('Graphics switch {0}: needs Windows build {1}, this PC has {2}' -f $key, $min, $b)
+        return 'NA'
+    }
+    if (Vrr-Missing $key) {
+        $script:Why = 'Windows shows this switch only for a screen that supports variable refresh rate, and none of the screens on this PC does'
+        $script:Now = ('Variable refresh rate switch not available. ' + ((@(Vrr-Check)[0]).Seen -join '; '))
+        return 'NA'
+    }
+    $v = Dx-Get (Dx-ReadText) $key
+    $shown = $v
+    if ($null -eq $v) {
+        $shown = 'no entry'
+        # only the windowed-games switch has a known default; for variable refresh rate Microsoft does not say, so nothing is claimed
+        if ($key -eq 'VRROptimizeEnable') { $shown += ' (Windows uses its own default for this PC)' }
+        elseif (Dx-DefaultOn) { $shown += ' (Windows treats that as on)' }
+        else { $shown += ' (Windows treats that as off)' }
+    }
+    $want = Dx-Want $key
+    $script:Now = ('Graphics switch {0}: {1}, wanted {2}' -f $key, $shown, $want)
+    # for variable refresh rate also say what each screen reported about itself, so it is visible why this switch is offered here
+    if ($key -eq 'VRROptimizeEnable') {
+        $seen = @((@(Vrr-Check)[0]).Seen)
+        if ($seen.Count -gt 0) { $script:Now += ('. Screens: ' + ($seen -join '; ')) } else { $script:Now += '. No screen could be read, so the switch is left available' }
+    }
+    if ($v -eq $want) { return 'On' }
+    # no entry: Windows' own default. Where the wanted value is 1 and Windows' default is on (Windows 11 24H2 and newer) that already counts as applied;
+    # where the wanted value is 0 (variable refresh rate) a missing entry is never "applied", the setting is simply there to be turned on
+    if ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn)) { return 'On' }
+    return 'Off'
+}
+function Custom-DxGlobal-Snapshot {
+    param($p)
+    $key = [string]$p.Data
+    $v = Dx-Get (Dx-ReadText) $key
+    $want = Dx-Want $key
+    # a switch that already has the wanted value when this app first looks (an entry with it, or for a wanted 1 no entry on a build where
+    # Windows' default is on): what it was before is unknown, undo then puts it back to the other value (or to no entry)
+    return @{ Key = $key; Had = ($null -ne $v); Was = [string]$v; Unknown = ($v -eq $want -or ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn))) }
+}
+function Custom-DxGlobal-Apply {
+    param($p, $mine)
+    $key = [string]$p.Data
+    # a switch that this Windows build does not have, or that no screen of this PC can use, is never written (the plan skips it too; this is the second lock)
+    if (-not (Dx-Supported $key)) { return }
+    if (Vrr-Missing $key) { return }
+    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key (Dx-Want $key)))
+}
+function Custom-DxGlobal-Revert {
+    param($p, $mine)
+    $key = [string]$p.Data
+    if (-not (Dx-Supported $key)) { return }
+    if (Vrr-Missing $key) { return }
+    $want = Dx-Want $key
+    $val = $null
+    if ($mine -and $mine.Had -and -not $mine.Unknown) { $val = [string]$mine.Was }
+    elseif ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
+    # otherwise the entry is removed again, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
+    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
+}
+
+# ------------------------------- Game Mode -----
+# Windows Game Mode (Settings > Gaming > Game Mode) is a switch of the current account: HKCU\Software\Microsoft\GameBar, AutoGameModeEnabled
+# (1 on, 0 off). Windows has it on by default and a clean Windows has no entry for it, so a missing entry is On. Guides for turning it off
+# also set AllowAutoGameMode, an older value of the same key, so both are read and Game Mode counts as on unless one of them is 0.
+$script:GmPath = 'HKCU:\Software\Microsoft\GameBar'
+$script:GmNames = @('AutoGameModeEnabled', 'AllowAutoGameMode')
+function Gm-Read {
+    $r = @{}
+    foreach ($n in $script:GmNames) { $r[$n] = Reg-Read $script:GmPath $n }
+    return $r
+}
+function Gm-IsOn {
+    param($r)
+    foreach ($n in $script:GmNames) { if ($r[$n].Exists -and [string]$r[$n].Value -eq '0') { return $false } }
+    return $true
+}
+function Custom-GameMode-Detect {
+    param($p)
+    $r = Gm-Read
+    $txt = @()
+    foreach ($n in $script:GmNames) {
+        $v = 'no entry (Windows treats that as on)'
+        if ($r[$n].Exists) { $v = [string]$r[$n].Value }
+        $txt += ('{0} = {1}' -f $n, $v)
+    }
+    $script:Now = ('{0}: {1}; wanted on' -f $script:GmPath, ($txt -join ', '))
+    if (Gm-IsOn $r) { return 'On' }
+    return 'Off'
+}
+function Custom-GameMode-Snapshot {
+    param($p)
+    $r = Gm-Read
+    $snap = @{ On = [bool](Gm-IsOn $r) }
+    # what each value was: when Game Mode was already on, nothing is known about "before" (undo then turns it off)
+    foreach ($n in $script:GmNames) { $snap[$n] = @{ Had = [bool]$r[$n].Exists; Was = $r[$n].Value; Kind = [string]$r[$n].Kind } }
+    return $snap
+}
+function Custom-GameMode-Apply {
+    param($p, $mine)
+    [void](Reg-Write $script:GmPath 'AutoGameModeEnabled' 1 'DWord')
+    # the older value is only changed where it exists (it is not created from nothing)
+    if ((Reg-Read $script:GmPath 'AllowAutoGameMode').Exists) { [void](Reg-Write $script:GmPath 'AllowAutoGameMode' 1 'DWord') }
+}
+function Custom-GameMode-Revert {
+    param($p, $mine)
+    if ($mine -and -not [bool]$mine.On) {
+        foreach ($n in $script:GmNames) {
+            $s = $mine.$n
+            if ($s -and [bool]$s.Had) {
+                $k = [string]$s.Kind; if (-not $k) { $k = 'DWord' }
+                [void](Reg-Write $script:GmPath $n $s.Was $k)
+            } else { [void](Reg-Remove $script:GmPath $n) }
+        }
+        return
+    }
+    # no record, or Game Mode was already on before this app saw it: switching it off needs an explicit 0 (removing the entries would
+    # leave Windows' default, which is on)
+    foreach ($n in $script:GmNames) { [void](Reg-Write $script:GmPath $n 0 'DWord') }
+}
+
+# ------------------------------- Windows AI core package -----
+# MicrosoftWindows.Client.CoreAI is part of Windows and is marked "not removable". Windows allows removing such a package once it is
+# marked end of life for the user: a key named after the package under ...\Appx\AppxAllUserStore\EndOfLife\<user SID>. The package is
+# then removed for every user and from the list of apps new accounts get.
+$script:AiCorePat = 'MicrosoftWindows.Client.CoreAI*'
+$script:EolRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife'
+function Ai-CoreFind {
+    $d = Appx-Data
+    $pk = @{}; $pv = @{}; $lv = @{}
+    foreach ($p in $d.Pkgs) { if ([string]$p.Name -like $script:AiCorePat) { $pk[[string]$p.Full] = [string]$p.Name; $lv[[string]$p.Full] = ($null -eq $p.Live -or [bool]$p.Live) } }
+    foreach ($p in $d.Prov) { if ([string]$p.Name -like $script:AiCorePat) { $pv[[string]$p.Pkg] = [string]$p.Name } }
+    return @{ Pkgs = $pk; Prov = $pv; Live = $lv }
+}
+# The accounts a package is installed for (the current account is always in the list)
+function Appx-UserSids {
+    param([string]$Full)
+    $sids = @()
+    try { $sids += [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { }
+    try {
+        foreach ($x in @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $Full })) {
+            foreach ($u in @($x.PackageUserInformation)) {
+                $s = ''
+                try { $s = [string]$u.UserSecurityId.Sid } catch { }
+                if ($s -and $sids -notcontains $s) { $sids += $s }
+            }
+        }
+    } catch { }
+    return @($sids | Where-Object { $_ })
+}
+function Appx-EolMark {
+    param([string]$Sid, [string]$Full)
+    if ($DryRun) { return }
+    try { New-Item -Path ($script:EolRoot + '\' + $Sid + '\' + $Full) -Force -ErrorAction Stop | Out-Null }
+    catch { Say "  ! could not mark the package as end of life for $Sid : $($_.Exception.Message)" 'Yellow' }
+}
+function Custom-AiCore-Detect {
+    param($p)
+    $m = Ai-CoreFind
+    # removed = installed for nobody: the copy that is only kept for new accounts does not count as installed
+    $inst = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } }
+    $left = ($m.Pkgs.Count - $inst) + $m.Prov.Count
+    $script:Now = ('Windows AI core package: {0} installed' -f $inst)
+    if ($left -gt 0) { $script:Now += (', {0} only kept for new accounts (not installed for anyone)' -f $left) }
+    $script:Now += ', wanted none installed'
+    if ($inst -gt 0) { return 'Off' }
+    return 'On'
+}
+function Custom-AiCore-Snapshot { param($p) return $null }
+function Custom-AiCore-Apply {
+    param($p, $mine)
+    $m = Ai-CoreFind
+    if ($m.Pkgs.Count -eq 0 -and $m.Prov.Count -eq 0) { Say '  (the Windows AI core package is not on this PC)' 'DarkGray'; return }
+    foreach ($full in @($m.Pkgs.Keys)) {
+        Say "  removing app $($m.Pkgs[$full])" 'Gray'
+        if ($DryRun) { continue }
+        foreach ($sid in @(Appx-UserSids $full)) { Appx-EolMark $sid $full }
+        try { Remove-AppxPackage -Package $full -AllUsers -ErrorAction Stop }
+        catch {
+            try { Remove-AppxPackage -Package $full -ErrorAction Stop }
+            catch { Say "  ! $($m.Pkgs[$full]) could not be removed: $($_.Exception.Message)" 'Yellow' }
+        }
+    }
+    foreach ($k in @($m.Prov.Keys)) {
+        if (-not $DryRun) { Remove-AppxProvisionedPackage -Online -PackageName $k -ErrorAction SilentlyContinue | Out-Null }
+    }
+    $script:Cache.Remove('appx')
+}
+function Custom-AiCore-Revert { param($p, $mine) Say '  (the removed AI package cannot be put back from here)' 'Yellow' }
+
+# ------------------------------- Settings pages hidden by name -----
+# Settings keeps its page-hiding policy in ONE text value, "hide:page1;page2" (or "showonly:..."). A setting here adds or takes out only
+# its own page and leaves every other page in the list exactly as it was.
+$script:ShPath = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer'
+$script:ShName = 'SettingsPageVisibility'
+function Sh-Parse {
+    param([string]$Text)
+    $t = ([string]$Text).Trim()
+    $mode = ''; $rest = ''
+    $i = $t.IndexOf(':')
+    if ($i -gt 0) { $mode = $t.Substring(0, $i).Trim().ToLowerInvariant(); $rest = $t.Substring($i + 1) }
+    $pages = @(([string]$rest -split ';') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    return @{ Mode = $mode; Pages = $pages }
+}
+function Sh-Has {
+    param($Pages, [string]$Key)
+    foreach ($x in @($Pages)) { if ([string]$x -ieq $Key) { return $true } }
+    return $false
+}
+function Sh-ReadText {
+    $r = Reg-Read $script:ShPath $script:ShName
+    if ($r.Exists) { return [string]$r.Value }
+    return ''
+}
+function Custom-SettingsHide-Detect {
+    param($p)
+    $key = [string]$p.Data
+    $t = Sh-Parse (Sh-ReadText)
+    $listText = 'no page list'; if ($t.Mode) { $listText = ('{0} list: {1}' -f $t.Mode, (Now-Clip (@($t.Pages) -join '; '))) }
+    $script:Now = ('Settings page "{0}": {1}, wanted hidden' -f $key, $listText)
+    if ($t.Mode -eq 'showonly') { $script:Why = 'Settings here is limited to a list of pages (a "showonly" list), so a page cannot be hidden by name'; return 'NA' }
+    if ($t.Mode -eq 'hide' -and (Sh-Has $t.Pages $key)) { return 'On' }
+    return 'Off'
+}
+function Custom-SettingsHide-Snapshot { param($p) return $null }
+function Custom-SettingsHide-Apply {
+    param($p, $mine)
+    $key = [string]$p.Data
+    $t = Sh-Parse (Sh-ReadText)
+    if ($t.Mode -eq 'showonly') { Say '  ! Settings is limited to a "showonly" list of pages here: nothing was changed' 'Yellow'; return }
+    $pages = @($t.Pages)
+    if ($t.Mode -ne 'hide') { $pages = @() }
+    if (-not (Sh-Has $pages $key)) { $pages += $key }
+    [void](Reg-Write $script:ShPath $script:ShName ('hide:' + ($pages -join ';')) 'String')
+}
+function Custom-SettingsHide-Revert {
+    param($p, $mine)
+    $key = [string]$p.Data
+    $t = Sh-Parse (Sh-ReadText)
+    if ($t.Mode -ne 'hide') { return }
+    $left = @($t.Pages | Where-Object { [string]$_ -ine $key })
+    if ($left.Count -eq 0) { [void](Reg-Remove $script:ShPath $script:ShName) }
+    else { [void](Reg-Write $script:ShPath $script:ShName ('hide:' + ($left -join ';')) 'String') }
+}
+
+# ------------------------------------------------------------ startup apps -----
+# Task Manager > Startup apps lists the Run keys and the two Startup folders. Whether an entry runs is a
+# small binary value under ...\Explorer\StartupApproved (first byte 02 = on, 03 = off, then the time it was
+# switched off). Writing that value for the current user is exactly what Task Manager does, and it changes
+# nothing else: the entry itself is never deleted.
+$script:ApprRoot = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
+function Appr-Path { param([string]$hive, [string]$kind) return ($hive + ':\' + $script:ApprRoot + '\' + $kind) }
+# Same text -> same short code on every run (the undo record is keyed by it)
+function Short-Hash {
+    param([string]$s)
+    $h = 5381
+    foreach ($ch in $s.ToCharArray()) { $h = ((($h * 33) -bxor [int]$ch) -band 0xFFFFFF) }
+    return $h.ToString('x6')
+}
+function Startup-Entries {
+    $out = @()
+    $runKeys = @(
+        @{ Kind = 'Run';   Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list of your account'; Tag = 'your account' }
+        @{ Kind = 'Run';   Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list for all users'; Tag = 'all users' }
+        @{ Kind = 'Run32'; Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Label = 'the Run list for all users (32-bit programs)'; Tag = 'all users, 32-bit' }
+    )
+    foreach ($rk in $runKeys) {
+        $vals = @()
+        try { $vals = @(Reg-Values $rk.Path) } catch { }          # one unreadable list must not hide the others
+        foreach ($v in $vals) {
+            $out += ,@{ Source = 'run'; From = $rk.Label; Tag = $rk.Tag; Show = [string]$v.Name; Name = [string]$v.Name; Appr = $rk.Kind; ApprName = [string]$v.Name
+                        Run = $rk.Path; Full = ''; Cmd = [string]$v.Value }
+        }
+    }
+    $dirs = @{ User = ''; Common = '' }
+    try { $dirs = Startup-Dirs } catch { }
+    $folders = @(
+        @{ Path = [string]$dirs.User;   Label = 'the Startup folder of your account'; Tag = 'your Startup folder' }
+        @{ Path = [string]$dirs.Common; Label = 'the Startup folder for all users'; Tag = 'all users Startup folder' }
+    )
+    foreach ($d in $folders) {
+        if (-not $d.Path) { continue }
+        $files = @()
+        try { $files = @(Fs-Files $d.Path) } catch { }
+        foreach ($f in $files) {
+            $cmd = ''
+            try { $cmd = Lnk-Target $f.Path } catch { }
+            if (-not $cmd) { $cmd = [string]$f.Path }
+            $show = $f.Name -replace '\.(lnk|url)$', ''
+            $out += ,@{ Source = 'folder'; From = $d.Label; Tag = $d.Tag; Show = [string]$show; Name = [string]$f.Name; Appr = 'StartupFolder'; ApprName = [string]$f.Name
+                        Run = ''; Full = [string]$f.Path; Cmd = $cmd }
+        }
+    }
+    return $out
+}
+function Startup-Exists {
+    param($e)
+    if ($e.Source -eq 'run') { return [bool](Reg-Read $e.Run $e.Name).Exists }
+    return [bool](Fs-Exists $e.Full)
+}
+function Appr-Read {
+    param([string]$hive, $e)
+    $r = @{ Exists = $false; Disabled = $false; Bytes = $null }
+    $c = Reg-Read (Appr-Path $hive $e.Appr) $e.ApprName
+    if ($c.Exists -and $c.Kind -eq 'Binary') {
+        $b = @($c.Value)
+        $r.Exists = $true
+        $r.Bytes = $c.Value
+        if ($b.Count -gt 0 -and (([int]$b[0]) -band 1) -eq 1) { $r.Disabled = $true }
+    }
+    return $r
+}
+# What Windows does for this user: this user's own record wins, else the machine-wide one, else it runs
+function Startup-Disabled {
+    param($e)
+    foreach ($h in 'HKCU', 'HKLM') {
+        $r = Appr-Read $h $e
+        if ($r.Exists) { return [bool]$r.Disabled }
+    }
+    return $false
+}
+function Appr-Bytes {
+    param([bool]$disabled)
+    $b = New-Object byte[] 12
+    if ($disabled) {
+        $b[0] = 3
+        $ts = [BitConverter]::GetBytes([int64][DateTime]::UtcNow.ToFileTimeUtc())
+        [Array]::Copy($ts, 0, $b, 4, 8)
+    } else {
+        $b[0] = 2
+    }
+    return ,$b
+}
+function Custom-Startup-Detect {
+    param($p)
+    $e = $p.Data
+    if (-not (Startup-Exists $e)) { $script:Why = 'it is no longer on the startup list'; $script:Now = ('Startup entry {0} ({1}): no longer on the list' -f $e.Show, $e.Tag); return 'NA' }
+    $dis = Startup-Disabled $e
+    $script:Now = ('Startup entry {0} ({1}): {2}, wanted switched off' -f $e.Show, $e.Tag, $(if ($dis) { 'switched off' } else { 'runs at sign-in' }))
+    if ($dis) { return 'On' }
+    return 'Off'
+}
+function Custom-Startup-Snapshot {
+    param($p)
+    $e = $p.Data
+    $mine = Appr-Read 'HKCU' $e
+    return @{ Exists = $mine.Exists; Bytes = $mine.Bytes; Unknown = (Startup-Disabled $e) }
+}
+function Custom-Startup-Apply {
+    param($p, $mine)
+    $e = $p.Data
+    if ($DryRun) { Say ("  [dry] {0}: switched off in the Startup apps list" -f $e.Show) 'DarkGray'; return }
+    $now = Appr-Read 'HKCU' $e
+    if ($now.Exists -and $now.Disabled) { Say ("  {0} is already switched off for your account" -f $e.Show) 'DarkGray'; return }     # keeps the time Windows recorded
+    $b = Appr-Bytes $true
+    if (Reg-Write (Appr-Path 'HKCU' $e.Appr) $e.ApprName $b 'Binary' -Quiet) { Say ("  {0} will not start with Windows any more" -f $e.Show) 'DarkGray' }
+}
+function Custom-Startup-Revert {
+    param($p, $mine)
+    $e = $p.Data
+    if ($DryRun) { Say ("  [dry] {0}: switched back on in the Startup apps list" -f $e.Show) 'DarkGray'; return }
+    $path = Appr-Path 'HKCU' $e.Appr
+    if ($mine -and -not $mine.Unknown) {
+        if ($mine.Exists) { [void](Reg-Write $path $e.ApprName $mine.Bytes 'Binary' -Quiet) } else { [void](Reg-Remove $path $e.ApprName -Quiet) }
+    } else {
+        $b = Appr-Bytes $false
+        [void](Reg-Write $path $e.ApprName $b 'Binary' -Quiet)
+    }
+    Say ("  {0} starts with Windows again" -f $e.Show) 'DarkGray'
+}
+
+# (Re)builds the "Startup apps" rows from what is on this PC right now. Safe to call again at any time:
+# it replaces the earlier rows, in the same place of the list.
+function Add-StartupTweaks {
+    if ($null -eq $script:StartupAt) { $script:StartupAt = $script:Catalog.Count }
+    for ($i = $script:Catalog.Count - 1; $i -ge 0; $i--) {
+        if ($script:Catalog[$i].Cat -eq $script:StartupCat) {
+            [void]$script:ById.Remove([string]$script:Catalog[$i].Id)
+            $script:Catalog.RemoveAt($i)
+        }
+    }
+    $at = [Math]::Min([int]$script:StartupAt, $script:Catalog.Count)
+    $seen = @{}
+    $entries = @(Startup-Entries | Sort-Object { $_.Show.ToLower() }, { $_.From })
+    $count = @{}
+    foreach ($e in $entries) { $k = $e.Show.ToLower(); if ($count.ContainsKey($k)) { $count[$k]++ } else { $count[$k] = 1 } }
+    foreach ($e in $entries) {
+        $slug = ($e.Show.ToLower() -replace '[^a-z0-9]+', '-').Trim('-')
+        if ($count[$e.Show.ToLower()] -gt 1) { $e.Show = $e.Show + ' (' + $e.Tag + ')' }     # the id above does not depend on this
+        if ($slug.Length -gt 14) { $slug = $slug.Substring(0, 14).Trim('-') }
+        if (-not $slug) { $slug = 'item' }
+        $id = 'startup-' + $slug + '-' + (Short-Hash ($e.Source + '|' + $e.From + '|' + $e.Name))
+        if ($seen.ContainsKey($id)) { continue }
+        $seen[$id] = 1
+        $shown = $e.Show; if ($shown.Length -gt 48) { $shown = $shown.Substring(0, 45) + '...' }
+        $nl = "`r`n"
+        $desc = 'Stops ' + $shown + ' from starting by itself when you sign in to Windows. The program stays installed and you can still open it yourself; switching it off puts it back on the startup list.' + $nl + $nl +
+                'It starts from: ' + $e.From + $nl +
+                'What it runs: ' + $e.Cmd + $nl + $nl +
+                'If this belongs to a driver or hardware tool (audio, mouse or keyboard software, RGB lighting, a printer, antivirus), its tray icon, shortcuts and profiles will not work until you open it yourself. ' +
+                'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.'
+        $info = 'Startup apps switch for "' + $e.Show + '": HKCU\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: put back as it was)'
+        Add-Tweak -Id $id -Cat $script:StartupCat -Name ($shown + ' does not start with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
+        $at++
+    }
+}
+
+# --------------------------------------------- BitLocker drive encryption off -----
+# A drive counts as encrypted while it is encrypted or being encrypted and can be unlocked now (a locked drive cannot be changed from here).
+# A drive that is already being decrypted counts as done: the decryption carries on by itself.
+function Bl-IsEncrypted {
+    param($v)
+    if ([string]$v.Lock -eq 'Locked') { return $false }
+    $s = [string]$v.Status
+    return ($s -ne 'FullyDecrypted' -and $s -ne 'DecryptionInProgress')
+}
+function Bl-Get { return @(Scan-Memo 'bl' { Bl-State })[0] }
+# One drive in plain words: "C: (Windows drive): NOT encrypted - fully decrypted". Status words are the ones Windows reports, split into words.
+function Bl-Describe {
+    param($v)
+    $kind = 'drive'
+    if ([string]$v.Type -eq 'OperatingSystem') { $kind = 'Windows drive' } elseif ([string]$v.Type -eq 'Data') { $kind = 'data drive' }
+    $words = ([string]$v.Status -creplace '([a-z])([A-Z])', '$1 $2').ToLower()
+    if (-not $words) { $words = 'status not reported' }
+    if ([string]$v.Lock -eq 'Locked') { return ('{0} ({1}): locked - {2}; it cannot be changed from here' -f $v.Mount, $kind, $words) }
+    switch ([string]$v.Status) {
+        'FullyDecrypted'       { return ('{0} ({1}): NOT encrypted - {2}' -f $v.Mount, $kind, $words) }
+        'DecryptionInProgress' { return ('{0} ({1}): being decrypted - {2}, {3}% still encrypted; it carries on by itself' -f $v.Mount, $kind, $words, [int]$v.Pct) }
+        'EncryptionInProgress' { return ('{0} ({1}): ENCRYPTED, still encrypting - {2}, {3}% done' -f $v.Mount, $kind, $words, [int]$v.Pct) }
+        default                { return ('{0} ({1}): ENCRYPTED - {2}, {3}%' -f $v.Mount, $kind, $words, [int]$v.Pct) }
+    }
+}
+function Custom-BitLocker-Detect {
+    param($p)
+    $b = Bl-Get
+    if (-not $b.Ok) {
+        $script:Now = 'BitLocker: could not be asked (neither Get-BitLockerVolume nor manage-bde gave an answer on this PC)'
+        if ((Get-WinEdition).Class -eq 'Home') { $script:Why = 'BitLocker is not available from here (on Windows Home the encryption is called Device encryption: see Settings > Privacy & security > Device encryption)' }
+        else { $script:Why = 'BitLocker is not available on this PC (some editions of Windows do not have it)' }
+        return 'NA'
+    }
+    $enc = 0; $lines = @()
+    foreach ($v in @($b.Vols)) { if (Bl-IsEncrypted $v) { $enc++ }; $lines += (Bl-Describe $v) }
+    $via = ''; if ($b.Via) { $via = (' (asked through {0})' -f $b.Via) }
+    $head = ('BitLocker{0}: {1} drive(s) listed, {2} encrypted, wanted none encrypted' -f $via, @($b.Vols).Count, $enc)
+    if (@($b.Vols).Count -eq 0) { $head = ('BitLocker{0}: no drive with a letter was listed, so nothing is encrypted' -f $via) }
+    $script:Now = (@($head) + $lines) -join "`n"
+    if ($enc -gt 0) { return 'Off' }
+    return 'On'
+}
+function Custom-BitLocker-Apply {
+    param($p, $mine)
+    $b = @(Bl-State)[0]
+    if (-not $b.Ok) { Say '  BitLocker cannot be asked about on this PC, nothing was changed' 'Yellow'; return }
+    $todo = @($b.Vols | Where-Object { Bl-IsEncrypted $_ })
+    foreach ($v in @($b.Vols | Where-Object { [string]$_.Lock -eq 'Locked' })) { Say ("  {0} is locked, so it is left as it is (unlock it first to decrypt it)" -f $v.Mount) 'Yellow' }
+    if ($todo.Count -eq 0) { Say '  no drive is encrypted, nothing to do' 'DarkGray'; return }
+    # the other drives first, the Windows drive last (a drive that unlocks itself needs the Windows drive's key)
+    $order = @($todo | Where-Object { [string]$_.Type -ne 'OperatingSystem' }) + @($todo | Where-Object { [string]$_.Type -eq 'OperatingSystem' })
+    foreach ($v in $order) {
+        if ($DryRun) { Say ("  [dry] Disable-BitLocker -MountPoint {0}" -f $v.Mount) 'DarkGray'; continue }
+        if (Bl-Decrypt ([string]$v.Mount)) { Say ("  decrypting {0}: it carries on in the background and the drive stays usable" -f $v.Mount) 'DarkGray' }
+    }
+}
+function Custom-BitLocker-Revert {
+    param($p, $mine)
+    # not offered: turning encryption on needs a key protector and a recovery key that you have to save yourself
+    Say '  BitLocker is not turned back on from here. Use Settings > Privacy & security > Device encryption, or Control Panel > BitLocker Drive Encryption (it also lets you save the new recovery key).' 'Yellow'
+}
+
+# ------------------------------------------------ clean-up actions (run once) ----
+# Disk Cleanup and the Temp folders are run when asked (Add-Tweak -Once): they never read "applied" and there is nothing to undo.
+# Everything that touches the PC goes through the small functions Cm-* and Temp-* so that a test can stand in for them.
+$script:VcRoot   = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
+$script:CleanSet = 7351          # the number used with  cleanmgr /sagerun:7351  (the marks are the values StateFlags7351)
+$script:CleanMinutes = 45        # how long the run is waited for
+# The Disk Cleanup items that are run: the names of their keys under VolumeCaches. Left out ON PURPOSE (never marked): Recycle Bin,
+# the Downloads folder (DownloadsFolder), Previous Windows installations (Windows.old), Device driver packages, the DirectX shader
+# cache (D3D Shader Cache), Language resource files and User file versions.
+$script:CleanItems = @('Active Setup Temp Folders', 'Delivery Optimization Files', 'Downloaded Program Files', 'Internet Cache Files', 'Old ChkDsk Files',
+                       'Setup Log Files', 'System error memory dump files', 'System error minidump files', 'Temporary Files', 'Temporary Setup Files',
+                       'Thumbnail Cache', 'Update Cleanup', 'Windows Error Reporting Files', 'Windows Upgrade Log Files')
+$script:TempMinutes = 60         # what was changed more recently than this is left alone
+function Cm-Exe { return ([string]$env:SystemRoot + '\System32\cleanmgr.exe') }
+function Cm-FlagName { return ('StateFlags{0:0000}' -f [int]$script:CleanSet) }
+# The names of the items Windows offers in Disk Cleanup
+function Cm-Handlers {
+    $o = @()
+    foreach ($k in @(Reg-SubKeys $script:VcRoot)) { $o += ([string]$k -split '\\')[-1] }
+    return $o
+}
+# Free bytes on the system drive, -1 when it cannot be read
+function Cm-FreeBytes {
+    try { $d = New-Object System.IO.DriveInfo (([string]$env:SystemDrive) + '\'); return [long]$d.AvailableFreeSpace } catch { return [long]-1 }
+}
+# Runs the marked items and waits (at most $Minutes). Returns Done, Code, Seconds and Error.
+function Cm-Run {
+    param([int]$Minutes = 45)
+    $o = @{ Done = $false; Code = $null; Seconds = 0; Error = '' }
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $pr = Start-Process -FilePath (Cm-Exe) -ArgumentList ('/sagerun:' + [int]$script:CleanSet) -PassThru -ErrorAction Stop
+        if ($pr.WaitForExit($Minutes * 60000)) { $o.Done = $true; $o.Code = $pr.ExitCode }
+    } catch { $o.Error = $_.Exception.Message }
+    $o.Seconds = [int]$sw.Elapsed.TotalSeconds
+    return $o
+}
+function Cm-Size {
+    param([long]$b)
+    if ($b -ge 1GB) { return ('{0:N1} GB' -f ($b / 1GB)) }
+    if ($b -ge 1MB) { return ('{0:N0} MB' -f ($b / 1MB)) }
+    if ($b -ge 1KB) { return ('{0:N0} KB' -f ($b / 1KB)) }
+    return ('{0} bytes' -f $b)
+}
+function Cm-Span {
+    param([int]$s)
+    if ($s -lt 90) { return ('{0} seconds' -f $s) }
+    return ('{0} minutes' -f [int][math]::Round($s / 60))
+}
+function Custom-DiskCleanup-Detect {
+    param($p)
+    if (-not (Fs-Exists (Cm-Exe))) { $script:Why = 'Disk Cleanup (cleanmgr.exe) is not on this PC'; $script:Now = 'Disk Cleanup program (cleanmgr.exe): not found'; return 'NA' }
+    $have = @(Cm-Handlers)
+    $n = 0; foreach ($i in $script:CleanItems) { if ($have -contains $i) { $n++ } }
+    if ($n -eq 0) {
+        $script:Why = 'Windows lists none of the Disk Cleanup items this action cleans'
+        $script:Now = ('Disk Cleanup program: found. Items it lists that are cleaned here: none of {0}' -f $script:CleanItems.Count)
+        return 'NA'
+    }
+    $script:Now = ('Disk Cleanup program (cleanmgr.exe): found. Windows lists {0} of the {1} items cleaned here. It runs when you press Apply.' -f $n, $script:CleanItems.Count)
+    return 'Off'
+}
+function Custom-DiskCleanup-Snapshot { param($p) return $null }
+function Custom-DiskCleanup-Apply {
+    param($p, $mine)
+    if (-not (Fs-Exists (Cm-Exe))) { throw 'Disk Cleanup (cleanmgr.exe) is not on this PC' }
+    $have = @(Cm-Handlers)
+    $want = @(); foreach ($i in $script:CleanItems) { if ($have -contains $i) { $want += $i } }
+    if ($want.Count -eq 0) { throw 'Windows lists none of the Disk Cleanup items this action cleans' }
+    $flag = Cm-FlagName
+    if ($DryRun) { Say ('  [dry] mark {0} Disk Cleanup items ({1} = 2), run cleanmgr /sagerun:{2}, then remove the marks' -f $want.Count, $flag, $script:CleanSet) 'DarkGray'; return }
+    Say ('  marking {0} Disk Cleanup items...' -f $want.Count) 'Gray'
+    # a mark of this number on any other item is removed first, so that only the items in the list are run
+    foreach ($h in $have) {
+        $key = $script:VcRoot + '\' + $h
+        if ($want -contains $h) { [void](Reg-Write $key $flag 2 'DWord' -Quiet) } else { [void](Reg-Remove $key $flag -Quiet) }
+    }
+    $before = Cm-FreeBytes
+    $res = $null
+    try {
+        Say '  running Disk Cleanup: a progress window opens, and Windows Update Cleanup can take several minutes...' 'Gray'
+        $res = Cm-Run $script:CleanMinutes
+    } finally {
+        foreach ($h in $want) { [void](Reg-Remove ($script:VcRoot + '\' + $h) $flag -Quiet) }
+    }
+    $after = Cm-FreeBytes
+    if ($res.Error) { throw ('Disk Cleanup could not be started: ' + $res.Error) }
+    if (-not $res.Done) { $script:RunResult = ('Disk Cleanup was still running after {0} minutes; it carries on in its own window' -f $script:CleanMinutes); return }
+    $txt = ('Disk Cleanup finished in {0}' -f (Cm-Span $res.Seconds))
+    if ($before -ge 0 -and $after -ge 0) {
+        $drive = [string]$env:SystemDrive
+        if ($after -gt $before) { $txt += ('; free space on {0} went from {1} to {2} ({3} freed)' -f $drive, (Cm-Size $before), (Cm-Size $after), (Cm-Size ($after - $before))) }
+        else { $txt += ('; free space on {0} is {1} (no gain measured)' -f $drive, (Cm-Size $after)) }
+    }
+    if ($null -ne $res.Code -and [int]$res.Code -ne 0) { $txt += ('; cleanmgr reported exit code {0}' -f $res.Code) }
+    $script:RunResult = $txt
+}
+function Custom-DiskCleanup-Revert { param($p, $mine) Say '  (Disk Cleanup is a one-time action: there is nothing to put back)' 'DarkGray' }
+
+# ---- the Temp folders ----
+# A folder is only cleaned when it is named Temp (or Tmp) and is not a drive root: a TEMP variable that points somewhere else
+# (a whole drive, a profile folder) is never emptied.
+function Temp-Safe {
+    param([string]$Path)
+    $leaf = ''; $parent = ''
+    try { $leaf = [string](Split-Path -Leaf $Path); $parent = [string](Split-Path -Parent $Path) } catch { }
+    return ([bool]$leaf -and [bool]$parent -and ($leaf -imatch '^(temp|tmp)$'))
+}
+# The Temp folders that exist: your own (TEMP) and the one of Windows. Safe = it may be cleaned.
+function Temp-Candidates {
+    $o = @()
+    foreach ($f in @([string]$env:TEMP, ([string]$env:SystemRoot + '\Temp'))) {
+        $f = $f.Trim().TrimEnd('\')
+        if (-not $f) { continue }
+        if (-not (Fs-Exists $f)) { continue }
+        if (@($o | Where-Object { $_.Path -ieq $f }).Count -gt 0) { continue }
+        $o += ,@{ Path = $f; Safe = (Temp-Safe $f) }
+    }
+    return $o
+}
+function Temp-Count {
+    param([string]$Path)
+    $n = 0
+    try { $n = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction Ignore).Count } catch { }
+    return $n
+}
+# Deletes what is old and not in use below one folder. A link to somewhere else is removed as a link: what it points to is never entered.
+function Temp-Walk {
+    param([string]$Dir, [datetime]$Cut, $R)
+    foreach ($it in @(Get-ChildItem -LiteralPath $Dir -Force -ErrorAction Ignore)) {
+        $link = (($it.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)
+        $old = ($it.LastWriteTime -lt $Cut)
+        if ($it.PSIsContainer) {
+            if ($link) {
+                if ($old) { try { [System.IO.Directory]::Delete($it.FullName); $R.Removed++ } catch { $R.Left++ } } else { $R.Left++ }
+                continue
+            }
+            Temp-Walk $it.FullName $Cut $R
+            $kids = @(Get-ChildItem -LiteralPath $it.FullName -Force -ErrorAction Ignore)
+            if ($kids.Count -eq 0) {
+                if ($old) { try { [System.IO.Directory]::Delete($it.FullName); $R.Removed++ } catch { $R.Left++ } } else { $R.Left++ }
+            }
+        } else {
+            if (-not $old) { $R.Left++; continue }
+            $len = [long]0
+            if (-not $link) { try { $len = [long]$it.Length } catch { } }
+            try { Remove-Item -LiteralPath $it.FullName -Force -ErrorAction Stop; $R.Removed++; $R.Bytes += $len } catch { $R.Left++ }
+        }
+    }
+}
+# Cleans one Temp folder (the folder itself stays). Returns Removed, Left, Bytes.
+function Temp-Clean {
+    param([string]$Path, [int]$MinAgeMinutes = 60)
+    $r = @{ Removed = 0; Left = 0; Bytes = [long]0 }
+    Temp-Walk $Path ((Get-Date).AddMinutes(-$MinAgeMinutes)) $r
+    return $r
+}
+function Custom-TempClean-Detect {
+    param($p)
+    $cand = @(Temp-Candidates)
+    $safe = @($cand | Where-Object { $_.Safe })
+    if ($safe.Count -eq 0) {
+        $script:Why = 'no Temp folder was found'
+        $script:Now = 'Temp folders: none found'
+        if ($cand.Count -gt 0) { $script:Why = 'the TEMP folder is not named Temp, so it is never emptied'; $script:Now = ('Temp folders: {0} is not named Temp, left alone' -f $cand[0].Path) }
+        return 'NA'
+    }
+    $lines = @('Temp folders (items at the top level):')
+    foreach ($c in $cand) {
+        if ($c.Safe) { $lines += ('  {0}: {1}' -f $c.Path, (Temp-Count $c.Path)) } else { $lines += ('  {0}: left alone (not named Temp)' -f $c.Path) }
+    }
+    $lines += 'It runs when you press Apply.'
+    $script:Now = ($lines -join "`n")
+    return 'Off'
+}
+function Custom-TempClean-Snapshot { param($p) return $null }
+function Custom-TempClean-Apply {
+    param($p, $mine)
+    $cand = @(Temp-Candidates)
+    $tot = @{ Removed = 0; Left = 0; Bytes = [long]0 }
+    $used = 0
+    foreach ($c in $cand) {
+        if (-not $c.Safe) { Say ('  left alone: {0} (the folder is not named Temp)' -f $c.Path) 'Yellow'; continue }
+        $used++
+        if ($DryRun) { Say ('  [dry] delete what is in {0} (not changed in the last {1} minutes, not in use)' -f $c.Path, $script:TempMinutes) 'DarkGray'; continue }
+        Say ('  cleaning {0} ...' -f $c.Path) 'Gray'
+        $r = Temp-Clean $c.Path $script:TempMinutes
+        Say ('    removed {0} item(s), {1}; left {2} (in use, or changed in the last {3} minutes)' -f $r.Removed, (Cm-Size $r.Bytes), $r.Left, $script:TempMinutes) 'DarkGray'
+        $tot.Removed += $r.Removed; $tot.Left += $r.Left; $tot.Bytes += $r.Bytes
+    }
+    if ($used -eq 0) { throw 'no Temp folder to clean was found' }
+    if ($DryRun) { return }
+    $script:RunResult = ('Removed {0} item(s) from {1} Temp folder(s), {2} freed; {3} left (in use, or changed in the last {4} minutes)' -f $tot.Removed, $used, (Cm-Size $tot.Bytes), $tot.Left, $script:TempMinutes)
+}
+function Custom-TempClean-Revert { param($p, $mine) Say '  (removing temporary files is a one-time action: there is nothing to put back)' 'DarkGray' }
+
+# =============================================================================
+# THE CATALOG. One entry per setting you can switch on.
+#   pReg  path name value [undo-value]  : undo-value $null = delete the value (Windows default is "not set")
+#   pSvc  name Disabled|Manual  undo-start-type
+# "Preset" = part of Recommended Debloat (everything the original script did, except the UAC engine switch).
+# =============================================================================
+$cPriv   = 'Privacy and telemetry'
+$cCloud  = 'Cloud, sync and OneDrive'
+$cRemote = 'Remote access and VPN'
+$cVpn    = $cRemote           # the one VPN setting lives on the Remote access page
+$cShare  = 'Network sharing and discovery'
+$cNic    = 'Network adapters and USB power'
+$cPower  = 'Power plan and startup'
+$cGame   = 'Gaming and performance'
+$script:DisplayCat = 'Display'          # the window puts its live display cards on this page
+$cDisplay = $script:DisplayCat
+$cNothing = 'Placebo Tweaks - Not Recommended (may do nothing, no proven benefit - each one says why)'
+$cSec    = 'Security prompts (turning these off lowers protection)'
+$cSvc    = 'Other Windows services'
+$cLook   = 'Look and feel'
+$cExplorer = 'File Explorer'
+$cAi     = 'AI features'
+$cEdge   = 'Microsoft Edge'
+$cApps   = 'Remove apps'
+$cLegacy = 'Legacy Windows features'
+$cStore  = 'Storage and clean-up'
+$script:TestingCat = 'Testing'          # always the last page in the menu; "Apply all" on "All settings" leaves it out
+$cTest   = $script:TestingCat
+$script:StartupCat ='Startup apps (switch on = do not start with Windows)'
+
+$edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
+$pol  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
+$adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
+
+# ------------------------------------------------------------ Privacy ---------
+Add-Tweak -Id 'telemetry' -Cat $cPriv -Preset -Name 'Disable Windows telemetry and error reporting' `
+    -Desc 'Sets diagnostic data to the minimum Windows allows, and turns off the Customer Experience program, Windows Error Reporting, app inventory collection and remote diagnostic-config downloads. The minimum is "Off" (0) on Enterprise and Education; Home and Pro treat 0 as 1, so there the app sets 1, "Required" only, which also stops the optional diagnostic data from being switched on in Settings.' `
+    -Parts @(
+        pEd 'Ent' (pReg "$pol\DataCollection" 'AllowTelemetry' 0)
+        pEd 'Home,Pro' (pReg "$pol\DataCollection" 'AllowTelemetry' 1)
+        pReg "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1
+        pReg "$pol\DataCollection" 'AllowDeviceNameInTelemetry' 0
+        pReg "$pol\DataCollection" 'DisableOneSettingsDownloads' 1
+        pReg "$pol\DataCollection" 'LimitDiagnosticLogCollection' 1
+        pReg "$pol\DataCollection" 'LimitDumpCollection' 1
+        pEd 'Ent' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0)
+        pEd 'Home,Pro' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1)
+        pReg "$pol\AppCompat" 'AITEnable' 0
+        pReg "$pol\AppCompat" 'DisableInventory' 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
+        pReg "$pol\Windows Error Reporting" 'Disabled' 1
+    )
+
+Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Preset -Name 'Disable telemetry services' `
+    -Desc 'Stops and disables Connected User Experiences and Telemetry (DiagTrack), WAP push message routing, the diagnostics hub collector and the Windows Error Reporting service.' `
+    -Parts @(
+        pSvc 'DiagTrack' 'Disabled' 'Automatic'
+        pSvc 'dmwappushservice' 'Disabled' 'Manual'
+        pSvc 'diagnosticshub.standardcollector.service' 'Disabled' 'Manual'
+        pSvc 'WerSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Preset -Name 'Disable telemetry scheduled tasks' `
+    -Desc 'Disables the compatibility appraiser, customer-experience, disk-diagnostic data and error-reporting tasks that run in the background.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser'
+        pTask '\Microsoft\Windows\Application Experience\ProgramDataUpdater'
+        pTask '\Microsoft\Windows\Application Experience\StartupAppTask'
+        pTask '\Microsoft\Windows\Application Experience\MareBackup'
+        pTask '\Microsoft\Windows\Customer Experience Improvement Program\Consolidator'
+        pTask '\Microsoft\Windows\Customer Experience Improvement Program\UsbCeip'
+        pTask '\Microsoft\Windows\DiskDiagnostic\Microsoft-Windows-DiskDiagnosticDataCollector'
+        pTask '\Microsoft\Windows\Feedback\Siuf\DmClient'
+        pTask '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload'
+        pTask '\Microsoft\Windows\Windows Error Reporting\QueueReporting'
+        pTask '\Microsoft\Windows\Autochk\Proxy'
+    )
+
+Add-Tweak -Id 'svc-telemetry2' -Cat $cPriv -Preset -Name 'Disable compatibility and usage reporting services' `
+    -Desc 'Turns off the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights. Both collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
+    -Parts @(
+        pSvc 'InventorySvc' 'Disabled' 'Manual'
+        pSvc 'wuqisvc' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'ads' -Cat $cPriv -Preset -Name 'Disable advertising ID and tailored experiences' `
+    -Desc 'Apps can no longer use your advertising ID, and Microsoft does not use your diagnostic data to tailor tips and ads.' `
+    -Parts @(
+        pReg "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
+    )
+
+Add-Tweak -Id 'activity' -Cat $cPriv -Preset -Name 'Disable activity history' `
+    -Desc 'Windows stops recording and uploading what you open and do (the old Timeline).' `
+    -Parts @(
+        pReg "$pol\System" 'PublishUserActivities' 0
+        pReg "$pol\System" 'EnableActivityFeed' 0
+        pReg "$pol\System" 'UploadUserActivities' 0
+    )
+
+Add-Tweak -Id 'feedback' -Cat $cPriv -Preset -Name 'Disable feedback pop-ups' `
+    -Desc 'Windows no longer asks you for feedback.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
+    )
+
+Add-Tweak -Id 'inking' -Cat $cPriv -Preset -Name 'Disable inking, typing, handwriting and speech data collection' `
+    -Desc 'Stops Windows from collecting what you type and write to personalise suggestions, and from sending handwriting data. Online speech recognition consent is withdrawn.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
+        pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
+        pReg 'HKCU:\Software\Microsoft\InputPersonalization\TrainedDataStore' 'HarvestContacts' 0 1
+        pReg 'HKCU:\Software\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy' 0
+        pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
+        pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
+        pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
+    )
+
+Add-Tweak -Id 'location' -Cat $cPriv -Name 'Disable location services' `
+    -Desc 'Turns off Windows location for the whole PC, and the Geolocation service. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
+    -Parts @(
+        pReg "$pol\LocationAndSensors" 'DisableLocation' 1
+        pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1
+        pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
+        pSvc 'lfsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'tracking' -Cat $cPriv -Preset -Name 'Disable language list and app-launch tracking' `
+    -Desc 'Websites cannot read your language list, and Start no longer tracks which apps you launch to rank them.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\International\User Profile' 'HttpAcceptLanguageOptOut' 1
+        pReg $adv 'Start_TrackProgs' 0 1
+    )
+
+Add-Tweak -Id 'bgapps' -Cat $cPriv -Preset -Risk 'note' -Name 'Store apps cannot run in the background' -NotRec 'Reported to stop programs from showing up in Start search.' `
+    -Desc 'Microsoft Store (UWP) apps stop running and fetching data while you are not using them. Normal desktop programs such as Steam, Discord and browsers are not affected.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1 0
+        pReg "$pol\AppPrivacy" 'LetAppsRunInBackground' 2
+    )
+
+Add-Tweak -Id 'defender-samples' -Cat $cPriv -Preset -Name 'Defender never sends samples to Microsoft automatically' `
+    -Desc 'Windows Defender keeps scanning as normal; it just never uploads suspicious files by itself.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' 'SubmitSamplesConsent' 2
+    )
+
+Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Preset -Name 'Disable clipboard history (Win+V)' `
+    -Desc 'Windows stops keeping a list of the things you copied, so Win+V shows no history and the switch in Settings > System > Clipboard is greyed out. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. This is separate from "Disable cloud clipboard", which only stops the list being shared with your other devices.' `
+    -Parts @(
+        pReg "$pol\System" 'AllowClipboardHistory' 0
+        pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0
+    )
+
+# -------------------------------------------------------------- Cloud ---------
+Add-Tweak -Id 'settingsync' -Cat $cCloud -Name 'Disable settings sync' `
+    -Desc 'Your theme, passwords-for-Wi-Fi and other Windows settings are not synced with your Microsoft account.' `
+    -Parts @(
+        pReg "$pol\SettingSync" 'DisableSettingSync' 2
+        pReg "$pol\SettingSync" 'DisableSettingSyncUserOverride' 1
+        pTask '\Microsoft\Windows\SettingSync\BackgroundUploadTask'
+        pTask '\Microsoft\Windows\SettingSync\NetworkStateChangeTask'
+    )
+
+Add-Tweak -Id 'clipboard' -Cat $cCloud -Name 'Disable cloud clipboard' `
+    -Desc 'Clipboard history (Win+V) still works on this PC; it just is not uploaded or shared with your other devices.' `
+    -Parts @(
+        pReg "$pol\System" 'AllowCrossDeviceClipboard' 0
+        pReg 'HKCU:\Software\Microsoft\Clipboard' 'CloudClipboardAutomaticUpload' 0
+    )
+
+Add-Tweak -Id 'crossdevice' -Cat $cCloud -Name 'Disable nearby sharing and Share across devices' `
+    -Desc 'Turns off Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them.' `
+    -Parts @(
+        pReg "$pol\System" 'EnableCdp' 0
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
+        pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
+    )
+
+Add-Tweak -Id 'syncsvc' -Cat $cCloud -Risk 'note' -Name 'Disable contacts, mail and calendar sync services' `
+    -Desc 'Disables the per-user background services behind the Mail, Calendar and People apps and Phone Link. Leave this off if you use those apps.' `
+    -Parts @(
+        pSvc 'OneSyncSvc' 'Disabled' 'AutomaticDelayed'
+        pSvc 'CDPUserSvc' 'Disabled' 'Automatic'
+        pSvc 'UnistoreSvc' 'Disabled' 'Manual'
+        pSvc 'UserDataSvc' 'Disabled' 'Manual'
+        pSvc 'PimIndexMaintenanceSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'offlinefiles' -Cat $cCloud -Name 'Disable Offline Files' `
+    -Desc 'Turns off the Offline Files service that keeps copies of network folders for use without a connection.' `
+    -Parts @(
+        pSvc 'CscService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Name 'Block OneDrive sync and hide it in File Explorer' `
+    -Desc 'A policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. Fully reversible.' `
+    -Parts @(
+        pReg "$pol\OneDrive" 'DisableFileSyncNGSC' 1
+        pReg 'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' 'System.IsPinnedToNameSpaceTree' 0 1
+    )
+
+Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -OneWay -Risk 'note' -Name 'Uninstall OneDrive' `
+    -Desc 'Runs the OneDrive uninstaller and removes leftovers (a OneDrive folder that still has files in it is left alone). Cannot be undone from here; reinstall later with  winget install Microsoft.OneDrive.' `
+    -Parts @(
+        pCustom 'OneDrive' 'OneDrive is stopped and uninstalled, leftover folders and its startup entry are removed'
+    )
+
+Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Name 'Disable Windows Update peer-to-peer sharing' `
+    -Desc 'Delivery Optimization downloads updates only from Microsoft, and never uploads them to other PCs on your network or the internet.' `
+    -Parts @(
+        pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0
+        pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
+    )
+
+# -------------------------------------------------------------- Remote --------
+Add-Tweak -Id 'rdp' -Cat $cRemote -Name 'Disable Remote Desktop' `
+    -Desc 'Nobody can connect to this PC with Remote Desktop. The Remote Desktop services are disabled and its firewall rules switched off. (Windows already ships with this off.)' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
+        pSvc 'TermService' 'Disabled' 'Manual'
+        pSvc 'UmRdpService' 'Disabled' 'Manual'
+        pSvc 'SessionEnv' 'Disabled' 'Manual'
+        pFw 'Remote Desktop'
+    )
+
+Add-Tweak -Id 'remote-assist' -Cat $cRemote -Name 'Disable Remote Assistance' `
+    -Desc 'Turns off "Allow Remote Assistance connections to this computer" and its firewall rules.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowToGetHelp' 0 1
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowFullControl' 0 1
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0 1
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowFullControl' 0 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
+        pFw 'Remote Assistance'
+    )
+
+Add-Tweak -Id 'quickassist' -Cat $cRemote -OneWay -Name 'Remove Quick Assist' `
+    -Desc 'Removes the Quick Assist remote-help app (and the older Quick Assist Windows capability). Cannot be undone from here; reinstall it from the Microsoft Store if you ever need it.' `
+    -Parts @(
+        pCap 'App.Support.QuickAssist*'
+        pAppx 'MicrosoftCorporationII.QuickAssist'
+    )
+
+Add-Tweak -Id 'winrm' -Cat $cRemote -Name 'Disable PowerShell remoting (WinRM)' `
+    -Desc 'Disables the Windows Remote Management service and its firewall rules, so this PC cannot be managed over the network with PowerShell remoting.' `
+    -Parts @(
+        pSvc 'WinRM' 'Disabled' 'Manual'
+        pFw 'Windows Remote Management'
+        pFw 'Windows Remote Management (Compatibility)'
+    )
+
+Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Name 'Disable other remote management' `
+    -Desc 'Disables Remote Registry, Routing and Remote Access, the legacy RPC locator and the OpenSSH server (if installed), and switches off the remote event log, scheduled task, service, volume and WMI firewall rules.' `
+    -Parts @(
+        pSvc 'RemoteRegistry' 'Disabled' 'Disabled'
+        pSvc 'RpcLocator' 'Disabled' 'Manual'
+        pSvc 'RemoteAccess' 'Disabled' 'Disabled'
+        pSvc 'sshd' 'Disabled' 'Manual'
+        pFw 'Remote Event Log Management'
+        pFw 'Remote Scheduled Tasks Management'
+        pFw 'Remote Service Management'
+        pFw 'Remote Volume Management'
+        pFw 'Windows Management Instrumentation (WMI)'
+    )
+
+# ---------------------------------------------------------------- VPN ---------
+Add-Tweak -Id 'vpn' -Cat $cVpn -Risk 'note' -Name 'Disable Windows'' built-in VPN services' `
+    -Desc 'Disables the services behind Windows'' own VPN client (IKEv2, SSTP, L2TP) and dial-up (Remote Access Connection Manager). VPN apps that bring their own driver, such as WireGuard, usually keep working, but some VPN clients need these services. It also breaks PPPoE broadband dial-ups.' `
+    -Parts @(
+        pSvc 'SstpSvc' 'Disabled' 'Manual'
+        pSvc 'IKEEXT' 'Disabled' 'Manual'
+        pSvc 'RasMan' 'Disabled' 'Manual'
+        pSvc 'RasAuto' 'Disabled' 'Manual'
+    )
+
+# ------------------------------------------------------------- Sharing --------
+Add-Tweak -Id 'fileshare' -Cat $cShare -Preset -Risk 'note' -Name 'Disable file and printer sharing' `
+    -Desc 'Other PCs cannot reach files or printers on this PC: the Server service is disabled, the default C$ and ADMIN$ shares are off, and File and Printer Sharing is unbound from your network adapters. You can still open shares on a NAS or other PCs (Client for Microsoft Networks stays on).' `
+    -Parts @(
+        pSvc 'LanmanServer' 'Disabled' 'Automatic'
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
+        pFw 'File and Printer Sharing'
+        pBind 'ms_server'
+    )
+
+Add-Tweak -Id 'discovery' -Cat $cShare -Preset -Name 'Disable network discovery and UPnP hosting' `
+    -Desc 'This PC stops announcing itself on the network and stops looking for devices: the Function Discovery, Link-Layer Topology Discovery, UPnP Device Host and Network Connected Devices services are disabled and Network Discovery''s firewall rules and adapter bindings are removed. SSDP Discovery is deliberately left alone, so games that use UPnP port mapping keep working. Side effect: Windows may stop finding new network printers and other devices by itself; adding a printer by its IP address still works.' `
+    -Parts @(
+        pSvc 'FDResPub' 'Disabled' 'Manual'
+        pSvc 'fdPHost' 'Disabled' 'Manual'
+        pSvc 'lltdsvc' 'Disabled' 'Manual'
+        pSvc 'upnphost' 'Disabled' 'Manual'
+        pSvc 'NcdAutoSetup' 'Disabled' 'Manual'
+        pFw 'Network Discovery'
+        pBind 'ms_lltdio'
+        pBind 'ms_rspndr'
+    )
+
+Add-Tweak -Id 'legacy-names' -Cat $cShare -Preset -Risk 'note' -Name 'Disable old name lookups (LLMNR, mDNS, NetBIOS)' `
+    -Desc 'Turns off three legacy ways of finding devices by name. Names that DNS can resolve keep working; a few old NAS boxes or printers that are only found by NetBIOS name may no longer show up by name.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'EnableMDNS' 0
+        pRegDyn -Info 'NetBIOS over TCP/IP: NetbiosOptions = 2 on every network interface    (undo: 0)' -Gen {
+            foreach ($k in @(Reg-SubKeys 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters\Interfaces')) {
+                pReg $k 'NetbiosOptions' 2 0
+            }
+        }
+    )
+
+Add-Tweak -Id 'svc-netbios' -Cat $cShare -Preset -Name 'Disable NetBIOS name helper' `
+    -Desc 'Stops the TCP/IP NetBIOS Helper, which looks up other computers by their old-style NetBIOS name. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
+    -Parts @(
+        pSvc 'lmhosts' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'smb1' -Cat $cShare -Preset -Reboot -Name 'SMB1 protocol removed' `
+    -Desc 'SMB1 is an obsolete, insecure file-sharing protocol that modern Windows no longer needs. Only add it back for very old devices.' `
+    -Parts @(
+        pFeat 'SMB1Protocol'
+    )
+
+Add-Tweak -Id 'ics' -Cat $cShare -Preset -Name 'Disable connection sharing (ICS, hotspot, media streaming)' `
+    -Desc 'Disables Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
+    -Parts @(
+        pSvc 'SharedAccess' 'Disabled' 'Manual' 'Test-UsesVirtualization' 'WSL2 / Hyper-V / Sandbox is on, so Internet Connection Sharing is left alone'
+        pSvc 'icssvc' 'Disabled' 'Manual'
+        pSvc 'WMPNetworkSvc' 'Disabled' 'Manual'
+    )
+
+# ----------------------------------------------------- Adapters and USB -------
+Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Reboot -Name 'Disable Windows powering down network adapters to save power' `
+    -Desc 'Unticks "Allow the computer to turn off this device to save power" on every physical network adapter (Wake-on-LAN settings you chose are kept).' `
+    -Parts @(
+        pCustom 'NicTurnOff' 'Device Manager > network adapter > Power Management > "Allow the computer to turn off this device": off, on every physical adapter'
+    )
+
+Add-Tweak -Id 'nic-eee' -Cat $cNic -Preset -Reboot -Name 'Disable Energy-Efficient Ethernet, Green Ethernet and Wi-Fi power save' `
+    -Desc 'Switches off the driver''s own power-saving options (EEE, Green Ethernet, Power Saving Mode, Ultra Low Power and similar) on your adapters, which can cause latency spikes and brief disconnects. Only options your adapter actually has are touched.' `
+    -Parts @(
+        pCustom 'NicEee' 'Adapter driver "Advanced" tab: Energy-Efficient Ethernet, Green Ethernet, power-saving mode options -> off (where present)'
+    )
+
+Add-Tweak -Id 'nic-suspend' -Cat $cNic -Preset -Reboot -Name 'Disable adapter selective suspend and sleep-on-disconnect' `
+    -Desc 'Stops Windows suspending USB network adapters and putting adapters to sleep when the cable is unplugged. Not shown as available on PCs whose adapters do not offer these options.' `
+    -Parts @(
+        pCustom 'NicSuspend' 'Adapter power management: Selective Suspend and Device Sleep on Disconnect -> off (where present)'
+    )
+
+Add-Tweak -Id 'usb-power' -Cat $cNic -Preset -Name 'Disable USB power saving for all USB devices' `
+    -Desc 'Unticks "Allow the computer to turn off this device to save power" for every USB device and disables USB selective suspend per device. Devices plugged in later start with Windows'' defaults, so switch this on again after adding new ones.' `
+    -Parts @(
+        pCustom 'UsbPower' 'Every USB device: "Allow the computer to turn off this device" off, and selective suspend off in its driver settings'
+    )
+
+# --------------------------------------------------------------- Power --------
+Add-Tweak -Id 'ultimate' -Cat $cPower -Preset -Name 'Use the Ultimate Performance power plan' `
+    -Desc 'Creates the Ultimate Performance plan (High Performance if your PC hides it), makes it the active plan, and inside it turns off USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving. Turning this off goes back to the plan you used before and deletes the plan this app made.' `
+    -Parts @(
+        pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
+    )
+
+Add-Tweak -Id 'plans-delete' -Cat $cPower -Risk 'note' -Name 'Delete all other power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
+    -Desc 'Leaves only the active power plan, so Windows cannot switch to Balanced or Power Saver. Turning this off recreates Balanced, High Performance and Power Saver. Not offered on laptops (a battery was detected) so you keep Balanced for when you unplug.' `
+    -Parts @(
+        pCustom 'PlansDelete' 'powercfg /delete for every plan except the active one'
+    )
+
+Add-Tweak -Id 'hibernate' -Cat $cPower -Risk 'note' -Name 'Disable Fast Startup and hibernation' `
+    -Desc 'Shut down becomes a real shutdown (no half-hibernated kernel state, which helps with driver and update glitches) and hiberfil.sys, several GB, is deleted. Hibernate is no longer available; Sleep still works.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 0 1
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled' 0 1
+        pCustom 'Hibernate' 'powercfg /h off   (undo: powercfg /h on)'
+    )
+
+# (desktop-delay and power-throttle used to be here; they are on the "Placebo Tweaks - Not Recommended" page now, further down)
+
+# ------------------------------------------------------- Startup apps ---------
+# One switch per program on Task Manager's Startup apps list (built from this PC, so it can differ each run).
+# If the PC cannot be read for some reason, the group is simply missing; the rest of the app is not affected.
+try { Add-StartupTweaks } catch { }
+
+# ---------------------------------------------------------------- Gaming ------
+Add-Tweak -Id 'gamedvr' -Cat $cGame -Preset -Name 'Disable Game Bar (Game Mode stays on)' `
+    -Desc 'Turns Xbox Game Bar off in settings: it stops recording clips in the background (which can cost frames), the Xbox button on a controller no longer opens it and its start-up tip is hidden. Windows Game Mode stays on. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely.' `
+    -Parts @(
+        pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
+        pReg "$pol\GameDVR" 'AllowGameDVR' 0
+        pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0
+        pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
+        pReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1 1
+    )
+
+Add-Tweak -Id 'mouse' -Cat $cGame -Preset -Name 'Disable mouse acceleration' `
+    -Desc 'Turns off "Enhance pointer precision" so the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Mouse' 'MouseSpeed' '0' '1' 'String'
+        pReg 'HKCU:\Control Panel\Mouse' 'MouseThreshold1' '0' '6' 'String'
+        pReg 'HKCU:\Control Panel\Mouse' 'MouseThreshold2' '0' '10' 'String'
+        pReg 'HKCU:\Control Panel\Mouse' 'MouseSensitivity' '10' '10' 'String'
+        pCustom 'MouseLive' 'also applied to the running session'
+    )
+
+Add-Tweak -Id 'wu-drivers' -Cat $cGame -Risk 'note' -Name 'Windows Update does not replace drivers' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
+    -Desc 'Keeps Windows Update from swapping the graphics and other drivers you installed yourself. You then update drivers manually (GPU maker''s installer or your motherboard''s site).' `
+    -Parts @(
+        pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1
+    )
+
+Add-Tweak -Id 'wpbt' -Cat $cGame -Reboot -Risk 'note' -Name 'Disable WPBT (firmware cannot install programs at startup)' `
+    -Desc 'Stops motherboard firmware from copying a program into Windows and running it at every boot (the Windows Platform Binary Table, WPBT). Some boards use it to deliver their own software: Gigabyte firmware has been reported installing an updater this way, and ASUS boards have a BIOS option, on by default, that downloads Armoury Crate. Side effects: tools that PC makers deliver this way, including some anti-theft software, are no longer installed, and a program the firmware already installed stays until you remove it. Your board''s BIOS setting for its own software is the other place to turn this off. Needs a restart.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
+    )
+
+Add-Tweak -Id 'hags' -Cat $cDisplay -Preset -Reboot -Name 'Hardware-accelerated GPU scheduling on (HAGS)' `
+    -Desc 'Lets the graphics card manage its own memory scheduling, which can lower latency and CPU load in some games. It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch this off if yours do.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2
+    )
+
+$mpoDwm = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'
+$mpoGfx = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
+Add-Tweak -Id 'mpo' -Cat $cDisplay -Reboot -Name 'Multiplane Overlay (MPO)' -NotRec 'A fix for flicker, not a speed-up: leave it on Enabled unless you see flicker.' `
+    -Desc ('Fix for screen flicker and stutter; not a speed-up. Multiplane Overlay lets the graphics hardware combine the game, the desktop and overlays itself, instead of Windows blending them into one picture. On some graphics card, driver and monitor combinations, switching between those layers is reported to cause flicker, black flashes or stutter, and turning MPO off makes Windows blend everything itself again. ' +
+           'That comes from user reports, not measurements, and it is not a speed-up: leave it on Enabled unless you see those problems. ' +
+           'Choose one of three options on the card. Enabled (Windows default): nothing is set. Disabled: OverlayTestMode = 5, the usual fix. Fully disabled: OverlayTestMode = 5 and DisableOverlays = 1 (the second value is what the Fully Disabled option of Chris Titus Tech''s WinUtil sets). ' +
+           'No Microsoft documentation for either value was found; they come from community guides and tools like WinUtil. Needs a restart. Changing the option or choosing Enabled again puts back the values you had before; a value that already had one of these settings before this app saw it is removed instead (neither value is set by default).') `
+    -Choices @(
+        @{ Key = 'default'; Label = 'Enabled (Windows default)'; Short = 'Enabled (default)'; Parts = @() }
+        @{ Key = 'disabled'; Label = 'Disabled'; Short = 'Disabled'; Parts = @( (pReg $mpoDwm 'OverlayTestMode' 5) ) }
+        @{ Key = 'full'; Label = 'Fully disabled'; Short = 'Fully disabled'; Parts = @( (pReg $mpoDwm 'OverlayTestMode' 5), (pReg $mpoGfx 'DisableOverlays' 1) ) }
+    )
+
+Add-Tweak -Id 'defender-idle' -Cat $cGame -Preset -Name 'Windows Security scans only when the PC is idle (low priority, low CPU)' `
+    -Desc 'Windows Security keeps protecting you in real time exactly as before. Only its scheduled scans change: they run only while the PC is idle, at low priority, and use at most 20% of the CPU. Scans take longer to finish. Shown as not available on PCs where Windows Security is turned off or replaced by another antivirus.' `
+    -Parts @(
+        pCustom 'DefenderIdle' 'Set-MpPreference: ScanOnlyIfIdleEnabled = on, EnableLowCpuPriority = on, ScanAvgCPULoadFactor = 20    (undo: your earlier values, else on / off / 50)'
+    )
+
+Add-Tweak -Id 'sticky-keys' -Cat $cGame -Preset -Name 'Disable Sticky Keys shortcut (Shift pressed 5 times)' `
+    -Desc 'Stops the "Do you want to turn on Sticky Keys?" window that appears when Shift is pressed five times in a row, which can interrupt a game. Only the shortcut is turned off; Sticky Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '506' '510' 'String'
+        pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
+    )
+
+Add-Tweak -Id 'filter-keys' -Cat $cGame -Preset -Name 'Disable Filter Keys shortcut (Right Shift held for 8 seconds)' `
+    -Desc 'Stops the "Do you want to turn on Filter Keys?" window and its beeps that appear when the right Shift key is held down for eight seconds. Only the shortcut is turned off; Filter Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '122' '126' 'String'
+        pCustom 'AccessLive' 'also applied to the running session' 'Filter'
+    )
+
+Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys shortcut (Num Lock held for 5 seconds)' `
+    -Desc 'Stops the beeps and the "Do you want to turn on Toggle Keys?" window that appear when Num Lock is held down for five seconds (Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed). Only the shortcut is turned off; Toggle Keys itself is still there under Settings > Accessibility > Keyboard.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '58' '62' 'String'
+        pCustom 'AccessLive' 'also applied to the running session' 'Toggle'
+    )
+
+# ------------------------------------------------------------ Display ----------
+# The Display page also shows live cards (resolution, refresh rate, HDR, the modes of each screen); those are drawn by the window and
+# are not settings. Windows has no switch that forces a refresh rate: Settings > System > Display > Advanced display sets it, and the
+# card on the page says what else keeps a game at the full rate. The two switches below are real: they are the "Optimizations for windowed
+# games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
+# keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
+Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -Name 'Optimizations for windowed games on' `
+    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here writes an explicit 0. Undo puts back what was there before.' `
+    -Parts @(
+        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: your earlier value; with none, the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
+    )
+
+Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Disable variable refresh rate for DirectX 11 full-screen games' `
+    -Desc 'Windows 10 version 2004 and newer. Turns off the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Microsoft describes that switch as adding variable refresh rate (G-SYNC, FreeSync, Adaptive-Sync) to DirectX 11 games in full screen that were not written for it; with it off those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games", the setting above. Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (greyed out, nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information that each screen reports about itself (its EDID, which Windows keeps) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as not turned off yet, and turning this on writes an explicit 0 (off). An entry of 0 is shown as on here and an entry of 1 as off. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Undo puts back what was there before; with nothing recorded it removes the entry again, which leaves the Windows default.' `
+    -Parts @(
+        pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: your earlier value; with none, the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
+    )
+
+Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -Name 'Game Mode on' `
+    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off turns Game Mode off. A missing entry is shown as on, because that is what Windows does when nothing has been changed; undo puts back what was there before, and with nothing recorded it writes an explicit 0 (Game Mode off). Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
+    -Parts @(
+        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: your earlier values; with none recorded, both are set to 0, which is Game Mode off)'
+    )
+
+# ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
+# Settings whose benefit is not proven, or that Windows ignores in the way they are usually used. They are harmless as far as is
+# known (the descriptions give the reason for each), so they stay available, but they are kept on a page of their own so
+# that nobody takes them for proven gaming tweaks. Every setting here carries -Unproven. What each description rests on:
+#   power-throttle : Microsoft's "Introducing Power Throttling" post (Windows Insider blog, 2017) and its Quality of Service page
+#   netthrottle    : Mark Russinovich's 2007 post on the multimedia network throttle; djdallmann's GamingPCSetup network research
+#   sysresp, gamesched : Microsoft's Multimedia Class Scheduler Service page (SystemResponsiveness, GPU / SFIO Priority, Priority);
+#                    djdallmann's GamingPCSetup trace of which MMCSS tasks games use
+#   tcp-nodelay    : Microsoft KB 328890 and KB 935458 (TcpAckFrequency); no Microsoft page was found for TCPNoDelay / TcpDelAckTicks
+#   svc-sysmain    : forum reports (no benchmark was found)
+#   desktop-delay  : Microsoft Q&A answers from community members and forum reports (no Microsoft documentation was found)
+Add-Tweak -Id 'power-throttle' -Cat $cNothing -Reboot -Unproven -Name 'Disable power throttling' `
+    -Desc 'Little to turn off on a plugged-in desktop: Microsoft said power throttling does not apply on AC power. That comes from its announcement of the feature in Windows 10 (2017), which also says the program you are using and anything playing audio are left alone and that, at the time, it needed an Intel CPU with Speed Shift. Windows 11 adds Efficiency mode (EcoQoS), which programs and Windows ask for themselves; Microsoft''s documentation does not say this setting switches that off, and the reports that it does are unverified (some readers say the value does not survive a restart). It matters most on laptops running on battery. It needs a restart and can raise power use and heat a little. Switch on: sets PowerThrottlingOff = 1 (power throttling off). Switch off: removes that value, which is how Windows ships.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' 'PowerThrottlingOff' 1
+    )
+
+$mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+Add-Tweak -Id 'netthrottle' -Cat $cNothing -Unproven -Name 'Disable network throttling' `
+    -Desc 'Should not change your ping: it only limits incoming traffic while media plays, and a game receives far fewer packets than the limit. Windows applies the limit only while a media-playback program is being boosted, and then caps received traffic at 10 packets per millisecond (about 15 MB/s, roughly 120 Mbps), so turning it off only matters for fast downloads while media plays. The one published measurement found (a Windows latency trace, build not stated) showed slightly higher network-driver latency with it off, and no measured ping gain was found. Microsoft''s current multimedia scheduler documentation does not mention this value, and it is not confirmed that Windows 11 still enforces it. Switch on: sets NetworkThrottlingIndex to 0xFFFFFFFF (throttling off). Switch off: puts your previous value back (Windows'' default of 10 if you never changed it).' `
+    -Parts @(
+        pReg $mm 'NetworkThrottlingIndex' ([uint32]4294967295) 10
+    )
+
+Add-Tweak -Id 'sysresp' -Cat $cNothing -Unproven -Name 'Set system responsiveness to 10% (multimedia scheduler)' `
+    -Desc 'May change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the Windows multimedia scheduler. It lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use it (a game''s audio threads, say) can take more when the CPU is completely busy. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows. Switch on: sets SystemResponsiveness to 10. Switch off: puts your previous value back (Windows'' default of 20 if you never changed it).' `
+    -Parts @(
+        pReg $mm 'SystemResponsiveness' 10 20
+    )
+
+Add-Tweak -Id 'gamesched' -Cat $cNothing -Unproven -Name 'Set game scheduling priority to High (multimedia scheduler "Games" task)' `
+    -Desc 'Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games. Switch on: sets Scheduling Category and SFIO Priority to High, Priority to 6 and GPU Priority to 8. Switch off: puts your previous values back (Windows ships Medium, Normal, 2 and 8).' `
+    -Parts @(
+        pReg "$mm\Tasks\Games" 'GPU Priority' 8 8
+        pReg "$mm\Tasks\Games" 'Priority' 6 2
+        pReg "$mm\Tasks\Games" 'Scheduling Category' 'High' 'Medium' 'String'
+        pReg "$mm\Tasks\Games" 'SFIO Priority' 'High' 'Normal' 'String'
+    )
+
+Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Reboot -Unproven -Name 'Set TCP to acknowledge at once (no-delay) on every network connection' `
+    -Desc 'Only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Switch on: sets TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 on every network interface, so Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this switched on again. Switch off: puts your previous values back, or deletes them if there were none (how Windows ships).' `
+    -Parts @(
+        pRegDyn -Info 'Every network interface under HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces: TcpAckFrequency = 1, TCPNoDelay = 1, TcpDelAckTicks = 0    (undo: values deleted)' -Gen {
+            foreach ($k in @(Reg-SubKeys 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces')) {
+                pReg $k 'TcpAckFrequency' 1
+                pReg $k 'TCPNoDelay' 1
+                pReg $k 'TcpDelAckTicks' 0
+            }
+        }
+    )
+
+Add-Tweak -Id 'svc-sysmain' -Cat $cNothing -Unproven -Name 'Set SysMain (Superfetch) to disabled' `
+    -Desc 'Little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. SysMain pre-loads frequently used apps into memory, which mainly helps hard drives. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it. Switch on: sets the SysMain service to Disabled. Switch off: puts your previous setting back (Windows'' default is Automatic).' `
+    -Parts @(
+        pSvc 'SysMain' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Unproven -Name 'Set the delay before startup programs and the desktop load to 0' `
+    -Desc 'May do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once. Switch on: sets StartupDelayInMSec and WaitforIdleState to 0. Switch off: puts your previous values back, or deletes them if there were none.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'WaitforIdleState' 0
+    )
+
+# ------------------------------------------------------------- Security -------
+$sys ='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+Add-Tweak -Id 'uac' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable UAC prompts ("Never notify")' -NotRec 'It gives no speed-up; it only removes a protection.' `
+    -Desc 'Sets the same values the Windows UAC slider writes at "Never notify": programs can start with administrator rights without asking you first. Malware benefits from this too.' `
+    -Parts @(
+        pReg $sys 'ConsentPromptBehaviorAdmin' 0 5
+        pReg $sys 'PromptOnSecureDesktop' 0 1
+    )
+
+Add-Tweak -Id 'uac-lua' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable UAC engine fully (not recommended)' -NotRec 'It gives no speed-up, and modern apps can refuse to start.' `
+    -Desc 'EnableLUA = 0 switches User Account Control off completely, beyond the slider. Modern apps (Settings, Calculator, Photos, Terminal) can refuse to launch. Not part of the Recommended preset.' `
+    -Parts @(
+        pReg $sys 'EnableLUA' 0 1
+    )
+
+$dg = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+# Asked before either of the two settings below is turned on (FACEIT: support.faceit.com "Windows Security Requirements FAQ";
+# Riot: support.riotgames.com "Vanguard security requirements")
+$acTitle = 'Turn off Memory Integrity / VBS?'
+$acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
+    'Memory Integrity and Virtualization-Based Security (VBS) are Windows security features that these anti-cheats look for:' + "`r`n" + `
+    '  - FACEIT: its Anti-Cheat requires VBS on Windows (it needs it to protect against DMA cheats), and it is switching the requirement on in waves. If your PC does not meet it, FACEIT may not let you play.' + "`r`n" + `
+    '  - Riot Vanguard (Valorant and other Riot games): can ask you to turn on Memory Integrity before it lets you launch the game.' + "`r`n" + `
+    'Applying this setting turns those features off.' + "`r`n" + "`r`n" + `
+    'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
+Add-Tweak -Id 'vbs' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable Memory Integrity (HVCI) and Virtualization-Based Security' `
+    -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
+    -Desc 'Can give a few percent more FPS in some games, but removes protection against kernel-level malware. Also turns off Credential Guard. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this off if you play on those - you are asked about it before it is applied. Undo leaves the values unset, so Windows decides again.' `
+    -Parts @(
+        pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
+        pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
+        pReg $dg 'EnableVirtualizationBasedSecurity' 0
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
+    )
+
+Add-Tweak -Id 'hypervisor' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable hypervisor start with Windows (hypervisorlaunchtype)' `
+    -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
+    -Desc 'Stops the Windows hypervisor from loading at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Undo puts the boot setting back as it was.' `
+    -Parts @(
+        pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: the value you had, else bcdedit /deletevalue hypervisorlaunchtype)'
+    )
+
+Add-Tweak -Id 'bitlocker' -Cat $cSec -OneWay -Risk 'security' -Name 'Disable BitLocker drive encryption (decrypts your drives)' `
+    -Ask ('BitLocker (and the Windows 11 "Device encryption" that uses it) protects your files if this PC or its drive is lost or stolen.' + "`r`n" + "`r`n" +
+          'Applying this setting starts decrypting every drive that is encrypted and unlocked:' + "`r`n" +
+          '  - anyone who gets this PC, or just its drive, can then read your files' + "`r`n" +
+          '  - it runs in the background and can take a long time on a big drive; the PC stays usable, and it is best kept plugged in' + "`r`n" +
+          '  - it cannot be undone from this window: to encrypt again use Settings > Privacy & security > Device encryption, or Control Panel > BitLocker Drive Encryption (that makes a new recovery key, which you must save)' + "`r`n" + "`r`n" +
+          'If you are not sure, answer No: nothing is changed. You can apply it later from the window.') `
+    -AskTitle 'Turn off BitLocker?' `
+    -Desc 'Starts decrypting every unlocked drive that BitLocker or Device encryption protects. Why: software encryption makes the drive do extra work on every read and write. One published test (Tom''s Hardware, reported by TechSpot; Samsung 990 Pro, Windows 11 22H2, software BitLocker) measured about 11% slower file copies, about 20% lower PCMark 10 storage scores and 45% slower random writes; the effect depends on the drive and the CPU. Windows 11 version 24H2 and newer can turn Device encryption on by default, which is why a new PC may be encrypted without you having set it up. Cost: if the PC or the drive is lost or stolen, anyone can read your files. Decryption carries on in the background and can take hours. This cannot be undone from here (switching it off only prints a note): to encrypt again use Windows'' own Device encryption or BitLocker settings, which make a new recovery key for you to save. Works on Windows Home too: if Windows has no BitLocker commands there, the drives are read and decrypted through the manage-bde tool of Windows (English Windows only). Shown as not available when neither can be asked, and as applied when no drive is encrypted. Not part of the Recommended preset, and left out of Apply all.' `
+    -Parts @(
+        pCustom 'BitLocker' 'Drive encryption: Disable-BitLocker on every drive that is encrypted and unlocked (other drives first, the Windows drive last)    (undo: not possible from here)'
+    )
+
+Add-Tweak -Id 'device-encryption-block' -Cat $cSec -Risk 'security' -Name 'Disable automatic Device encryption (Windows will not encrypt this PC by itself)' `
+    -Desc 'Stops Windows from turning on Device encryption (the simple form of BitLocker) by itself. Windows 11 can do that on a new install, or when you sign in with a Microsoft account on a PC that qualifies, which is how a PC ends up encrypted without you having set it up. This only blocks the automatic start: it does not decrypt anything and does not touch a drive that is already encrypted (the setting above does that), and you can still turn BitLocker on yourself whenever you like. Cost: if the PC or its drive is lost or stolen, an unencrypted drive can be read by whoever has it. Turning this off removes the value, which is the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' 'PreventDeviceEncryption' 1
+    )
+
+# ------------------------------------------------------------- Services -------
+Add-Tweak -Id 'svc-search' -Cat $cSvc -Risk 'note' -Name 'Search indexer runs only on demand (file and program search can stop working)' -NotRec 'File and program search can stop finding things.' `
+    -Desc 'Windows Search (the file indexer) is set to Manual, so it no longer starts with Windows. Start-menu results for installed apps keep working, but results that come from the index can stop appearing: files, and programs that are not installed, such as a portable program that runs from its own folder. Benefit: a little less background disk and CPU use while Windows builds the index, which is small on a fast SSD. This is not part of the Recommended preset. If search stops finding something, turn this off: the service goes back to Automatic (Delayed Start) and starts again straight away.' `
+    -Parts @(
+        pSvc 'WSearch' 'Manual' 'AutomaticDelayed'
+    )
+
+Add-Tweak -Id 'svc-misc' -Cat $cSvc -Preset -Name 'Disable rarely used services' `
+    -Desc 'Retail Demo, Fax, Parental Controls, NFC / payments, Phone service, Windows Insider service and Downloaded Maps Manager are disabled; Distributed Link Tracking is set to Manual.' `
+    -Parts @(
+        pSvc 'RetailDemo' 'Disabled' 'Manual'
+        pSvc 'Fax' 'Disabled' 'Manual'
+        pSvc 'WpcMonSvc' 'Disabled' 'Manual'
+        pSvc 'SEMgrSvc' 'Disabled' 'Manual'
+        pSvc 'PhoneSvc' 'Disabled' 'Manual'
+        pSvc 'wisvc' 'Disabled' 'Manual'
+        pSvc 'MapsBroker' 'Disabled' 'AutomaticDelayed'
+        pSvc 'TrkWks' 'Manual' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-smartcard' -Cat $cSvc -Risk 'note' -Name 'Disable smart card services' `
+    -Desc 'Needed only for smart-card logins and some hardware security keys. Leave this switched off if you use one.' `
+    -Parts @(
+        pSvc 'SCardSvr' 'Disabled' 'Manual'
+        pSvc 'ScDeviceEnum' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'printing' -Cat $cSvc -Risk 'note' -Name 'Disable printing (Print Spooler)' `
+    -Ask ('Do you need printing?' + "`r`n" + "`r`n" + `
+          'Applying this setting stops the Print Spooler and its notification service. From then on this PC cannot print at all:' + "`r`n" + `
+          '  - no paper printing, to a USB printer or to a network printer' + "`r`n" + `
+          '  - no "Microsoft Print to PDF" and no "Microsoft XPS Document Writer" (they are printers too)' + "`r`n" + `
+          '  - programs that print or save through the Windows print dialog just fail' + "`r`n" + "`r`n" + `
+          'If you ever print, or save things as PDF that way, answer No: the setting stays off and printing keeps working. You can apply it later from the window.') `
+    -AskTitle 'Turn off printing?' `
+    -Desc 'Disables the Print Spooler and its notification service. No printing, and no "Microsoft Print to PDF", until you turn this off again. You are asked first whether you need printing.' `
+    -Parts @(
+        pSvc 'Spooler' 'Disabled' 'Automatic'
+        pSvc 'PrintNotify' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Risk 'note' -Name 'Disable Xbox services' `
+    -Desc 'Disables Xbox sign-in, cloud saves, accessory and network services. Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG are not affected.' `
+    -Parts @(
+        pSvc 'XblAuthManager' 'Disabled' 'Manual'
+        pSvc 'XblGameSave' 'Disabled' 'Manual'
+        pSvc 'XboxGipSvc' 'Disabled' 'Manual'
+        pSvc 'XboxNetApiSvc' 'Disabled' 'Manual'
+    )
+
+# (The usage-reporting, NetBIOS and Storage Service ones sit on the Privacy, Network sharing and Storage pages, where they belong.)
+# More background services that a gaming PC does not need. Health and Optimized Experiences, diagnostics, Program Compatibility Assistant and the data usage meter are in the Recommended preset; the others are yours to switch on.
+Add-Tweak -Id 'svc-whe' -Cat $cSvc -Preset -Risk 'note' -Name 'Disable Windows Health and Optimized Experiences' `
+    -Desc 'Stops the service that watches CPU, heat and battery and records performance traces on this PC when Windows feels slow. Microsoft says the traces stay on the PC unless you send them in a Feedback Hub report. Little downside on a desktop; on a laptop it may weaken battery optimisation.' `
+    -Parts @(
+        pSvc 'whesvc' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-diag' -Cat $cSvc -Preset -Name 'Disable troubleshooting and diagnostics services' -NotRec 'Little to gain, and the built-in Troubleshoot wizards stop working.' `
+    -Desc 'Disables the Diagnostic Policy Service, Diagnostic System Host and Diagnostic Service Host. The built-in "Troubleshoot" wizards (network, audio, Windows Update) stop working until you turn this off again.' `
+    -Parts @(
+        pSvc 'DPS' 'Disabled' 'Automatic'
+        pSvc 'WdiSystemHost' 'Disabled' 'Manual'
+        pSvc 'WdiServiceHost' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-pca' -Cat $cSvc -Preset -Name 'Disable Program Compatibility Assistant' `
+    -Desc 'Stops the service behind the "this program might not have installed correctly" pop-ups and automatic compatibility fixes for old programs. Compatibility settings you choose yourself in a program''s Properties still apply. Leave this off if you play old games and like those prompts.' `
+    -Parts @(
+        pSvc 'PcaSvc' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Preset -Name 'Disable data usage meter' `
+    -Desc 'Stops the service that counts how much data each app uses (Settings > Network & internet > Data usage). That page shows nothing afterwards; networking itself is not affected.' `
+    -Parts @(
+        pSvc 'DusmSvc' 'Disabled' 'Automatic'
+    )
+
+# Windows gives every service its own svchost.exe process once a PC has more than 3.5 GB of RAM. A threshold above the
+# installed memory makes it group them again after a restart. The value is far above any home PC (256 GB in KB); undo removes it,
+# which gives Windows' own default (3.5 GB).
+Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Preset -Reboot -Risk 'note' -Name 'Service Host processes merged (about 50 fewer svchost.exe)' -NotRec 'Saves little memory, and one crashing service can take others down with it.' `
+    -Desc 'Windows runs each background service in its own svchost.exe process. This groups them again after a restart: roughly 50 fewer processes and a little less memory. The costs: one service that crashes can take others in its group with it, and Task Manager can no longer show which service uses the CPU. WinUtil warns that it can interfere with Xbox services.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control' 'SvcHostSplitThresholdInKB' 268435456 3670016
+    )
+
+Add-Tweak -Id 'defender-core' -Cat $cPriv -Preset -Risk 'note' -Name 'Disable Defender Core Service telemetry and experiments' `
+    -Desc 'Windows Security keeps scanning as normal. Turns off the telemetry sent by the Defender Core Service and its use of Microsoft''s experimentation service to deliver fixes (fixes still arrive through the normal Defender updates). Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features' 'DisableCoreServiceECSIntegration' 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features' 'DisableCoreService1DSTelemetry' 1
+    )
+
+# ------------------------------------------------------- Storage and clean-up ---
+Add-Tweak -Id 'storage-sense' -Cat $cStore -Name 'Disable Storage Sense' `
+    -Desc 'Turns off Storage Sense, the Windows feature that deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and that can be set up to clear your Downloads folder as well. With it off Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This only changes that one switch; undo puts it back the way it was.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
+    )
+
+Add-Tweak -Id 'svc-storage' -Cat $cStore -Name 'Storage Service runs only on demand' `
+    -Desc 'Sets Storage Service (storage settings and external-drive handling) to Manual, so it starts when Windows needs it instead of at every start. One background process fewer while it is idle.' `
+    -Parts @(
+        pSvc 'StorSvc' 'Manual' 'Automatic'
+    )
+
+Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Risk 'note' -Name 'Run Disk Cleanup now (one time)' `
+    -Desc 'Runs the Disk Cleanup program that comes with Windows (cleanmgr) once, on every drive, for these items only: temporary files, temporary setup files, setup and upgrade log files, Active Setup temp folders, thumbnail cache, Windows error reports, downloaded program files, old browser cache files, Delivery Optimization files, old Check Disk files, system error memory dumps and minidumps, and Windows Update Cleanup. It never touches the Recycle Bin, your Downloads folder, the old Windows installation (Windows.old), device driver packages, the DirectX shader cache, language files or file history versions. Windows Update Cleanup removes the files of updates that were replaced by newer ones: updates that are already installed can no longer be uninstalled afterwards. A Disk Cleanup window shows the progress and it can take several minutes. It is an action, not a switch: it runs when you press Apply, files it deletes do not go to the Recycle Bin, and it is never part of Apply all, Turn all on or the Recommended preset.' `
+    -Parts @(
+        pCustom 'DiskCleanup' 'cleanmgr /sagerun for 14 items: temporary and setup files, logs, thumbnail and error report caches, Delivery Optimization, old update files, memory dumps (not the Recycle Bin, Downloads, Windows.old, drivers or shader cache)'
+    )
+
+Add-Tweak -Id 'temp-files' -Cat $cStore -Once -Risk 'note' -Name 'Remove temporary files now (one time)' `
+    -Desc 'Deletes what is inside your own Temp folder (the TEMP folder of your account) and inside C:\Windows\Temp, once. Anything that was changed in the last hour is left alone, and so is anything a running program is using, because Windows does not allow it to be deleted. Folders that end up empty are removed; the two Temp folders themselves stay. Shortcuts and links inside them are removed but never followed, so nothing outside the Temp folders is touched, and a TEMP folder that is not named Temp is never emptied. When it is done it says how many items were removed and how much space that freed. It is an action, not a switch: it runs when you press Apply, deleted files do not go to the Recycle Bin, and it is never part of Apply all, Turn all on or the Recommended preset.' `
+    -Parts @(
+        pCustom 'TempClean' 'delete the files in %TEMP% and C:\Windows\Temp that are older than an hour and not in use; empty sub-folders are removed'
+    )
+
+# ------------------------------------------------------------ Look and feel ---
+$pers = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
+Add-Tweak -Id 'dark' -Cat $cLook -Preset -Explorer -Name 'Dark mode for apps and Windows' `
+    -Desc 'Dark theme for apps, the taskbar and Start, with no accent colour on the taskbar.' `
+    -Parts @(
+        pReg $pers 'AppsUseLightTheme' 0 1
+        pReg $pers 'SystemUsesLightTheme' 0 1
+        pReg $pers 'ColorPrevalence' 0 0
+    )
+
+Add-Tweak -Id 'transparency' -Cat $cLook -Preset -Explorer -Name 'Disable transparency effects' `
+    -Desc 'Windows and menus use solid backgrounds instead of the see-through effect.' `
+    -Parts @(
+        pReg $pers 'EnableTransparency' 0 1
+    )
+
+Add-Tweak -Id 'taskbar-left' -Cat $cLook -Preset -Explorer -Name 'Taskbar icons on the left' `
+    -Desc 'Moves the taskbar icons to the left, like Windows 10. (Windows 11 cannot dock the taskbar to the side of the screen.)' `
+    -Parts @(
+        pReg $adv 'TaskbarAl' 0 1
+    )
+
+Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Preset -Name 'End task in the taskbar right-click menu' `
+    -Desc 'Adds "End task" to the menu you get when you right-click a program on the taskbar, so a frozen game or app can be closed in one click without opening Task Manager. It is the same switch as Settings > System > For developers > End Task, which needs Windows 11 version 23H2 (build 22631.2715) or newer; on an older build the value does nothing.' `
+    -Parts @(
+        pReg "$adv\TaskbarDeveloperSettings" 'TaskbarEndTask' 1
+    )
+
+Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Preset -Explorer -Name 'Disable Widgets and Chat taskbar buttons' `
+    -Desc 'Hides the Widgets and Chat / Teams buttons from the taskbar and turns the Widgets feed off by policy. The Widgets button switch itself is protected on newer Windows 11 builds and may refuse to change; the Widgets policy hides the button anyway, so the setting still counts as applied.' `
+    -Parts @(
+        pRegSoft $adv 'TaskbarDa' 0 1
+        pReg $adv 'TaskbarMn' 0 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
+        pReg "$pol\Windows Chat" 'ChatIcon' 3
+    )
+
+Add-Tweak -Id 'taskbar-search' -Cat $cLook -Preset -Explorer -Name 'Disable taskbar search button' `
+    -Desc 'Hides the search box or search icon from the taskbar. Search still opens with Win+S, and typing in the Start menu still searches. Turning this off puts back the search button the way you had it before.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
+    )
+
+Add-Tweak -Id 'taskbar-taskview' -Cat $cLook -Preset -Explorer -Name 'Disable taskbar Task View button' `
+    -Desc 'Hides the Task View button (the two overlapping rectangles) from the taskbar. Win+Tab still opens Task View and your virtual desktops keep working.' `
+    -Parts @(
+        pReg $adv 'ShowTaskViewButton' 0 1
+    )
+
+# Settings > Personalization > Dynamic Lighting: both switches are per-user values in HKCU\Software\Microsoft\Lighting (1 = on, the default)
+$lighting = 'HKCU:\Software\Microsoft\Lighting'
+Add-Tweak -Id 'dynamic-lighting' -Cat $cLook -Preset -Name 'Disable Dynamic Lighting (RGB devices)' `
+    -Desc 'Turns off "Use Dynamic Lighting on my devices" in Settings > Personalization > Dynamic Lighting. Windows then stops controlling the lights of keyboards, mice and other RGB devices that support it, so the lighting software that came with them (or one you chose yourself) is the only thing that sets them. Nothing is removed and the devices keep their own lighting settings. Turning this off brings Dynamic Lighting back. If the lights do not change at once, sign out of Windows and back in.' `
+    -Parts @(
+        pReg $lighting 'AmbientLightingEnabled' 0 1
+    )
+
+Add-Tweak -Id 'dynamic-lighting-foreground' -Cat $cLook -Preset -Name 'Disable "Foreground apps always control lighting"' `
+    -Desc 'Turns off "Compatible apps in the foreground always control lighting" in Settings > Personalization > Dynamic Lighting. While that switch is on, the app you are using controls the lights first if it supports Dynamic Lighting; with it off, the order under "Background light control" decides, so apps in the background can control the lights as well. It only matters while Dynamic Lighting itself is on: with "Disable Dynamic Lighting (RGB devices)" applied you will see no difference. Turning this off puts the switch back on.' `
+    -Parts @(
+        pReg $lighting 'ControlledByForegroundApp' 0 1
+    )
+
+Add-Tweak -Id 'start-recommended' -Cat $cLook -Preset -Explorer -Risk 'note' -Name 'Start menu Recommended section hidden' `
+    -Desc 'Hides the Recommended section (recent files and suggested apps) from the Start menu, so only your pinned apps show. It sets the Start policy, the matching group policy and a flag that marks the PC as an education device. Microsoft supports the policy on Education and Enterprise only; the education flag is the workaround people report works on Pro and Home, but Microsoft does not document it, so check the Start menu after Explorer restarts. Side effect: the education flag also turns Windows Spotlight off on the lock screen. The tips setting on the Privacy page and the switches under Settings > Personalization > Start are separate.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start' 'HideRecommendedSection' 1
+        pReg 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Education' 'IsEducationEnvironment' 1
+        pReg "$pol\Explorer" 'HideRecommendedSection' 1
+    )
+
+Add-Tweak -Id 'blackdesk' -Cat $cLook -Preset -Name 'Solid black desktop' `
+    -Desc 'No wallpaper, plain black background. Turning this off restores the wallpaper you had when you switched it on.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Colors' 'Background' '0 0 0' '0 0 0' 'String'
+        pReg 'HKCU:\Control Panel\Desktop' 'WallPaper' '' "$env:SystemRoot\web\wallpaper\Windows\img0.jpg" 'String'
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers' 'BackgroundType' 1 0
+        pCustom 'DesktopLive' 'also applied to the running desktop'
+    )
+
+Add-Tweak -Id 'animations' -Cat $cLook -Preset -Explorer -Name 'Disable visual effects (only smooth font edges stays on)' `
+    -Desc 'Sets Performance Options > Visual Effects to Custom with only "Smooth edges of screen fonts" left on (ClearType, so text stays sharp). Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Undo hands back the settings you had before.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 3 0
+        pReg 'HKCU:\Control Panel\Desktop\WindowMetrics' 'MinAnimate' '0' '1' 'String'
+        pReg $adv 'TaskbarAnimations' 0 1
+        pReg $adv 'ListviewAlphaSelect' 0 1
+        pReg $adv 'ListviewShadow' 0 1
+        pReg $adv 'IconsOnly' 1 0
+        pReg 'HKCU:\Software\Microsoft\Windows\DWM' 'EnableAeroPeek' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\DWM' 'AlwaysHibernateThumbnails' 0 1
+        pReg 'HKCU:\Control Panel\Desktop' 'DragFullWindows' '0' '1' 'String'
+        pReg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' '2' 'String'
+        pReg 'HKCU:\Control Panel\Desktop' 'FontSmoothingType' 2 2
+        pCustom 'AnimLive' 'also applied to the running session'
+    )
+
+Add-Tweak -Id 'notifications' -Cat $cLook -Preset -Explorer -Risk 'note' -Name 'Disable notifications (pop-ups and the notification centre)' `
+    -Desc 'No toast pop-ups from apps, games or Windows, and the notification centre is switched off; the calendar flyout goes with it. Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0 1
+    )
+
+# ------------------------------------------------------------ File Explorer ---
+Add-Tweak -Id 'launchto' -Cat $cExplorer -Explorer -Name 'File Explorer opens to This PC' `
+    -Desc 'File Explorer starts at This PC (your drives) instead of Home.' `
+    -Parts @(
+        pReg $adv 'LaunchTo' 1
+    )
+
+Add-Tweak -Id 'showext' -Cat $cExplorer -Explorer -Name 'Always show file extensions' `
+    -Desc 'Shows .exe, .txt, .jpg and so on, which makes disguised files easier to spot.' `
+    -Parts @(
+        pReg $adv 'HideFileExt' 0 1
+    )
+
+$clsidMenu = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
+Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Preset -Explorer -Name 'Classic right-click menu (no "Show more options")' `
+    -Desc 'Brings back the full right-click menu of Windows 10 in File Explorer and on the desktop, instead of Windows 11''s short menu with "Show more options". File Explorer restarts when this is applied, so open Explorer windows close for a moment. Only does something on Windows 11.' `
+    -Parts @(
+        pKey "$clsidMenu\InprocServer32" $clsidMenu
+    )
+
+# The side pane entries are per-user switches (System.IsPinnedToNameSpaceTree = 0 in the entry's own class key); 0 hides, no value = Windows default.
+$clsidHome    = 'HKCU:\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}'
+$clsidGallery = 'HKCU:\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}'
+Add-Tweak -Id 'nav-home' -Cat $cExplorer -Preset -Explorer -Name 'Home removed from the File Explorer side pane' `
+    -Desc 'Hides "Home" (the first entry of the left-hand pane in File Explorer) for your account. File Explorer restarts when this is applied, so open Explorer windows close for a moment. It does not change where File Explorer opens: "File Explorer opens to This PC" does that. If "Show all folders" is switched on in File Explorer''s options, Home can still show. Turning this off brings Home back.' `
+    -Parts @(
+        pReg $clsidHome 'System.IsPinnedToNameSpaceTree' 0
+    )
+
+Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Preset -Explorer -Name 'Gallery removed from the File Explorer side pane' `
+    -Desc 'Hides "Gallery" (the photo view of your Pictures folder, Windows 11 23H2 and newer) from the left-hand pane in File Explorer for your account. File Explorer restarts when this is applied, so open Explorer windows close for a moment. Your pictures are not touched. If "Show all folders" is switched on in File Explorer''s options, Gallery can still show. Turning this off brings Gallery back.' `
+    -Parts @(
+        pReg $clsidGallery 'System.IsPinnedToNameSpaceTree' 0
+    )
+
+$cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
+Add-Tweak -Id 'suggestions' -Cat $cLook -Preset -Name 'Disable ads, suggestions and auto-installed apps' `
+    -Desc 'No promoted apps in Start, no tips and suggestions on the lock screen or in Settings, no silently installed sponsored apps, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, so on Home and Pro the app sets only the per-user switches, which work on every edition.' `
+    -Parts @(
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsSpotlightFeatures' 1)
+        pReg $cdm 'ContentDeliveryAllowed' 0 1
+        pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
+        pReg $cdm 'PreInstalledAppsEnabled' 0 1
+        pReg $cdm 'PreInstalledAppsEverEnabled' 0 1
+        pReg $cdm 'SilentInstalledAppsEnabled' 0 1
+        pReg $cdm 'SystemPaneSuggestionsEnabled' 0 1
+        pReg $cdm 'SoftLandingEnabled' 0 1
+        pReg $cdm 'SubscribedContentEnabled' 0 1
+        pReg $cdm 'SubscribedContent-310093Enabled' 0 1
+        pReg $cdm 'SubscribedContent-338387Enabled' 0 1
+        pReg $cdm 'SubscribedContent-338388Enabled' 0 1
+        pReg $cdm 'SubscribedContent-338389Enabled' 0 1
+        pReg $cdm 'SubscribedContent-338393Enabled' 0 1
+        pReg $cdm 'SubscribedContent-353694Enabled' 0 1
+        pReg $cdm 'SubscribedContent-353696Enabled' 0 1
+        pReg $cdm 'SubscribedContent-353698Enabled' 0 1
+        pReg $cdm 'RotatingLockScreenOverlayEnabled' 0 1
+        pReg $adv 'Start_IrisRecommendations' 0 1
+        pReg $adv 'ShowSyncProviderNotifications' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' 'ScoobeSystemSettingEnabled' 0 1
+    )
+
+Add-Tweak -Id 'settings-promo' -Cat $cLook -Preset -Name 'Disable Copilot and Microsoft account cards in Settings' `
+    -Desc 'Hides the Microsoft account and Copilot subscription cards on the Settings home page and turns off the cloud-optimized suggestions Windows pulls in. Both policies are only obeyed by Enterprise and Education, so on Home and Pro this setting is shown as not available.' `
+    -Parts @(
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableConsumerAccountStateContent' 1)
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableCloudOptimizedContent' 1)
+    )
+
+$wsch = "$pol\Windows Search"
+$ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
+Add-Tweak -Id 'search-web' -Cat $cLook -Preset -Name 'Disable web and cloud results in Start search' `
+    -Desc 'Start search only looks on this PC: no Bing results, no cloud account search, no search highlights, no search history on the device.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
+        pReg $wsch 'AllowCloudSearch' 0
+        pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0)
+        pReg $wsch 'AllowSearchToUseLocation' 0
+        pReg $wsch 'DisableWebSearch' 1
+        pReg $wsch 'AllowCortana' 0
+        pReg $ssm 'IsDeviceSearchHistoryEnabled' 0 1
+        pReg $ssm 'IsMSACloudSearchEnabled' 0 1
+        pReg $ssm 'IsAADCloudSearchEnabled' 0 1
+        pReg $ssm 'IsDynamicSearchBoxEnabled' 0 1
+    )
+
+# ------------------------------------------------------------------ AI ---------
+Add-Tweak -Id 'copilot' -Cat $cAi -Preset -Explorer -Name 'Disable Copilot' `
+    -Desc 'Turns the old Windows Copilot side panel off by policy (Microsoft has marked that policy as deprecated) and hides the Copilot button on the taskbar. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
+    -Parts @(
+        pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+        pReg $adv 'ShowCopilotButton' 0 1
+    )
+
+Add-Tweak -Id 'recall' -Cat $cAi -Preset -Reboot -Name 'Disable Recall, Click to Do and Settings AI search' `
+    -Desc 'Turns off Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings by policy. On Copilot+ PCs it also removes the Recall optional feature and switches off the Windows AI Fabric service. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
+    -Parts @(
+        pReg "$pol\WindowsAI" 'DisableAIDataAnalysis' 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
+        pReg "$pol\WindowsAI" 'AllowRecallEnablement' 0
+        pReg "$pol\WindowsAI" 'DisableClickToDo' 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableClickToDo' 1
+        pEd 'Ent' (pReg "$pol\WindowsAI" 'DisableSettingsAgent' 1)
+        pFeat 'Recall'
+        pSvc 'WSAIFabricSvc' 'Disabled' 'Manual'
+    )
+
+$paintPol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'
+Add-Tweak -Id 'ai-apps' -Cat $cAi -Preset -Risk 'note' -Name 'Disable AI features in Notepad and Paint' `
+    -Desc 'Turns off Notepad''s AI features (Rewrite, Summarize, Write) and Paint''s Image Creator, Cocreator and Generative Fill by policy. Paint''s "Generative erase" and "Remove background" cannot be turned off this way. A few Windows builds have refused to start Paint while Image Creator is blocked; if that happens, switch this off again and restart.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\WindowsNotepad' 'DisableAIFeatures' 1
+        pReg $paintPol 'DisableImageCreator' 1
+        pReg $paintPol 'DisableCocreator' 1
+        pReg $paintPol 'DisableGenerativeFill' 1
+    )
+
+Add-Tweak -Id 'ai-generative' -Cat $cAi -Preset -Name 'Apps cannot use Windows'' text and image generation' `
+    -Desc 'Sets the "Text and image generation" and "System AI models" privacy settings (Settings > Privacy and security) to Deny for every app, by policy, so an app cannot switch them back on. It only concerns Windows'' own AI features; ordinary apps and games are not touched.' `
+    -Parts @(
+        pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
+        pReg "$pol\AppPrivacy" 'LetAppsAccessSystemAIModels' 2
+    )
+
+Add-Tweak -Id 'ai-voice' -Cat $cAi -Preset -Name 'Disable voice activation (wake word)' `
+    -Desc 'Apps can no longer be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also not from the lock screen. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it.' `
+    -Parts @(
+        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2
+        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
+        pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps' 'AgentActivationEnabled' 0 1
+    )
+
+Add-Tweak -Id 'ai-core' -Cat $cAi -OneWay -Risk 'note' -Name 'Windows AI core package removed' `
+    -Desc 'Removes MicrosoftWindows.Client.CoreAI, the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Windows treats it as part of the system, so this app first marks it as end of life for your account, which is the way Windows allows such a package to be removed, and then removes it for all users and from the list of apps new accounts get. On a PC that does not have it, the setting reads as done and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
+    -Parts @(
+        pCustom 'AiCore' 'marks MicrosoftWindows.Client.CoreAI as end of life for your account (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife), removes it for all users and from the apps new accounts get    (cannot be undone from here)'
+    )
+
+Add-Tweak -Id 'ai-page' -Cat $cAi -Preset -Name 'Settings: AI components page hidden' `
+    -Desc 'Hides the "AI components" page in Settings (System > AI components, on the Windows versions that have it) by adding it to the list of Settings pages that policy hides. Pages that are already in that list stay in it. The AI features themselves are not changed, the page only stops being shown. Undo takes just that page off the list again. If Settings on this PC is limited to a "showonly" list of pages, this setting reads as not available.' `
+    -Parts @(
+        pCustom 'SettingsHide' 'adds aicomponents to the hide: list in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\SettingsPageVisibility and leaves every other page in that list as it is    (undo: takes only aicomponents out again)' 'aicomponents'
+    )
+
+# ----------------------------------------------------------------- Edge --------
+Add-Tweak -Id 'edge-ai' -Cat $cEdge -Preset -Name 'Edge: disable Copilot sidebar and recommendations' `
+    -Desc 'Turns off Edge''s sidebar, Copilot page context, Microsoft 365 Copilot icon, shopping assistant and recommendations.' `
+    -Parts @(
+        pReg $edge 'HubsSidebarEnabled' 0
+        pReg $edge 'CopilotPageContext' 0
+        pReg $edge 'Microsoft365CopilotChatIconEnabled' 0
+        pReg $edge 'ShowRecommendationsEnabled' 0
+        pReg $edge 'EdgeShoppingAssistantEnabled' 0
+    )
+
+Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Preset -Name 'Edge: disable AI writing help, history search and local AI model' `
+    -Desc 'Turns off Edge''s Rewrite writing assistant, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search and the built-in AI interfaces for websites. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
+    -Parts @(
+        pReg $edge 'ComposeInlineEnabled' 0
+        pReg $edge 'EdgeHistoryAISearchEnabled' 0
+        pReg $edge 'AIGenThemesEnabled' 0
+        pReg $edge 'NewTabPageBingChatEnabled' 0
+        pReg $edge 'CopilotNewTabPageEnabled' 0
+        pReg $edge 'AllowBrowsingWithCopilot' 0
+        pReg $edge 'EdgeEntraCopilotPageContext' 0
+        pReg $edge 'ShareBrowsingHistoryWithCopilotSearchAllowed' 0
+        pReg $edge 'BuiltInAIAPIsEnabled' 0
+        pReg $edge 'GenAILocalFoundationalModelSettings' 1
+    )
+
+Add-Tweak -Id 'edge-bg' -Cat $cEdge -Preset -Name 'Edge: no startup boost or background running' `
+    -Desc 'Edge does not pre-load at sign-in and does not keep running after you close it.' `
+    -Parts @(
+        pReg $edge 'StartupBoostEnabled' 0
+        pReg $edge 'BackgroundModeEnabled' 0
+    )
+
+Add-Tweak -Id 'edge-tele' -Cat $cEdge -Preset -Name 'Edge: disable telemetry and sync' `
+    -Desc 'Turns off Edge usage reporting, personalisation reporting, diagnostic data, feedback, and Edge profile sync.' `
+    -Parts @(
+        pReg $edge 'MetricsReportingEnabled' 0
+        pReg $edge 'PersonalizationReportingEnabled' 0
+        pReg $edge 'DiagnosticData' 0
+        pReg $edge 'SyncDisabled' 1
+        pReg $edge 'UserFeedbackAllowed' 0
+        pReg $edge 'SendSiteInfoToImproveServices' 0
+    )
+
+Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Preset -Name 'Edge: disable first-run page, rewards, shortcuts and other nags' `
+    -Desc 'Sets these Edge policies: no first-run welcome page, no desktop shortcut made when Edge updates, Do Not Track on (sites may ignore it), no suggestions on error pages, Collections off, no Insider promotion, no Microsoft Rewards, no web widget, no asset delivery service (Microsoft content pushed to Edge), no donation prompt in Wallet and no "make Edge your default browser" campaigns. Edge shows "Managed by your organization" while any policy is set. Undo removes the policies.' `
+    -Parts @(
+        pReg $edge 'HideFirstRunExperience' 1
+        pReg $edge 'ConfigureDoNotTrack' 1
+        pReg $edge 'AlternateErrorPagesEnabled' 0
+        pReg $edge 'EdgeCollectionsEnabled' 0
+        pReg $edge 'MicrosoftEdgeInsiderPromotionEnabled' 0
+        pReg $edge 'ShowMicrosoftRewards' 0
+        pReg $edge 'WebWidgetAllowed' 0
+        pReg $edge 'EdgeAssetDeliveryServiceEnabled' 0
+        pReg $edge 'WalletDonationEnabled' 0
+        pReg $edge 'DefaultBrowserSettingsCampaignEnabled' 0
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0
+    )
+
+Add-Tweak -Id 'edge-upd' -Cat $cEdge -Preset -Name 'Edge update services run only on demand' `
+    -Desc 'Sets the Edge update and elevation services to Manual. Edge still updates itself through its scheduled update tasks, so the "Microsoft Edge Update" process still shows up in the background list; the next setting stops those tasks too.' `
+    -Parts @(
+        pSvc 'edgeupdate' 'Manual' 'AutomaticDelayed'
+        pSvc 'edgeupdatem' 'Manual' 'Manual'
+        pSvc 'MicrosoftEdgeElevationService' 'Manual' 'Manual'
+    )
+
+Add-Tweak -Id 'edge-tasks' -Cat $cEdge -Preset -Risk 'note' -Name 'Disable Edge background update tasks' `
+    -Desc 'Stops Edge Update from starting at sign-in and every hour (its two scheduled tasks), which keeps the "Microsoft Edge Update" process out of your background list. Edge, and the WebView2 component that many apps use, then stop getting background updates, so only turn this on if you do not use Edge.' `
+    -Parts @(
+        pTaskDyn '\' 'MicrosoftEdgeUpdateTask' 'scheduled tasks \MicrosoftEdgeUpdateTask* (Edge Update, at sign-in and hourly): off    (undo: on)'
+    )
+
+# ----------------------------------------------------------------- Apps --------
+Add-Tweak -Id 'apps-ai' -Cat $cApps -OneWay -Name 'Copilot and Cortana apps' `
+    -Desc 'Removes the Copilot app and the Cortana app for all users.' `
+    -Parts @(
+        pAppx 'Microsoft.Copilot', 'Microsoft.Windows.Ai.Copilot.Provider', 'Microsoft.549981C3F5F10'
+    )
+
+Add-Tweak -Id 'apps-news' -Cat $cApps -OneWay -Name 'News, Weather, Maps and Bing Search apps' `
+    -Desc 'Removes the Bing News, Weather, Search and Windows Maps apps.' `
+    -Parts @(
+        pAppx 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.BingSearch', 'Microsoft.WindowsMaps'
+    )
+
+Add-Tweak -Id 'apps-mail' -Cat $cApps -OneWay -Name 'Mail, Calendar, Outlook, People and Teams' `
+    -Desc 'Removes the Mail and Calendar app, the new Outlook, People, and the Teams chat apps.' `
+    -Parts @(
+        pAppx 'microsoft.windowscommunicationsapps', 'Microsoft.OutlookForWindows', 'Microsoft.People', 'MSTeams', 'MicrosoftTeams'
+    )
+
+Add-Tweak -Id 'apps-phone' -Cat $cApps -OneWay -Name 'Phone Link and Cross Device' `
+    -Desc 'Removes the Phone Link (Your Phone) and Cross Device apps.' `
+    -Parts @(
+        pAppx 'Microsoft.YourPhone', 'MicrosoftWindows.CrossDevice'
+    )
+
+Add-Tweak -Id 'apps-media' -Cat $cApps -OneWay -Risk 'note' -Name 'Media Player and Movies & TV' `
+    -Desc 'Removes the ZuneMusic and ZuneVideo packages. On Windows 11, ZuneMusic IS the Media Player app, so Media Player goes too.' `
+    -Parts @(
+        pAppx 'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo'
+    )
+
+Add-Tweak -Id 'apps-notes' -Cat $cApps -OneWay -Name 'Sticky Notes, To Do, OneNote, Whiteboard and Power Automate' `
+    -Desc 'Removes the Sticky Notes, Microsoft To Do, OneNote, Whiteboard and Power Automate apps.' `
+    -Parts @(
+        pAppx 'Microsoft.MicrosoftStickyNotes', 'Microsoft.Todos', 'Microsoft.Office.OneNote', 'Microsoft.Whiteboard', 'Microsoft.PowerAutomateDesktop'
+    )
+
+Add-Tweak -Id 'apps-extras' -Cat $cApps -OneWay -Name 'Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras' `
+    -Desc 'Removes Get Help, Tips, Feedback Hub, Dev Home, the Microsoft 365 hub, Solitaire Collection, Clipchamp, 3D Viewer, Mixed Reality Portal, Print 3D, Paint 3D, Skype, OneConnect and Microsoft Family.' `
+    -Parts @(
+        pAppx 'Microsoft.GetHelp', 'Microsoft.Getstarted', 'Microsoft.WindowsFeedbackHub', 'Microsoft.Windows.DevHome',
+              'Microsoft.MicrosoftOfficeHub', 'Microsoft.MicrosoftSolitaireCollection', 'Clipchamp.Clipchamp',
+              'Microsoft.Microsoft3DViewer', 'Microsoft.MixedReality.Portal', 'Microsoft.Print3D', 'Microsoft.MSPaint',
+              'Microsoft.SkypeApp', 'Microsoft.OneConnect', 'MicrosoftCorporationII.MicrosoftFamily'
+    )
+
+Add-Tweak -Id 'apps-widgets' -Cat $cApps -OneWay -Name 'Widgets (Windows Web Experience Pack)' `
+    -Desc 'Removes the Widgets panel completely. If you only want to hide the button, use "Disable Widgets and Chat taskbar buttons" instead, which can be undone.' `
+    -Parts @(
+        pAppx 'MicrosoftWindows.Client.WebExperience'
+    )
+
+Add-Tweak -Id 'apps-promo' -Cat $cApps -OneWay -Risk 'note' -Name 'Pre-installed promo apps (LinkedIn, Disney+, Spotify, TikTok...)' `
+    -Desc 'Removes LinkedIn, Disney+, Spotify, TikTok, Instagram, Facebook, Twitter, Netflix, Amazon / Prime Video, Hulu, Candy Crush, Duolingo, Flipboard, McAfee and Norton by name. Careful: this also removes the Microsoft Store versions of those apps if you installed them yourself. Games such as Roblox are not touched.' `
+    -Parts @(
+        pAppx '*LinkedIn*', '*Disney*', '*Spotify*', '*TikTok*', '*Instagram*', '*Facebook*', '*Twitter*', '*Netflix*', '*Amazon*',
+              '*PrimeVideo*', '*Hulu*', '*CandyCrush*', '*Duolingo*', '*Flipboard*', '*McAfee*', '*Norton*'
+    )
+
+Add-Tweak -Id 'apps-dolby' -Cat $cApps -OneWay -Risk 'note' -Name 'Dolby Access' `
+    -Desc 'Removes the Dolby Access app only (not the Dolby audio drivers). Without it Dolby Atmos for headphones and home theatre stops working, so leave this off if you use Atmos.' `
+    -Parts @(
+        pAppx 'DolbyLaboratories.DolbyAccess'
+    )
+
+Add-Tweak -Id 'apps-gamebar' -Cat $cApps -OneWay -Risk 'note' -Name 'Game Bar app' `
+    -Desc 'Removes the Xbox Game Bar overlay (Win+G, the screenshot and recording widgets) and its speech-to-text overlay. The Xbox app and Game Pass are not touched; the next setting takes those out. Removing Game Bar can make an "ms-gamingoverlay" pop-up appear in some games or on controller buttons; "Disable Game Bar" under Gaming and performance is the usual fix. Get it back with winget install 9pfhdd62mxs1.' `
+    -Parts @(
+        pAppx 'Microsoft.XboxGamingOverlay', 'Microsoft.XboxGameOverlay', 'Microsoft.XboxSpeechToTextOverlay'
+    )
+
+Add-Tweak -Id 'apps-xbox' -Cat $cApps -OneWay -Risk 'note' -Name 'Xbox app and Xbox sign-in' `
+    -Desc 'Removes the Xbox app, Xbox Identity Provider and the Xbox sign-in dialog package. Breaks Game Pass, the Xbox app and Microsoft Store games. Game Bar is a separate setting above this one.' `
+    -Parts @(
+        pAppx 'Microsoft.GamingApp', 'Microsoft.XboxIdentityProvider', 'Microsoft.Xbox.TCUI', 'Microsoft.XboxApp'
+    )
+
+Add-Tweak -Id 'apps-store' -Cat $cApps -OneWay -Risk 'note' -Name 'Microsoft Store app' `
+    -Desc 'Removes the Microsoft Store app (this is the setting that works on every edition of Windows) and its purchase / engagement helpers. winget (App Installer) stays. Apps that come from the Store (for example NVIDIA Control Panel and Photos) stop receiving updates. Get it back later with  wsreset -i.' `
+    -Parts @(
+        pAppx 'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.Services.Store.Engagement'
+    )
+
+Add-Tweak -Id 'apps-clock' -Cat $cApps -OneWay -Name 'Clock app (alarms, timers, stopwatch)' `
+    -Desc 'Removes the Clock app (Microsoft.WindowsAlarms) for all users. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store if you want it.' `
+    -Parts @(
+        pAppx 'Microsoft.WindowsAlarms'
+    )
+
+Add-Tweak -Id 'apps-startexp' -Cat $cApps -OneWay -Name 'Start Experiences App' `
+    -Desc 'Removes the Start Experiences App (Microsoft.StartExperiencesApp) for all users. It is a Microsoft app listed under Installed apps; nothing else was found that depends on it, and a forum report says removing it harms nothing. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here.' `
+    -Parts @(
+        pAppx 'Microsoft.StartExperiencesApp'
+    )
+
+Add-Tweak -Id 'apps-camera' -Cat $cApps -OneWay -Name 'Camera app' `
+    -Desc 'Removes the Camera app (Microsoft.WindowsCamera) for all users. Your webcam keeps working in other programs (browsers, Discord, Teams) and for Windows Hello; only the Camera app itself goes. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+    -Parts @(
+        pAppx 'Microsoft.WindowsCamera'
+    )
+
+Add-Tweak -Id 'apps-paint' -Cat $cApps -OneWay -Name 'Paint app' `
+    -Desc 'Removes the Paint app (Microsoft.Paint) for all users. Paint 3D is a different app and is removed by "Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras". If Paint is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+    -Parts @(
+        pAppx 'Microsoft.Paint'
+    )
+
+Add-Tweak -Id 'apps-snip' -Cat $cApps -OneWay -Risk 'note' -Name 'Snipping Tool' `
+    -Desc 'Removes the Snipping Tool app (Microsoft.ScreenSketch) for all users. It is Windows'' own screenshot tool: the editing window that follows Win+Shift+S and what the Print Screen key opens go with it, so keep it if you use them. Screenshots from Steam, the NVIDIA overlay and other programs are not affected. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+    -Parts @(
+        pAppx 'Microsoft.ScreenSketch'
+    )
+
+Add-Tweak -Id 'apps-recorder' -Cat $cApps -OneWay -Name 'Sound Recorder app' `
+    -Desc 'Removes the Sound Recorder app (Microsoft.WindowsSoundRecorder) for all users. Recording in other programs is not affected. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+    -Parts @(
+        pAppx 'Microsoft.WindowsSoundRecorder'
+    )
+
+Add-Tweak -Id 'store-policy' -Cat $cApps -Name 'Disable Microsoft Store (policy and install service)' `
+    -Desc 'Sets the "Turn off the Store application" policy and disables the Microsoft Store Install Service. Only Enterprise and Education editions honour the policy; on Home and Pro Windows ignores it, but the service part works on every edition and stops Store installs and updates. To make the Store app itself disappear, use "Microsoft Store app" above. Fully reversible.' `
+    -Parts @(
+        pEd 'Ent' (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'RemoveWindowsStore' 1)
+        pSvc 'InstallService' 'Disabled' 'Manual'
+    )
+
+# --------------------------------------------------------------- Legacy --------
+Add-Tweak -Id 'legacy' -Cat $cLegacy -Reboot -Name 'Internet Explorer mode, Steps Recorder, Work Folders and Fax' `
+    -Desc 'Removes four legacy components. Turning this off adds them back from Windows Update (internet connection needed).' `
+    -Parts @(
+        pCap 'Browser.InternetExplorer*'
+        pCap 'App.StepsRecorder*'
+        pFeat 'WorkFolders-Client'
+        pFeat 'FaxServicesClientPackage'
+    )
+# --------------------------------------------------------------- Testing -------
+# Settings taken from other debloat scripts that have not been proven to matter for gaming. They live on their own page, are not part
+# of the Recommended preset and are left out of "Apply all" and "Turn all on" on "All settings" (the Testing page's own buttons take them).
+# Every service and every scheduled task is its own card, so any one of them can be turned back on without touching the others.
+Add-Tweak -Id 'mouse-keys' -Cat $cTest -Preset -Name 'Disable Mouse Keys shortcut (Left Alt + Left Shift + Num Lock)' `
+    -Desc 'Stops the "Do you want to turn on Mouse Keys?" window and its beeps that appear when Left Alt, Left Shift and Num Lock are pressed together, which is easy to hit in a game. Only the shortcut is turned off; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so it works from your next sign-in, not in the session that is open now.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '186' '190' 'String'
+    )
+
+Add-Tweak -Id 'contrast-keys' -Cat $cTest -Preset -Name 'Disable High Contrast shortcut (Left Alt + Left Shift + Print Screen)' `
+    -Desc 'Stops the "Do you want to turn on High Contrast?" window that appears when Left Alt, Left Shift and Print Screen are pressed together. Only the shortcut is turned off; High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so it works from your next sign-in, not in the session that is open now.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '122' '126' 'String'
+    )
+
+Add-Tweak -Id 'audio-ducking' -Cat $cTest -Name 'Disable Windows volume ducking (Sound > Communications: Do nothing)' `
+    -Desc 'By default Windows turns the volume of other sounds down by 80% when it sees a call or voice chat start. This sets Sound > Communications to "Do nothing", so a game keeps its full volume while you talk. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio. Turning it off puts the Windows default back (reduce by 80%).' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3
+    )
+
+Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Risk 'note' -Name 'Disable Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
+    -Desc 'Turns off Windows Automatic Maintenance, the job that wakes up while the PC is idle and starts background tasks such as Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up. With it off those tasks do not start on their own schedule; you can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update, so look again after one.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
+    )
+
+$clsidCmdA = 'HKCU:\Software\Classes\CLSID\{2aa9162e-c906-4dd9-ad0b-3d24a8eef5a0}'
+$clsidCmdB = 'HKCU:\Software\Classes\CLSID\{6480100b-5a83-4d1e-9f69-8ae5a88e9a33}'
+Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar (instead of the Windows 11 command bar)' `
+    -Desc 'Tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is applied; if it still looks the same, sign out and in. Turning this off removes the two blocks and the Windows 11 command bar comes back. It is on the Testing page for that reason.' `
+    -Parts @(
+        pKey "$clsidCmdA\InprocServer32" $clsidCmdA
+        pKey "$clsidCmdB\InprocServer32" $clsidCmdB
+    )
+
+Add-Tweak -Id 'svc-smsrouter' -Cat $cTest -Name 'Disable SMS Router service (SmsRouter)' `
+    -Desc 'Sends text messages (SMS) to the right app. It is only used with a mobile-broadband modem or a phone link that carries texts; a desktop PC does not use it. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'SmsRouter' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-wallet' -Cat $cTest -Name 'Disable Wallet service (WalletService)' `
+    -Desc 'Used by the Wallet feature for payment cards, tickets and passes. A desktop gaming PC does not use it. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'WalletService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-scpolicy' -Cat $cTest -Risk 'note' -Name 'Disable Smart Card Removal Policy service (SCPolicySvc)' `
+    -Desc 'Locks the PC or signs you out when a smart card is pulled out of its reader. It only matters if you sign in with a smart card. The other two smart-card services are in "Disable smart card services" on the "Other Windows services" page; this one is separate so it can be switched on its own. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'SCPolicySvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-spotverifier' -Cat $cTest -Risk 'note' -Name 'Disable Spot Verifier service (svsvc)' `
+    -Desc 'Checks a drive for file-system damage in the background when Windows has noticed a problem with it. With it off that automatic follow-up check does not run; you can still run a check yourself (chkdsk). Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'svsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-biometric' -Cat $cTest -Risk 'note' -Name 'Disable Windows Biometric Service (WbioSrvc)' `
+    -Desc 'Needed for fingerprint and face sign-in (Windows Hello). A PIN or a password does not use it. Leave this one on if you sign in with a fingerprint reader or a face camera. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'WbioSrvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-sensormon' -Cat $cTest -Name 'Disable Sensor Monitoring service (SensrSvc)' `
+    -Desc 'Watches sensors such as ambient light and screen orientation for automatic brightness and rotation. A desktop PC with a normal monitor does not have them. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'SensrSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-sensordata' -Cat $cTest -Name 'Disable Sensor Data service (SensorDataService)' `
+    -Desc 'Passes the readings of those sensors on to apps. A desktop PC with a normal monitor does not have them. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'SensorDataService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-mixedreality' -Cat $cTest -Name 'Disable Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
+    -Desc 'Only used by Windows Mixed Reality headsets; other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+    -Parts @(
+        pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'task-sqm' -Cat $cTest -Name 'Disable scheduled task: Software Quality Metrics (PI\Sqm-Tasks)' `
+    -Desc 'A scheduled task that gathers software-quality and reliability data for Microsoft. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\PI\Sqm-Tasks'
+    )
+
+Add-Tweak -Id 'task-maps' -Cat $cTest -Name 'Disable scheduled task: Maps update (Maps\MapsUpdateTask)' `
+    -Desc 'Downloads updates for offline maps used by the Maps app. It only matters if you use downloaded maps. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
+    )
+
+Add-Tweak -Id 'task-familysafety' -Cat $cTest -Name 'Disable scheduled task: Family Safety monitor (Shell\FamilySafetyMonitor)' `
+    -Desc 'Part of Microsoft Family Safety (parental controls and screen-time limits). It only matters if this PC is used by a child account in a Microsoft family group. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Shell\FamilySafetyMonitor'
+    )
+
+Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Name 'Disable scheduled task: Power Efficiency Diagnostics (AnalyzeSystem)' `
+    -Desc 'Looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report. Nothing else depends on it. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
+    )
+}   # ---- end of $engine ----
+# =============================================================================
+# LATENCY TESTS (measuring side). Nothing here changes a setting: it only measures and rates.
+#
+# What it can measure from software alone:
+#   PC latency   timer wake-up jitter, CPU stalls (interrupts, drivers, firmware), interrupt / DPC load,
+#                and how steadily Windows refreshes the screen.
+# What it cannot measure: the monitor's own processing and pixel response. That needs a high-speed camera or a hardware tester
+# (for example the latency analyzer built into some NVIDIA Reflex monitors).
+#
+# Ratings are rules of thumb tied to the frame time of YOUR monitor (1000 / refresh rate): a delay of half a frame or more
+# can cost a frame, a stall longer than a frame does. Each result shows its rule.
+#
+# Everything lives in $latEngine so the same text can run on the window's thread and in a background worker.
+# C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
+# =============================================================================
+$LatQ = $null    # the queue the background worker reports through (its host sets it; the code below only reads it)
+$latEngine = {
+
+$script:LatSrcProbe = @'
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+
+public static class LatProbe
+{
+    [DllImport("ntdll.dll")]
+    static extern int NtQueryTimerResolution(out uint minimum, out uint maximum, out uint current);
+    [DllImport("winmm.dll")]
+    static extern uint timeBeginPeriod(uint period);
+    [DllImport("winmm.dll")]
+    static extern uint timeEndPeriod(uint period);
+    [DllImport("dwmapi.dll")]
+    static extern int DwmFlush();
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr CreateWaitableTimerEx(IntPtr attributes, string name, uint flags, uint access);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime, int period, IntPtr completion, IntPtr argument, bool resume);
+    [DllImport("kernel32.dll")]
+    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+    [DllImport("kernel32.dll")]
+    static extern bool CloseHandle(IntPtr handle);
+
+    public static string WaitMode = "";
+    public static long StallLoops = 0;
+
+    // minimum, maximum (finest) and current system timer resolution, in 100 ns units
+    public static uint[] TimerResolution()
+    {
+        uint mn; uint mx; uint cur;
+        int rc = NtQueryTimerResolution(out mn, out mx, out cur);
+        if (rc != 0) { throw new InvalidOperationException("NtQueryTimerResolution returned " + rc); }
+        return new uint[] { mn, mx, cur };
+    }
+
+    // How late each 1 ms wait ends, in milliseconds. Uses a high-resolution waitable timer when Windows has one.
+    public static double[] WaitJitter(int count)
+    {
+        double[] r = new double[count];
+        double toMs = 1000.0 / Stopwatch.Frequency;
+        IntPtr h = IntPtr.Zero;
+        try { h = CreateWaitableTimerEx(IntPtr.Zero, null, 0x2, 0x1F0003); }
+        catch (Exception) { h = IntPtr.Zero; }
+        bool hi = (h != IntPtr.Zero);
+        WaitMode = hi ? "high-resolution timer" : "Sleep(1)";
+        ThreadPriority old = Thread.CurrentThread.Priority;
+        bool began = false;
+        try
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            if (!hi) { began = (timeBeginPeriod(1) == 0); }
+            for (int i = 0; i < count; i++)
+            {
+                long t0 = Stopwatch.GetTimestamp();
+                if (hi)
+                {
+                    long due = -10000;   // 1 ms, relative (negative, in 100 ns units)
+                    // if Windows refuses to arm the timer, stop here: waiting on it would take a full second per step
+                    if (!SetWaitableTimer(h, ref due, 0, IntPtr.Zero, IntPtr.Zero, false)) { throw new InvalidOperationException("SetWaitableTimer failed (" + Marshal.GetLastWin32Error() + ")"); }
+                    WaitForSingleObject(h, 1000);
+                }
+                else
+                {
+                    Thread.Sleep(1);
+                }
+                long t1 = Stopwatch.GetTimestamp();
+                double late = (t1 - t0) * toMs - 1.0;
+                r[i] = late < 0 ? 0 : late;
+            }
+        }
+        finally
+        {
+            if (began) { timeEndPeriod(1); }
+            if (h != IntPtr.Zero) { CloseHandle(h); }
+            Thread.CurrentThread.Priority = old;
+        }
+        return r;
+    }
+
+    // Spin on the clock and note every gap longer than thresholdUs: the thread was stopped by something (an interrupt,
+    // a driver routine, firmware, another thread). Returns the gaps in microseconds.
+    public static double[] Stalls(int durationMs, double thresholdUs)
+    {
+        List<double> gaps = new List<double>();
+        long freq = Stopwatch.Frequency;
+        long minTicks = (long)(thresholdUs * freq / 1000000.0);
+        long span = (long)(durationMs * (double)freq / 1000.0);
+        long loops = 0;
+        ThreadPriority old = Thread.CurrentThread.Priority;
+        try
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            long start = Stopwatch.GetTimestamp();
+            long end = start + span;
+            long prev = start;
+            while (true)
+            {
+                long now = Stopwatch.GetTimestamp();
+                loops++;
+                long d = now - prev;
+                if (d >= minTicks) { gaps.Add(d * 1000000.0 / freq); }
+                prev = now;
+                if (now >= end) { break; }
+            }
+        }
+        finally { Thread.CurrentThread.Priority = old; }
+        StallLoops = loops;
+        return gaps.ToArray();
+    }
+
+    // The time between the desktop compositor's refreshes, in milliseconds
+    public static double[] DwmIntervals(int count)
+    {
+        double[] r = new double[count];
+        double toMs = 1000.0 / Stopwatch.Frequency;
+        ThreadPriority old = Thread.CurrentThread.Priority;
+        try
+        {
+            Thread.CurrentThread.Priority = ThreadPriority.Highest;
+            int rc = DwmFlush();
+            if (rc != 0) { throw new InvalidOperationException("DwmFlush returned 0x" + rc.ToString("X")); }
+            long prev = Stopwatch.GetTimestamp();
+            for (int i = 0; i < count; i++)
+            {
+                DwmFlush();
+                long now = Stopwatch.GetTimestamp();
+                r[i] = (now - prev) * toMs;
+                prev = now;
+            }
+        }
+        finally { Thread.CurrentThread.Priority = old; }
+        return r;
+    }
+}
+'@
+
+# ------------------------------------------------------------------ compiling the helpers ----
+# Returns '' when the helper is ready, otherwise the reason it could not be built.
+function Lat-EnsureProbe {
+    if ('LatProbe' -as [type]) { return '' }
+    try {
+        Add-Type -TypeDefinition $script:LatSrcProbe -Language CSharp -ErrorAction Stop
+        return ''
+    } catch {
+        return [string]$_.Exception.Message
+    }
+}
+# ------------------------------------------------------------------ the probes (thin, so tests can replace them) ----
+function Lat-ProbeTimerRes {
+    $r = [LatProbe]::TimerResolution()
+    return @{ Min = [double]$r[0]; Max = [double]$r[1]; Cur = [double]$r[2] }
+}
+function Lat-ProbeWait {
+    param([int]$Count)
+    [void][LatProbe]::WaitJitter(20)             # warm-up, so compiling the loop is not measured
+    $v = [LatProbe]::WaitJitter($Count)
+    return @{ Values = [double[]]$v; Mode = [string][LatProbe]::WaitMode }
+}
+function Lat-ProbeStalls {
+    param([int]$Ms, [double]$MinUs)
+    [void][LatProbe]::Stalls(60, $MinUs)         # warm-up
+    $g = [LatProbe]::Stalls($Ms, $MinUs)
+    return @{ Gaps = [double[]]$g; Loops = [long][LatProbe]::StallLoops; Ms = $Ms }
+}
+function Lat-ProbeDwm {
+    param([int]$Count)
+    return (, [double[]][LatProbe]::DwmIntervals($Count))
+}
+# Interrupt and DPC time per logical processor, averaged over a few one-second samples (the first is dropped).
+# The CIM class names are the same on every Windows language.
+function Lat-ProbeIrq {
+    param([int]$Seconds = 5)
+    $sum = @{}
+    $cnt = 0
+    $total = @{ Dpc = 0.0; Isr = 0.0 }
+    for ($i = 0; $i -lt $Seconds; $i++) {
+        Start-Sleep -Milliseconds 1000
+        $rows = @(Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop)
+        if ($i -eq 0) { continue }
+        $cnt++
+        foreach ($r in $rows) {
+            $n = [string]$r.Name
+            if ($n -eq '_Total') { $total.Dpc += [double]$r.PercentDPCTime; $total.Isr += [double]$r.PercentInterruptTime; continue }
+            if ($n -like '*_Total') { continue }
+            if (-not $sum.ContainsKey($n)) { $sum[$n] = @{ Dpc = 0.0; Isr = 0.0 } }
+            $sum[$n].Dpc += [double]$r.PercentDPCTime
+            $sum[$n].Isr += [double]$r.PercentInterruptTime
+        }
+    }
+    if ($cnt -lt 1) { throw 'The processor counters gave no samples.' }
+    $cores = @()
+    foreach ($k in @($sum.Keys)) { $cores += , @{ Name = $k; Dpc = ($sum[$k].Dpc / $cnt); Isr = ($sum[$k].Isr / $cnt) } }
+    return @{ Cores = $cores; Total = @{ Dpc = ($total.Dpc / $cnt); Isr = ($total.Isr / $cnt) }; Samples = $cnt }
+}
+
+# ------------------------------------------------------------------ this PC ----
+$script:LatPlans = @{
+    '381b4222-f694-41f0-9685-ff5bb260df2e' = 'Balanced'
+    '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' = 'High performance'
+    'a1841308-3541-4fab-bc81-f71556f20b4a' = 'Power saver'
+    'e9a42b02-d5df-448d-aa00-03f14749eb61' = 'Ultimate Performance'
+}
+# The hardware that the ratings are tied to. Every field is optional: what cannot be read stays empty / 0.
+function Get-LatSpecs {
+    $s = @{ Cpu = ''; Cores = 0; Threads = 0; RamGB = 0.0; RamSpeed = 0; RamRated = 0; RamType = ''; RamModules = 0; Gpu = ''; RefreshHz = 0; ResW = 0; ResH = 0; Plan = ''; Os = '' }
+    try {
+        $c = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)[0]
+        $s.Cpu = ([string]$c.Name).Trim()
+        $s.Cores = [int]$c.NumberOfCores
+        $s.Threads = [int]$c.NumberOfLogicalProcessors
+    } catch { }
+    try {
+        $m = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+        $s.RamModules = $m.Count
+        $bytes = 0.0; foreach ($x in $m) { $bytes += [double]$x.Capacity }
+        $s.RamGB = [Math]::Round($bytes / 1GB, 0)
+        $s.RamRated = [int](($m | ForEach-Object { [int]$_.Speed } | Measure-Object -Maximum).Maximum)
+        $s.RamSpeed = [int](($m | ForEach-Object { [int]$_.ConfiguredClockSpeed } | Measure-Object -Maximum).Maximum)
+        $t = [int]$m[0].SMBIOSMemoryType
+        if ($t -eq 34) { $s.RamType = 'DDR5' } elseif ($t -eq 26) { $s.RamType = 'DDR4' } elseif ($t -eq 24) { $s.RamType = 'DDR3' }
+    } catch { }
+    try {
+        $v = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        $names = @($v | ForEach-Object { ([string]$_.Name).Trim() } | Where-Object { $_ })
+        $s.Gpu = ($names -join ' + ')
+        $best = $null
+        foreach ($x in $v) { if ([int]$x.CurrentRefreshRate -gt 0 -and (-not $best -or [int]$x.CurrentRefreshRate -gt [int]$best.CurrentRefreshRate)) { $best = $x } }
+        if ($best) { $s.RefreshHz = [int]$best.CurrentRefreshRate; $s.ResW = [int]$best.CurrentHorizontalResolution; $s.ResH = [int]$best.CurrentVerticalResolution }
+    } catch { }
+    try {
+        $o = & powercfg /getactivescheme 2>$null
+        $g = [regex]::Match(([string]($o -join ' ')), '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
+        if ($g.Success) {
+            $k = $g.Value.ToLower()
+            if ($script:LatPlans.ContainsKey($k)) { $s.Plan = $script:LatPlans[$k] } else { $s.Plan = 'a custom plan' }
+        }
+    } catch { }
+    try { $s.Os = [string][Environment]::OSVersion.Version } catch { }
+    return $s
+}
+
+# One frame of the monitor, in milliseconds. A monitor that Windows did not report counts as 60 Hz (and is flagged).
+function Get-LatFrame {
+    param($Specs)
+    $hz = 0.0
+    if ($Specs -and [double]$Specs.RefreshHz -ge 24) { $hz = [double]$Specs.RefreshHz }
+    $assumed = $false
+    if ($hz -lt 24) { $hz = 60.0; $assumed = $true }
+    return @{ Hz = $hz; Ms = (1000.0 / $hz); Assumed = $assumed }
+}
+
+# ------------------------------------------------------------------ numbers ----
+function Lat-Arr {
+    param($v)
+    if ($null -eq $v) { return (, [double[]]@()) }
+    return (, [double[]]@($v))
+}
+function Lat-Sorted {
+    param($v)
+    $a = ([double[]](Lat-Arr $v)).Clone()
+    [Array]::Sort($a)
+    return (, $a)
+}
+# nearest-rank percentile of a sorted array
+function Lat-Pct {
+    param($Sorted, [double]$P)
+    $a = [double[]]$Sorted
+    $n = $a.Length
+    if ($n -eq 0) { return 0.0 }
+    $i = [int][Math]::Ceiling($P / 100.0 * $n) - 1
+    if ($i -lt 0) { $i = 0 }
+    if ($i -ge $n) { $i = $n - 1 }
+    return [double]$a[$i]
+}
+function Lat-RateLow {
+    param([double]$v, [double]$good, [double]$ok)
+    if ($v -le $good) { return 'Good' }
+    if ($v -le $ok) { return 'OK' }
+    return 'Poor'
+}
+# the worst of several ratings ('None' is ignored; 'None' if there is nothing to judge)
+function Lat-Worst {
+    param($Ratings)
+    $rank = @{ 'Good' = 1; 'OK' = 2; 'Poor' = 3 }
+    $w = 0
+    foreach ($r in @($Ratings)) { if ($rank.ContainsKey([string]$r) -and $rank[[string]$r] -gt $w) { $w = $rank[[string]$r] } }
+    switch ($w) { 1 { return 'Good' } 2 { return 'OK' } 3 { return 'Poor' } }
+    return 'None'
+}
+function New-LatResult {
+    param([string]$Id, [string]$Title, [string]$Value, [string]$Rating, [string]$Rule, [string]$Detail, [string]$Advice = '')
+    return @{ Id = $Id; Title = $Title; Value = $Value; Rating = $Rating; Rule = $Rule; Detail = $Detail; Advice = $Advice }
+}
+function Lat-NotMeasured {
+    param([string]$Id, [string]$Title, [string]$Why)
+    return (New-LatResult $Id $Title 'Not measured' 'None' '' $Why)
+}
+function Lat-FrameNote {
+    param($F)
+    if ($F.Assumed) { return ('{0:0} Hz is assumed because Windows did not report your refresh rate.' -f $F.Hz) }
+    return ('{0:0} Hz is your monitor''s current refresh rate.' -f $F.Hz)
+}
+
+# What to look at when a result is not Good
+$script:LatAdvice = @{
+    wait  = 'Something delays the Windows scheduler for about as long as part of a frame. Close background programs (overlays, launchers, browsers, RGB and monitoring tools) and run the test again; if it stays like this, a driver or power-saving feature is the likely cause.'
+    stall = 'Something stops the CPU for a noticeable time: usually a driver (network, audio, GPU, USB), a power-saving state, or firmware (SMI). A tool such as LatencyMon can name the driver. Updating chipset, network and GPU drivers and switching off adapter power saving are the usual first steps.'
+    irq   = 'One processor core spends a large share of its time answering a device. That is usually the network adapter, GPU, USB controller or audio device. Updating its driver, or switching off its power saving, is the usual first step.'
+    dwm   = 'Windows is not refreshing the desktop at your monitor''s rate, or skips refreshes. Check Settings > System > Display > Advanced display for the refresh rate, unplug or lower the refresh rate of other monitors to test, and close overlays.'
+}
+
+# ------------------------------------------------------------------ PC latency: turning numbers into results ----
+function Get-LatTimerResult {
+    param($Res)
+    $title = 'Windows timer tick'
+    if (-not $Res) { return (Lat-NotMeasured 'timer' $title 'Could not be read.') }
+    $cur = [double]$Res.Cur / 10000.0
+    $fine = [double]$Res.Max / 10000.0
+    $detail = 'This is how often Windows wakes up to schedule timers right now. At rest it is usually 15.6 ms; games and audio programs raise it to 1 ms or 0.5 ms while they run. The finest tick this PC allows is {0:0.0##} ms. It is shown for information and is not rated.' -f $fine
+    return (New-LatResult 'timer' $title ('{0:0.0##} ms now' -f $cur) 'None' '' $detail)
+}
+
+function Get-LatWaitResult {
+    param($Values, [string]$Mode, $F)
+    $title = 'Timer wake-up jitter'
+    $v = Lat-Sorted $Values
+    if ($v.Length -lt 50) { return (Lat-NotMeasured 'wait' $title 'Too few samples were collected.') }
+    $med = Lat-Pct $v 50
+    $p99 = Lat-Pct $v 99
+    $max = [double]$v[$v.Length - 1]
+    $spread = [Math]::Max(0.0, $p99 - $med)
+    $good = 0.20 * $F.Ms
+    $ok = 0.50 * $F.Ms
+    $rating = Lat-RateLow $spread $good $ok
+    $rule = 'Good: under {0:0.00} ms (20% of one frame). OK: under {1:0.00} ms (50%). {2}' -f $good, $ok, (Lat-FrameNote $F)
+    $detail = '{0} waits of 1 ms using a {1}. A wait normally ends {2:0.00} ms late; 99 in 100 ended within {3:0.00} ms of that, the worst {4:0.00} ms late.' -f $v.Length, $Mode, $med, $spread, $max
+    if ($Mode -eq 'Sleep(1)') { $detail += ' This Windows has no high-resolution timer, so the result is less precise.' }
+    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.wait }
+    return (New-LatResult 'wait' $title ('{0:0.00} ms jitter' -f $spread) $rating $rule $detail $adv)
+}
+
+function Get-LatStallResult {
+    param($Gaps, [long]$Loops, [int]$Ms, $F)
+    $title = 'Longest CPU stall'
+    if ($Loops -lt 1000 -or $Ms -lt 500) { return (Lat-NotMeasured 'stall' $title 'The test did not run long enough.') }
+    $g = [double[]](Lat-Arr $Gaps)
+    $maxUs = 0.0; $sumUs = 0.0; $n100 = 0; $n500 = 0; $n1000 = 0
+    foreach ($x in $g) {
+        if ($x -gt $maxUs) { $maxUs = $x }
+        $sumUs += $x
+        if ($x -ge 100) { $n100++ }
+        if ($x -ge 500) { $n500++ }
+        if ($x -ge 1000) { $n1000++ }
+    }
+    $maxMs = $maxUs / 1000.0
+    $good = 0.25 * $F.Ms
+    $ok = 1.00 * $F.Ms
+    $rating = Lat-RateLow $maxMs $good $ok
+    $rule = 'Good: no stall over {0:0.00} ms (a quarter of one frame). OK: none over {1:0.00} ms (one frame). {2}' -f $good, $ok, (Lat-FrameNote $F)
+    $lost = $sumUs / ($Ms * 1000.0) * 100.0
+    $val = 'no stall over 0.05 ms'
+    if ($g.Length -gt 0) { $val = '{0:0.00} ms' -f $maxMs }
+    $detail = 'A thread running at high priority for {0:0.0} s was stopped {1} time(s) for 0.1 ms or more, {2} time(s) for 0.5 ms or more and {3} time(s) for 1 ms or more; {4:0.00}% of the time was lost to stops longer than 0.05 ms.' -f ($Ms / 1000.0), $n100, $n500, $n1000, $lost
+    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.stall }
+    return (New-LatResult 'stall' $title $val $rating $rule $detail $adv)
+}
+
+function Get-LatIrqResult {
+    param($Data)
+    $title = 'Interrupt and driver load'
+    if (-not $Data -or @($Data.Cores).Count -eq 0) { return (Lat-NotMeasured 'irq' $title 'The processor counters could not be read.') }
+    $best = $null; $bestV = -1.0; $sumAll = 0.0
+    foreach ($c in @($Data.Cores)) {
+        $t = [double]$c.Dpc + [double]$c.Isr
+        $sumAll += $t
+        if ($t -gt $bestV) { $bestV = $t; $best = $c }
+    }
+    $avg = $sumAll / @($Data.Cores).Count
+    $rating = Lat-RateLow $bestV 3.0 8.0
+    $rule = 'Good: the busiest core spends under 3% of its time on interrupts and driver routines (DPCs). OK: under 8%.'
+    $detail = 'Averaged over {0} one-second samples. Busiest core: {1} ({2:0.00}% in driver routines, {3:0.00}% in interrupts). Average over all {4} cores: {5:0.00}%.' -f $Data.Samples, $best.Name, [double]$best.Dpc, [double]$best.Isr, @($Data.Cores).Count, $avg
+    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.irq }
+    return (New-LatResult 'irq' $title ('{0:0.0}% of the busiest core' -f $bestV) $rating $rule $detail $adv)
+}
+
+function Get-LatDwmResult {
+    param($Intervals, [double]$ReportedHz)
+    $title = 'Screen refresh steadiness'
+    $v = Lat-Sorted $Intervals
+    if ($v.Length -lt 60) { return (Lat-NotMeasured 'dwm' $title 'Too few refreshes were collected.') }
+    $med = Lat-Pct $v 50
+    if ($med -le 0) { return (Lat-NotMeasured 'dwm' $title 'The refresh timing could not be read.') }
+    $hz = 1000.0 / $med
+    $late = 0
+    foreach ($x in $v) { if ($x -gt (1.5 * $med)) { $late++ } }
+    $latePct = $late * 100.0 / $v.Length
+    $max = [double]$v[$v.Length - 1]
+    $ratio = 1.0
+    if ($ReportedHz -ge 24) { $ratio = $hz / $ReportedHz }
+    if ($ratio -ge 0.97 -and $latePct -le 0.5) { $rating = 'Good' }
+    elseif ($ratio -ge 0.90 -and $latePct -le 2.0) { $rating = 'OK' }
+    else { $rating = 'Poor' }
+    $rule = 'Good: Windows refreshes the desktop at 97% or more of your monitor''s rate and under 0.5% of refreshes are late. OK: 90% or more and under 2%.'
+    $rep = 'Windows did not report a refresh rate for your monitor'
+    if ($ReportedHz -ge 24) { $rep = 'Windows reports {0:0} Hz for your monitor' -f $ReportedHz }
+    $detail = '{0} refreshes timed. {1}. {2} of them ({3:0.0}%) came late (more than 1.5 times the usual {4:0.00} ms); the slowest took {5:0.00} ms.' -f $v.Length, $rep, $late, $latePct, $med, $max
+    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.dwm }
+    return (New-LatResult 'dwm' $title ('{0:0.0} Hz' -f $hz) $rating $rule $detail $adv)
+}
+
+# ------------------------------------------------------------------ the PC latency test (runs in the worker) ----
+# $Progress: a scriptblock taking (percent, text). Every step has its own try, so one failing probe does not stop the rest.
+function Invoke-LatPcTest {
+    param($Specs, $Progress)
+    $say = { param($p, $t) if ($Progress) { try { & $Progress $p $t } catch { } } }
+    $F = Get-LatFrame $Specs
+    $out = New-Object System.Collections.ArrayList
+    & $say 2 'Preparing the measuring code...'
+    $why = Lat-EnsureProbe
+    if ($why) {
+        foreach ($d in @(@('timer', 'Windows timer tick'), @('wait', 'Timer wake-up jitter'), @('stall', 'Longest CPU stall'), @('dwm', 'Screen refresh steadiness'))) {
+            [void]$out.Add((Lat-NotMeasured $d[0] $d[1] ('The measuring code could not be built on this PC: ' + $why)))
+        }
+    } else {
+        & $say 8 'Reading the timer tick...'
+        try { [void]$out.Add((Get-LatTimerResult (Lat-ProbeTimerRes))) } catch { [void]$out.Add((Lat-NotMeasured 'timer' 'Windows timer tick' $_.Exception.Message)) }
+        & $say 14 'Timer wake-up test (about 2 seconds)...'
+        try { $w = Lat-ProbeWait 1500; [void]$out.Add((Get-LatWaitResult $w.Values $w.Mode $F)) } catch { [void]$out.Add((Lat-NotMeasured 'wait' 'Timer wake-up jitter' $_.Exception.Message)) }
+        & $say 30 'CPU stall test (3 seconds)...'
+        try { $s = Lat-ProbeStalls 3000 50; [void]$out.Add((Get-LatStallResult $s.Gaps $s.Loops $s.Ms $F)) } catch { [void]$out.Add((Lat-NotMeasured 'stall' 'Longest CPU stall' $_.Exception.Message)) }
+        & $say 46 'Interrupt and driver load (5 seconds)...'
+        try { [void]$out.Add((Get-LatIrqResult (Lat-ProbeIrq 5))) } catch { [void]$out.Add((Lat-NotMeasured 'irq' 'Interrupt and driver load' $_.Exception.Message)) }
+        & $say 78 'Screen refresh test (about 2 seconds)...'
+        try {
+            $cnt = [int][Math]::Min(1200, [Math]::Max(120, [Math]::Round($F.Hz * 2)))
+            $iv = Lat-ProbeDwm $cnt
+            $rep = 0.0; if ($Specs -and [double]$Specs.RefreshHz -ge 24) { $rep = [double]$Specs.RefreshHz }
+            [void]$out.Add((Get-LatDwmResult $iv $rep))
+        } catch { [void]$out.Add((Lat-NotMeasured 'dwm' 'Screen refresh steadiness' $_.Exception.Message)) }
+    }
+    & $say 100 'Done.'
+    return @($out)
+}
+
+# Worker entry points: results go into the queue $LatQ as hashtables with T = specs | progress | done | error
+# Reading the hardware (a second or two of WMI queries) - done in the background when the window opens
+function Invoke-LatSpecsJob {
+    try {
+        $LatQ.Enqueue(@{ T = 'specs'; Specs = (Get-LatSpecs) })
+    } catch {
+        $LatQ.Enqueue(@{ T = 'error'; Text = [string]$_.Exception.Message })
+    }
+}
+function Invoke-LatPcTestJob {
+    try {
+        $sp = Get-LatSpecs
+        $LatQ.Enqueue(@{ T = 'specs'; Specs = $sp })
+        $res = Invoke-LatPcTest -Specs $sp -Progress { param($pct, $text) $LatQ.Enqueue(@{ T = 'progress'; Pct = $pct; Text = $text }) }
+        $LatQ.Enqueue(@{ T = 'done'; Specs = $sp; Results = $res })
+    } catch {
+        $LatQ.Enqueue(@{ T = 'error'; Text = [string]$_.Exception.Message })
+    }
+}
+
+function Get-LatOverall {
+    param($Results)
+    $w = Lat-Worst @(@($Results) | ForEach-Object { $_.Rating })
+    switch ($w) {
+        'Good' { return @{ Rating = 'Good'; Text = 'Good: nothing measured here is likely to cost you frames or response.' } }
+        'OK'   { return @{ Rating = 'OK'; Text = 'OK: mostly fine, with something worth a look.' } }
+        'Poor' { return @{ Rating = 'Poor'; Text = 'Needs attention: something below is likely to be felt in games.' } }
+    }
+    return @{ Rating = 'None'; Text = 'Nothing could be measured.' }
+}
+
+# ------------------------------------------------------------------ the report ----
+function Get-LatSpecLines {
+    param($Specs, $F)
+    $l = New-Object System.Collections.ArrayList
+    if ($Specs) {
+        if ($Specs.Cpu) { $t = [string]$Specs.Cpu; if ($Specs.Cores -gt 0) { $t += ' ({0} cores, {1} threads)' -f $Specs.Cores, $Specs.Threads }; [void]$l.Add('CPU: ' + $t) }
+        if ($Specs.RamGB -gt 0) {
+            $t = '{0:0} GB' -f $Specs.RamGB
+            if ($Specs.RamType) { $t += ' ' + $Specs.RamType }
+            if ($Specs.RamSpeed -gt 0) { $t += ' at {0} MT/s' -f $Specs.RamSpeed }
+            if ($Specs.RamModules -gt 0) { $t += ' ({0} module(s))' -f $Specs.RamModules }
+            [void]$l.Add('Memory: ' + $t)
+        }
+        if ($Specs.Gpu) { [void]$l.Add('Graphics: ' + $Specs.Gpu) }
+        if ($Specs.RefreshHz -ge 24) {
+            $t = '{0} Hz' -f $Specs.RefreshHz
+            if ($Specs.ResW -gt 0) { $t = '{0} x {1}, {2}' -f $Specs.ResW, $Specs.ResH, $t }
+            [void]$l.Add(('Monitor: {0} (one frame is {1:0.00} ms)' -f $t, $F.Ms))
+        } else {
+            [void]$l.Add(('Monitor: refresh rate not reported, 60 Hz assumed (one frame is {0:0.00} ms)' -f $F.Ms))
+        }
+        if ($Specs.Plan) { [void]$l.Add('Power plan: ' + $Specs.Plan) }
+    }
+    return @($l)
+}
+
+# Findings about the setup itself (not from a test)
+function Get-LatSetupNotes {
+    param($Specs)
+    $n = New-Object System.Collections.ArrayList
+    if ($Specs -and $Specs.RamRated -gt 0 -and $Specs.RamSpeed -gt 0 -and $Specs.RamSpeed -lt (0.9 * $Specs.RamRated)) {
+        [void]$n.Add(('Your memory runs at {0} MT/s but its modules are rated {1} MT/s. The memory profile (EXPO or XMP) may be switched off in the BIOS.' -f $Specs.RamSpeed, $Specs.RamRated))
+    }
+    return @($n)
+}
+
+# The whole report as styled pieces (same shape as the settings' details text: S = style, T = text)
+function Get-LatParts {
+    param($Specs, $Pc, [string]$When = '')
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    $F = Get-LatFrame $Specs
+    [void]$p.Add(@{ S = 'title'; C = ''; T = 'Latency results' + $nl })
+    if ($When) { [void]$p.Add(@{ S = 'sub'; C = ''; T = $When + $nl }) }
+    $lines = @(Get-LatSpecLines $Specs $F)
+    if ($lines.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Your PC' + $nl })
+        foreach ($x in $lines) { [void]$p.Add(@{ S = 'body'; C = ''; T = $x + $nl }) }
+    }
+    foreach ($x in @(Get-LatSetupNotes $Specs)) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $x + $nl }) }
+    if (@($Pc).Count -eq 0) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What the test does' + $nl })
+        [void]$p.Add(@{ S = 'metric'; C = ''; T = $nl + 'PC latency test (about 12 seconds)' + $nl })
+        [void]$p.Add(@{ S = 'body'; C = ''; T = 'Measures how late Windows wakes up a timer, how long the CPU gets stopped by drivers or firmware, how much of a core is spent answering devices, and how steadily Windows refreshes the screen. Keep the mouse still and close other programs while it runs.' + $nl })
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Each result is rated against your monitor''s refresh rate, and the rule used is shown with it.' + $nl })
+    }
+    $res = @($Pc)
+    if ($res.Count -gt 0) {
+        $ov = Get-LatOverall $res
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'PC latency' + $nl })
+        [void]$p.Add(@{ S = [string]$ov.Rating.ToLower(); C = ''; T = $ov.Text + $nl })
+        foreach ($r in $res) {
+            [void]$p.Add(@{ S = 'metric'; C = ''; T = $nl + $r.Title + $nl })
+            $rt = [string]$r.Rating
+            if ($rt -eq 'None') { [void]$p.Add(@{ S = 'none'; C = ''; T = $r.Value + $nl }) }
+            else { [void]$p.Add(@{ S = $rt.ToLower(); C = ''; T = ('{0}: {1}' -f $rt, $r.Value) + $nl }) }
+            if ($r.Detail) { [void]$p.Add(@{ S = 'body'; C = ''; T = $r.Detail + $nl }) }
+            if ($r.Rule)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Rating rule: ' + $r.Rule + $nl }) }
+            if ($r.Advice) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'What to try: ' + $r.Advice + $nl }) }
+        }
+    }
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What this test cannot see' + $nl })
+    [void]$p.Add(@{ S = 'note'; C = ''; T = 'Software cannot measure the monitor''s own processing and its pixel response. A high-speed camera, or the latency analyzer built into some NVIDIA Reflex monitors, measures that. The ratings are rules of thumb tied to your monitor''s frame time, not an official standard.' + $nl })
+    return $p
+}
+function Get-LatText {
+    param($Specs, $Pc, [string]$When = '')
+    $s = ''
+    foreach ($x in @(Get-LatParts $Specs $Pc $When)) { $s += [string]$x.T }
+    return $s
+}
+
+}   # ---- end of $latEngine ----
+. $latEngine
+
+# =============================================================================
+# SYSTEM INFORMATION (read only): what the Home page and the Display page show.
+# Nothing here changes a setting or installs anything: it only looks.
+#
+# Where each number comes from:
+#   Windows version, CPU / RAM / board names   Windows' own WMI (CIM) and the registry
+#   CPU usage, clock, processes, memory used   Windows performance counters
+#   GPU temperature, power, clock, memory      nvidia-smi (installed with the NVIDIA driver), when there is one
+#   Drive model, size, health, temperature     Windows' storage service (Get-PhysicalDisk, Get-StorageReliabilityCounter): no driver needed
+#   CPU temperature, CPU power, RAM timings    Windows does not report these. They are read from HWiNFO (its shared memory, or
+#                                              failing that its "Gadget" registry export) or LibreHardwareMonitor /
+#                                              OpenHardwareMonitor (their WMI provider), but only while one of those programs is
+#                                              running; otherwise the page says so.
+#   Resolution, refresh rate, HDR              the display driver (EnumDisplaySettings, QueryDisplayConfig)
+#
+# Everything lives in $sysEngine so the same text can run in a background worker and in the tests.
+# C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
+# Names to avoid for local variables here (the engine uses them as shared names): $log $DryRun $StorePath $Q
+# =============================================================================
+$SysShared = $null    # the shared state of the background reader (its host sets it; the code below reads and writes its fields)
+$sysEngine = {
+
+$script:SysSrcDisp = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class SysDisp
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DEVMODE
+    {
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmDeviceName;
+        public short dmSpecVersion;
+        public short dmDriverVersion;
+        public short dmSize;
+        public short dmDriverExtra;
+        public int dmFields;
+        public int dmPositionX;
+        public int dmPositionY;
+        public int dmDisplayOrientation;
+        public int dmDisplayFixedOutput;
+        public short dmColor;
+        public short dmDuplex;
+        public short dmYResolution;
+        public short dmTTOption;
+        public short dmCollate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string dmFormName;
+        public short dmLogPixels;
+        public int dmBitsPerPel;
+        public int dmPelsWidth;
+        public int dmPelsHeight;
+        public int dmDisplayFlags;
+        public int dmDisplayFrequency;
+        public int dmICMMethod;
+        public int dmICMIntent;
+        public int dmMediaType;
+        public int dmDitherType;
+        public int dmReserved1;
+        public int dmReserved2;
+        public int dmPanningWidth;
+        public int dmPanningHeight;
+    }
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Ansi)]
+    public struct DISPLAY_DEVICE
+    {
+        public int cb;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string DeviceName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceString;
+        public int StateFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceID;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)] public string DeviceKey;
+    }
+
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+    static extern bool EnumDisplaySettings(string deviceName, int modeNum, ref DEVMODE devMode);
+    [DllImport("user32.dll", CharSet = CharSet.Ansi)]
+    static extern bool EnumDisplayDevices(string device, uint devNum, ref DISPLAY_DEVICE dd, uint flags);
+
+    static DEVMODE NewMode()
+    {
+        DEVMODE d = new DEVMODE();
+        d.dmSize = (short)Marshal.SizeOf(typeof(DEVMODE));
+        return d;
+    }
+
+    // "device name|1 if primary|monitor id|monitor name", one per screen that is part of the desktop
+    public static string[] Screens()
+    {
+        List<string> res = new List<string>();
+        for (uint i = 0; i < 16; i++)
+        {
+            DISPLAY_DEVICE dd = new DISPLAY_DEVICE();
+            dd.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+            if (!EnumDisplayDevices(null, i, ref dd, 0)) { break; }
+            if ((dd.StateFlags & 1) == 0) { continue; }
+            string mon = "";
+            string monName = "";
+            DISPLAY_DEVICE md = new DISPLAY_DEVICE();
+            md.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+            if (EnumDisplayDevices(dd.DeviceName, 0, ref md, 0)) { mon = md.DeviceID; monName = md.DeviceString; }
+            res.Add(dd.DeviceName + "|" + (((dd.StateFlags & 4) != 0) ? "1" : "0") + "|" + mon + "|" + monName);
+        }
+        return res.ToArray();
+    }
+
+    // "width|height|hertz|bits per pixel" of the mode in use now, or "" when it cannot be read
+    public static string Current(string device)
+    {
+        DEVMODE m = NewMode();
+        if (!EnumDisplaySettings(device, -1, ref m)) { return ""; }
+        return m.dmPelsWidth + "|" + m.dmPelsHeight + "|" + m.dmDisplayFrequency + "|" + m.dmBitsPerPel;
+    }
+
+    // "width|height|hertz" for every mode the screen offers (each combination once)
+    public static string[] Modes(string device)
+    {
+        List<string> res = new List<string>();
+        HashSet<string> seen = new HashSet<string>();
+        for (int i = 0; i < 20000; i++)
+        {
+            DEVMODE m = NewMode();
+            if (!EnumDisplaySettings(device, i, ref m)) { break; }
+            string k = m.dmPelsWidth + "|" + m.dmPelsHeight + "|" + m.dmDisplayFrequency;
+            if (seen.Add(k)) { res.Add(k); }
+        }
+        return res.ToArray();
+    }
+}
+'@
+
+# HDR ("advanced colour") and the exact refresh rate of each active screen. The structures are read from plain memory by offset
+# (a path is 72 bytes, a packet 20 bytes of header plus its data), so nothing depends on how a struct is laid out in C#.
+$script:SysSrcColor = @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class SysColor
+{
+    [DllImport("user32.dll")]
+    static extern int GetDisplayConfigBufferSizes(uint flags, out uint numPaths, out uint numModes);
+    [DllImport("user32.dll")]
+    static extern int QueryDisplayConfig(uint flags, ref uint numPaths, IntPtr paths, ref uint numModes, IntPtr modes, IntPtr topology);
+    [DllImport("user32.dll")]
+    static extern int DisplayConfigGetDeviceInfo(IntPtr packet);
+
+    // one line per active screen: "GDI name|colour supported|colour enabled|wide colour only|bits per channel|refresh numerator|refresh denominator"
+    public static string[] Query()
+    {
+        List<string> res = new List<string>();
+        uint np;
+        uint nm;
+        if (GetDisplayConfigBufferSizes(2, out np, out nm) != 0 || np == 0) { return res.ToArray(); }
+        IntPtr paths = Marshal.AllocHGlobal((int)(np * 144));
+        IntPtr modes = Marshal.AllocHGlobal((int)((nm + 1) * 128));
+        IntPtr pkt = Marshal.AllocHGlobal(256);
+        try
+        {
+            if (QueryDisplayConfig(2, ref np, paths, ref nm, modes, IntPtr.Zero) != 0) { return res.ToArray(); }
+            for (int i = 0; i < (int)np; i++)
+            {
+                int p = i * 72;
+                for (int b = 0; b < 256; b += 4) { Marshal.WriteInt32(pkt, b, 0); }
+                Marshal.WriteInt32(pkt, 0, 1);                                  // the name of the screen (source) this path starts at
+                Marshal.WriteInt32(pkt, 4, 84);
+                Marshal.WriteInt32(pkt, 8, Marshal.ReadInt32(paths, p));
+                Marshal.WriteInt32(pkt, 12, Marshal.ReadInt32(paths, p + 4));
+                Marshal.WriteInt32(pkt, 16, Marshal.ReadInt32(paths, p + 8));
+                string name = "";
+                if (DisplayConfigGetDeviceInfo(pkt) == 0)
+                {
+                    name = Marshal.PtrToStringUni(new IntPtr(pkt.ToInt64() + 20), 32);
+                    int z = name.IndexOf('\0');
+                    if (z >= 0) { name = name.Substring(0, z); }
+                }
+                for (int b = 0; b < 256; b += 4) { Marshal.WriteInt32(pkt, b, 0); }
+                Marshal.WriteInt32(pkt, 0, 9);                                  // advanced colour information of the monitor (target)
+                Marshal.WriteInt32(pkt, 4, 32);
+                Marshal.WriteInt32(pkt, 8, Marshal.ReadInt32(paths, p + 20));
+                Marshal.WriteInt32(pkt, 12, Marshal.ReadInt32(paths, p + 24));
+                Marshal.WriteInt32(pkt, 16, Marshal.ReadInt32(paths, p + 28));
+                int sup = 0; int en = 0; int wide = 0; int bits = 0;
+                if (DisplayConfigGetDeviceInfo(pkt) == 0)
+                {
+                    int v = Marshal.ReadInt32(pkt, 20);
+                    sup = v & 1;
+                    en = (v >> 1) & 1;
+                    wide = (v >> 2) & 1;
+                    bits = Marshal.ReadInt32(pkt, 28);
+                }
+                uint num = (uint)Marshal.ReadInt32(paths, p + 48);
+                uint den = (uint)Marshal.ReadInt32(paths, p + 52);
+                res.Add(name + "|" + sup + "|" + en + "|" + wide + "|" + bits + "|" + num + "|" + den);
+            }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(paths);
+            Marshal.FreeHGlobal(modes);
+            Marshal.FreeHGlobal(pkt);
+        }
+        return res.ToArray();
+    }
+}
+'@
+
+# Returns '' when the helper is ready, otherwise the reason it could not be built.
+function Sys-Ensure {
+    param([string]$Which)
+    $type = 'SysDisp'; $src = $script:SysSrcDisp
+    if ($Which -eq 'Color') { $type = 'SysColor'; $src = $script:SysSrcColor }
+    if ($type -as [type]) { return '' }
+    try {
+        Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
+        return ''
+    } catch {
+        return [string]$_.Exception.Message
+    }
+}
+
+# ------------------------------------------------------------------ small helpers ----
+# A number out of a text: '12.5', '4,198 MHz', '52,5' (decimal comma, when $Raw says the text is an unformatted number),
+# '[N/A]' and '' give $null
+function Sys-Num {
+    param($v, [switch]$Raw)
+    if ($null -eq $v) { return $null }
+    $s = ([string]$v).Trim()
+    if (-not $s) { return $null }
+    if ($s -match '^\[?\s*(N/A|Not Supported|Unknown Error|Not Available)\s*\]?$') { return $null }
+    $m = [regex]::Match($s, '^-?[\d.,]*\d')
+    if (-not $m.Success) { return $null }
+    $t = $m.Value
+    if ($t.Contains(',') -and $t.Contains('.')) { $t = $t.Replace(',', '') }
+    elseif ($t.Contains(',')) { if ($Raw) { $t = $t.Replace(',', '.') } else { $t = $t.Replace(',', '') } }
+    $d = 0.0
+    if ([double]::TryParse($t, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d)) { return $d }
+    return $null
+}
+
+function Sys-RegGet {
+    param([string]$Hive, [string]$Sub, [string]$Name)
+    $root = $null
+    try {
+        if ($Hive -eq 'HKCU') { $root = [Microsoft.Win32.Registry]::CurrentUser } else { $root = [Microsoft.Win32.Registry]::LocalMachine }
+        $k = $root.OpenSubKey($Sub)
+        if (-not $k) { return $null }
+        try { return $k.GetValue($Name, $null) } finally { $k.Close() }
+    } catch { return $null }
+}
+# every value of a key as name -> value; $null when the key is not there
+function Sys-RegAll {
+    param([string]$Hive, [string]$Sub)
+    try {
+        if ($Hive -eq 'HKCU') { $root = [Microsoft.Win32.Registry]::CurrentUser } else { $root = [Microsoft.Win32.Registry]::LocalMachine }
+        $k = $root.OpenSubKey($Sub)
+        if (-not $k) { return $null }
+        try {
+            $h = @{}
+            foreach ($n in $k.GetValueNames()) { if ($n) { $h[[string]$n] = $k.GetValue($n, $null) } }
+            return $h
+        } finally { $k.Close() }
+    } catch { return $null }
+}
+function Sys-RegSubKeys {
+    param([string]$Hive, [string]$Sub)
+    try {
+        if ($Hive -eq 'HKCU') { $root = [Microsoft.Win32.Registry]::CurrentUser } else { $root = [Microsoft.Win32.Registry]::LocalMachine }
+        $k = $root.OpenSubKey($Sub)
+        if (-not $k) { return @() }
+        try { return @($k.GetSubKeyNames()) } finally { $k.Close() }
+    } catch { return @() }
+}
+
+function Sys-ProcRunning {
+    param([string[]]$Names)
+    foreach ($n in $Names) {
+        try { if (@([System.Diagnostics.Process]::GetProcessesByName($n)).Count -gt 0) { return $true } } catch { }
+    }
+    return $false
+}
+
+# Runs a program and returns what it printed, or $null when it failed or took longer than $TimeoutMs
+function Sys-RunTool {
+    param([string]$Exe, [string]$ToolArgs, [int]$TimeoutMs = 4000)
+    $p = $null
+    try {
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = $Exe
+        $psi.Arguments = $ToolArgs
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.CreateNoWindow = $true
+        $p = New-Object System.Diagnostics.Process
+        $p.StartInfo = $psi
+        [void]$p.Start()
+        $task = $p.StandardOutput.ReadToEndAsync()
+        $err = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($TimeoutMs)) { try { $p.Kill() } catch { }; return $null }
+        [void]$task.Wait(2000)
+        return [string]$task.Result
+    } catch {
+        return $null
+    } finally {
+        if ($p) { try { $p.Dispose() } catch { } }
+    }
+}
+
+# A CIM date (or text) as a date, $null when it is none
+function Sys-Date {
+    param($v)
+    if ($null -eq $v) { return $null }
+    if ($v -is [datetime]) { if ($v.Year -lt 1990) { return $null }; return $v }
+    $s = ([string]$v).Trim()
+    if (-not $s) { return $null }
+    if ($s -match '^\d{14}\.\d+[+-]\d+$') {
+        try { return [Management.ManagementDateTimeConverter]::ToDateTime($s) } catch { return $null }
+    }
+    if ($s -match '^\d{10}$') { return ([datetime]'1970-01-01').AddSeconds([double]$s) }
+    if ($s -match '^\d{13}$') { return ([datetime]'1970-01-01').AddMilliseconds([double]$s) }
+    $d = [datetime]::MinValue
+    if ([datetime]::TryParse($s, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeLocal, [ref]$d)) { if ($d.Year -ge 1990) { return $d } }
+    return $null
+}
+
+# ----------------------------------------------------------------- the PC, once ----
+# "Microsoft Windows 11 Pro" / "Windows 10 Pro" with a Windows 11 build number -> "Windows 11 Pro"
+function Sys-OsName {
+    param([string]$Caption, [string]$Build, [string]$Product)
+    $c = ([string]$Caption).Trim()
+    if ($c.StartsWith('Microsoft ')) { $c = $c.Substring(10).Trim() }
+    $b = 0; [void][int]::TryParse([string]$Build, [ref]$b)
+    if (-not $c) { $c = ([string]$Product).Trim() }
+    if ($b -ge 22000 -and $c -match '^Windows 10') { $c = 'Windows 11' + $c.Substring(10) }
+    if (-not $c) { $c = 'Windows' }
+    return $c
+}
+# the vendor name as people write it
+function Sys-Vendor {
+    param([string]$Text)
+    $t = [string]$Text
+    if ($t -match 'AuthenticAMD|Advanced Micro Devices|\bAMD\b') { return 'AMD' }
+    if ($t -match 'GenuineIntel|Intel') { return 'Intel' }
+    if ($t -match 'NVIDIA') { return 'NVIDIA' }
+    return ''
+}
+
+function Get-SysOs {
+    $o = @{ Name = ''; Edition = ''; Display = ''; Build = ''; Ubr = ''; Full = ''; Arch = ''; Installed = $null; Boot = $null; TotalMB = 0 }
+    $cv = 'SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $caption = ''
+    try {
+        $c = @(Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop)[0]
+        $caption = [string]$c.Caption
+        $o.Arch = [string]$c.OSArchitecture
+        $o.Installed = Sys-Date $c.InstallDate
+        $o.Boot = Sys-Date $c.LastBootUpTime
+        $o.TotalMB = [int]([double]$c.TotalVisibleMemorySize / 1024)
+        $o.Build = [string]$c.BuildNumber
+    } catch { }
+    $b = [string](Sys-RegGet 'HKLM' $cv 'CurrentBuild')
+    if (-not $b) { $b = [string](Sys-RegGet 'HKLM' $cv 'CurrentBuildNumber') }
+    if ($b) { $o.Build = $b }
+    $o.Ubr = [string](Sys-RegGet 'HKLM' $cv 'UBR')
+    $dv = [string](Sys-RegGet 'HKLM' $cv 'DisplayVersion')
+    if (-not $dv) { $dv = [string](Sys-RegGet 'HKLM' $cv 'ReleaseId') }
+    $o.Display = $dv
+    $o.Edition = [string](Sys-RegGet 'HKLM' $cv 'EditionID')
+    $o.Name = Sys-OsName $caption $o.Build ([string](Sys-RegGet 'HKLM' $cv 'ProductName'))
+    if ($o.Build) { $o.Full = $o.Build; if ($o.Ubr) { $o.Full = $o.Build + '.' + $o.Ubr } }
+    return $o
+}
+
+function Get-SysCpu {
+    $o = @{ Name = ''; Vendor = ''; Cores = 0; Threads = 0; BaseMHz = 0; L3MB = 0 }
+    try {
+        $c = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)[0]
+        $o.Name = ([regex]::Replace([string]$c.Name, '\s+', ' ')).Trim()
+        $o.Vendor = Sys-Vendor ([string]$c.Manufacturer + ' ' + [string]$c.Name)
+        $o.Cores = [int]$c.NumberOfCores
+        $o.Threads = [int]$c.NumberOfLogicalProcessors
+        $o.BaseMHz = [int]$c.MaxClockSpeed
+        $o.L3MB = [int]([double]$c.L3CacheSize / 1024)
+    } catch { }
+    return $o
+}
+
+# The graphics card shown on the page: an NVIDIA card first, then any other that is not the basic one built into the processor
+function Sys-PickGpu {
+    param($Names)
+    $list = @($Names | Where-Object { $_ })
+    foreach ($n in $list) { if ($n -match 'NVIDIA|GeForce|RTX|GTX|Quadro') { return [string]$n } }
+    foreach ($n in $list) { if ($n -match 'Radeon (RX|PRO)|Arc\b|Intel.*Arc') { return [string]$n } }
+    foreach ($n in $list) { if ($n -notmatch 'Basic|Remote|Virtual|Microsoft') { return [string]$n } }
+    if ($list.Count) { return [string]$list[0] }
+    return ''
+}
+function Get-SysGpu {
+    $o = @{ Name = ''; Vendor = ''; Driver = ''; VramMB = 0; Others = @() }
+    try {
+        $v = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
+        $names = @($v | ForEach-Object { ([string]$_.Name).Trim() } | Where-Object { $_ })
+        $o.Name = Sys-PickGpu $names
+        $o.Others = @($names | Where-Object { $_ -ne $o.Name })
+        $o.Vendor = Sys-Vendor $o.Name
+        foreach ($x in $v) {
+            if (([string]$x.Name).Trim() -eq $o.Name) {
+                $o.Driver = [string]$x.DriverVersion
+                $o.VramMB = [int]([double]$x.AdapterRAM / 1MB)       # a 32-bit number: at most 4 GB, so the real size is read below
+            }
+        }
+    } catch { }
+    # the real video memory: the driver writes it as a 64-bit number under the display adapter class
+    try {
+        $cls = 'SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}'
+        foreach ($k in (Sys-RegSubKeys 'HKLM' $cls)) {
+            if ($k -notmatch '^\d{4}$') { continue }
+            $desc = [string](Sys-RegGet 'HKLM' ($cls + '\' + $k) 'DriverDesc')
+            if ($desc.Trim() -ne $o.Name) { continue }
+            $q = Sys-RegGet 'HKLM' ($cls + '\' + $k) 'HardwareInformation.qwMemorySize'
+            # a 64-bit number on most PCs, 8 bytes of plain data on some
+            if ($q -is [array] -and @($q).Count -eq 8) { $q = [BitConverter]::ToInt64([byte[]]@($q), 0) }
+            if ($null -ne $q -and [double]$q -gt 0) { $o.VramMB = [int]([double]$q / 1MB); break }
+        }
+    } catch { }
+    return $o
+}
+
+# DDR type from the SMBIOS memory type code
+function Sys-RamType {
+    param([int]$Code)
+    switch ($Code) { 34 { return 'DDR5' } 26 { return 'DDR4' } 24 { return 'DDR3' } 35 { return 'LPDDR5' } 29 { return 'LPDDR3' } 30 { return 'LPDDR4' } }
+    return ''
+}
+# Win32_PhysicalMemory passes on what the memory's SMBIOS entry says, and a few firmware versions write the clock (half the transfer rate)
+# instead of the rate. DDR5 does not exist below 3200 MT/s nor DDR4 below 1600, so a lower number is a clock and is doubled.
+function Sys-FixMT {
+    param([string]$Type, [int]$MT)
+    if ($MT -le 0) { return $MT }
+    if ($Type -eq 'DDR5' -and $MT -lt 3200) { return ($MT * 2) }
+    if ($Type -eq 'DDR4' -and $MT -lt 1600) { return ($MT * 2) }
+    return $MT
+}
+function Get-SysRam {
+    $o = @{ TotalGB = 0.0; Type = ''; Modules = @(); SpeedMT = 0; RatedMT = 0 }
+    try {
+        $m = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
+        $bytes = 0.0
+        $mods = @()
+        foreach ($x in $m) {
+            $bytes += [double]$x.Capacity
+            $ty = Sys-RamType ([int]$x.SMBIOSMemoryType)
+            $mods += ,@{ Slot = ([string]$x.DeviceLocator).Trim(); GB = [Math]::Round([double]$x.Capacity / 1GB, 0); Maker = ([string]$x.Manufacturer).Trim()
+                         Part = ([string]$x.PartNumber).Trim(); RatedMT = (Sys-FixMT $ty ([int]$x.Speed)); MT = (Sys-FixMT $ty ([int]$x.ConfiguredClockSpeed)); Type = $ty }
+        }
+        $o.Modules = $mods
+        $o.TotalGB = [Math]::Round($bytes / 1GB, 0)
+        if ($mods.Count) {
+            $o.Type = [string]$mods[0].Type
+            $o.SpeedMT = [int](($mods | ForEach-Object { [int]$_.MT } | Measure-Object -Maximum).Maximum)
+            $o.RatedMT = [int](($mods | ForEach-Object { [int]$_.RatedMT } | Measure-Object -Maximum).Maximum)
+        }
+    } catch { }
+    return $o
+}
+
+function Get-SysBoard {
+    $o = @{ Maker = ''; Product = ''; Version = ''; Model = ''; BiosVendor = ''; BiosVersion = ''; BiosDate = $null }
+    try {
+        $b = @(Get-CimInstance -ClassName Win32_BaseBoard -ErrorAction Stop)[0]
+        $o.Maker = ([string]$b.Manufacturer).Trim()
+        $o.Product = ([string]$b.Product).Trim()
+        $o.Version = ([string]$b.Version).Trim()
+    } catch { }
+    try {
+        $s = @(Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop)[0]
+        $o.Model = ([string]$s.Model).Trim()
+    } catch { }
+    try {
+        $bios = @(Get-CimInstance -ClassName Win32_BIOS -ErrorAction Stop)[0]
+        $o.BiosVendor = ([string]$bios.Manufacturer).Trim()
+        $o.BiosVersion = ([string]$bios.SMBIOSBIOSVersion).Trim()
+        $o.BiosDate = Sys-Date $bios.ReleaseDate
+    } catch { }
+    return $o
+}
+
+function Get-SysStatic {
+    $s = @{ Os = $null; Cpu = $null; Gpu = $null; Ram = $null; Board = $null; Storage = $null; At = (Get-Date) }
+    try { $s.Os = Get-SysOs } catch { }
+    try { $s.Cpu = Get-SysCpu } catch { }
+    try { $s.Gpu = Get-SysGpu } catch { }
+    try { $s.Ram = Get-SysRam } catch { }
+    try { $s.Board = Get-SysBoard } catch { }
+    try { $s.Storage = @(Get-SysStorage) } catch { }
+    return $s
+}
+
+# --------------------------------------------------------------- drives ----
+# Windows' own storage service knows each drive's model, size, kind and (through the drive's SMART data) its temperature and wear, so
+# none of this needs a driver or another program. A drive or a driver that does not report a number gives $null for it.
+function Get-SysStorage {
+    $list = @()
+    foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
+        $sz = $null; try { $sz = [double]$d.Size } catch { }
+        $list += ,@{ Id = [string]$d.DeviceId; Name = ([string]$d.FriendlyName).Trim(); Media = [string]$d.MediaType; Bus = [string]$d.BusType; Bytes = $sz; Health = [string]$d.HealthStatus }
+    }
+    return $list
+}
+# Id -> @{ Temp; Wear; Hours } for every drive Windows has numbers for
+function Sys-StorageLive {
+    $o = @{}
+    foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
+        $rc = $null
+        try { $rc = $d | Get-StorageReliabilityCounter -ErrorAction Stop } catch { }
+        if (-not $rc) { continue }
+        $t = Sys-Num $rc.Temperature
+        if ($null -ne $t -and ([double]$t -le 0 -or [double]$t -ge 150)) { $t = $null }          # 0 means "not reported"
+        $w = Sys-Num $rc.Wear
+        if ($null -ne $w -and ([double]$w -lt 0 -or [double]$w -gt 100)) { $w = $null }
+        $h = Sys-Num $rc.PowerOnHours
+        if ($null -ne $h -and [double]$h -lt 0) { $h = $null }
+        $o[[string]$d.DeviceId] = @{ Temp = $t; Wear = $w; Hours = $h }
+    }
+    return $o
+}
+
+# --------------------------------------------------------------- the live numbers ----
+# Performance counters are created once and kept (a rate counter needs two readings). The names are English: on a Windows in
+# another language a counter is simply missing and the page shows "not available" for it.
+$script:SysPc = $null
+function Sys-PcNew {
+    $o = @{}
+    $defs = @(
+        @('CpuUtil', 'Processor Information', '% Processor Utility', '_Total'),
+        @('CpuPerf', 'Processor Information', '% Processor Performance', '_Total'),
+        @('CpuFreq', 'Processor Information', 'Processor Frequency', '_Total'),
+        @('Procs', 'System', 'Processes', ''),
+        @('Threads', 'System', 'Threads', ''),
+        @('MemAvail', 'Memory', 'Available MBytes', '')
+    )
+    foreach ($d in $defs) {
+        try {
+            if ($d[3]) { $c = New-Object System.Diagnostics.PerformanceCounter($d[1], $d[2], $d[3], $true) }
+            else { $c = New-Object System.Diagnostics.PerformanceCounter($d[1], $d[2], '', $true) }
+            [void]$c.NextValue()
+            $o[$d[0]] = $c
+        } catch { }
+    }
+    return $o
+}
+function Sys-PcRead {
+    param($c)
+    if (-not $c) { return $null }
+    try { return [double]$c.NextValue() } catch { return $null }
+}
+
+# The clock the CPU runs at: the nominal frequency times "% Processor Performance" (what Task Manager's Speed shows)
+function Sys-CpuClock {
+    param($FreqMHz, $PerfPct)
+    if ($null -eq $FreqMHz -or $null -eq $PerfPct) { return $null }
+    if ([double]$FreqMHz -le 0 -or [double]$PerfPct -le 0) { return $null }
+    return [Math]::Round([double]$FreqMHz * [double]$PerfPct / 100.0, 0)
+}
+
+# ---- NVIDIA ----
+$script:SysSmi = $null              # the path of nvidia-smi, '' when there is none, $null before the first look
+$script:SmiSets = @(
+    @('name', 'driver_version', 'temperature.gpu', 'power.draw', 'power.limit', 'clocks.gr', 'clocks.max.gr', 'clocks.mem', 'utilization.gpu', 'memory.used', 'memory.total', 'fan.speed', 'pstate'),
+    @('name', 'driver_version', 'temperature.gpu', 'power.draw', 'clocks.gr', 'utilization.gpu', 'memory.used', 'memory.total')
+)
+$script:SmiSet = 0
+function Sys-FindSmi {
+    foreach ($p in @("$env:SystemRoot\System32\nvidia-smi.exe", "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe")) {
+        try { if ($p -and (Test-Path -LiteralPath $p)) { return $p } } catch { }
+    }
+    try { $c = Get-Command 'nvidia-smi.exe' -ErrorAction Ignore; if ($c) { return [string]$c.Source } } catch { }
+    return ''
+}
+# "NVIDIA GeForce RTX 5080, 581.80, 45, 38.52, 360.00, 2640, 3090, 14001, 3, 1062, 16303, 0, P8" -> a table of the fields. $null when the
+# line does not have as many values as asked for.
+function Sys-ParseSmi {
+    param([string]$Text, [string[]]$Fields)
+    foreach ($line in ([string]$Text -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l -or $l -match 'not a valid field|Failed to initialize|No devices were found|NVIDIA-SMI has failed') { continue }
+        $parts = @($l -split ',' | ForEach-Object { $_.Trim() })
+        if ($parts.Count -ne $Fields.Count) { return $null }
+        $h = @{}
+        for ($i = 0; $i -lt $Fields.Count; $i++) { $h[[string]$Fields[$i]] = [string]$parts[$i] }
+        return $h
+    }
+    return $null
+}
+function Sys-GpuNvidia {
+    if ($null -eq $script:SysSmi) { $script:SysSmi = Sys-FindSmi }
+    if (-not $script:SysSmi) { return $null }
+    for ($tries = 0; $tries -lt $script:SmiSets.Count; $tries++) {
+        $f = @($script:SmiSets[$script:SmiSet])
+        $txt = Sys-RunTool $script:SysSmi ('--query-gpu=' + ($f -join ',') + ' --format=csv,noheader,nounits') 5000
+        if ($null -eq $txt) { return $null }        # the program did not run or did not answer in time: nothing to learn about the fields
+        $h = Sys-ParseSmi $txt $f
+        if ($h) { return (Sys-GpuFromSmi $h) }
+        # an older driver may not know every field: try the shorter list once, and remember which one worked
+        if ($script:SmiSet -lt ($script:SmiSets.Count - 1)) { $script:SmiSet++ } else { break }
+    }
+    return $null
+}
+# A number outside what a graphics card can report (a glitch, or a driver's placeholder) is no reading: $null
+function Sys-Plausible {
+    param($v, $Min, $Max)
+    if (Sys-InRange $v $Min $Max) { return [double]$v }
+    return $null
+}
+function Sys-GpuFromSmi {
+    param($h)
+    $used = Sys-Plausible (Sys-Num $h['memory.used']) 0 1000000
+    $tot = Sys-Plausible (Sys-Num $h['memory.total']) 1 1000000
+    if ($null -ne $used -and $null -ne $tot -and $used -gt $tot) { $used = $null }
+    return @{ Source = 'nvidia-smi'; Name = [string]$h['name']; Driver = [string]$h['driver_version']
+              Temp = (Sys-Plausible (Sys-Num $h['temperature.gpu']) 1 130); Power = (Sys-Plausible (Sys-Num $h['power.draw']) 0 2000)
+              PowerLimit = (Sys-Plausible (Sys-Num $h['power.limit']) 1 2000)
+              ClockMHz = (Sys-Plausible (Sys-Num $h['clocks.gr']) 0 6000); ClockMaxMHz = (Sys-Plausible (Sys-Num $h['clocks.max.gr']) 1 6000)
+              MemClockMHz = (Sys-Plausible (Sys-Num $h['clocks.mem']) 0 20000)
+              Usage = (Sys-Plausible (Sys-Num $h['utilization.gpu']) 0 100); MemUsedMB = $used; MemTotalMB = $tot
+              Fan = (Sys-Plausible (Sys-Num $h['fan.speed']) 0 100); PState = [string]$h['pstate'] }
+}
+# without nvidia-smi: what Windows itself counts (usage of the 3D engine, video memory in use)
+function Sys-GpuWindows {
+    $g = @{ Source = 'windows'; Name = ''; Driver = ''; Temp = $null; Power = $null; PowerLimit = $null; ClockMHz = $null; ClockMaxMHz = $null; MemClockMHz = $null
+            Usage = $null; MemUsedMB = $null; MemTotalMB = $null; Fan = $null; PState = '' }
+    try {
+        $s = @((Get-Counter -Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction Stop).CounterSamples)
+        if ($s.Count) { $sum = 0.0; foreach ($x in $s) { $sum += [double]$x.CookedValue }; $g.Usage = [Math]::Min(100.0, [Math]::Round($sum, 0)) }
+    } catch { }
+    try {
+        $s = @((Get-Counter -Counter '\GPU Adapter Memory(*)\Dedicated Usage' -ErrorAction Stop).CounterSamples)
+        if ($s.Count) { $max = 0.0; foreach ($x in $s) { if ([double]$x.CookedValue -gt $max) { $max = [double]$x.CookedValue } }; $g.MemUsedMB = [Math]::Round($max / 1MB, 0) }
+    } catch { }
+    return $g
+}
+
+# ---- sensors from HWiNFO and LibreHardwareMonitor ----
+# HWiNFO writes one group of values per sensor the person ticked ("Report value in Gadget") under HKCU\SOFTWARE\HWiNFO64\VSB:
+# Sensor<N> (the group), Label<N> (the reading), Value<N> (formatted, with unit) and ValueRaw<N> (the plain number).
+function Sys-HwiItems {
+    param($Values)
+    $items = @()
+    $idx = @()
+    foreach ($k in @($Values.Keys)) { if ([string]$k -match '^Label(\d+)$') { $idx += [int]$Matches[1] } }
+    foreach ($ix in @($idx | Sort-Object)) {
+        $n = [string]$ix
+        $k = 'Label' + $n
+        $text = [string]$Values["Value$n"]
+        $v = Sys-Num $Values["ValueRaw$n"] -Raw
+        if ($null -eq $v) { $v = Sys-Num $text }
+        $unit = ''
+        $m = [regex]::Match($text, '^\s*-?[\d.,]+\s*(.*)$')
+        if ($m.Success) { $unit = $m.Groups[1].Value.Trim() }
+        $items += ,@{ Sensor = [string]$Values["Sensor$n"]; Label = ([string]$Values[$k]).Trim(); Text = $text; Value = $v; Unit = $unit }
+    }
+    return $items
+}
+# HWiNFO's shared memory ("Shared Memory Support" in its Settings, off by default) holds EVERY reading, with no need to tick them one by
+# one. It is a memory-mapped file named Global\HWiNFO_SENS_SM2: a header, a list of sensors and a list of readings (HWiNFO's own
+# hwisenssm2.h describes it). The free HWiNFO switches it off again after 12 hours; HWiNFO Pro does not.
+#   header   signature 'HWiS' (0x53695748; 'DEAD' or 'DAED' once HWiNFO has ended), version, revision, poll time (8 bytes),
+#            then six numbers: offset, element size and count of the sensor list, and of the reading list, then the polling period (ms)
+#   sensor   id, instance, name (128 bytes), your name for it (128 bytes)
+#   reading  type, sensor index, id, label (128), your label (128), unit (16), value, min, max, average (doubles)
+# The reading is cut out of a byte array so that it can be tested without Windows.
+$script:Latin1 = [System.Text.Encoding]::GetEncoding('iso-8859-1')
+function Sys-HwiText {
+    param([byte[]]$B, [int]$Off, [int]$Len)
+    $cnt = [Math]::Min($Len, $B.Length - $Off)
+    if ($cnt -le 0) { return '' }
+    $z = [Array]::IndexOf($B, [byte]0, $Off, $cnt)
+    $n = $cnt
+    if ($z -ge 0) { $n = $z - $Off }
+    if ($n -le 0) { return '' }
+    return $script:Latin1.GetString($B, $Off, $n)
+}
+# Where the two lists are, from the first bytes. $null when this is not a HWiNFO header.  Why: signature | ended | layout | short
+function Sys-HwiLayout {
+    param([byte[]]$Hdr)
+    $r = @{ Ok = $false; Why = ''; Base = 20; OffS = 0; SizeS = 0; NumS = 0; OffR = 0; SizeR = 0; NumR = 0 }
+    if (-not $Hdr -or $Hdr.Length -lt 48) { $r.Why = 'short'; return $r }
+    $sig = [BitConverter]::ToUInt32($Hdr, 0)
+    # "DEAD" once HWiNFO has ended. Programs that read this memory spell it both ways ("DEAD" = 0x44414544, "DAED" = 0x44454144), and which
+    # one HWiNFO writes was not checked here, so both count
+    if ($sig -eq 0x44414544 -or $sig -eq 0x44454144) { $r.Why = 'ended'; return $r }
+    if ($sig -ne 0x53695748) { $r.Why = 'signature'; return $r }
+    # the header is packed (the six numbers start at byte 20); a build that aligns the poll time to 8 bytes has them from byte 24
+    foreach ($b in 20, 24) {
+        if ($Hdr.Length -lt ($b + 24)) { continue }
+        $offS = [uint32][BitConverter]::ToUInt32($Hdr, $b);      $sizeS = [uint32][BitConverter]::ToUInt32($Hdr, $b + 4);  $numS = [uint32][BitConverter]::ToUInt32($Hdr, $b + 8)
+        $offR = [uint32][BitConverter]::ToUInt32($Hdr, $b + 12); $sizeR = [uint32][BitConverter]::ToUInt32($Hdr, $b + 16); $numR = [uint32][BitConverter]::ToUInt32($Hdr, $b + 20)
+        if ($offS -ge ($b + 24) -and $offS -le 256 -and $sizeS -ge 8 -and $sizeS -le 4096 -and $numS -le 4096 -and $sizeR -ge 316 -and $sizeR -le 8192 -and $numR -le 100000 -and $offR -ge $offS) {
+            $r.Ok = $true; $r.Base = $b; $r.OffS = [int]$offS; $r.SizeS = [int]$sizeS; $r.NumS = [int]$numS; $r.OffR = [int]$offR; $r.SizeR = [int]$sizeR; $r.NumR = [int]$numR
+            return $r
+        }
+    }
+    $r.Why = 'layout'
+    return $r
+}
+# HWiNFO writes the time of its last poll (seconds since 1970, UTC) into the header, and the polling period (milliseconds) after the six
+# numbers. When its Sensors window is closed or paused, the memory stays but nothing in it changes any more: the numbers are frozen. $Now is
+# the current time in the same unit. A poll time that is 0 or lies far in the future (a clock that is wrong) is not judged.
+function Sys-HwiUnixNow {
+    return [int64]([DateTime]::UtcNow - (New-Object DateTime 1970, 1, 1, 0, 0, 0, ([DateTimeKind]::Utc))).TotalSeconds
+}
+function Sys-HwiStale {
+    param([byte[]]$Hdr, $Lay, $Now = $null)
+    if (-not $Hdr -or -not $Lay -or -not $Lay.Ok) { return $false }
+    $pAt = [int]$Lay.Base - 8
+    if ($pAt -lt 12 -or $Hdr.Length -lt ($pAt + 8)) { return $false }
+    $poll = [BitConverter]::ToInt64($Hdr, $pAt)
+    if ($poll -le 0) { return $false }
+    if ($null -eq $Now) { $Now = Sys-HwiUnixNow }
+    $age = [int64]$Now - $poll
+    if ($age -lt -600) { return $false }
+    $limit = 60.0
+    $perAt = [int]$Lay.Base + 24
+    if ($Hdr.Length -ge ($perAt + 4)) {
+        $per = [BitConverter]::ToUInt32($Hdr, $perAt)
+        if ($per -ge 100 -and $per -le 600000) { $limit = [Math]::Max($limit, 5.0 * $per / 1000.0) }
+    }
+    return ($age -gt $limit)
+}
+# $Want (a regular expression) keeps only the readings whose label matches: the others are not cut out at all. Total is the number of
+# readings in the memory, whatever was kept.
+function Sys-HwiParseShared {
+    param([byte[]]$Bytes, $Now = $null, [string]$Want = '')
+    $r = @{ Ok = $false; Why = ''; Items = @(); Total = 0 }
+    $lay = Sys-HwiLayout $Bytes
+    if (-not $lay.Ok) { $r.Why = [string]$lay.Why; return $r }
+    if (Sys-HwiStale $Bytes $lay $Now) { $r.Why = 'stale'; return $r }
+    $end = [Math]::Max($lay.OffS + $lay.SizeS * $lay.NumS, $lay.OffR + $lay.SizeR * $lay.NumR)
+    if ($Bytes.Length -lt $end) { $r.Why = 'short'; return $r }
+    $r.Total = [int]$lay.NumR
+    $names = @()
+    for ($i = 0; $i -lt $lay.NumS; $i++) {
+        $o = $lay.OffS + $i * $lay.SizeS
+        $nm = ''
+        if ($lay.SizeS -ge 136 + 128) { $nm = Sys-HwiText $Bytes ($o + 136) 128 }
+        if (-not $nm) { $nm = Sys-HwiText $Bytes ($o + 8) 128 }
+        $names += $nm
+    }
+    $items = @()
+    $rx = $null
+    if ($Want) { $rx = New-Object System.Text.RegularExpressions.Regex($Want, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase) }
+    for ($j = 0; $j -lt $lay.NumR; $j++) {
+        $o = $lay.OffR + $j * $lay.SizeR
+        # the label is cut out in place (this runs for every reading, up to a thousand, every two seconds)
+        $label = ''
+        $z = [Array]::IndexOf($Bytes, [byte]0, $o + 12, 128)
+        $n = 128; if ($z -ge 0) { $n = $z - ($o + 12) }
+        if ($n -gt 0) { $label = $script:Latin1.GetString($Bytes, $o + 12, $n).Trim() }
+        if (-not $label) { $label = (Sys-HwiText $Bytes ($o + 140) 128).Trim() }
+        if (-not $label) { continue }
+        if ($rx -and -not $rx.IsMatch($label)) { continue }
+        $si = [int][BitConverter]::ToUInt32($Bytes, $o + 4)
+        $unit = (Sys-HwiText $Bytes ($o + 268) 16).Trim()
+        $val = [BitConverter]::ToDouble($Bytes, $o + 284)
+        $num = $null
+        if (-not [double]::IsNaN($val) -and -not [double]::IsInfinity($val)) { $num = [double]$val }
+        $sensor = ''; if ($si -ge 0 -and $si -lt $names.Count) { $sensor = [string]$names[$si] }
+        $text = ''
+        if ($null -ne $num) { $text = ([double]$num).ToString('0.###', [Globalization.CultureInfo]::InvariantCulture); if ($unit) { $text += ' ' + $unit } }
+        $items += ,@{ Sensor = $sensor; Label = $label; Text = $text; Value = $num; Unit = $unit }
+    }
+    $r.Items = $items
+    $r.Ok = $true
+    if ($r.Total -eq 0) { $r.Why = 'empty' }
+    return $r
+}
+# The bytes HWiNFO shares, or $null with the reason: off (nothing is shared: Shared Memory Support is off or its sensors are not running),
+# denied (Windows refused access), error
+#
+# HWiNFO refills the list of readings while it polls: it counts the number of readings down to zero and back up again. A copy made at that
+# moment would be empty or half old, half new, so the copy is checked: the header is read again afterwards and must be the same, and a list
+# of zero readings is waited out. $Read is a script block (offset, count) that returns the bytes it could read (fewer at the end of the
+# memory); a block is used so that this can be tested without Windows.
+function Sys-HwiSnapshot {
+    param([scriptblock]$Read, [int]$Tries = 4, [int]$WaitMs = 120)
+    $r = @{ Bytes = $null; Why = '' }
+    $last = $null
+    for ($t = 0; $t -lt $Tries; $t++) {
+        if ($t -gt 0) { Start-Sleep -Milliseconds $WaitMs }
+        $hdr = [byte[]](& $Read 0 64)
+        $lay = Sys-HwiLayout $hdr
+        if (-not $lay.Ok) { $r.Why = [string]$lay.Why; return $r }
+        $need = [Math]::Max($lay.OffS + $lay.SizeS * $lay.NumS, $lay.OffR + $lay.SizeR * $lay.NumR)
+        if ($need -gt 64MB) { $r.Why = 'layout'; return $r }
+        $refill = ($lay.NumR -eq 0 -or $lay.NumS -eq 0)
+        $buf = [byte[]](& $Read 0 $need)
+        if ($buf.Length -lt $need) { $r.Why = 'short'; continue }
+        $last = $buf
+        $r.Why = ''
+        if ($refill) { continue }
+        $again = [byte[]](& $Read 0 64)
+        $same = ($again.Length -ge 48)
+        for ($i = 0; $same -and $i -lt 48; $i++) { if ($again[$i] -ne $buf[$i]) { $same = $false } }
+        if ($same) { $r.Bytes = $buf; return $r }
+    }
+    # still changing after every try: the numbers are all single readings, so the last copy is as good as any
+    if ($last) { $r.Bytes = $last; $r.Why = '' }
+    return $r
+}
+# The script block that reads (offset, count) from a stream: the bytes it got, fewer at the end of the stream
+function Sys-HwiStreamReader {
+    param([System.IO.Stream]$Stream)
+    $st = $Stream
+    return {
+        param([int]$Off, [int]$Cnt)
+        $st.Position = $Off
+        $b = New-Object byte[] $Cnt
+        $have = 0
+        while ($have -lt $Cnt) { $n = $st.Read($b, $have, $Cnt - $have); if ($n -le 0) { break }; $have += $n }
+        if ($have -lt $Cnt) { $x = New-Object byte[] $have; [Array]::Copy($b, $x, $have); return , $x }
+        return , $b
+    }.GetNewClosure()
+}
+function Sys-HwiSharedBytes {
+    $r = @{ Bytes = $null; Why = '' }
+    $mmf = $null; $st = $null
+    try {
+        $mmf = [System.IO.MemoryMappedFiles.MemoryMappedFile]::OpenExisting('Global\HWiNFO_SENS_SM2', [System.IO.MemoryMappedFiles.MemoryMappedFileRights]::Read)
+        $st = $mmf.CreateViewStream(0, 0, [System.IO.MemoryMappedFiles.MemoryMappedFileAccess]::Read)
+        return (Sys-HwiSnapshot (Sys-HwiStreamReader $st))
+    } catch [System.IO.FileNotFoundException] { $r.Why = 'off' }
+    catch [System.UnauthorizedAccessException] { $r.Why = 'denied' }
+    catch { $r.Why = 'off' }
+    finally {
+        if ($st) { try { $st.Dispose() } catch { } }
+        if ($mmf) { try { $mmf.Dispose() } catch { } }
+    }
+    return $r
+}
+# HWiNFO: running or not, its readings (shared memory first, the Gadget list in the registry second), where they came from (Via) and,
+# when there are none, why not (Why: off | denied | ended | layout | short | signature | empty | error)
+function Sys-ReadHwi {
+    $r = @{ Running = $false; Items = @(); Via = ''; Why = '' }
+    if (-not (Sys-ProcRunning @('HWiNFO64', 'HWiNFO32'))) { return $r }
+    $r.Running = $true
+    $why = 'off'
+    try {
+        $b = Sys-HwiSharedBytes
+        if ($b.Bytes) {
+            $p = Sys-HwiParseShared $b.Bytes $null $script:HwiWanted
+            if ($p.Ok -and [int]$p.Total -gt 0) { $r.Items = @($p.Items); $r.Via = 'shared memory'; return $r }
+            $why = [string]$p.Why
+        } else { $why = [string]$b.Why }
+    } catch { $why = 'error' }
+    # frozen shared memory means HWiNFO's sensors are paused: its gadget list in the registry is frozen too, so it is not used
+    if ($why -ne 'stale') {
+        foreach ($hive in 'HKCU', 'HKLM') {
+            $h = Sys-RegAll $hive 'SOFTWARE\HWiNFO64\VSB'
+            if ($h -and $h.Count) { $r.Items = @(Sys-HwiItems $h); $r.Via = 'gadget list'; break }
+        }
+    }
+    if ($r.Items.Count -eq 0) { $r.Why = $why }
+    return $r
+}
+function Sys-ReadLhm {
+    $r = @{ Running = $false; Name = ''; Items = @() }
+    $pn = ''
+    if (Sys-ProcRunning @('LibreHardwareMonitor')) { $pn = 'LibreHardwareMonitor' }
+    elseif (Sys-ProcRunning @('OpenHardwareMonitor')) { $pn = 'OpenHardwareMonitor' }
+    if (-not $pn) { return $r }
+    $r.Name = $pn
+    foreach ($ns in @('root\LibreHardwareMonitor', 'root\OpenHardwareMonitor')) {
+        try {
+            $rows = @(Get-CimInstance -Namespace $ns -ClassName Sensor -ErrorAction Stop)
+            $r.Running = $true
+            $items = @()
+            foreach ($x in $rows) { $items += ,@{ Parent = [string]$x.Parent; Label = [string]$x.Name; Type = [string]$x.SensorType; Id = [string]$x.Identifier; Value = (Sys-Num $x.Value) } }
+            if ($items.Count) { $r.Items = $items; break }
+        } catch { }
+    }
+    return $r
+}
+# A number is "plausible" when it lies in [Min, Max] (either end may be $null = open). Sensors do glitch: a Ryzen 9800X3D has been seen
+# to report a die temperature of 203.2 degrees for one poll. Such a reading is skipped, so the next candidate row (or none) is used.
+function Sys-InRange {
+    param($Value, $Min = $null, $Max = $null)
+    if ($null -eq $Value) { return $false }
+    $v = [double]$Value
+    if ([double]::IsNaN($v) -or [double]::IsInfinity($v)) { return $false }
+    if ($null -ne $Min -and $v -lt [double]$Min) { return $false }
+    if ($null -ne $Max -and $v -gt [double]$Max) { return $false }
+    return $true
+}
+# The first item whose label matches one of the patterns (in the order of the patterns) and that has a plausible number and, if asked, the unit
+function Sys-FindHwi {
+    param($Items, [string[]]$Labels, [string]$Unit = '', $Min = $null, $Max = $null, [string]$Not = '')
+    foreach ($pat in $Labels) {
+        foreach ($i in @($Items)) {
+            if ([string]$i.Label -notmatch $pat) { continue }
+            if ($Not -and [string]$i.Label -match $Not) { continue }
+            if ($null -eq $i.Value) { continue }
+            if ($Unit -and [string]$i.Unit -notmatch $Unit) { continue }
+            if (-not (Sys-InRange $i.Value $Min $Max)) { continue }
+            return $i
+        }
+    }
+    return $null
+}
+# A temperature from HWiNFO in degrees Celsius: HWiNFO can be set to show Fahrenheit, and the unit comes with the reading. Returns
+# @{ Value; Label } or $null. A value of 0 or below, or above 125 degrees, is not a CPU temperature.
+function Sys-HwiTemp {
+    param($Items, [string[]]$Labels)
+    foreach ($pat in $Labels) {
+        foreach ($i in @($Items)) {
+            if ([string]$i.Label -notmatch $pat) { continue }
+            if ($null -eq $i.Value) { continue }
+            $u = [string]$i.Unit
+            if ($u -notmatch '[CF]$') { continue }
+            $c = [double]$i.Value
+            if ($u -match 'F$') { $c = ($c - 32.0) / 1.8 }
+            if (-not (Sys-InRange $c 1 125)) { continue }
+            return @{ Value = [Math]::Round($c, 1); Label = [string]$i.Label }
+        }
+    }
+    return $null
+}
+function Sys-FindLhm {
+    param($Items, [string]$Type, [string]$IdLike, [string[]]$Labels, $Min = $null, $Max = $null)
+    foreach ($pat in $Labels) {
+        foreach ($i in @($Items)) {
+            if ([string]$i.Type -ne $Type) { continue }
+            if ($IdLike -and [string]$i.Id -notmatch $IdLike) { continue }
+            if ([string]$i.Label -notmatch $pat) { continue }
+            if ($null -eq $i.Value) { continue }
+            if (-not (Sys-InRange $i.Value $Min $Max)) { continue }
+            return $i
+        }
+    }
+    return $null
+}
+# The rows this app reads out of HWiNFO, by label. They are kept in one place so that the reader of the shared memory can skip every other
+# reading (a PC has some 500 to 1000 of them and the memory is read every two seconds) without a second list that could go out of step.
+$script:HwiLabTemp  = @('^CPU \(Tctl/Tdie\)$', '^CPU Die \(average\)$', '^CPU Package$', '^CPU \(Tctl\)$', '^CPU \(Tdie\)$', '^CPU Tdie$', '^CPU Tctl$', '^CPU Temperature$')
+$script:HwiLabPower = @('^CPU Package Power( \(SMU\))?$', '^CPU PPT$', '^Package Power$', '^CPU Power$')
+$script:HwiLabMclk  = @('^Memory Clock$')
+$script:HwiLabTime  = [ordered]@{ Tcas = '^Tcas$'; Trcd = '^Trcd(rd| \(read\))?$'; Trp = '^Trp$'; Tras = '^Tras$'; Trc = '^Trc$'; Trfc = '^Trfc$' }
+$script:HwiLabCr    = @('^Command Rate$')
+# The memory controller clock (UCLK on Ryzen; HWiNFO calls the row "Memory Controller Clock", newer builds may add "(UCLK)")
+$script:HwiLabUclk  = @('^Memory Controller Clock( \(UCLK\))?$', '^UCLK( \(.*\))?$')
+# The DRAM voltage. The board's own chip usually gives it as "DRAM" (or DIMM / VDIMM); the last pattern catches names such as "DIMM[1] VDD".
+# DDR5 also has VPP (1.8 V), VDDQ and VDDIO rows that must not be taken for it, and a memory temperature or power row never counts.
+$script:HwiLabVdimm = @('^DRAM$', '^DRAM Voltage$', '^VDIMM$', '^DIMM$', '^DIMM Voltage$', '^Memory Voltage$', '^VDD_MEM$', '^DRAM VDD$', '^DIMM VDD$', '(DRAM|DIMM).*\b(Voltage|VDD)\b')
+$script:HwiNotVdimm = 'VPP|VDDQ|VDDIO|VTT|Temp|Current|Power'
+# The memory I/O voltage as the CPU itself reads it (Ryzen VDDIO). It is the supply of the memory interface, which a BIOS can set apart from
+# the DRAM's own voltage, so it is only used when no DRAM row exists, and the card says so.
+$script:HwiLabVddio = @('^CPU VDDIO / MC Voltage$', '^CPU VDDIO( / MC)?$', '^VDDIO( MEM)?$', '^VDDIO_MEM$')
+$script:HwiWanted   = ((@($script:HwiLabTemp) + @($script:HwiLabPower) + @($script:HwiLabMclk) + @($script:HwiLabTime.Values) + @($script:HwiLabCr) + @($script:HwiLabUclk) + @($script:HwiLabVdimm) + @($script:HwiLabVddio)) -join '|')
+# What the two programs report, boiled down:  CpuTemp, CpuPower (numbers or $null) with CpuTempFrom / CpuPowerFrom (the row they came
+# from, so the Sensors card can say which one it is), RAM timings Tcas Trcd Trp Tras Trc Trfc (numbers) and Cr (text such as "1T"),
+# RamMclk, RamUclk (the memory controller clock, with UclkFrom), Vdimm (the DRAM voltage in volts, with VdimmFrom; VdimmIo is $true when
+# the row is the CPU's memory I/O voltage because no DRAM row exists), and Source (who gave them).
+function Sys-PickSensors {
+    param($Hwi, $Lhm)
+    $o = @{ CpuTemp = $null; CpuPower = $null; CpuTempFrom = ''; CpuPowerFrom = ''; RamMclk = $null; RamUclk = $null; UclkFrom = ''; Vdimm = $null; VdimmFrom = ''; VdimmIo = $false; Tcas = $null; Trcd = $null; Trp = $null; Tras = $null; Trc = $null; Trfc = $null; Cr = ''; Source = '' }
+    $src = @()
+    $hi = @(); if ($Hwi) { $hi = @($Hwi.Items) }
+    $li = @(); if ($Lhm) { $li = @($Lhm.Items) }
+    if ($hi.Count) {
+        $x = Sys-HwiTemp $hi $script:HwiLabTemp
+        if ($x) { $o.CpuTemp = [double]$x.Value; $o.CpuTempFrom = [string]$x.Label }
+        $x = Sys-FindHwi $hi $script:HwiLabPower 'W$' 0 1000
+        if ($x) { $o.CpuPower = [double]$x.Value; $o.CpuPowerFrom = [string]$x.Label }
+        $x = Sys-FindHwi $hi $script:HwiLabMclk 'MHz' 100 6000
+        if ($x) { $o.RamMclk = [double]$x.Value }
+        $x = Sys-FindHwi $hi $script:HwiLabUclk 'MHz' 100 6000
+        if ($x) { $o.RamUclk = [double]$x.Value; $o.UclkFrom = [string]$x.Label }
+        # 1.0 to 2.0 V: DDR5 runs at 1.1 V and up, and a chip that reads half the true voltage (seen on some boards) is below that and skipped
+        $x = Sys-FindHwi $hi $script:HwiLabVdimm '^V$' 1.0 2.0 $script:HwiNotVdimm
+        if (-not $x) {
+            $x = Sys-FindHwi $hi $script:HwiLabVddio '^V$' 1.0 2.0
+            if ($x) { $o.VdimmIo = $true }
+        }
+        if ($x) { $o.Vdimm = [double]$x.Value; $o.VdimmFrom = [string]$x.Label }
+        foreach ($t in @($script:HwiLabTime.Keys)) {
+            $x = Sys-FindHwi $hi @([string]$script:HwiLabTime[$t]) '' 1 4096
+            if ($x) { $o[$t] = [double]$x.Value }
+        }
+        $x = Sys-FindHwi $hi $script:HwiLabCr '' 1 3
+        if ($x) { $o.Cr = ('{0:0}T' -f [double]$x.Value) }
+        if ($null -ne $o.CpuTemp -or $null -ne $o.CpuPower -or $null -ne $o.Tcas -or $null -ne $o.RamMclk -or $null -ne $o.RamUclk -or $null -ne $o.Vdimm) { $src += 'HWiNFO' }
+    }
+    if ($li.Count -and ($null -eq $o.CpuTemp -or $null -eq $o.CpuPower -or $null -eq $o.Vdimm)) {
+        $used = $false
+        # the DRAM voltage from the board's chip as LibreHardwareMonitor names it (it has no memory controller clock)
+        if ($null -eq $o.Vdimm) {
+            $x = Sys-FindLhm $li 'Voltage' '' @('^DRAM$', '^DIMM$', '^VDIMM$', '^DRAM Voltage$', '^Memory Voltage$') 1.0 2.0
+            if ($x) { $o.Vdimm = [double]$x.Value; $o.VdimmFrom = [string]$x.Label; $used = $true }
+        }
+        if ($null -eq $o.CpuTemp) {
+            $x = Sys-FindLhm $li 'Temperature' '/(amd|intel)cpu/' @('Core \(Tctl/Tdie\)', 'CPU Package', 'Package', 'Tdie', 'Tctl', 'CPU Die', 'Core Max') 1 125
+            if ($x) { $o.CpuTemp = [double]$x.Value; $o.CpuTempFrom = [string]$x.Label; $used = $true }
+        }
+        if ($null -eq $o.CpuPower) {
+            $x = Sys-FindLhm $li 'Power' '/(amd|intel)cpu/' @('^Package$', 'CPU Package', 'Package') 0 1000
+            if ($x) { $o.CpuPower = [double]$x.Value; $o.CpuPowerFrom = [string]$x.Label; $used = $true }
+        }
+        if ($used) { $src += [string]$Lhm.Name }
+    }
+    $o.Source = ($src -join ' + ')
+    return $o
+}
+
+# ---- displays ----
+# The picture of one screen from what the driver lists. $Current = @(width, height, hertz, bits); $Modes = @(@(w, h, hz), ...)
+function Sys-ModeSummary {
+    param($Current, $Modes)
+    $w = [int]$Current[0]; $h = [int]$Current[1]; $hz = [int]$Current[2]
+    $atRes = @()
+    $bestPix = 0; $best = $null
+    foreach ($m in @($Modes)) {
+        $mw = [int]$m[0]; $mh = [int]$m[1]; $mhz = [int]$m[2]
+        if ($mw -eq $w -and $mh -eq $h) { $atRes += $mhz }
+        # the biggest picture, and the highest rate it comes with
+        $pix = $mw * $mh
+        if ($pix -gt $bestPix -or ($pix -eq $bestPix -and $best -and $mhz -gt $best.Hz)) { $bestPix = $pix; $best = @{ W = $mw; H = $mh; Hz = $mhz } }
+    }
+    $rates = @($atRes | Sort-Object -Unique)
+    $maxHz = 0; if ($rates.Count) { $maxHz = [int]$rates[$rates.Count - 1] }
+    # the highest rate of any mode of the screen, whatever the resolution
+    $topHz = 0; $topW = 0; $topH = 0
+    foreach ($m in @($Modes)) { if ([int]$m[2] -gt $topHz) { $topHz = [int]$m[2]; $topW = [int]$m[0]; $topH = [int]$m[1] } }
+    return @{ W = $w; H = $h; Hz = $hz; MaxHzHere = $maxHz; RatesHere = $rates; Biggest = $best; TopHz = $topHz; TopW = $topW; TopH = $topH; ModeCount = @($Modes).Count }
+}
+# "ACI27A3" (from "MONITOR\ACI27A3\{4d36e96e-...}\0004") -> the code of the monitor model
+function Sys-MonitorCode {
+    param([string]$DeviceId)
+    $p = @([string]$DeviceId -split '\\')
+    if ($p.Count -ge 2) { return $p[1].ToUpperInvariant() }
+    return ''
+}
+$script:SysVendors = @{ ACI = 'ASUS'; AUS = 'ASUS'; AOC = 'AOC'; GSM = 'LG'; SAM = 'Samsung'; DEL = 'Dell'; BNQ = 'BenQ'; GBT = 'Gigabyte'; MSI = 'MSI'; ACR = 'Acer'
+                        LEN = 'Lenovo'; HWP = 'HP'; VSC = 'ViewSonic'; PHL = 'Philips'; AUO = 'AU Optronics'; CMN = 'Chimei'; LGD = 'LG Display'; NVD = 'NVIDIA'; ENC = 'Eizo'
+                        MEG = 'MSI'; XMI = 'Xiaomi'; KOG = 'Koorui'; ECO = 'ECO' }
+# A readable monitor name from the model code and the name in its EDID; the maker is put in front when the name does not have it
+function Sys-MonitorName {
+    param([string]$Code, [string]$Friendly)
+    $f = ([string]$Friendly).Trim()
+    $mk = ''
+    if ($Code.Length -ge 3) { $mk = [string]$script:SysVendors[$Code.Substring(0, 3)] }
+    if (-not $f) { if ($mk) { return ($mk + ' monitor (' + $Code + ')') }; return '' }
+    if ($mk -and $f -notmatch ('^' + [regex]::Escape($mk))) { return ($mk + ' ' + $f) }
+    return $f
+}
+# monitor model code -> name, from the EDID that Windows keeps (WMI root\wmi)
+function Sys-MonitorNames {
+    $h = @{}
+    try {
+        foreach ($m in @(Get-CimInstance -Namespace 'root\wmi' -ClassName WmiMonitorID -ErrorAction Stop)) {
+            $inst = @(([string]$m.InstanceName) -split '\\')
+            if ($inst.Count -lt 2) { continue }
+            $bytes = @($m.UserFriendlyName | Where-Object { $_ -ne 0 } | ForEach-Object { [byte]$_ })
+            $name = ''
+            if ($bytes.Count) { $name = [System.Text.Encoding]::ASCII.GetString([byte[]]$bytes) }
+            $code = $inst[1].ToUpperInvariant()
+            if (-not $h.ContainsKey($code) -or $name) { $h[$code] = (Sys-MonitorName $code $name) }
+        }
+    } catch { }
+    return $h
+}
+function Get-SysDisplays {
+    $r = @{ Why = ''; List = @() }
+    $why = Sys-Ensure 'Disp'
+    if ($why) { $r.Why = $why; return $r }
+    $color = @{}
+    if ((Sys-Ensure 'Color') -eq '') {
+        try {
+            foreach ($l in @([SysColor]::Query())) {
+                $p = @(([string]$l) -split '\|')
+                if ($p.Count -ge 7) { $color[$p[0]] = @{ Supported = ($p[1] -eq '1'); Enabled = ($p[2] -eq '1'); WideOnly = ($p[3] -eq '1'); Bits = [int]$p[4]; Num = [double]$p[5]; Den = [double]$p[6] } }
+            }
+        } catch { }
+    }
+    $names = Sys-MonitorNames
+    $list = @()
+    try {
+        foreach ($sc in @([SysDisp]::Screens())) {
+            $p = @(([string]$sc) -split '\|')
+            $dev = [string]$p[0]
+            $cur = @(([string][SysDisp]::Current($dev)) -split '\|')
+            if ($cur.Count -lt 4) { continue }
+            $modes = @()
+            foreach ($m in @([SysDisp]::Modes($dev))) { $q = @(([string]$m) -split '\|'); if ($q.Count -ge 3) { $modes += ,@([int]$q[0], [int]$q[1], [int]$q[2]) } }
+            $sum = Sys-ModeSummary @([int]$cur[0], [int]$cur[1], [int]$cur[2], [int]$cur[3]) $modes
+            $code = Sys-MonitorCode ([string]$p[2])
+            $nm = [string]$names[$code]
+            if (-not $nm) { $nm = ([string]$p[3]).Trim() }
+            $hdr = 'unknown'
+            $exact = $null
+            $c = $color[$dev]
+            if ($c) {
+                if (-not $c.Supported) { $hdr = 'none' } elseif ($c.Enabled -and -not $c.WideOnly) { $hdr = 'on' } else { $hdr = 'off' }
+                if ($c.Den -gt 0 -and $c.Num -gt 0) { $exact = [Math]::Round($c.Num / $c.Den, 3) }
+            }
+            $list += ,@{ Device = $dev; Primary = ($p[1] -eq '1'); Name = $nm; Code = $code; Bits = [int]$cur[3]; Summary = $sum; Hdr = $hdr; HzExact = $exact }
+        }
+    } catch { $r.Why = [string]$_.Exception.Message }
+    $r.List = $list
+    return $r
+}
+
+# ---- one pass over the live numbers ----
+function Get-SysLive {
+    param([int]$Round, $Static)
+    $o = @{ At = (Get-Date); CpuUsage = $null; CpuClockMHz = $null; Procs = $null; Threads = $null; RamUsedMB = $null; RamTotalMB = $null; Uptime = $null
+            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null }
+    if ($null -eq $script:SysPc) {
+        $script:SysPc = Sys-PcNew
+        Start-Sleep -Milliseconds 700          # a rate counter needs two readings a little apart
+    }
+    $pc = $script:SysPc
+    $u = Sys-PcRead $pc.CpuUtil
+    if ($null -eq $u) { try { $u = [double]@(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)[0].LoadPercentage } catch { } }
+    if ($null -ne $u) { $o.CpuUsage = [Math]::Min(100.0, [Math]::Max(0.0, [Math]::Round($u, 0))) }
+    $o.CpuClockMHz = Sys-CpuClock (Sys-PcRead $pc.CpuFreq) (Sys-PcRead $pc.CpuPerf)
+    $np = Sys-PcRead $pc.Procs
+    if ($null -eq $np) { try { $np = @(Get-Process).Count } catch { } }
+    if ($null -ne $np) { $o.Procs = [int]$np }
+    $nt = Sys-PcRead $pc.Threads
+    if ($null -ne $nt) { $o.Threads = [int]$nt }
+    $tot = 0; if ($Static -and $Static.Os) { $tot = [int]$Static.Os.TotalMB }
+    $av = Sys-PcRead $pc.MemAvail
+    if ($tot -gt 0) { $o.RamTotalMB = $tot; if ($null -ne $av) { $o.RamUsedMB = [Math]::Max(0, $tot - [int]$av) } }
+    if ($Static -and $Static.Os -and $Static.Os.Boot) { try { $o.Uptime = [int]((Get-Date) - $Static.Os.Boot).TotalSeconds } catch { } }
+    # the graphics card
+    $g = $null
+    try { $g = Sys-GpuNvidia } catch { }
+    if (-not $g) { try { $g = Sys-GpuWindows } catch { } }
+    $o.Gpu = $g
+    $o.Smi = [string]$script:SysSmi
+    # sensors
+    $hwi = $null; $lhm = $null
+    try { $hwi = Sys-ReadHwi } catch { }
+    try { $lhm = Sys-ReadLhm } catch { }
+    if ($hwi) { $o.Hwi = [bool]$hwi.Running; $o.HwiVia = [string]$hwi.Via; $o.HwiWhy = [string]$hwi.Why }
+    if ($lhm) { $o.Lhm = [bool]$lhm.Running }
+    try { $o.Sensors = Sys-PickSensors $hwi $lhm } catch { }
+    # the screens: every 5th round (the list of modes is long and changes rarely)
+    if ($Round % 5 -eq 0) { try { $o.Displays = Get-SysDisplays } catch { } }
+    # the drives' temperature and wear change slowly and take a moment to ask for: every 5th round as well
+    if ($Round % 5 -eq 0) { try { $o.Storage = Sys-StorageLive } catch { } }
+    return $o
+}
+
+# The background reader: the PC once, then the live numbers every two seconds for as long as the window is open.
+# Shared state (set by the host): Stop (the host wants it to end), Active (the Home or Display page is showing: only then are the live
+# numbers read), Ver (counts every new Live), Static, Live, Displays.
+function Invoke-SysLoop {
+    try { $SysShared.Static = Get-SysStatic } catch { }
+    $SysShared.Ver = [int]$SysShared.Ver + 1
+    $round = 0
+    $lastDisp = $null
+    $lastSto = $null
+    while (-not $SysShared.Stop) {
+        if ($SysShared.Force) { $SysShared.Force = $false; $round = 0 }
+        if ($SysShared.Active) {
+            try {
+                $live = Get-SysLive $round $SysShared.Static
+                if ($live.Displays) { $lastDisp = $live.Displays } else { $live.Displays = $lastDisp }
+                if ($null -ne $live.Storage) { $lastSto = $live.Storage } else { $live.Storage = $lastSto }
+                $SysShared.Live = $live
+                $SysShared.Ver = [int]$SysShared.Ver + 1
+            } catch { }
+            $round++
+        }
+        for ($i = 0; $i -lt 20 -and -not $SysShared.Stop -and -not $SysShared.Force; $i++) { Start-Sleep -Milliseconds 100 }
+    }
+}
+
+}   # ---- end of $sysEngine ----
+
+# =============================================================================
+# THE LIST: what is ticked, what will change, what the texts say.
+# Nothing in this part touches a control, so it works the same in the window and in the console.
+# =============================================================================
+$script:Rows = [ordered]@{}     # setting id -> row
+$script:Cats = @()              # category names, in catalog order
+$script:Scanning = $false       # the check of the PC is running
+$script:Applying = $false       # changes are being made
+$script:Building = $false       # the list is being filled in; ignore tick events
+# One page of the side menu is not a list of settings but a read-out (an "info page"): the Home page the app opens to. It takes the
+# place of a category name in $script:NavCat.
+$script:PageHome = '#home'
+function Test-InfoPage { param([string]$cat) return ($cat -eq $script:PageHome) }
+
+# A row:  T = the catalog entry, State = Checking|On|Off|Partial|NA|Unknown, Detail = text from the check,
+#         Want = is the box ticked, Force = 'Undo' when "put fully back" was chosen for a partly applied one,
+#         Choice / Pick = for a setting with options (T.Choices): the option that is in force now, and the one that is chosen on the card
+#         ('' while it is not known or when the values match no option),
+#         Note/NoteDetail = result of the last run, Item = the list line (or $null), Visible = shown by the filter
+function New-Rows {
+    $script:Rows = [ordered]@{}
+    $script:Cats = @()
+    foreach ($t in $script:Catalog) {
+        $script:Rows[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
+                                 Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = '' }
+        if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
+    }
+}
+
+# Programs come and go on the startup list. Before a new check, look at the PC again and bring the
+# rows in line with it (rows for programs that are gone disappear, new ones appear as "Checking...").
+# The background worker builds its own catalog the same way, so both sides end up with the same list.
+function Sync-StartupRows {
+    Add-StartupTweaks
+    $fresh = [ordered]@{}
+    $script:Cats = @()
+    foreach ($t in $script:Catalog) {
+        $old = $script:Rows[$t.Id]
+        if ($old) {
+            $old.T = $t
+            $fresh[$t.Id] = $old
+        } else {
+            $fresh[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
+                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = '' }
+        }
+        if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
+    }
+    $script:Rows = $fresh
+}
+
+# 'Apply' (turn on), 'Undo' (turn off) or '' (nothing to do) for one row
+function Get-Action {
+    param($row)
+    if ($row.State -eq 'Checking' -or $row.State -eq 'NA') { return '' }
+    if ($row.Force) { return [string]$row.Force }
+    if ($row.T.Choices) {
+        # a setting with options: nothing to do while the option on the card is the one in force; the Windows default means undo
+        $now = ''
+        if ($row.State -eq 'On') { $now = [string]$row.Choice } elseif ($row.State -eq 'Off') { $now = 'default' }
+        $pick = [string]$row.Pick
+        if (-not $pick -or $pick -eq $now) { return '' }
+        if ($pick -eq 'default') { return 'Undo' }
+        return 'Apply'
+    }
+    $cur = ($row.State -eq 'On')
+    if ($row.Want -and -not $cur) { return 'Apply' }
+    if (-not $row.Want -and $cur) { return 'Undo' }
+    return ''
+}
+
+function Get-BusyReason {
+    if ($script:Scanning) { return 'Please wait - still checking your PC.' }
+    if ($script:Applying) { return 'Please wait - changes are being made.' }
+    return ''
+}
+
+# '' when the row may be changed now, otherwise the reason it may not
+function Test-CanChange {
+    param($row)
+    $b = Get-BusyReason
+    if ($b) { return $b }
+    if ($row.State -eq 'Checking') { return 'Still checking this one.' }
+    if ($row.State -eq 'NA') { return ('Not available on this PC: ' + $row.Detail) }
+    return ''
+}
+
+# The user ticked (want = true) or unticked (false) a box. Returns '' when accepted, else why not.
+function Try-SetWant {
+    param([string]$id, [bool]$want)
+    $row = $script:Rows[$id]
+    if (-not $row) { return 'Unknown setting.' }
+    $why = Test-CanChange $row
+    if ($why) { return $why }
+    if ((-not $want) -and $row.State -eq 'On' -and $row.T.OneWay) {
+        return ('"' + $row.T.Name + '" cannot be undone from here. Its description says how to get it back.')
+    }
+    if ($row.T.Choices) {
+        # no single switch: "off" means the Windows default; "on" is not guessed, one of the options has to be picked
+        if ($want) { return ('"' + $row.T.Name + '" has several options: pick one on its card.') }
+        return (Try-SetPick $id 'default')
+    }
+    $row.Want = $want
+    $row.Force = ''
+    $row.Note = ''
+    $row.NoteDetail = ''
+    return ''
+}
+
+# The user picked one option of a setting that has options. Returns '' when accepted, else why not.
+function Try-SetPick {
+    param([string]$id, [string]$key)
+    $row = $script:Rows[$id]
+    if (-not $row) { return 'Unknown setting.' }
+    if (-not $row.T.Choices) { return 'This setting has no options.' }
+    $why = Test-CanChange $row
+    if ($why) { return $why }
+    $found = $false
+    foreach ($c in @($row.T.Choices)) { if ([string]$c.Key -eq $key) { $found = $true } }
+    if (-not $found) { return 'Unknown option.' }
+    $row.Pick = $key
+    $row.Want = ($key -ne 'default')
+    $row.Force = ''
+    $row.Note = ''
+    $row.NoteDetail = ''
+    return ''
+}
+
+# "Put this one fully back" for a partly applied (or applied) setting
+function Try-ForceUndo {
+    param([string]$id)
+    $row = $script:Rows[$id]
+    if (-not $row) { return 'Unknown setting.' }
+    $why = Test-CanChange $row
+    if ($why) { return $why }
+    if ($row.T.OneWay) { return ('"' + $row.T.Name + '" cannot be undone from here.') }
+    if ($row.State -eq 'Off') { return 'It is not applied, so there is nothing to undo.' }
+    $row.Want = $false
+    if ($row.T.Choices) { $row.Pick = 'default' }
+    $row.Force = 'Undo'
+    $row.Note = ''
+    $row.NoteDetail = ''
+    return ''
+}
+
+# Tick or untick everything in one group that the filter is showing. Returns how many rows changed.
+function Set-GroupWant {
+    # $cat = '' means every page ("All settings"). Never ticked in bulk: a run-once action (a clean-up), and the settings "Apply all" leaves
+    # out on purpose (Get-ApplyAllSkip). "Turn all off" on "All settings" leaves those alone too.
+    param([string]$cat, [bool]$want)
+    $changed = 0
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($cat -and $row.T.Cat -ne $cat) { continue }
+        if (-not $row.Visible) { continue }
+        if ($row.T.Once) { continue }
+        if ((Get-ApplyAllSkip $row $cat) -and ($want -or -not $cat)) { continue }
+        $before = Get-Action $row
+        if ((Try-SetWant $id $want) -eq '') {
+            if ((Get-Action $row) -ne $before) { $changed++ }
+        }
+    }
+    return $changed
+}
+
+# The settings "Turn all on" leaves out on this page ($cat = '' for all of them): the ones "Apply all" leaves out, that are not on yet
+function Get-GroupLeftOut {
+    param([string]$cat)
+    $left = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($cat -and $row.T.Cat -ne $cat) { continue }
+        if (-not $row.Visible -or $row.T.Once -or $row.State -eq 'NA' -or $row.State -eq 'On') { continue }
+        if (Get-ApplyAllSkip $row $cat) { $left += [string]$row.T.Name }
+    }
+    return $left
+}
+
+# ------------------------------------------------------------ the presets ----
+# The "Select Optimization Preset" button (bottom left) opens a window with three presets. A preset is a set of settings; applying one
+# switches on the ones that are not on yet (after the list of changes has been shown and confirmed):
+#   recommended  the settings marked T.Preset ("Recommended Debloat"); the window describes them in groups (see $script:RecommendedSummary)
+#   advanced     the Recommended set plus $script:AdvancedExtra ("Advanced Debloat"): the further settings the user chose, in catalog
+#                order by page. Every entry must be a setting id, and none may be a run-once or an option (Choices) setting.
+#   personal     the settings the user saved from this PC ("Custom Preset"), kept in a file the user can take along
+$script:PresetNames = @{ recommended = 'Recommended Debloat'; advanced = 'Advanced Debloat'; personal = 'Custom Preset' }
+$script:AdvancedExtra = @(
+    # Cloud, sync and OneDrive (all)
+    'settingsync', 'clipboard', 'crossdevice', 'syncsvc', 'offlinefiles', 'onedrive-policy', 'onedrive-remove', 'deliveryopt',
+    # Remote access and VPN (all)
+    'rdp', 'remote-assist', 'quickassist', 'winrm', 'remote-mgmt', 'vpn',
+    # Network adapters and USB power: the one Recommended leaves out
+    'nic-turnoff',
+    # Power plan and startup: the two Recommended leaves out
+    'plans-delete', 'hibernate',
+    # Gaming and performance (all but WPBT; Recommended has the rest)
+    'wu-drivers',
+    # Security prompts (all but BitLocker and automatic device encryption)
+    'uac', 'uac-lua', 'vbs', 'hypervisor',
+    # Other Windows services (all; Recommended has the other six)
+    'svc-search', 'svc-smartcard', 'printing', 'xbox-svc',
+    # File Explorer opens to This PC
+    'launchto',
+    # AI features (all)
+    'ai-core',
+    # Remove apps (all but Snipping Tool, Xbox app and sign-in, and the Microsoft Store)
+    'apps-ai', 'apps-news', 'apps-mail', 'apps-phone', 'apps-media', 'apps-notes', 'apps-extras', 'apps-widgets', 'apps-promo',
+    'apps-dolby', 'apps-gamebar', 'apps-clock', 'apps-startexp', 'apps-camera', 'apps-paint', 'apps-recorder',
+    # more services and the four scheduled tasks
+    'svc-smsrouter', 'svc-scpolicy', 'svc-biometric', 'svc-sensormon', 'svc-sensordata',
+    'task-sqm', 'task-maps', 'task-familysafety', 'task-powerdiag'
+)
+# the warning for Advanced Debloat: shown in its part of the window, and (with Yes / No) before it does anything
+$script:AdvancedWarningText = 'Advanced Debloat is only recommended for PCs that are used mainly for gaming.' + "`r`n" + "`r`n" +
+    'It can switch off services and features that other uses of this PC need (work, printing, remote access, virtual machines, ' +
+    'sharing and so on). If you also use this PC for anything besides gaming, use Recommended Debloat instead.'
+$script:AdvancedWarning = $script:AdvancedWarningText + "`r`n" + "`r`n" +
+    'Yes = go on: the list of changes is shown next and nothing is changed before you confirm it.' + "`r`n" + 'No = cancel.'
+# the saved Custom Preset: Picks = setting id -> the option picked on its card ('' for a plain on/off setting), Saved = when,
+# Source = the file it was saved to or opened from ('' when it is only kept inside the app)
+$script:Personal = @{ Saved = ''; Picks = @{}; Source = '' }
+
+# Is this row in the preset? ($key: recommended | advanced | personal)
+function Test-InPreset {
+    param($row, [string]$key)
+    $id = [string]$row.T.Id
+    switch ($key) {
+        'recommended' { return [bool]$row.T.Preset }
+        'advanced'    { return ([bool]$row.T.Preset -or (@($script:AdvancedExtra) -contains $id)) }
+        'personal'    { return $script:Personal.Picks.ContainsKey($id) }
+    }
+    return $false
+}
+
+# Tick the settings of a preset that are not applied yet. Returns how many rows are now waiting to be turned on.
+function Select-PresetKey {
+    param([string]$key)
+    $n = 0
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if (-not (Test-InPreset $row $key)) { continue }
+        if ($row.T.Once) { continue }          # a run-once action (a clean-up) is never part of a preset
+        $pick = ''
+        if ($row.T.Choices) { $pick = [string]$script:Personal.Picks[[string]$id] }
+        if ($row.T.Choices -and $pick) {
+            if ($row.State -eq 'On' -and [string]$row.Choice -eq $pick) { continue }
+            if ((Try-SetPick $id $pick) -eq '' -and (Get-Action $row) -eq 'Apply') { $n++ }
+            continue
+        }
+        if ($row.State -eq 'On') { continue }
+        if ((Try-SetWant $id $true) -eq '') { $n++ }
+    }
+    return $n
+}
+
+# Tick everything of the Recommended preset that is not applied yet. Returns how many rows were ticked.
+function Select-Preset { return (Select-PresetKey 'recommended') }
+
+# The settings that are on in the window right now (applied, or waiting to be turned on, and not waiting to be turned off):
+# what the Custom Preset saves. Returns setting id -> picked option ('' for a plain setting). Run-once actions are not part of it.
+function Get-PersonalCapture {
+    $cap = [ordered]@{}
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($row.T.Once -or $row.State -eq 'NA' -or $row.State -eq 'Checking') { continue }
+        $act = Get-Action $row
+        if ($row.T.Choices) {
+            $k = [string]$row.Pick
+            if (-not $k) { if ($row.State -eq 'On') { $k = [string]$row.Choice } }
+            if ($k -and $k -ne 'default') { $cap[[string]$id] = $k }
+            continue
+        }
+        if (($row.State -eq 'On' -and $act -ne 'Undo') -or $act -eq 'Apply') { $cap[[string]$id] = '' }
+    }
+    return $cap
+}
+
+# Where the Custom Preset is kept inside the app: beside the undo record
+function Get-PersonalPath {
+    if ($script:PersonalFile) { return [string]$script:PersonalFile }
+    if ($StorePath) { return (Join-Path ([IO.Path]::GetDirectoryName([string]$StorePath)) 'personal-preset.xml') }
+    return ''
+}
+
+# Make these picks (setting id -> option) the Custom Preset, and keep a copy beside the undo record so that it is there the next
+# time the window opens. Returns '' when the copy was written, else why not (it is then only kept until the window closes).
+function Set-Personal {
+    param($picks, [string]$saved, [string]$source = '')
+    $script:Personal = @{ Saved = $saved; Picks = $picks; Source = $source }
+    $p = Get-PersonalPath
+    if (-not $p) { return 'There is no place to keep it.' }
+    try {
+        $dir = [IO.Path]::GetDirectoryName($p)
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $ids = @($picks.Keys | Sort-Object)
+        $keys = @($ids | ForEach-Object { [string]$picks[$_] })
+        Export-Clixml -InputObject @{ Saved = $saved; Source = $source; Ids = [string[]]$ids; Keys = [string[]]$keys } -LiteralPath $p -Depth 4 -Force -ErrorAction Stop
+        return ''
+    } catch { return $_.Exception.Message }
+}
+
+# Make $cap (setting id -> option, from Get-PersonalCapture) the Custom Preset inside the app. Returns '' or why the copy could not be kept.
+function Save-Personal {
+    param($cap, [string]$source = '')
+    $picks = @{}
+    foreach ($k in @($cap.Keys)) { $picks[[string]$k] = [string]$cap[$k] }
+    return (Set-Personal $picks ((Get-Date).ToString('yyyy-MM-dd HH:mm')) $source)
+}
+
+# Read the Custom Preset kept inside the app (if there is one). Never throws: a missing or damaged copy means none.
+function Load-Personal {
+    $script:Personal = @{ Saved = ''; Picks = @{}; Source = '' }
+    $p = Get-PersonalPath
+    if (-not $p -or -not (Test-Path -LiteralPath $p)) { return }
+    try {
+        $x = Import-Clixml -LiteralPath $p -ErrorAction Stop
+        $ids = @($x.Ids); $keys = @($x.Keys)
+        $picks = @{}
+        for ($i = 0; $i -lt $ids.Count; $i++) {
+            $k = ''
+            if ($i -lt $keys.Count) { $k = [string]$keys[$i] }
+            if ([string]$ids[$i]) { $picks[[string]$ids[$i]] = $k }
+        }
+        $script:Personal = @{ Saved = [string]$x.Saved; Picks = $picks; Source = [string]$x.Source }
+    } catch { $script:Personal = @{ Saved = ''; Picks = @{}; Source = '' } }
+}
+
+# ---- the configuration file: the Custom Preset in a file the user keeps, so that it survives a clean install of Windows.
+# Plain JSON (readable in Notepad): the format name, a version, when it was saved and each setting's id, name and option.
+$script:ConfigFormat = 'Headroom configuration'
+$script:ConfigFormatOld = 'FasterWin configuration'     # what the files saved before the app was called Headroom say; they are still read
+$script:ConfigVersion = 1
+
+# Write the settings in $cap (setting id -> option) to $Path. When the file was written the same settings also become the Custom
+# Configuration inside the app. Returns @{ Error; Saved; Count; PersonalError }: Error is '' when the file was written.
+function Save-Configuration {
+    param([string]$Path, $cap)
+    $saved = (Get-Date).ToString('yyyy-MM-dd HH:mm')
+    $res = @{ Error = ''; Saved = $saved; Count = @($cap.Keys).Count; PersonalError = '' }
+    if (-not $Path) { $res.Error = 'No file was chosen.'; return $res }
+    $list = @()
+    $picks = @{}
+    foreach ($k in @($cap.Keys)) {
+        $nm = ''
+        if ($script:ById[[string]$k]) { $nm = [string]$script:ById[[string]$k].Name }
+        $list += [pscustomobject]@{ Id = [string]$k; Name = $nm; Option = [string]$cap[$k] }
+        $picks[[string]$k] = [string]$cap[$k]
+    }
+    try {
+        $doc = [ordered]@{ Format = $script:ConfigFormat; Version = $script:ConfigVersion; Saved = $saved; Count = $list.Count; Settings = @($list) }
+        $json = ConvertTo-Json -InputObject $doc -Depth 5
+        $dir = [IO.Path]::GetDirectoryName($Path)
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        [IO.File]::WriteAllText($Path, $json, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { $res.Error = $_.Exception.Message; return $res }
+    $res.PersonalError = Set-Personal $picks $saved $Path
+    return $res
+}
+
+# Read a configuration file without changing anything. Returns @{ Ok; Error; Saved; Picks; Count; Skipped }: Picks = setting id -> option
+# for the settings this version of the app knows, Skipped = how many in the file it does not know.
+function Read-Configuration {
+    param([string]$Path)
+    $r = @{ Ok = $false; Error = ''; Saved = ''; Picks = @{}; Count = 0; Skipped = 0 }
+    if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { $r.Error = 'The file was not found.'; return $r }
+    $doc = $null
+    try { $doc = ConvertFrom-Json -InputObject ([IO.File]::ReadAllText($Path)) -ErrorAction Stop } catch { $doc = $null }
+    if (-not $doc -or ([string]$doc.Format -ne $script:ConfigFormat -and [string]$doc.Format -ne $script:ConfigFormatOld)) { $r.Error = 'This is not a Headroom configuration file.'; return $r }
+    $ver = 0
+    [void][int]::TryParse([string]$doc.Version, [ref]$ver)
+    if ($ver -lt 1) { $r.Error = 'This is not a Headroom configuration file.'; return $r }
+    if ($ver -gt $script:ConfigVersion) { $r.Error = 'This file was saved by a newer version of Headroom. Update the app, then open it again.'; return $r }
+    foreach ($it in @($doc.Settings)) {
+        $id = [string]$it.Id
+        if (-not $id) { continue }
+        if ($script:ById[$id]) { $r.Picks[$id] = [string]$it.Option } else { $r.Skipped++ }
+    }
+    if ($r.Picks.Count -eq 0) { $r.Error = 'The file has no settings that this version of Headroom knows.'; return $r }
+    $r.Ok = $true
+    $r.Saved = [string]$doc.Saved
+    $r.Count = $r.Picks.Count
+    return $r
+}
+
+# Open a configuration file and make it the Custom Preset (inside the app too). Returns what Read-Configuration returns,
+# plus PersonalError ('' unless the copy inside the app could not be kept; the opened configuration is used either way).
+function Open-Configuration {
+    param([string]$Path)
+    $r = Read-Configuration $Path
+    $r.PersonalError = ''
+    if (-not $r.Ok) { return $r }
+    $saved = [string]$r.Saved
+    if (-not $saved) { $saved = (Get-Item -LiteralPath $Path).LastWriteTime.ToString('yyyy-MM-dd HH:mm') }
+    $r.PersonalError = Set-Personal $r.Picks $saved $Path
+    return $r
+}
+
+# The names of the saved Custom Preset's settings that exist on this PC now (in catalog order), and which of them are not on yet
+function Get-PersonalInfo {
+    $names = @(); $off = @(); $na = 0
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if (-not (Test-InPreset $row 'personal')) { continue }
+        $names += [string]$row.T.Name
+        if ($row.State -eq 'NA') { $na++ }
+        if ($row.State -ne 'NA' -and $row.State -ne 'On') { $off += [string]$row.T.Name }
+        elseif ($row.T.Choices -and $row.State -eq 'On' -and [string]$row.Choice -ne [string]$script:Personal.Picks[[string]$id]) { $off += [string]$row.T.Name }
+    }
+    return @{ Names = $names; NotOn = $off; Na = $na; Saved = [string]$script:Personal.Saved; Source = [string]$script:Personal.Source }
+}
+
+# "Apply all": offered on "All settings" and on every group page (not while a search is showing).
+# Left out of "Apply all" on purpose (the reason is shown in the question that is asked first).
+$script:ApplyAllSkip = @{ 'uac-lua' = 'it can stop Settings, Calculator and other apps from opening'
+                         'bitlocker' = 'it decrypts your drives, which is a decision of its own'
+                         'mpo' = 'it is a fix for flicker and stutter, not a speed-up, so you choose it yourself' }
+
+# '' when "Apply all" takes this setting, otherwise why it does not. $cat is the page ('' = All settings).
+# The Startup apps and the Testing settings are left out of "All settings" only: which programs start with Windows is your own
+# choice and the Testing page holds untested ideas, so they are switched on in bulk only when you press Apply all on their own page.
+function Get-ApplyAllSkip {
+    param($row, [string]$cat = '')
+    if (-not $cat -and [string]$row.T.Cat -like 'Startup apps*') { return 'which programs start with Windows is your own choice' }
+    if (-not $cat -and [string]$row.T.Cat -eq $script:TestingCat) { return 'they are untested ideas from other debloat scripts, so you pick them yourself on the Testing page' }
+    $why = $script:ApplyAllSkip[[string]$row.T.Id]
+    if ($why) { return [string]$why }
+    return ''
+}
+
+# Is "Apply all" offered on this page? ($cat is '' for "All settings"; a search is not a page)
+function Test-ApplyAllPage {
+    param([string]$cat, [string]$searchText)
+    if ($searchText) { return $false }
+    if (Test-InfoPage $cat) { return $false }
+    return $true
+}
+
+# Tick every setting on one page ($cat = '' means all of them) that "Apply all" takes. The filter buttons and the search
+# box do not matter: it is the whole page. A waiting "turn off" on such a setting is cancelled.
+# Returns  Ticked = how many will be turned on, Left = the settings left out (Name, Why) that are not on yet.
+function Select-ApplyAll {
+    param([string]$cat)
+    $left = @()
+    $startN = 0; $startWhy = ''
+    $testN = 0; $testWhy = ''
+    $ticked = 0
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($cat -and [string]$row.T.Cat -ne $cat) { continue }
+        if ($row.State -eq 'NA') { continue }
+        if ($row.T.Once) { continue }          # a run-once action (a clean-up) is only ever started on purpose, never in bulk
+        $why = Get-ApplyAllSkip $row $cat
+        if ($why) {
+            if ($row.State -ne 'On') {
+                if ([string]$row.T.Cat -like 'Startup apps*') { $startN++; $startWhy = $why }
+                elseif ([string]$row.T.Cat -eq $script:TestingCat) { $testN++; $testWhy = $why }
+                else { $left += ,@{ Name = [string]$row.T.Name; Why = $why } }
+            }
+            continue
+        }
+        if ((Try-SetWant $id $true) -eq '') {
+            if ((Get-Action $row) -eq 'Apply') { $ticked++ }
+        }
+    }
+    if ($startN -gt 0) { $left += ,@{ Name = ('Startup apps ({0})' -f $startN); Why = $startWhy } }
+    if ($testN -gt 0) { $left += ,@{ Name = ('Testing ({0})' -f $testN); Why = $testWhy } }
+    return @{ Ticked = $ticked; Left = $left }
+}
+
+# Throw away all waiting changes
+function Reset-Ticks {
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        $row.Want = ($row.State -eq 'On')
+        $row.Pick = Get-RealPick $row
+        $row.Force = ''
+        $row.Note = ''
+        $row.NoteDetail = ''
+    }
+}
+
+# For a setting with options: the key of the option that is in force now ('' when the values match none, and for the others)
+function Get-RealPick {
+    param($row)
+    if (-not $row.T.Choices) { return '' }
+    if ($row.State -eq 'On') { return [string]$row.Choice }
+    if ($row.State -eq 'Off') { return 'default' }
+    return ''
+}
+
+# The state of a row was (re)checked. During the first check the tick follows the real state.
+function Set-RowState {
+    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '')
+    $row = $script:Rows[$id]
+    if (-not $row) { return }
+    $row.State = $state
+    $row.Detail = $detail
+    $row.Choice = $choice
+    $row.Read = $read          # what the check read from the PC (one line per value)
+    $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
+    $row.Force = ''
+    if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row }
+}
+
+# The changes the user has queued, in catalog order:  @{ Id; Action = 'Apply'|'Undo' }  (+ Choice = the option to set, for a setting with options)
+function Get-Pending {
+    $out = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        $a = Get-Action $row
+        if (-not $a) { continue }
+        if ($row.T.Choices -and $a -eq 'Apply') { $out += ,@{ Id = $id; Action = $a; Choice = [string]$row.Pick } }
+        else { $out += ,@{ Id = $id; Action = $a } }
+    }
+    return $out
+}
+
+function Get-Counts {
+    $c = @{ Total = 0; On = 0; Off = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0 }
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        $c.Total++
+        switch ([string]$row.State) {
+            'On'       { $c.On++ }
+            'Off'      { $c.Off++ }
+            'Partial'  { $c.Partial++ }
+            'NA'       { $c.NA++ }
+            'Checking' { $c.Checking++ }
+            default    { $c.Unknown++ }
+        }
+        $a = Get-Action $row
+        if ($a -eq 'Apply') { $c.Apply++ }
+        if ($a -eq 'Undo') { $c.Undo++ }
+    }
+    return $c
+}
+
+# ---------------------------------------------------------------- the texts ----
+function Get-StateText {
+    param($row)
+    switch ([string]$row.State) {
+        'Checking' { return 'Checking...' }
+        'On'       {
+            # 'Already applied' = it was like this before this app did anything (no undo record), so there is nothing of ours to take back
+            $w = 'Applied'; if ($row.Mine -eq 'no') { $w = 'Already applied' }
+            if ($row.T -and $row.T.Choices) { return ($w + ': ' + (Get-ChoiceLabel $row.T ([string]$row.Choice))) }
+            return $w
+        }
+        'Off'      {
+            # a run-once action is never "applied": it is ready to be run
+            if ($row.Once -or ($row.T -and $row.T.Once)) { return 'Ready to run' }
+            return 'Not applied'
+        }
+        'Partial'  { return 'Partly applied' }
+        'NA'       { return 'Not on this PC' }
+    }
+    return 'Unknown'
+}
+
+function Get-NextText {
+    param($row)
+    if ($row.Note) { return [string]$row.Note }
+    $a = Get-Action $row
+    if ($row.T.Choices -and $a) { return ('Set to ' + (Get-ChoiceLabel $row.T ([string]$row.Pick))) }
+    if ($a -eq 'Apply' -and $row.T.Once) { return 'Run now' }
+    if ($a -eq 'Apply') { return 'Turn on' }
+    if ($a -eq 'Undo') { return 'Turn off' }
+    return ''
+}
+
+function Get-HeadsUp {
+    param($t)
+    if ($t.OneWay) { return 'One-way' }
+    if ($t.Risk -eq 'security') { return 'Lowers security' }
+    if ($t.Risk -eq 'note') { return 'Has side effects' }
+    return ''
+}
+
+function Get-SummaryText {
+    $c = Get-Counts
+    if ($c.Checking -gt 0) { return 'Checking your PC...' }
+    $n = $c.Apply + $c.Undo
+    $s = ('{0} settings: {1} applied, {2} not applied' -f ($c.Total - $c.NA), $c.On, ($c.Off + $c.Partial + $c.Unknown))
+    if ($c.NA -gt 0) { $s += (', {0} not on this PC' -f $c.NA) }
+    if ($n -gt 0) {
+        $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.Apply, $c.Undo)
+    } else {
+        $s += '.  Switch settings on or off to choose changes.'
+    }
+    return $s
+}
+
+function Get-GroupHeader {
+    param([string]$cat)
+    $tot = 0; $on = 0; $checking = 0
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($row.T.Cat -ne $cat) { continue }
+        if ($row.State -eq 'NA') { continue }
+        if ($row.State -eq 'Checking') { $checking++ }
+        $tot++
+        if ($row.State -eq 'On') { $on++ }
+    }
+    if ($checking -gt 0) { return $cat }
+    return ('{0}   ({1} of {2} applied)' -f $cat, $on, $tot)
+}
+
+# The same counts for every group in one pass:  category -> @{ Total; On; Checking }  (settings that are not on this PC are left out)
+function Get-GroupCounts {
+    $h = @{}
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        $cat = [string]$row.T.Cat
+        if (-not $h.ContainsKey($cat)) { $h[$cat] = @{ Total = 0; On = 0; Checking = 0 } }
+        if ($row.State -eq 'NA') { continue }
+        $g = $h[$cat]
+        if ($row.State -eq 'Checking') { $g.Checking++ }
+        $g.Total++
+        if ($row.State -eq 'On') { $g.On++ }
+    }
+    return $h
+}
+function Get-GroupCountText {
+    param($g)
+    if (-not $g -or $g.Checking -gt 0) { return '' }
+    return ('{0} of {1} applied' -f $g.On, $g.Total)
+}
+
+# ---------------------------------------------------------------- names and counts for the window's pages ----
+# "Security prompts (turning these off lowers protection)" -> Short = "Security prompts", Hint = "Turning these off lowers protection"
+function Split-CatName {
+    param([string]$cat)
+    if ($cat -eq $script:PageHome) { return @{ Short = 'Home'; Hint = '' } }
+    $short = $cat
+    $hint = ''
+    $i = $cat.IndexOf(' (')
+    if ($i -gt 0 -and $cat.EndsWith(')')) {
+        $short = $cat.Substring(0, $i)
+        $hint = $cat.Substring($i + 2, $cat.Length - $i - 3)
+    }
+    if ($hint -match '^(tick|switch on) = do not start') { $hint = 'Turn a switch on to stop that program starting with Windows' }
+    elseif ($hint.Length -gt 1) { $hint = $hint.Substring(0, 1).ToUpper() + $hint.Substring(1) }
+    return @{ Short = $short; Hint = $hint }
+}
+
+# The name in the side menu (a few are shortened so that they fit; the page itself, and its title, carry the full name)
+function Get-NavTitle {
+    param([string]$cat)
+    $s = (Split-CatName $cat).Short
+    switch ($s) {
+        'Privacy and telemetry' { return 'Privacy' }
+        'Cloud, sync and OneDrive' { return 'Cloud and OneDrive' }
+        'Network sharing and discovery' { return 'Network sharing' }
+        'Network adapters and USB power' { return 'Adapters and USB' }
+        'Power plan and startup' { return 'Power and startup' }
+        'Remote access and VPN' { return 'Remote and VPN' }
+        'Gaming and performance' { return 'Gaming' }
+        'Other Windows services' { return 'Other services' }
+        'Legacy Windows features' { return 'Legacy features' }
+        'Placebo Tweaks - Not Recommended' { return 'Placebo Tweaks' }
+    }
+    return $s
+}
+
+# One line of what the setting does: the first sentence of its description
+function Get-ShortDesc {
+    param($t)
+    $d = ([string]$t.Desc -replace '\s+', ' ').Trim()
+    $i = $d.IndexOf('. ')
+    if ($i -ge 20) { $d = $d.Substring(0, $i) }
+    $d = $d.TrimEnd('.')
+    if ($d.Length -gt 200) { $d = $d.Substring(0, 200) }
+    return $d
+}
+
+# The risk level of a setting: 'Risky' (lowers a protection), 'Medium risk' (has side effects, or cannot be undone from here),
+# else 'Low risk'. "Low risk" is only what this script's own notes say; the description still tells the whole story.
+function Get-RiskLevel {
+    param($t)
+    if ([string]$t.Risk -eq 'security') { return 'Risky' }
+    if ([string]$t.Risk -eq 'note' -or [bool]$t.OneWay) { return 'Medium risk' }
+    return 'Low risk'
+}
+
+# The badge on a card: the risk level and its colour name in the theme. The three risk filter buttons use the same three words.
+function Get-RiskBadge {
+    param($t)
+    $l = Get-RiskLevel $t
+    if ($l -eq 'Risky') { return @{ Text = $l; Key = 'Bad' } }
+    if ($l -eq 'Medium risk') { return @{ Text = $l; Key = 'Warn' } }
+    return @{ Text = $l; Key = 'Good' }
+}
+
+# "Not recommended": the setting is one this script's notes advise against switching on (no proven benefit, or it is known to
+# break something common). Returns the reason, or '' when the setting is not marked. A setting marked -Unproven always counts,
+# with the same reason its "May do nothing" tag stands for. The card shows the words next to its risk badge.
+$script:NotRecText = 'Not recommended'
+function Get-NotRecReason {
+    param($t)
+    if ([string]$t.NotRec) { return [string]$t.NotRec }
+    if ([bool]$t.Unproven) { return 'No proven benefit: it may change nothing. The description says why.' }
+    return ''
+}
+
+# The small tags on a card, most useful first
+function Get-CardTags {
+    param($t)
+    $tags = @((Get-NavTitle ([string]$t.Cat)))
+    if ($t.Reboot) { $tags += 'Needs restart' }
+    if ($t.OneWay) { $tags += 'One-way' }
+    if ($t.Once) { $tags += 'Runs once' }
+    if ($t.Ask) { $tags += 'Asks first' }
+    # on the "Placebo Tweaks - Not Recommended" page the first tag already says it
+    if ($t.Unproven -and $tags[0] -ne 'Placebo Tweaks') { $tags += 'May do nothing' }
+    if ($t.Preset) { $tags += 'Recommended preset' }
+    return $tags
+}
+
+# How many settings each filter would show (for the numbers on the filter buttons). $cat = '' means all categories;
+# $text is the search, which narrows every number the same way it narrows the list. The state buttons (All, Applied, ...) count
+# within the risk button that is on ($risk); the risk buttons count within the state button that is on ($mode), so every number is
+# what pressing that button next to the current choice would show.
+function Get-ModeCounts {
+    param([string]$cat = '', [string]$text = '', [string]$mode = 'All settings', [string]$risk = 'Any risk')
+    $c = @{ 'All settings' = 0; 'Applied' = 0; 'Not applied' = 0; 'Waiting to change' = 0; 'Recommended' = 0; 'Personal' = 0; Checking = 0
+            'Any risk' = 0; 'Low risk' = 0; 'Medium risk' = 0; 'Risky' = 0 }
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($cat -and [string]$row.T.Cat -ne $cat) { continue }
+        if ($text -and -not (Test-RowVisible $row $text 'All settings')) { continue }
+        $level = Get-RiskLevel $row.T
+        if ($row.State -eq 'Checking') { $c.Checking++ }
+        # the risk buttons: rows that the state button that is on lets through
+        if (Test-RowVisible $row '' $mode) {
+            $c['Any risk']++
+            $c[$level]++
+        }
+        # the state buttons: rows that the risk button that is on lets through
+        if ($risk -ne 'Any risk' -and $level -ne $risk) { continue }
+        $c['All settings']++
+        if ($row.State -eq 'On') { $c['Applied']++ }
+        elseif ($row.State -eq 'Off' -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') { $c['Not applied']++ }
+        if (Get-Action $row) { $c['Waiting to change']++ }
+        if ($row.T.Preset) { $c['Recommended']++ }
+        if ($script:Personal.Picks.ContainsKey([string]$row.T.Id)) { $c['Personal']++ }
+    }
+    return $c
+}
+
+# The big title and the line under it for the page that is showing ($shown = how many settings the list has)
+function Get-PageInfo {
+    param([string]$cat, [string]$text, [int]$shown)
+    $c = Get-Counts
+    if ($text) {
+        return @{ Title = 'Search results'; Sub = ('{0} setting(s) match "{1}"' -f $shown, $text) }
+    }
+    if ($cat -eq $script:PageHome) { return @{ Title = 'Home'; Sub = 'Your PC right now, every 2 seconds. Changes nothing on its own.' } }
+    if ($c.Checking -gt 0) {
+        $t = 'All settings'
+        if ($cat) { $t = (Split-CatName $cat).Short }
+        return @{ Title = $t; Sub = 'Checking your PC...' }
+    }
+    if (-not $cat) {
+        $s = ('{0} settings, {1} applied' -f ($c.Total - $c.NA), $c.On)
+        $n = $c.Apply + $c.Undo
+        if ($n -gt 0) { $s += (', {0} waiting to change' -f $n) }
+        return @{ Title = 'All settings'; Sub = $s }
+    }
+    $nm = Split-CatName $cat
+    $g = (Get-GroupCounts)[$cat]
+    $s = ''
+    if ($g) { $s = ('{0} of {1} applied' -f $g.On, $g.Total) }
+    if ($nm.Hint) { if ($s) { $s += '  -  ' }; $s += $nm.Hint }
+    return @{ Title = $nm.Short; Sub = $s }
+}
+
+# The text next to a setting, in styled pieces:  S = style (title|sub|now|wait|last|body|warn|note|head|mono),
+# C = colour hint (good|warn|sub), T = the text. Get-DetailText joins them, so both always agree.
+function Get-DetailParts {
+    param($row)
+    $t = $row.T
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    $c = 'sub'
+    if ([string]$row.State -eq 'On') { $c = 'good' }
+    elseif ([string]$row.State -eq 'Partial' -or [string]$row.State -eq 'Unknown') { $c = 'warn' }
+    [void]$p.Add(@{ S = 'title'; C = ''; T = $t.Name + $nl })
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = $t.Cat + $nl + $nl })
+    [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it, so there is nothing of its own to put back.' + $nl }) }
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Applied by this app: the values from before are saved, so turning it off puts them back.' + $nl }) }
+    $a = Get-Action $row
+    if ($t.Choices -and $a) {
+        [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be set to "' + (Get-ChoiceLabel $t ([string]$row.Pick)) + '" when you press the button' + $(if ($a -eq 'Undo') { ' (your previous values are put back)' } else { '' }) + $nl) })
+    } elseif ($a -eq 'Apply' -and $t.Once) { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will run once when you press the button' + $nl }) }
+    elseif ($a -eq 'Apply') { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned ON when you press the button' + $nl }) }
+    elseif ($a -eq 'Undo')  { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned OFF (your previous values are put back) when you press the button' + $nl }) }
+    if ($row.NoteDetail) { [void]$p.Add(@{ S = 'last'; C = ''; T = 'Last result: ' + [string]$row.Note + ' - ' + [string]$row.NoteDetail + $nl }) }
+    if ([string]$row.Read) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Read from your PC (the last check):' + $nl })
+        foreach ($l in @(([string]$row.Read) -split "`n")) { if ($l.Trim()) { [void]$p.Add(@{ S = 'mono'; C = ''; T = '  ' + $l.TrimEnd() + $nl }) } }
+    }
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + $t.Desc + $nl + $nl })
+    $nr = Get-NotRecReason $t
+    if ($nr) { [void]$p.Add(@{ S = 'warn'; C = ''; T = ($script:NotRecText + ': ' + $nr) + $nl }) }
+    if ($t.Risk -eq 'security') { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this lowers a security protection. Read the description above before switching it on.' + $nl }) }
+    if ($t.Risk -eq 'note')     { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this has side effects. Read the description above before switching it on.' + $nl }) }
+    if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: this cannot be turned back on from this window.' + $nl }) }
+    if ($t.Unproven) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'May have no effect: read the description above for why.' + $nl }) }
+    if ($t.Reboot) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Needs a restart of the PC to take full effect.' + $nl }) }
+    if ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Turn all on or any preset.' + $nl }) }
+    elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
+    else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (switch it on yourself if you want it).' + $nl }) }
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What it changes:' + $nl })
+    foreach ($l in @(Describe-Tweak $t)) { [void]$p.Add(@{ S = 'mono'; C = ''; T = '  ' + [string]$l + $nl }) }
+    return $p
+}
+function Get-DetailText {
+    param($row)
+    $s = ''
+    foreach ($x in @(Get-DetailParts $row)) { $s += [string]$x.T }
+    return $s
+}
+
+# $mode: 'All settings' | 'Applied' | 'Not applied' | 'Waiting to change' | 'Recommended' | 'Personal'
+# $risk: 'Any risk' | 'Low risk' | 'Medium risk' | 'Risky'   (both must let the row through)
+function Test-RowVisible {
+    param($row, [string]$text, [string]$mode, [string]$risk = 'Any risk')
+    if ($risk -and $risk -ne 'Any risk' -and (Get-RiskLevel $row.T) -ne $risk) { return $false }
+    if ($text) {
+        $hay = $row.T.Name + ' ' + $row.T.Desc + ' ' + $row.T.Id + ' ' + $row.T.Cat
+        if (Get-NotRecReason $row.T) { $hay += ' ' + $script:NotRecText }        # a search for "not recommended" finds the marked ones
+        if ($hay.IndexOf($text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+    }
+    switch ($mode) {
+        'Applied'              { return ($row.State -eq 'On') }
+        'Not applied'          { return ($row.State -eq 'Off' -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') }
+        'Waiting to change'    { return [bool](Get-Action $row) }
+        'Recommended'          { return [bool]$row.T.Preset }
+        'Personal'             { return [bool]$script:Personal.Picks.ContainsKey([string]$row.T.Id) }
+    }
+    return $true
+}
+
+function Format-NameList {
+    param($names, [int]$max = 12)
+    $names = @($names)
+    $nl = "`r`n"
+    $s = ''
+    $i = 0
+    foreach ($n in $names) {
+        $i++
+        if ($i -gt $max) { $s += ('  ...and {0} more' -f ($names.Count - $max)) + $nl; break }
+        $s += '  - ' + [string]$n + $nl
+    }
+    return $s
+}
+
+# The name of a planned change; a setting with options also says which option is set
+function Get-PlanName {
+    param($item)
+    $t = $script:ById[[string]$item.Id]
+    if ($t.Choices -and [string]$item.Action -eq 'Apply') {
+        $k = [string]$item.Choice
+        if (-not $k) { $k = [string](Resolve-Choice $t '').Key }
+        return ('{0}: set to {1}' -f $t.Name, (Get-ChoiceLabel $t $k))
+    }
+    return [string]$t.Name
+}
+
+# The question asked before real changes are made
+function Get-ConfirmText {
+    param($Plan, [string]$Extra = '')
+    $Plan = @($Plan)
+    $nl = "`r`n"
+    $on = @($Plan | Where-Object { $_.Action -eq 'Apply' -and -not $script:ById[$_.Id].Once } | ForEach-Object { Get-PlanName $_ })
+    $run = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once } | ForEach-Object { $script:ById[$_.Id].Name })
+    $off = @($Plan | Where-Object { $_.Action -eq 'Undo' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $one = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].OneWay } | ForEach-Object { $script:ById[$_.Id].Name })
+    $rb = @($Plan | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
+    $s = ('Make {0} change(s) on this PC?' -f $Plan.Count) + $nl + $nl
+    if ($Extra) { $s += $Extra + $nl }
+    if ($on.Count)  { $s += ('Turn ON ({0}):' -f $on.Count) + $nl + (Format-NameList $on) + $nl }
+    if ($run.Count) { $s += ('RUN once ({0}); files they delete are gone for good, they do not go to the Recycle Bin:' -f $run.Count) + $nl + (Format-NameList $run) + $nl }
+    if ($off.Count) { $s += ('Turn OFF ({0}):' -f $off.Count) + $nl + (Format-NameList $off) + $nl }
+    if ($one.Count) { $s += ('These cannot be undone from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
+    if ($rb.Count)  { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl + $nl }
+    if (@($Plan | Where-Object { -not $script:ById[$_.Id].Once }).Count -gt 0) {
+        $s += 'A restore point is created first, and your current values are saved so that switching a setting off later puts them back.'
+    } else {
+        $s += 'Nothing here can be undone, so no restore point is made.'
+    }
+    return $s
+}
+
+# The warning lists shared by the heads-up texts of "Apply all" and the presets: what lowers protection, what can stop something
+# working, what may do nothing, which programs stop starting. $apply = the planned changes that turn something on.
+function Get-NoteSections {
+    param($apply)
+    $nl = "`r`n"
+    $apply = @($apply)
+    $sec = @($apply | Where-Object { $script:ById[$_.Id].Risk -eq 'security' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $note = @($apply | Where-Object { $script:ById[$_.Id].Risk -eq 'note' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $dud = @($apply | Where-Object { $script:ById[$_.Id].Unproven } | ForEach-Object { $script:ById[$_.Id].Name })
+    $start = @($apply | Where-Object { [string]$script:ById[$_.Id].Cat -like 'Startup apps*' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $s = ''
+    if ($sec.Count)  { $s += ('These lower protection or turn a feature off ({0}):' -f $sec.Count) + $nl + (Format-NameList $sec 12) + $nl }
+    if ($note.Count) { $s += ('These can stop something you use from working ({0}):' -f $note.Count) + $nl + (Format-NameList $note 40) + $nl }
+    if ($dud.Count)  { $s += ('These may do nothing on your PC; each description says why ({0}):' -f $dud.Count) + $nl + (Format-NameList $dud 12) + $nl }
+    if ($start.Count) { $s += ('These programs will no longer start with Windows ({0}); switch one back off here or in Task Manager to let it start again:' -f $start.Count) + $nl + (Format-NameList $start 20) + $nl }
+    return $s
+}
+
+# The heads-up shown first when "Apply all" is pressed: what it takes in, what can stop working, what was left out
+function Get-ApplyAllNote {
+    param($Plan, $Left, [string]$Where)
+    $nl = "`r`n"
+    $Plan = @($Plan)
+    $apply = @($Plan | Where-Object { $_.Action -eq 'Apply' })
+    $s = ('APPLY ALL: this switches on every setting on "{0}" ({1} of them) in one go.' -f $Where, $apply.Count) + $nl
+    $s += 'Read the list before you say yes. Each setting''s description says what it changes.' + $nl + $nl
+    $s += Get-NoteSections $apply
+    $lf = @($Left)
+    if ($lf.Count) {
+        $s += 'Left out on purpose:' + $nl
+        foreach ($l in $lf) { $s += ('  - {0}: {1}' -f $l.Name, $l.Why) + $nl }
+        $s += $nl
+    }
+    return $s
+}
+
+# The settings in a plan that FACEIT's Anti-Cheat or Riot Vanguard (Valorant, League of Legends) can refuse to run with: the ones
+# that ask the anti-cheat question (AskGroup 'anticheat': Memory Integrity / VBS, the hypervisor)
+function Get-AntiCheatNames {
+    param($Plan)
+    return @(@($Plan) | Where-Object { $_.Action -eq 'Apply' -and [string]$script:ById[[string]$_.Id].AskGroup -eq 'anticheat' } | ForEach-Object { [string]$script:ById[[string]$_.Id].Name })
+}
+
+# The heads-up shown first when a preset button is pressed. $Key = recommended | advanced | personal, $Before = how many
+# changes were already lined up before the preset added its own.
+function Get-PresetNote {
+    param([string]$Key, $Plan, [int]$Before = 0)
+    $nl = "`r`n"
+    $Plan = @($Plan)
+    $apply = @($Plan | Where-Object { $_.Action -eq 'Apply' })
+    $name = [string]$script:PresetNames[$Key]
+    $s = ('{0}: this switches on {1} setting(s) in one go.' -f $name.ToUpper(), $apply.Count) + $nl
+    if ($Key -eq 'advanced') {
+        $s += 'Advanced Debloat is only recommended for PCs that are used mainly for gaming: it can remove services other uses need.' + $nl
+    } elseif ($Key -eq 'personal') {
+        $s += ('These are the settings of your Custom Preset (saved {0}).' -f [string]$script:Personal.Saved) + $nl
+    }
+    if ($Before -gt 0) { $s += ('{0} change(s) you had already lined up are in this list too.' -f $Before) + $nl }
+    $s += 'Read the list before you say yes. Each setting''s description says what it changes.' + $nl + $nl
+    $ac = @(Get-AntiCheatNames $Plan)
+    if ($ac.Count) {
+        $s += ('WARNING for FACEIT and Riot Vanguard (Valorant, League of Legends) players: these can stop those games from starting or from letting you play ({0}):' -f $ac.Count) + $nl
+        $s += (Format-NameList $ac 12) + 'If you play on either, answer No here, switch these off in the list, and apply again.' + $nl + $nl
+    }
+    $nr = @($apply | Where-Object { Get-NotRecReason $script:ById[[string]$_.Id] } | ForEach-Object { [string]$script:ById[[string]$_.Id].Name })
+    if ($nr.Count) { $s += ('These carry a "{0}" mark; the reason is in each setting''s description ({1}):' -f $script:NotRecText, $nr.Count) + $nl + (Format-NameList $nr 12) + $nl }
+    $s += Get-NoteSections $apply
+    return $s
+}
+
+# ------------------------------------------------------------ the questions ----
+# Some settings ask a question before they are turned on (anti-cheat, printing). These work out what to ask for a plan.
+# One entry per question: Group, Title, Ask (the text), Ids and Names of the settings it covers (in plan order).
+# Settings with the same AskGroup are asked about once. Only "turn on" is asked about; turning a setting off never is.
+function Get-GuardQuestions {
+    param($Plan)
+    $out = @(); $byGroup = @{}
+    foreach ($p in @($Plan)) {
+        if ([string]$p.Action -ne 'Apply') { continue }
+        $t = $script:ById[[string]$p.Id]
+        if (-not $t -or -not $t.Ask) { continue }
+        $g = [string]$t.AskGroup
+        if (-not $g) { $g = [string]$t.Id }
+        if (-not $byGroup.ContainsKey($g)) {
+            $q = @{ Group = $g; Title = [string]$t.AskTitle; Ask = [string]$t.Ask; Ids = @(); Names = @() }
+            $byGroup[$g] = $q
+            $out += ,$q
+        }
+        $q = $byGroup[$g]
+        $q.Ids += [string]$t.Id
+        $q.Names += [string]$t.Name
+    }
+    return $out
+}
+
+# The text of one question: what it is about, which settings the answer covers, and what Yes and No do
+function Get-GuardText {
+    param($q)
+    $nl = "`r`n"
+    $s = [string]$q.Ask + $nl + $nl
+    $names = @($q.Names)
+    if ($names.Count -eq 1) { $s += 'This is about: ' + [string]$names[0] + $nl + $nl }
+    else {
+        $s += 'The answer covers these settings:' + $nl
+        foreach ($n in $names) { $s += '  - ' + [string]$n + $nl }
+        $s += $nl
+    }
+    $s += 'Yes = go ahead and apply it.' + $nl + 'No = leave it as it is (nothing is changed for it).'
+    return $s
+}
+
+# A plan without the given setting ids
+function Remove-FromPlan {
+    param($Plan, $Ids)
+    $drop = @{}
+    foreach ($i in @($Ids)) { $drop[[string]$i] = $true }
+    $out = @()
+    foreach ($p in @($Plan)) { if (-not $drop.ContainsKey([string]$p.Id)) { $out += ,$p } }
+    return $out
+}
+
+# ----------------------------------------------- events from the background job ----
+# The window part supplies Ui-Log, Ui-Progress, Ui-RefreshRow, Ui-Reveal, Ui-ScanFinished, Ui-RunFinished.
+function Handle-Event {
+    param($ev)
+    switch ([string]$ev.Kind) {
+        'log' { Ui-Log ([string]$ev.Text) ([string]$ev.Color) }
+        'state' {
+            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine)
+            if ($script:Scanning) { Ui-Progress ([int]$ev.A) ([int]$ev.B) }
+            Ui-RefreshRow ([string]$ev.Id)
+        }
+        'item' {
+            $row = $script:Rows[[string]$ev.Id]
+            if ($row) {
+                switch ([string]$ev.State) {
+                    'running' { $row.Note = 'Working...'; $row.NoteDetail = ''; Ui-Progress ([int]$ev.A - 1) ([int]$ev.B); Ui-Reveal ([string]$ev.Id) }
+                    'done'    { $row.Note = 'Done'; $row.NoteDetail = [string]$ev.Detail; if ($row.T.Once) { $row.Want = $false }; Ui-Progress ([int]$ev.A) ([int]$ev.B) }
+                    'failed'  { $row.Note = 'Failed'; $row.NoteDetail = [string]$ev.Detail; Ui-Progress ([int]$ev.A) ([int]$ev.B) }
+                    'dry'     { $row.Note = 'Preview only'; $row.NoteDetail = ''; Ui-Progress ([int]$ev.A) ([int]$ev.B) }
+                }
+                Ui-RefreshRow ([string]$ev.Id)
+            }
+        }
+        'wait' {
+            $script:WaitText = [string]$ev.Text
+            $script:DProg = $true
+        }
+        'scandone' {
+            $script:Scanning = $false
+            $script:WaitText = ''
+            # a row the worker never reported on (the startup list changed between the window and the worker)
+            # must not sit on "Checking..." for ever
+            foreach ($id in @($script:Rows.Keys)) {
+                $r = $script:Rows[$id]
+                if ($r.State -eq 'Checking') { $r.State = 'Unknown'; $r.Detail = 'Not checked - press "Check again"' }
+            }
+            Ui-ScanFinished
+        }
+        'finished' {
+            $script:Applying = $false
+            Ui-RunFinished $ev
+        }
+    }
+}
+
+# =============================================================================
+# CONSOLE MODE (-NoGui, -List, -Preset, -Apply, -Undo)
+# =============================================================================
+function Split-Ids {
+    param($values)
+    $out = @()
+    foreach ($v in @($values)) {
+        foreach ($p in ([string]$v -split ',')) {
+            $p = $p.Trim()
+            if ($p) { $out += $p }
+        }
+    }
+    return $out
+}
+
+# Check every setting; returns id -> event (State, Detail). Messages from the check are printed.
+# One name from -Apply / -Undo:  "id"  or  "id=option"  (an option is for a setting that has options, e.g. mpo=full).
+# Returns @{ Id; Choice } ('' when no option was given).
+function Split-IdChoice {
+    param([string]$raw)
+    $i = $raw.IndexOf('=')
+    if ($i -lt 0) { return @{ Id = $raw.Trim(); Choice = '' } }
+    return @{ Id = $raw.Substring(0, $i).Trim(); Choice = $raw.Substring($i + 1).Trim() }
+}
+
+function Invoke-ConsoleScan {
+    $script:Q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    Write-Host 'Checking this PC...' -ForegroundColor Cyan
+    $null = Invoke-Scan
+    $states = @{}
+    $ev = $null
+    while ($script:Q.TryDequeue([ref]$ev)) {
+        if ($ev.Kind -eq 'state') { $states[$ev.Id] = $ev }
+        elseif ($ev.Kind -eq 'log') { Write-Host $ev.Text -ForegroundColor $ev.Color }
+    }
+    $script:Q = $null
+    return $states
+}
+
+function Get-ConsoleState {
+    param($States, [string]$id)
+    if ($States.ContainsKey($id)) { return [string]$States[$id].State }
+    return 'Unknown'
+}
+
+function Write-ConsoleList {
+    param($States)
+    foreach ($cat in @($script:Catalog | ForEach-Object { $_.Cat } | Select-Object -Unique)) {
+        Write-Host ''
+        Write-Host $cat -ForegroundColor Cyan
+        foreach ($t in $script:Catalog) {
+            if ($t.Cat -ne $cat) { continue }
+            $st = Get-ConsoleState $States $t.Id
+            $mine = ''; if ($States.ContainsKey($t.Id)) { $mine = [string]$States[$t.Id].Mine }
+            $text = Get-StateText @{ State = $st; Mine = $mine; Once = [bool]$t.Once }
+            $col = 'Gray'
+            if ($st -eq 'On') { $col = 'Green' }
+            elseif ($st -eq 'Partial') { $col = 'Yellow' }
+            elseif ($st -eq 'NA') { $col = 'DarkGray' }
+            $mark = ''; if ($t.OneWay) { $mark = '  [one-way]' }
+            if ($t.Once) { $mark = '  [runs once when you use -Apply]' }
+            if ($t.Choices) {
+                $opts = @($t.Choices | Where-Object { [string]$_.Key -ne 'default' } | ForEach-Object { [string]$_.Key })
+                $mark = '  [options: ' + ($opts -join ', ') + '; Windows default = off]'
+                $now = ''
+                if ($st -eq 'On' -and $States.ContainsKey($t.Id)) { $now = [string]$States[$t.Id].Choice }
+                if ($now) { $mark += '  [now: ' + $now + ']' }
+            }
+            if (Get-NotRecReason $t) { $mark += '  [not recommended]' }
+            # a setting that cannot be used on this PC says why (for example: Windows Home ignores it)
+            if ($st -eq 'NA' -and $States.ContainsKey($t.Id) -and [string]$States[$t.Id].Detail) { $mark += '  (' + [string]$States[$t.Id].Detail + ')' }
+            Write-Host ('  {0,-30} {1,-15} {2}{3}' -f $t.Id, $text, $t.Name, $mark) -ForegroundColor $col
+        }
+    }
+    Write-Host ''
+    Write-Host 'Turn settings on with  -Apply id1,id2   off with  -Undo id1,id2   the Recommended preset with  -Preset' -ForegroundColor DarkGray
+    Write-Host 'A setting that lists options takes one:  -Apply id=option  (without an option the first one is used);  -Undo id  puts the Windows default back' -ForegroundColor DarkGray
+}
+
+# Works out what -Preset / -Apply / -Undo mean on this PC. Returns Plan (what to do) and Warn (what was skipped, and why).
+function Build-ConsolePlan {
+    param($States, [bool]$UsePreset, $ApplyIds, $UndoIds)
+    $plan = @(); $warn = @(); $seen = @{}; $unknown = 0
+    $applyList = @(Split-Ids $ApplyIds)
+    $undoList = @(Split-Ids $UndoIds)
+    # the same id in both lists is a contradiction: skip it rather than guess
+    $both = @{}
+    foreach ($a in $applyList) {
+        $aid = [string](Split-IdChoice $a).Id
+        foreach ($u in $undoList) {
+            if ($aid -eq [string](Split-IdChoice $u).Id -and $script:ById.ContainsKey($aid)) { $both[$script:ById[$aid].Id] = $true }
+        }
+    }
+    foreach ($id in @($both.Keys)) { $warn += ("{0}: asked to turn on and off in the same run, skipped" -f $id) }
+    if ($UsePreset) {
+        foreach ($t in $script:Catalog) {
+            if (-not $t.Preset) { continue }
+            $st = Get-ConsoleState $States $t.Id
+            if ($st -eq 'On' -or $st -eq 'NA') { continue }
+            $plan += ,@{ Id = $t.Id; Action = 'Apply' }
+            $seen[$t.Id] = 'Apply'
+        }
+    }
+    foreach ($raw in $applyList) {
+        $sp = Split-IdChoice $raw
+        $t = $script:ById[[string]$sp.Id]
+        if (-not $t) { $warn += ("unknown setting '{0}' (run with -List to see the ids)" -f $sp.Id); $unknown++; continue }
+        if ($seen.ContainsKey($t.Id) -or $both.ContainsKey($t.Id)) { continue }
+        $st = Get-ConsoleState $States $t.Id
+        if ($t.Choices) {
+            # a setting with options: name one (id=option), or leave it out for the first option; id=default means the Windows default
+            $opt = $null
+            try { $opt = Resolve-Choice $t ([string]$sp.Choice) } catch {
+                $keys = @($t.Choices | ForEach-Object { [string]$_.Key })
+                $warn += ("{0}: unknown option '{1}' (options: {2})" -f $t.Id, $sp.Choice, ($keys -join ', ')); $unknown++; continue
+            }
+            if ($st -eq 'NA') { $warn += ("{0}: not available on this PC, skipped" -f $t.Id); continue }
+            $nowKey = ''
+            if ($States.ContainsKey($t.Id)) { $nowKey = [string]$States[$t.Id].Choice }
+            if ([string]$opt.Key -eq 'default') {
+                if ($st -eq 'Off') { $warn += ("{0}: already the Windows default, skipped" -f $t.Id); continue }
+                $plan += ,@{ Id = $t.Id; Action = 'Undo' }
+                $seen[$t.Id] = 'Undo'
+                continue
+            }
+            if ($st -eq 'On' -and -not [string]$sp.Choice) { $warn += ("{0}: already set ({1}); name an option to change it, e.g. -Apply {0}={2}" -f $t.Id, $nowKey, [string]$opt.Key); continue }
+            if ($st -eq 'On' -and $nowKey -eq [string]$opt.Key) { $warn += ("{0}: already set to {1}, skipped" -f $t.Id, $nowKey); continue }
+            $plan += ,@{ Id = $t.Id; Action = 'Apply'; Choice = [string]$opt.Key }
+            $seen[$t.Id] = 'Apply'
+            continue
+        }
+        if ($sp.Choice) { $warn += ("{0}: has no options, so '{1}' is not understood; use -Apply {0}" -f $t.Id, $sp.Choice); $unknown++; continue }
+        if ($st -eq 'NA') { $warn += ("{0}: not available on this PC, skipped" -f $t.Id); continue }
+        if ($st -eq 'On') { $warn += ("{0}: already on, skipped" -f $t.Id); continue }
+        $plan += ,@{ Id = $t.Id; Action = 'Apply' }
+        $seen[$t.Id] = 'Apply'
+    }
+    foreach ($raw in $undoList) {
+        $sp = Split-IdChoice $raw
+        $t = $script:ById[[string]$sp.Id]
+        if (-not $t) { $warn += ("unknown setting '{0}' (run with -List to see the ids)" -f $sp.Id); $unknown++; continue }
+        if ($both.ContainsKey($t.Id)) { continue }
+        if ($sp.Choice) { $warn += ("{0}: -Undo takes no option (it puts the Windows default back); use  -Undo {0}" -f $t.Id); $unknown++; continue }
+        if ($seen.ContainsKey($t.Id)) { $warn += ("{0}: turned on by -Preset in the same run, not turned off" -f $t.Id); continue }
+        if ($t.OneWay) { $warn += ("{0}: cannot be undone from here, skipped" -f $t.Id); continue }
+        if ($t.Once) { $warn += ("{0}: a one-time action, nothing to undo" -f $t.Id); continue }
+        $st = Get-ConsoleState $States $t.Id
+        if ($st -eq 'NA') { $warn += ("{0}: not available on this PC, skipped" -f $t.Id); continue }
+        if ($st -eq 'Off') { $warn += ("{0}: not applied, nothing to undo" -f $t.Id); continue }
+        $plan += ,@{ Id = $t.Id; Action = 'Undo' }
+        $seen[$t.Id] = 'Undo'
+    }
+    return [pscustomobject]@{ Plan = $plan; Warn = $warn; Unknown = $unknown }
+}
+
+# Can this console be asked a question? (Not when the input is piped or redirected, e.g. from a scheduled task.)
+function Test-ConsoleCanAsk {
+    try { return ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) } catch { return $false }
+}
+
+function Read-ConsoleYesNo {
+    param([string]$Prompt)
+    $a = Read-Host $Prompt
+    return ([string]$a -match '^\s*(y|yes)\s*$')
+}
+
+# The questions some settings ask before they are turned on (see Get-GuardQuestions). In the console:
+#   - a setting you named yourself with -Apply counts as your answer, so it is not asked again (a note is printed);
+#   - one that -Preset pulled in is asked about here when this console can be answered, otherwise it is skipped.
+# Nothing is asked for a -DryRun (nothing changes). Returns the plan that is left, and warnings for what was left out.
+function Resolve-ConsoleGuards {
+    param($Plan, $ApplyIds, [bool]$Dry)
+    $keep = @($Plan); $warn = @()
+    if ($Dry) { return [pscustomobject]@{ Plan = $keep; Warn = $warn } }
+    $named = @{}
+    foreach ($raw in @(Split-Ids $ApplyIds)) { $rid = [string](Split-IdChoice $raw).Id; if ($script:ById.ContainsKey($rid)) { $named[$script:ById[$rid].Id] = $true } }
+    $canAsk = Test-ConsoleCanAsk
+    foreach ($q in @(Get-GuardQuestions $keep)) {
+        $ask = @($q.Ids | Where-Object { -not $named.ContainsKey([string]$_) })
+        $said = @($q.Ids | Where-Object { $named.ContainsKey([string]$_) })
+        foreach ($id in $said) { $warn += ("{0}: you named it with -Apply, so it is not asked about: {1}" -f $id, $q.Title) }
+        if ($ask.Count -eq 0) { continue }
+        $drop = $false
+        if ($canAsk) {
+            Write-Host ''
+            Write-Host $q.Title -ForegroundColor Yellow
+            Write-Host ([string]$q.Ask) -ForegroundColor Gray
+            Write-Host ('This covers: ' + ((@($ask | ForEach-Object { [string]$script:ById[[string]$_].Name })) -join '; ')) -ForegroundColor Gray
+            if (-not (Read-ConsoleYesNo 'Apply it anyway? (y = yes, anything else = leave it as it is)')) { $drop = $true; $warn += ("{0}: you answered no, left as it is" -f ($ask -join ', ')) }
+        } else {
+            $drop = $true
+            $warn += ("{0}: skipped - it asks a question first ({1}) and this console cannot be asked. Name it with -Apply {2} to turn it on." -f ($ask -join ', '), $q.Title, ($ask -join ','))
+        }
+        if ($drop) { $keep = @(Remove-FromPlan $keep $ask) }
+    }
+    return [pscustomobject]@{ Plan = $keep; Warn = $warn }
+}
+
+# Returns the exit code: 0 = fine, 1 = something needs attention
+function Start-ConsoleMode {
+    param([bool]$ShowList, [bool]$UsePreset, $ApplyIds, $UndoIds)
+    Write-Host 'Headroom  -  Debloat Tool' -ForegroundColor Magenta
+    $wanted = ($UsePreset -or @(Split-Ids $ApplyIds).Count -gt 0 -or @(Split-Ids $UndoIds).Count -gt 0)
+    $states = Invoke-ConsoleScan
+    if ($ShowList -or -not $wanted) { Write-ConsoleList $states }
+    if (-not $wanted) { return 0 }
+    $r = Build-ConsolePlan $states $UsePreset $ApplyIds $UndoIds
+    $g = Resolve-ConsoleGuards $r.Plan $ApplyIds ([bool]$DryRun)
+    $r = [pscustomobject]@{ Plan = @($g.Plan); Warn = @(@($r.Warn) + @($g.Warn)); Unknown = $r.Unknown }
+    Write-Host ''
+    foreach ($w in @($r.Warn)) { Write-Host ('  ' + $w) -ForegroundColor Yellow }
+    if (@($r.Plan).Count -eq 0) {
+        Write-Host 'Nothing to change.' -ForegroundColor Green
+        return $(if ($r.Unknown -gt 0) { 1 } else { 0 })
+    }
+    $last = @(Invoke-Plan $r.Plan)[-1]
+    if ($r.Unknown -gt 0) { return 1 }
+    if ($last -and $last.Bad -gt 0) { return 1 }
+    return 0
+}
+
+# =============================================================================
+# THE WINDOW, part 1: colours, fonts, sizes, the few Windows calls, and the small helpers.
+# All controls live in $script:UI (a hashtable) so every function below can reach them.
+# Names to avoid in here (they are also script-level variables / parameters): log, Q, DryRun, List, Preset, Apply, Undo, engine.
+# =============================================================================
+$script:UI = @{}
+$script:Job = $null
+$script:LastErr = ''
+$script:Scale = 1.0
+$script:Th = @{}                  # colours
+$script:M = @{}                   # sizes (already scaled for the screen)
+$script:TF = @{}                  # text drawing flags
+$script:Fonts = @{}
+$script:Brushes = @{}
+$script:Pens = @{}
+$script:Native = $null            # the Windows calls (dark title bar, ...), $null if they could not be set up
+$script:LogBuf = New-Object System.Collections.ArrayList
+$script:DList = $false            # the list needs repainting
+$script:DHead = $false            # group counts need recomputing
+$script:DNav = $false             # the side menu, the page title and the numbers on the filter buttons need recomputing
+$script:DCounts = $false          # the button / change count needs recomputing
+$script:DDetail = $false          # the details panel needs refilling
+$script:DProg = $false            # the progress bar needs updating
+$script:ProgA = 0
+$script:WaitText = ''          # what the check is still waiting for Windows to answer (shown in the status line)
+$script:ProgB = 1
+$script:BarShown = 0
+$script:Mode = 'All settings'     # which state filter button is on (All / Applied / Not applied / Waiting / Recommended / Personal)
+$script:Risk = 'Any risk'         # which risk filter button is on (Any risk / Low risk / Medium risk / Risky); it combines with the state filter
+$script:RiskNames = @('Any risk', 'Low risk', 'Medium risk', 'Risky')
+$script:BtnHot = $null            # the button under the mouse
+$script:BtnDown = $null           # the button being pressed
+$script:ChipCount = @{}           # filter name -> the number shown on its button ('' = none yet)
+$script:TabAccent = @{}           # tab name -> the colour of its bar and number when it is not the accent one (the preset window's tabs)
+$script:StartupSynced = $false    # the startup list was just read, no need to read it again for the first check
+
+# a size in pixels, scaled for the screen
+function Px {
+    param([double]$v)
+    return [int][math]::Round($v * $script:Scale)
+}
+
+function Rgb {
+    param([int]$r, [int]$g, [int]$b)
+    return [System.Drawing.Color]::FromArgb($r, $g, $b)
+}
+
+function Ui-InitTheme {
+    # Near-black navy with one light-purple accent: the window and side menu are the darkest navy (#0f0f19), the page is a little lighter,
+    # cards lighter again. Purple (accent) is used for the selected tab, switches that are on, the main button and a change that is waiting.
+    $script:Th = @{
+        Bg        = (Rgb 18 18 30)       # the page
+        Side      = (Rgb 15 15 25)       # the window frame and the side menu
+        SideHot   = (Rgb 22 22 35)
+        SideSel   = (Rgb 28 28 43)
+        Panel     = (Rgb 24 24 39)       # dialogs
+        Card      = (Rgb 24 24 39)       # cards
+        CardHot   = (Rgb 29 29 46)
+        CardSel   = (Rgb 33 33 52)
+        Head      = (Rgb 24 24 39)
+        HeadHot   = (Rgb 29 29 46)
+        Raised    = (Rgb 40 40 62)       # buttons, tags
+        RaisedHot = (Rgb 52 52 78)
+        RaisedDown = (Rgb 31 31 48)
+        Border    = (Rgb 64 64 92)
+        Tag       = (Rgb 34 34 53)       # the tag pills on a card (quieter than the buttons)
+        TagText   = (Rgb 170 170 194)
+        Edge      = (Rgb 40 40 60)       # the quiet outline of a card
+        EdgeHot   = (Rgb 66 66 96)
+        Text      = (Rgb 244 244 251)
+        Sub       = (Rgb 200 200 216)
+        Mute      = (Rgb 152 152 174)    # descriptions
+        Dim       = (Rgb 106 106 128)
+        Accent    = (Rgb 183 156 255)    # light purple
+        AccentHot = (Rgb 62 51 102)
+        AccentDim = (Rgb 49 40 82)
+        AccentSoft = (Rgb 43 35 74)      # tinted chips and buttons
+        Good      = (Rgb 112 206 100)
+        GoodSoft  = (Rgb 28 52 44)
+        Warn      = (Rgb 255 160 92)
+        WarnSoft  = (Rgb 66 47 40)
+        Bad       = (Rgb 255 138 138)
+        BadSoft   = (Rgb 70 38 52)
+        TintApply = (Rgb 30 28 50)       # a card waiting to be turned on
+        TintUndo  = (Rgb 36 27 43)       # a card waiting to be turned off
+        TintApplySel = (Rgb 35 33 57)
+        TintUndoSel  = (Rgb 42 31 50)
+        EdgeApply = (Rgb 72 60 122)
+        EdgeUndo  = (Rgb 98 62 88)
+        Hover     = (Rgb 29 29 46)
+        Sel       = (Rgb 33 33 52)
+        Track     = (Rgb 46 46 68)       # switch, off
+        TrackEdge = (Rgb 100 100 130)    # the outline of a switch that is off
+        TrackOff  = (Rgb 28 28 44)       # switch, not available
+        KnobOff   = (Rgb 196 196 214)
+        KnobOn    = (Rgb 22 16 48)
+        KnobDim   = (Rgb 72 72 96)
+        Thumb     = (Rgb 76 76 104)
+        ThumbHot  = (Rgb 124 124 162)
+        ThumbTrack = (Rgb 27 27 42)      # the faint groove behind a scroll thumb while the pointer is on the scroll bar
+        LogBg     = (Rgb 13 13 22)
+        BtnText   = (Rgb 24 16 52)
+        GoodText  = (Rgb 118 214 106)       # the bright green of the Low risk badge text
+        WarnText  = (Rgb 255 170 90)        # the orange of the Medium risk badge text
+        BadText   = (Rgb 255 142 142)       # the red of the Risky badge text
+        BadFill   = (Rgb 74 40 54)    # the dark red tint behind the Risky badge
+        GoodFill  = (Rgb 28 54 46)
+        WarnFill  = (Rgb 70 48 40)
+    }
+}
+
+function Ui-InitMetrics {
+    $script:M = @{
+        Row = (Px 184); Gap = (Px 12); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); TogZone = (Px 68); ViewW = (Px 118); ViewGap = (Px 8); BandH = (Px 44); ChoiceY = (Px 96); ChoiceH = (Px 28)
+        Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 10); BtnR = (Px 8)
+        ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
+        CardMin = (Px 380); ColGap = (Px 14); Wheel = (Px 110)
+        Side = (Px 244); Gutter = (Px 28); Details = (Px 340); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
+        NavTop = (Px 84); NavRow = (Px 40); NavLabel = (Px 44); NavSb = (Px 12); NavWheel = (Px 80)
+    }
+}
+
+function Ui-InitFlags {
+    $base = 'VerticalCenter, EndEllipsis, NoPrefix, SingleLine, NoPadding'
+    $script:TF = @{
+        L = [System.Windows.Forms.TextFormatFlags]('Left, ' + $base)
+        R = [System.Windows.Forms.TextFormatFlags]('Right, ' + $base)
+        C = [System.Windows.Forms.TextFormatFlags]('HorizontalCenter, ' + $base)
+        N = [System.Windows.Forms.TextFormatFlags]'NoPadding, SingleLine, NoPrefix'
+        W = [System.Windows.Forms.TextFormatFlags]'Left, Top, WordBreak, EndEllipsis, NoPrefix, NoPadding'
+        CW = [System.Windows.Forms.TextFormatFlags]'HorizontalCenter, Top, WordBreak, EndEllipsis, NoPrefix, NoPadding'
+    }
+}
+
+# ----------------------------------------------------------- fonts, brushes, pens ----
+function Ui-NewFont {
+    param([string]$family, [double]$size)
+    return (New-Object System.Drawing.Font($family, [single]$size))
+}
+
+function Ui-Font {
+    param([string]$key)
+    $f = $script:Fonts[$key]
+    if ($f) { return $f }
+    switch ($key) {
+        'uib'      { $f = Ui-NewFont 'Segoe UI Semibold' 9 }
+        'btn'      { $f = Ui-NewFont 'Segoe UI Semibold' 9 }
+        'row'      { $f = Ui-NewFont 'Segoe UI' 9.5 }
+        'rowName'  { $f = Ui-NewFont 'Segoe UI Semibold' 10 }
+        'desc'     { $f = Ui-NewFont 'Segoe UI' 9 }
+        'head'     { $f = Ui-NewFont 'Segoe UI Semibold' 10.5 }
+        'small'    { $f = Ui-NewFont 'Segoe UI' 8.5 }
+        'smallb'   { $f = Ui-NewFont 'Segoe UI Semibold' 8.5 }
+        'cap'      { $f = Ui-NewFont 'Segoe UI Semibold' 8 }
+        'title'    { $f = Ui-NewFont 'Segoe UI Semibold' 22 }
+        'titleS'   { $f = Ui-NewFont 'Segoe UI Semibold' 16 }       # the page title when the name is too long for the big size
+        'cardName' { $f = Ui-NewFont 'Segoe UI Semibold' 11.5 }
+        'cardId'   { $f = Ui-NewFont 'Segoe UI' 8 }
+        'cardDesc' { $f = Ui-NewFont 'Segoe UI' 9.5 }
+        'sub'      { $f = Ui-NewFont 'Segoe UI' 10 }
+        'brand'    { $f = Ui-NewFont 'Segoe UI Semibold' 11.5 }
+        'hero'     { $f = Ui-NewFont 'Segoe UI Semibold' 34 }        # the welcome screen
+        'heroSub'  { $f = Ui-NewFont 'Segoe UI' 12 }
+        'bigbtn'   { $f = Ui-NewFont 'Segoe UI Semibold' 12 }
+        'stepcap'  { $f = Ui-NewFont 'Segoe UI Semibold' 8.5 }
+        'wbody'    { $f = Ui-NewFont 'Segoe UI' 11.5 }
+        'nav'      { $f = Ui-NewFont 'Segoe UI' 9.5 }
+        'navb'     { $f = Ui-NewFont 'Segoe UI Semibold' 9.5 }
+        'body'     { $f = Ui-NewFont 'Segoe UI' 9.5 }
+        'detTitle' { $f = Ui-NewFont 'Segoe UI Semibold' 14 }
+        'mono'     { $f = Ui-NewFont 'Consolas' 9 }
+        'monoS'    { $f = Ui-NewFont 'Consolas' 8.5 }
+        default    { $f = Ui-NewFont 'Segoe UI' 9 }
+    }
+    $script:Fonts[$key] = $f
+    return $f
+}
+
+function Ui-Brush {
+    param($c)
+    $k = $c.ToArgb()
+    $b = $script:Brushes[$k]
+    if (-not $b) {
+        $b = New-Object System.Drawing.SolidBrush($c)
+        $script:Brushes[$k] = $b
+    }
+    return $b
+}
+
+function Ui-Pen {
+    param($c, [double]$width = 1)
+    $k = [string]$c.ToArgb() + '/' + [string]$width
+    $p = $script:Pens[$k]
+    if (-not $p) {
+        $p = New-Object System.Drawing.Pen($c, [single]$width)
+        $script:Pens[$k] = $p
+    }
+    return $p
+}
+
+# The only places that draw. Tests swap these for recording versions.
+function Ui-Fill {
+    param($g, $c, [int]$x, [int]$y, [int]$w, [int]$h)
+    $g.FillRectangle((Ui-Brush $c), $x, $y, $w, $h)
+}
+function Ui-FillOval {
+    param($g, $c, [int]$x, [int]$y, [int]$w, [int]$h)
+    $g.FillEllipse((Ui-Brush $c), $x, $y, $w, $h)
+}
+# a filled shape with straight sides; $pts is a list of @(x, y) corners
+function Ui-FillPoly {
+    param($g, $c, $pts)
+    $list = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    foreach ($p in $pts) { $list.Add([System.Drawing.PointF]::new([single]$p[0], [single]$p[1])) }
+    $g.FillPolygon((Ui-Brush $c), $list.ToArray())
+}
+function Ui-Line {
+    param($g, $c, [double]$width, [int]$x1, [int]$y1, [int]$x2, [int]$y2)
+    $g.DrawLine((Ui-Pen $c $width), $x1, $y1, $x2, $y2)
+}
+# a pen with round ends and round corners (the icons are drawn with it)
+function Ui-IconPen {
+    param($c, [double]$width)
+    $k = 'i' + [string]$c.ToArgb() + '/' + [string]$width
+    $p = $script:Pens[$k]
+    if (-not $p) {
+        $p = New-Object System.Drawing.Pen($c, [single]$width)
+        $p.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $p.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $p.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+        $script:Pens[$k] = $p
+    }
+    return $p
+}
+# the outline of an oval
+function Ui-StrokeOval {
+    param($g, $c, [double]$width, [double]$x, [double]$y, [double]$w, [double]$h)
+    $g.DrawEllipse((Ui-IconPen $c $width), [single]$x, [single]$y, [single]$w, [single]$h)
+}
+# a line through several points, round at the ends and at the corners; $pts is a list of @(x, y)
+function Ui-StrokePoly {
+    param($g, $c, [double]$width, $pts)
+    $list = New-Object 'System.Collections.Generic.List[System.Drawing.PointF]'
+    foreach ($p in $pts) { $list.Add([System.Drawing.PointF]::new([single]$p[0], [single]$p[1])) }
+    if ($list.Count -ge 2) { $g.DrawLines((Ui-IconPen $c $width), $list.ToArray()) }
+}
+function Ui-Text {
+    param($g, [string]$s, $font, $c, [int]$x, [int]$y, [int]$w, [int]$h, $flags)
+    if ($w -le 0) { return }
+    [System.Windows.Forms.TextRenderer]::DrawText($g, $s, $font, [System.Drawing.Rectangle]::new($x, $y, $w, $h), $c, $flags)
+}
+# the outline of a rectangle with round corners (radius r), as a path
+function Ui-RoundPath {
+    param([double]$x, [double]$y, [double]$w, [double]$h, [double]$r)
+    $gp = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $d = [Math]::Min(($r * 2.0), [Math]::Min($w, $h))
+    if ($d -le 0) {
+        $gp.AddRectangle([System.Drawing.RectangleF]::new([single]$x, [single]$y, [single]$w, [single]$h))
+        return $gp
+    }
+    $fx = [single]$x; $fy = [single]$y; $fd = [single]$d
+    $fr = [single]($x + $w - $d); $fb = [single]($y + $h - $d)
+    $gp.AddArc($fx, $fy, $fd, $fd, [single]180, [single]90)
+    $gp.AddArc($fr, $fy, $fd, $fd, [single]270, [single]90)
+    $gp.AddArc($fr, $fb, $fd, $fd, [single]0, [single]90)
+    $gp.AddArc($fx, $fb, $fd, $fd, [single]90, [single]90)
+    $gp.CloseFigure()
+    return $gp
+}
+function Ui-FillRound {
+    param($g, $c, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
+    $gp = Ui-RoundPath $x $y $w $h $r
+    try { $g.FillPath((Ui-Brush $c), $gp) } finally { $gp.Dispose() }
+}
+# A scroll thumb: a thin rounded pill with its right edge at $right. $trackTop / $trackH = the strip it travels in, $thumbY = where the
+# thumb starts in that strip, $thumbH = its length. It is slim at rest and grows (with a faint groove behind it) while the pointer is
+# on the scroll bar or the thumb is being dragged.
+function Ui-PaintThumb {
+    param($g, [int]$right, [int]$trackTop, [int]$trackH, [int]$thumbY, [int]$thumbH, [bool]$hot, [bool]$drag)
+    $Th = $script:Th
+    $bw = Px 5
+    $c = $Th.Thumb
+    if ($drag -or $hot) { $bw = Px 8; $c = $Th.ThumbHot }
+    $x = $right - $bw
+    if ($drag -or $hot) { Ui-FillRound $g $Th.ThumbTrack $x $trackTop $bw $trackH ([int]($bw / 2)) }
+    Ui-FillRound $g $c $x ($trackTop + $thumbY) $bw $thumbH ([int]($bw / 2))
+}
+function Ui-StrokeRound {
+    param($g, $c, [double]$width, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
+    $o = $width / 2.0
+    $gp = Ui-RoundPath ($x + $o) ($y + $o) ($w - $width) ($h - $width) ([Math]::Max(0.0, ($r - $o)))
+    try { $g.DrawPath((Ui-Pen $c $width), $gp) } finally { $gp.Dispose() }
+}
+# the width of a text in pixels (for putting one thing right after another)
+function Ui-Measure {
+    param($g, [string]$s, $font)
+    if (-not $s) { return 0 }
+    $sz = [System.Windows.Forms.TextRenderer]::MeasureText($g, $s, $font, [System.Drawing.Size]::new(10000, 200), $script:TF.N)
+    return [int]$sz.Width
+}
+
+# the width of a text in pixels when there is no drawing surface at hand (for fitting a text into a label)
+function Ui-TextWidth {
+    param([string]$s, $font)
+    if (-not $s) { return 0 }
+    $sz = [System.Windows.Forms.TextRenderer]::MeasureText($s, $font, [System.Drawing.Size]::new(10000, 200), $script:TF.N)
+    return [int]$sz.Width
+}
+# The big page title: the normal size, or the smaller one when the name does not fit the space it has (a long name such as
+# "Placebo Tweaks - Not Recommended" would otherwise be cut short with "..." and lose its last words).
+function Ui-FitTitle {
+    $t = $script:UI.title
+    if (-not $t) { return }
+    $want = 'title'
+    if ([int]$t.Width -gt 0 -and (Ui-TextWidth ([string]$t.Text) (Ui-Font 'title')) -gt [int]$t.Width) { $want = 'titleS' }
+    if ($script:TitleFont -ne $want) { $script:TitleFont = $want; $t.Font = (Ui-Font $want) }
+}
+
+# ----------------------------------------------------------- calls into Windows ----
+# Builds a small class of static methods that call into DLLs, without compiling anything (so it is instant).
+# $Defs: array of @{ Name; Lib; Entry (optional); Ret; Args = types; Ansi (optional) }
+function Ui-EmitNative {
+    param($Defs, [string]$TypeName = 'GamingWinNative')
+    $an = New-Object System.Reflection.AssemblyName ('GamingUi' + [guid]::NewGuid().ToString('N'))
+    $ab = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($an, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $mb = $ab.DefineDynamicModule('GamingUiModule')
+    $tb = $mb.DefineType($TypeName, [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    foreach ($d in $Defs) {
+        $cs = [System.Runtime.InteropServices.CharSet]::Unicode
+        if ($d.Ansi) { $cs = [System.Runtime.InteropServices.CharSet]::Ansi }
+        $entry = [string]$d.Entry
+        if (-not $entry) { $entry = [string]$d.Name }
+        $argTypes = [Type[]]@($d.Args)
+        $m = $tb.DefinePInvokeMethod([string]$d.Name, [string]$d.Lib, $entry,
+            [System.Reflection.MethodAttributes]'Public, Static, PinvokeImpl',
+            [System.Reflection.CallingConventions]::Standard, $d.Ret, $argTypes,
+            [System.Runtime.InteropServices.CallingConvention]::Winapi, $cs)
+        $m.SetImplementationFlags([System.Reflection.MethodImplAttributes]::PreserveSig)
+    }
+    return $tb.CreateType()
+}
+
+function Ui-InitNative {
+    $script:Native = $null
+    try {
+        $defs = @(
+            @{ Name = 'DwmSetWindowAttribute'; Lib = 'dwmapi.dll'; Ret = [int]; Args = @([IntPtr], [int], [int].MakeByRefType(), [int]) }
+            @{ Name = 'SetWindowTheme'; Lib = 'uxtheme.dll'; Ret = [int]; Args = @([IntPtr], [string], [string]) }
+            @{ Name = 'SendMessageText'; Entry = 'SendMessageW'; Lib = 'user32.dll'; Ret = [IntPtr]; Args = @([IntPtr], [int], [IntPtr], [string]) }
+            @{ Name = 'SendMessageNum'; Entry = 'SendMessageW'; Lib = 'user32.dll'; Ret = [IntPtr]; Args = @([IntPtr], [int], [IntPtr], [IntPtr]) }
+            @{ Name = 'SetProcessDPIAware'; Lib = 'user32.dll'; Ret = [bool]; Args = @() }
+        )
+        $script:Native = Ui-EmitNative $defs
+    } catch {
+        $script:Native = $null
+    }
+    # crisp text on high-DPI screens (must happen before the first window is created)
+    $n = $script:Native
+    if ($n) { try { [void]$n::SetProcessDPIAware() } catch { } }
+}
+
+function Ui-GetScale {
+    $s = 1.0
+    try {
+        $g = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+        try { $s = [double]$g.DpiX / 96.0 } finally { $g.Dispose() }
+    } catch {
+        $s = 1.0
+    }
+    if ($s -lt 1.0) { $s = 1.0 }
+    if ($s -gt 3.0) { $s = 3.0 }
+    return $s
+}
+
+function Ui-WorkArea {
+    return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+# dark title bar (Windows 10 2004 and later, Windows 11)
+function Ui-DarkTitle {
+    param($form)
+    $n = $script:Native
+    if (-not $n) { return }
+    try {
+        $v = 1
+        $r = $n::DwmSetWindowAttribute($form.Handle, 20, [ref]$v, 4)
+        if ($r -ne 0) { [void]$n::DwmSetWindowAttribute($form.Handle, 19, [ref]$v, 4) }
+    } catch { }
+}
+
+# Windows 11: paint the title bar and the window border in the page colour (older Windows ignores this)
+function Ui-TitleColor {
+    param($form)
+    $n = $script:Native
+    if (-not $n) { return }
+    $bg = $script:Th.Side
+    $fg = $script:Th.Text
+    try {
+        $c = [int]($bg.R + 256 * $bg.G + 65536 * $bg.B)          # a COLORREF is 0x00BBGGRR
+        $t = [int]($fg.R + 256 * $fg.G + 65536 * $fg.B)
+        [void]$n::DwmSetWindowAttribute($form.Handle, 35, [ref]$c, 4)     # caption colour
+        [void]$n::DwmSetWindowAttribute($form.Handle, 34, [ref]$c, 4)     # border colour
+        [void]$n::DwmSetWindowAttribute($form.Handle, 36, [ref]$t, 4)     # caption text colour
+    } catch { }
+}
+
+# dark scroll bars on a text box
+function Ui-DarkScroll {
+    param($ctl)
+    $n = $script:Native
+    if (-not $n) { return }
+    try { [void]$n::SetWindowTheme($ctl.Handle, 'DarkMode_Explorer', $null) } catch { }
+}
+
+# the grey hint text inside the search box
+function Ui-Cue {
+    param($ctl, [string]$text)
+    $n = $script:Native
+    if (-not $n) { return }
+    try { [void]$n::SendMessageText($ctl.Handle, 0x1501, [IntPtr]1, $text) } catch { }
+}
+
+# stop / allow a text box to repaint while it is being filled
+function Ui-Redraw {
+    param($ctl, [bool]$on)
+    $n = $script:Native
+    if (-not $n) { return }
+    try {
+        $w = 0; if ($on) { $w = 1 }
+        [void]$n::SendMessageNum($ctl.Handle, 0x000B, [IntPtr]$w, [IntPtr]::Zero)
+        if ($on) { $ctl.Invalidate() }
+    } catch { }
+}
+
+# a stand-in for the list control's double buffering (the property is protected, so it goes through reflection)
+function Ui-DoubleBuffer {
+    param($ctl)
+    $flags = [System.Reflection.BindingFlags]'Instance, NonPublic'
+    try {
+        $styles = [System.Windows.Forms.ControlStyles]'UserPaint, AllPaintingInWmPaint, OptimizedDoubleBuffer, ResizeRedraw'
+        [void][System.Windows.Forms.Control].GetMethod('SetStyle', $flags).Invoke($ctl, @($styles, $true))
+    } catch {
+        try { [System.Windows.Forms.Control].GetProperty('DoubleBuffered', $flags).SetValue($ctl, $true, $null) } catch { }
+    }
+}
+
+# ----------------------------------------------------------- log, status, progress ----
+function Get-LogColor {
+    param([string]$name)
+    switch ($name) {
+        'Cyan'     { return (Rgb 96 200 230) }
+        'Green'    { return (Rgb 120 220 140) }
+        'Yellow'   { return (Rgb 240 200 100) }
+        'Red'      { return (Rgb 255 120 120) }
+        'DarkGray' { return (Rgb 124 124 136) }
+        'White'    { return (Rgb 245 245 248) }
+    }
+    return (Rgb 196 196 206)
+}
+
+# Lines are collected and written to the log box together (Ui-FlushLog), which is much faster than one by one
+function Ui-Log {
+    param([string]$text, [string]$color = 'Gray')
+    [void]$script:LogBuf.Add(@{ T = $text; C = $color })
+}
+
+function Ui-FlushLog {
+    if ($script:LogBuf.Count -eq 0) { return }
+    $items = $script:LogBuf.ToArray()
+    $script:LogBuf.Clear()
+    $b = $script:UI.log
+    if (-not $b) { return }
+    foreach ($it in $items) {
+        $b.SelectionStart = $b.TextLength
+        $b.SelectionLength = 0
+        $b.SelectionColor = (Get-LogColor $it.C)
+        $b.AppendText($it.T + "`n")
+    }
+    $b.SelectionStart = $b.TextLength
+    $b.ScrollToCaret()
+}
+
+# A line from the window itself: into the log box and into the log file
+function Ui-Note {
+    param([string]$text, [string]$color = 'Gray')
+    if ($log) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    Ui-Log $text $color
+}
+
+function Ui-Fail {
+    param($err)
+    $m = ''
+    try { $m = $err.Exception.Message } catch { }
+    if (-not $m) { $m = [string]$err }
+    if ($m -eq $script:LastErr) { return }
+    $script:LastErr = $m
+    try { Ui-Note ('! internal error in the window: ' + $m) 'Red' } catch { }
+}
+
+function Ui-Status {
+    param([string]$text)
+    $s = $script:UI.status
+    if ($s -and [string]$s.Text -ne $text) { $s.Text = $text }
+}
+
+# The progress bar is thin and drawn by two panels: a track and the part that is filled
+function Ui-Progress {
+    param([int]$a, [int]$b)
+    $script:ProgA = $a
+    $script:ProgB = $b
+    $script:DProg = $true
+}
+
+function Ui-ApplyBar {
+    $v = 0
+    if ($script:ProgB -gt 0) { $v = [int][math]::Round(100.0 * $script:ProgA / $script:ProgB) }
+    if ($v -lt 0) { $v = 0 }
+    if ($v -gt 100) { $v = 100 }
+    $script:BarShown = $v
+    $t = $script:UI.barTrack
+    $f = $script:UI.barFill
+    if ($t -and $f) { $f.Width = [int]($t.Width * $v / 100) }
+}
+
+# ----------------------------------------------------------- buttons ----------------
+# Buttons are ordinary flat buttons whose Paint event draws over everything (round corners, quiet colours).
+# Ui-StyleBtn only sets the colours; Ui-PaintBtn reads them back, so there is one place that decides how a button looks.
+# kinds: primary (the purple one) | accent (tinted purple) | secondary | ghost (no background) | chip | chipon | tab | tabon (the filter tabs)
+function Ui-StyleBtn {
+    param($b)
+    $Th = $script:Th
+    $kind = [string]$b.Tag
+    $on = [bool]$b.Enabled
+    $back = $Th.Raised; $fore = $Th.Text; $hover = $Th.RaisedHot; $down = $Th.RaisedDown
+    $bsize = 0
+    $kind = $kind -replace '^big', ''           # 'bigprimary' / 'bigghost' (the welcome screen) look like 'primary' / 'ghost', only larger
+    if ($kind -eq 'primary') {
+        if ($on) { $back = $Th.Accent; $fore = $Th.BtnText; $hover = (Rgb 203 184 255); $down = (Rgb 158 128 236) }
+        else { $back = $Th.Raised; $fore = $Th.Dim; $hover = $back; $down = $back }
+    } elseif ($kind -eq 'accent') {
+        $back = $Th.AccentSoft; $fore = $Th.Accent; $hover = $Th.AccentHot; $down = $Th.AccentDim
+        if (-not $on) { $back = $Th.Card; $fore = $Th.Dim; $hover = $back; $down = $back }
+    } elseif ($kind -eq 'ghost') {
+        $back = $Th.Bg; $fore = $Th.Sub; $hover = $Th.Raised; $down = $Th.RaisedDown
+        if (-not $on) { $fore = $Th.Dim; $hover = $back; $down = $back }
+    } elseif ($kind -eq 'chip') {
+        $back = $Th.Card; $fore = $Th.Sub; $hover = $Th.Raised; $down = $Th.RaisedDown
+    } elseif ($kind -eq 'chipon') {
+        $back = $Th.AccentSoft; $fore = $Th.Accent; $hover = $Th.AccentSoft; $down = $Th.AccentSoft
+    } elseif ($kind -eq 'tab') {
+        $back = $Th.Bg; $fore = $Th.Mute; $hover = $Th.Bg; $down = $Th.Bg
+    } elseif ($kind -eq 'tabon') {
+        $back = $Th.Bg; $fore = $Th.Text; $hover = $Th.Bg; $down = $Th.Bg
+    } else {
+        if (-not $on) { $back = $Th.Card; $fore = $Th.Dim; $hover = $back; $down = $back }
+    }
+    $b.BackColor = $back
+    $b.ForeColor = $fore
+    $fa = $b.FlatAppearance
+    $fa.BorderSize = $bsize
+    $fa.BorderColor = $Th.Border
+    $fa.MouseOverBackColor = $hover
+    $fa.MouseDownBackColor = $down
+    $b.Invalidate()
+}
+
+# The colour behind a control (what shows in the corners): the fill of the card it sits on, or the colour of its parent
+function Ui-BehindColor {
+    param($ctl)
+    $p = $null
+    try { $p = $ctl.Parent } catch { }
+    if ($p) {
+        $t = $null
+        try { $t = $p.Tag } catch { }
+        if ($t -is [hashtable] -and $t.Fill) { return $t.Fill }
+        $bc = $null
+        try { $bc = $p.BackColor } catch { }
+        if ($bc -is [System.Drawing.Color]) { return $bc }
+    }
+    return $script:Th.Bg
+}
+
+function Ui-PaintBtn {
+    param($b, $g)
+    $Th = $script:Th
+    $M = $script:M
+    $TF = $script:TF
+    $w = [int]$b.Width
+    $h = [int]$b.Height
+    if ($w -le 2 -or $h -le 2) { return }
+    $kind = [string]$b.Tag
+    $big = ($kind -like 'big*')
+    $kind = $kind -replace '^big', ''
+    $on = [bool]$b.Enabled
+    $fa = $b.FlatAppearance
+    $behind = Ui-BehindColor $b
+    $hot = ($on -and ($script:BtnHot -eq $b))
+    $down = ($hot -and ($script:BtnDown -eq $b))
+    $isTab = ($kind -eq 'tab' -or $kind -eq 'tabon')
+    $back = $b.BackColor
+    if ($down) { $back = $fa.MouseDownBackColor } elseif ($hot) { $back = $fa.MouseOverBackColor }
+    elseif ($kind -eq 'ghost' -or $kind -eq 'chip') { $back = $behind }
+    if ($isTab) { $back = $behind }                      # a tab has no box, only its text and (when it is the open one) a bar below
+    $r = [Math]::Min($M.BtnR, [int]($h / 2))
+    Ui-Fill $g $behind 0 0 $w $h
+    Ui-FillRound $g $back 0 0 $w $h $r
+    if ([int]$fa.BorderSize -gt 0) { Ui-StrokeRound $g $fa.BorderColor 1 0 0 $w $h $r }
+    $fore = $b.ForeColor
+    if (($kind -eq 'chip' -or $kind -eq 'tab') -and $hot) { $fore = $Th.Text }
+    $font = Ui-Font 'btn'
+    if ($big) { $font = Ui-Font 'bigbtn' }
+    $label = [string]$b.Text
+    $cnt = ''
+    if ($kind -eq 'chip' -or $kind -eq 'chipon' -or $isTab) { $cnt = [string]$script:ChipCount[[string]$b.Name] }
+    if ($cnt) {
+        # the label, then the number in a quieter colour, the two together centred
+        $sf = Ui-Font 'small'
+        $lw = Ui-Measure $g $label $font
+        $cw = Ui-Measure $g $cnt $sf
+        $gap = Px 7
+        $x0 = [int](($w - ($lw + $gap + $cw)) / 2)
+        $cc = $Th.Dim
+        if ($kind -eq 'chipon') { $cc = $Th.Accent }
+        if ($kind -eq 'tabon') { $cc = $Th.Mute }
+        if ($isTab -and $script:TabAccent.ContainsKey([string]$b.Name)) { $cc = $script:TabAccent[[string]$b.Name] }
+        Ui-Text $g $label $font $fore $x0 0 ($lw + (Px 6)) $h $TF.L
+        Ui-Text $g $cnt $sf $cc ($x0 + $lw + $gap) 0 ($cw + (Px 6)) $h $TF.L
+    } else {
+        Ui-Text $g $label $font $fore 0 0 $w $h $TF.C
+    }
+    if ($kind -eq 'tabon') {
+        $uw = Px 28
+        $bc = $Th.Accent
+        if ($script:TabAccent.ContainsKey([string]$b.Name)) { $bc = $script:TabAccent[[string]$b.Name] }
+        Ui-FillRound $g $bc ([int](($w - $uw) / 2)) ($h - (Px 5)) $uw (Px 3) (Px 1)
+    }
+    if ($on -and ($b.Focused -eq $true)) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h $r }
+}
+
+# "Preview only": the label on the left and a small switch on the right
+function Ui-PaintSwitch {
+    param($b, $g)
+    $Th = $script:Th
+    $M = $script:M
+    $TF = $script:TF
+    $w = [int]$b.Width
+    $h = [int]$b.Height
+    if ($w -le 2 -or $h -le 2) { return }
+    $on = [bool]$b.Checked
+    $behind = Ui-BehindColor $b
+    $hot = ($script:BtnHot -eq $b)
+    $back = $Th.Card
+    if ($hot) { $back = $Th.CardHot }
+    Ui-Fill $g $behind 0 0 $w $h
+    Ui-FillRound $g $back 0 0 $w $h $M.BtnR
+    Ui-StrokeRound $g $Th.Edge 1 0 0 $w $h $M.BtnR
+    $fore = $Th.Sub
+    if ($on) { $fore = $Th.Text }
+    $swW = Px 36
+    $swH = Px 20
+    Ui-Text $g ([string]$b.Text) (Ui-Font 'btn') $fore (Px 14) 0 ($w - $swW - (Px 36)) $h $TF.L
+    Ui-DrawToggle $g ($w - $swW - (Px 14)) ([int](($h - $swH) / 2)) $on $true $swW $swH
+    if ($b.Focused -eq $true) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h $M.BtnR }
+}
+
+function New-Btn {
+    param([string]$text, [int]$w, [string]$kind = 'secondary', [string]$tip = '', [int]$h = 36)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $text
+    $b.Size = New-Object System.Drawing.Size((Px $w), (Px $h))
+    $b.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $b.UseVisualStyleBackColor = $false
+    $b.Tag = $kind
+    $b.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $b.Font = (Ui-Font 'btn')
+    Ui-DoubleBuffer $b
+    Ui-StyleBtn $b
+    Ui-WireBtn $b
+    if ($tip -and $script:UI.tip) { $script:UI.tip.SetToolTip($b, $tip) }
+    return $b
+}
+
+# hover, pressed and the round-cornered drawing
+function Ui-WireBtn {
+    param($b, [string]$how = 'button')
+    $b.Add_MouseEnter({ param($s, $e) try { $script:BtnHot = $s; $s.Invalidate() } catch { } })
+    $b.Add_MouseLeave({ param($s, $e) try { if ($script:BtnHot -eq $s) { $script:BtnHot = $null }; if ($script:BtnDown -eq $s) { $script:BtnDown = $null }; $s.Invalidate() } catch { } })
+    $b.Add_MouseDown({ param($s, $e) try { $script:BtnDown = $s; $s.Invalidate() } catch { } })
+    $b.Add_MouseUp({ param($s, $e) try { if ($script:BtnDown -eq $s) { $script:BtnDown = $null }; $s.Invalidate() } catch { } })
+    if ($how -eq 'switch') {
+        $b.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintSwitch $s $e.Graphics } catch { Ui-Fail $_ } })
+    } else {
+        $b.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintBtn $s $e.Graphics } catch { Ui-Fail $_ } })
+    }
+}
+
+function Ui-SetEnabled {
+    param($b, [bool]$on)
+    if ($b -and [bool]$b.Enabled -ne $on) {
+        $b.Enabled = $on
+        Ui-StyleBtn $b
+    }
+}
+
+# ----------------------------------------------------------- cards ----------------
+# A card is a panel with round corners and a quiet outline. Its Tag holds how it looks:  Fill, Edge, R (corner radius),
+# Icon ('search' draws a magnifying glass at the left). The panel's own colour is the colour of what is behind it.
+function Ui-NewCard {
+    param($fill, $edge, [int]$radius, [string]$icon = '')
+    $c = New-Object System.Windows.Forms.Panel
+    $c.BackColor = $script:Th.Bg
+    $c.Tag = @{ Fill = $fill; Edge = $edge; R = $radius; Icon = $icon }
+    Ui-DoubleBuffer $c
+    $c.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintCard $s $e.Graphics } catch { Ui-Fail $_ } })
+    return $c
+}
+
+function Ui-PaintCard {
+    param($c, $g)
+    $t = $c.Tag
+    if ($t -isnot [hashtable]) { return }
+    $w = [int]$c.Width
+    $h = [int]$c.Height
+    if ($w -le 2 -or $h -le 2) { return }
+    Ui-FillRound $g $t.Fill 0 0 $w $h $t.R
+    Ui-StrokeRound $g $t.Edge 1 0 0 $w $h $t.R
+    if ($t.Icon -eq 'search') {
+        # a magnifying glass: a ring and a short handle
+        $d = Px 12
+        $x = Px 14
+        $y = [int](($h - $d) / 2) - (Px 1)
+        Ui-StrokeRound $g $script:Th.Mute 1.6 $x $y $d $d ([int]($d / 2))
+        Ui-Line $g $script:Th.Mute 1.6 ($x + $d - (Px 1)) ($y + $d - (Px 1)) ($x + $d + (Px 4)) ($y + $d + (Px 4))
+    }
+}
+
+# ----------------------------------------------------------- the question box ----------
+# Yes / No in the window's own colours. Falls back to the plain Windows message box if it cannot be built.
+function Ui-AskDark {
+    param([string]$text, [string]$title, [bool]$warn)
+    $Th = $script:Th
+    $f = New-Object System.Windows.Forms.Form
+    try {
+        $f.Text = $title
+        $f.Font = (Ui-Font 'ui')
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+        $f.MaximizeBox = $false
+        $f.MinimizeBox = $false
+        $f.ShowInTaskbar = $false
+        $f.BackColor = $Th.Panel
+        # long lines wrap at about 80 characters, so count them as more than one
+        $lines = 0
+        foreach ($ln in @($text -split "`n")) { $lines += [Math]::Max(1, [int][Math]::Ceiling(($ln.Trim("`r").Length) / 80.0)) }
+        $hh = (Px 160) + $lines * (Px 19)
+        $hh = [Math]::Max((Px 250), [Math]::Min((Px 580), $hh))
+        $f.ClientSize = New-Object System.Drawing.Size((Px 580), $hh)
+
+        $strip = New-Object System.Windows.Forms.Panel
+        $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+        $strip.Height = (Px 3)
+        $strip.BackColor = $Th.Accent
+        if ($warn) { $strip.BackColor = $Th.Warn }
+
+        $head = New-Object System.Windows.Forms.Label
+        $head.Dock = [System.Windows.Forms.DockStyle]::Top
+        $head.Height = (Px 50)
+        $head.Text = $title
+        $head.Font = (Ui-Font 'detTitle')
+        $head.ForeColor = $Th.Text
+        $head.BackColor = $Th.Panel
+        $head.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $head.Padding = New-Object System.Windows.Forms.Padding((Px 20), (Px 4), (Px 20), 0)
+
+        $bar = New-Object System.Windows.Forms.Panel
+        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $bar.Height = (Px 64)
+        $bar.BackColor = $Th.Bg
+        $no = New-Btn 'No' 96 'secondary' '' 36
+        $yes = New-Btn 'Yes' 96 'primary' '' 36
+        $no.DialogResult = [System.Windows.Forms.DialogResult]::No
+        $yes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+        $cw = $f.ClientSize.Width
+        $no.Location = New-Object System.Drawing.Point(($cw - (Px 20) - $no.Width), (Px 14))
+        $yes.Location = New-Object System.Drawing.Point(($no.Left - (Px 10) - $yes.Width), (Px 14))
+        $bar.Controls.Add($yes)
+        $bar.Controls.Add($no)
+
+        $body = New-Object System.Windows.Forms.Panel
+        $body.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $body.BackColor = $Th.Panel
+        $body.Padding = New-Object System.Windows.Forms.Padding((Px 20), 0, (Px 12), (Px 10))
+        $tb = New-Object System.Windows.Forms.TextBox
+        $tb.Multiline = $true
+        $tb.ReadOnly = $true
+        $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+        $tb.BackColor = $Th.Panel
+        $tb.ForeColor = $Th.Text
+        $tb.Font = (Ui-Font 'body')
+        $tb.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+        $tb.TabStop = $false
+        $tb.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $tb.Text = ($text -replace "`r?`n", "`r`n")
+        $body.Controls.Add($tb)
+
+        # the one added first fills what is left; each one added later is laid out before it
+        $f.Controls.Add($body)
+        $f.Controls.Add($bar)
+        $f.Controls.Add($head)
+        $f.Controls.Add($strip)
+        $f.CancelButton = $no
+        $f.ActiveControl = $no
+        $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+        $owner = $script:UI.form
+        if ($owner) { $ans = $f.ShowDialog($owner) } else { $ans = $f.ShowDialog() }
+        return ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
+    } finally {
+        try { $f.Dispose() } catch { }
+    }
+}
+
+function Ui-Ask {
+    param([string]$text, [string]$title, [bool]$warn = $false)
+    $res = $null
+    try { $res = Ui-AskDark $text $title $warn } catch { $res = $null }
+    if ($null -ne $res) { return [bool]$res }
+    $icon = [System.Windows.Forms.MessageBoxIcon]::Question
+    if ($warn) { $icon = [System.Windows.Forms.MessageBoxIcon]::Warning }
+    $ans = [System.Windows.Forms.MessageBox]::Show($script:UI.form, $text, $title, [System.Windows.Forms.MessageBoxButtons]::YesNo, $icon, [System.Windows.Forms.MessageBoxDefaultButton]::Button2)
+    return ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+
+# =============================================================================
+# THE WINDOW, part 2: the settings list.
+# It is one custom-drawn control instead of a ListView. Only the rows that are on screen are ever drawn and a
+# change repaints once, which is what makes it fast. A "view entry" is a small hashtable per line:
+#   row:  Kind='row'  Id Key Cat Name Desc Y H Idx Checked Enabled State Action StateText NextText HeadText Tint
+#         StateKey NextKey HeadKey ChipText ChipKey Failed   Choices Pick Now
+#         (Choices = $null, or for a setting with options the list of @{ Key; Short; Label }; Pick = the key that is picked on the card,
+#          Now = the key of the option that is in force, '' when not known. Such a card has a row of option buttons instead of a switch.)
+#   head: Kind='head' Key Cat Title CountText Y H Idx Open
+#   info: Kind='info' Key Cat Title Sub Lines Note Chip ChipKey Span Y H Idx  (a read-out card, see u6-sys.ps1; it has no switch and cannot be
+#         selected. Its height depends on what it says, so a line of the list is as tall as its tallest card.)
+# Each row is drawn as a card: its id in small grey letters, the title, a few tags, the description (two lines), then a risk badge,
+# a small status chip and the switch. Cards sit in one column, or in two when the list is wide enough (X and W of an entry say where).
+# A head is a section title across the whole width; it is only in the list on the "All settings" page (a category page has no heads).
+# Names used for local variables in this file: $Th = colours, $M = sizes, $Cl = column positions.
+# =============================================================================
+$script:Groups = New-Object System.Collections.ArrayList     # @{ Cat; Head; Rows } for every group that has something to show
+$script:View = New-Object System.Collections.ArrayList       # the entries that are in the list now, top to bottom
+$script:Total = 0                                            # height of everything in the list
+$script:ScrollY = 0
+$script:ListW = 700
+$script:ListH = 500
+$script:SelKey = ''                                          # key of the selected entry ('' = none)
+$script:HotEntry = $null                                     # the entry under the mouse
+$script:HotZone = ''
+$script:Collapsed = @{}
+$script:Filtering = $false                                   # a search or a filter button is hiding rows: show every group open
+$script:Single = $false                                      # one category page: no section titles
+$script:NavCat = ''                                          # the category page that is showing ('' = all settings)
+$script:DragOff = -1                                         # >= 0 while the scroll thumb is being dragged
+$script:MX = -1
+$script:MY = -1
+$script:Col = @{}
+$script:CursorIs = ''
+$script:FirstSel = -1                                        # index of the first entry that can be selected (-1 = none: a page of read-outs only)
+
+# ----------------------------------------------------------- sizes and scrolling ----
+function Ui-ListSize {
+    $l = $script:UI.list
+    if ($l) {
+        $cs = $l.ClientSize
+        if ([int]$cs.Width -gt 0) { $script:ListW = [int]$cs.Width }
+        if ([int]$cs.Height -gt 0) { $script:ListH = [int]$cs.Height }
+    }
+    $M = $script:M
+    $right = $script:ListW - $M.Sb                      # where the cards end (the scroll bar lives to the right of that)
+    # one column of cards, or two when each card can still be wide enough
+    $cols = 1
+    if ($right -ge (2 * $M.CardMin + $M.ColGap)) { $cols = 2 }
+    $cw = [int](($right - ($cols - 1) * $M.ColGap) / $cols)
+    $oldCols = [int]$script:Col.Cols
+    $oldCw = [int]$script:Col.CardW
+    $script:Col = @{ Right = $right; Cols = $cols; CardW = $cw }
+    if ($oldCols -ne $cols -or $oldCw -ne $cw) { Ui-Layout }
+    Ui-ClampScroll
+}
+
+function Ui-ClampScroll {
+    $max = [Math]::Max(0, $script:Total - $script:ListH)
+    if ($script:ScrollY -gt $max) { $script:ScrollY = $max }
+    if ($script:ScrollY -lt 0) { $script:ScrollY = 0 }
+}
+
+function Ui-InvalidateAll {
+    $l = $script:UI.list
+    if ($l) { $l.Invalidate() }
+}
+
+function Ui-InvalidateEntry {
+    param($e)
+    $l = $script:UI.list
+    if (-not $l -or -not $e) { return }
+    $l.Invalidate([System.Drawing.Rectangle]::new([int]$e.X, ($e.Y - $script:ScrollY), [int]$e.W, $e.H))
+}
+
+function Ui-ScrollTo {
+    param([int]$y)
+    $max = [Math]::Max(0, $script:Total - $script:ListH)
+    if ($y -gt $max) { $y = $max }
+    if ($y -lt 0) { $y = 0 }
+    if ($y -eq $script:ScrollY) { return }
+    $script:ScrollY = $y
+    Ui-InvalidateAll
+}
+
+# index of the first entry that ends below y (the first one that has to be drawn)
+function Ui-FirstAt {
+    param([int]$y)
+    $v = $script:View
+    $lo = 0
+    $hi = $v.Count
+    while ($lo -lt $hi) {
+        $mid = ($lo + $hi) -shr 1
+        $e = $v[$mid]
+        if (($e.Y + $e.H) -le $y) { $lo = $mid + 1 } else { $hi = $mid }
+    }
+    return $lo
+}
+
+# index of the entry that contains the point (list coordinates, scroll included), or -1. Without x it is the first entry on that line.
+function Ui-HitIndex {
+    param([int]$y, [int]$x = -1)
+    $i = Ui-FirstAt $y
+    $v = $script:View
+    if ($i -ge $v.Count) { return -1 }
+    $e = $v[$i]
+    if ($e.Y -gt $y) { return -1 }
+    if ($x -lt 0) { return $i }
+    # in a grid several cards share a line: find the one under x
+    $j = $i
+    while ($j -lt $v.Count -and $v[$j].Y -eq $e.Y) {
+        $c = $v[$j]
+        if ($x -ge $c.X -and $x -lt ($c.X + $c.W)) { return $j }
+        $j++
+    }
+    return -1
+}
+
+function Ui-OnListResize {
+    Ui-ListSize
+    Ui-InvalidateAll
+}
+
+# ----------------------------------------------------------- filling the entries ----
+# Copy what the row says into its line (cheap: it only sets fields, nothing is drawn)
+function Ui-FillEntry {
+    param($row)
+    $e = $row.Item
+    if (-not $e) { return }
+    $a = Get-Action $row
+    $st = [string]$row.State
+    $note = [string]$row.Note
+    $e.Checked = [bool]$row.Want
+    if ($row.T.Choices) { $e.Pick = [string]$row.Pick; $e.Now = [string](Get-RealPick $row) }
+    $e.State = $st
+    $e.Action = $a
+    $e.Enabled = ($st -ne 'NA' -and $st -ne 'Checking')
+    $e.StateText = Get-StateText $row
+    $e.NextText = Get-NextText $row
+    $e.HeadText = Get-HeadsUp $row.T
+    $e.Failed = $note.StartsWith('Failed')
+    $e.Tint = ''
+    if ($a -eq 'Apply') { $e.Tint = 'TintApply' } elseif ($a -eq 'Undo') { $e.Tint = 'TintUndo' }
+    $sk = 'Sub'
+    if ($st -eq 'On') { $sk = 'Good' }
+    elseif ($st -eq 'Partial' -or $st -eq 'Unknown') { $sk = 'Warn' }
+    elseif ($st -eq 'NA' -or $st -eq 'Checking') { $sk = 'Dim' }
+    $e.StateKey = $sk
+    $nk = 'Sub'
+    if ($e.Failed) { $nk = 'Bad' }
+    elseif ($note -eq 'Done') { $nk = 'Good' }
+    elseif ($note -eq 'Working...') { $nk = 'Accent' }
+    elseif (-not $note) {
+        if ($a -eq 'Apply') { $nk = 'Accent' } elseif ($a -eq 'Undo') { $nk = 'Warn' }
+    }
+    $e.NextKey = $nk
+    $hk = 'Sub'
+    if ($row.T.Risk -eq 'security') { $hk = 'Warn' }
+    $e.HeadKey = $hk
+    # the chip on the right says something only when there is something to say
+    $ct = ''; $ck = 'Sub'
+    if ($note) { $ct = $note; $ck = $nk }
+    elseif ($a -eq 'Apply') { $ct = 'Will turn on'; $ck = 'Accent'; if ($row.T.Choices) { $ct = 'Will change' } }
+    elseif ($a -eq 'Undo') { $ct = 'Will turn off'; $ck = 'Warn'; if ($row.T.Choices) { $ct = 'Will reset' } }
+    elseif ($st -eq 'Partial') { $ct = 'Partly applied'; $ck = 'Warn' }
+    elseif ($st -eq 'On' -and $row.Mine -eq 'no') { $ct = 'Already applied'; $ck = 'Good' }
+    elseif ($st -eq 'Unknown') { $ct = 'Unknown'; $ck = 'Warn' }
+    elseif ($st -eq 'NA') { $ct = 'Not on this PC'; $ck = 'Dim' }
+    elseif ($st -eq 'Checking') { $ct = 'Checking...'; $ck = 'Dim' }
+    $e.ChipText = $ct
+    $e.ChipKey = $ck
+}
+
+# The "3 of 12 applied" text of every group header (one pass over all rows)
+function Ui-FillHeads {
+    $gc = Get-GroupCounts
+    foreach ($g in $script:Groups) {
+        $g.Head.CountText = Get-GroupCountText $gc[[string]$g.Cat]
+    }
+}
+
+# Put the entries in order, top to bottom, and work out where each one is (X and W too: a line holds one card, or two in a grid).
+# A group has Info (read-out cards, on top) and Rows (settings). A read-out may take the whole width (Span 2); the cards of one line
+# all get the height of the tallest of them.
+function Ui-Layout {
+    $M = $script:M
+    $view = New-Object System.Collections.ArrayList
+    $y = $M.Top
+    $single = [bool]$script:Single
+    $cols = [Math]::Max(1, [int]$script:Col.Cols)
+    $cw = [int]$script:Col.CardW
+    if ($cw -le 0) { $cw = [Math]::Max((Px 100), $script:ListW - $M.Sb) }
+    $full = $cw * $cols + $M.ColGap * ($cols - 1)
+    foreach ($g in $script:Groups) {
+        $open = ($single -or $script:Filtering -or -not [bool]$script:Collapsed[[string]$g.Cat])
+        $h = $g.Head
+        $h.Open = $open
+        $h.X = 0
+        $h.W = $full
+        if ($single) {
+            $h.Y = -1
+            $h.H = 0
+            $h.Idx = -1
+        } else {
+            $h.Y = $y
+            $h.H = $M.Head
+            $h.Idx = $view.Count
+            [void]$view.Add($h)
+            $y += $M.Head
+        }
+        $c = 0
+        $line = @()
+        $lineH = 0
+        $prev = ''
+        $items = New-Object System.Collections.ArrayList
+        if ($g.Info) { foreach ($x in @($g.Info)) { [void]$items.Add($x) } }
+        foreach ($x in @($g.Rows)) { [void]$items.Add($x) }
+        foreach ($r in $items) {
+            if (-not $open) {
+                $r.Y = -1
+                $r.Idx = -1
+                continue
+            }
+            # a line ends when the next entry is a read-out that wants the whole width, or the first settings card after read-outs
+            $wide = ($r.Kind -eq 'info' -and ($cols -le 1 -or [int]$r.Span -ge 2))
+            if (($wide -or ($prev -eq 'info' -and $r.Kind -ne 'info')) -and $c -gt 0) {
+                foreach ($e in $line) { $e.H = $lineH }
+                $y += $lineH
+                $c = 0; $line = @(); $lineH = 0
+            }
+            if ($r.Kind -eq 'info') {
+                $iw = $cw
+                if ($wide) { $iw = $full }
+                Info-Prepare $r $iw
+            } else {
+                $r.W = $cw
+                $r.H = $M.Row
+            }
+            if ($wide) {
+                $r.X = 0
+                $r.Y = $y
+                $r.Idx = $view.Count
+                [void]$view.Add($r)
+                $y += $r.H
+            } else {
+                $r.X = $c * ($cw + $M.ColGap)
+                $r.Y = $y
+                $r.Idx = $view.Count
+                [void]$view.Add($r)
+                $line += $r
+                if ($r.H -gt $lineH) { $lineH = $r.H }
+                $c++
+                if ($c -ge $cols) {
+                    foreach ($e in $line) { $e.H = $lineH }
+                    $y += $lineH
+                    $c = 0; $line = @(); $lineH = 0
+                }
+            }
+            $prev = [string]$r.Kind
+        }
+        if ($c -gt 0) {                               # the last line of the group is only part full
+            foreach ($e in $line) { $e.H = $lineH }
+            $y += $lineH
+        }
+    }
+    $script:View = $view
+    $script:Total = $y + $M.Bottom
+    $script:FirstSel = -1
+    for ($i = 0; $i -lt $view.Count; $i++) { if ($view[$i].Kind -ne 'info') { $script:FirstSel = $i; break } }
+    Ui-ClampScroll
+}
+
+# Build the list again from the rows, using the search text, the category page and the chosen filter button
+function Ui-RebuildList {
+    $text = ''
+    if ($script:UI.find) { $text = ([string]$script:UI.find.Text).Trim() }
+    $mode = [string]$script:Mode
+    $risk = [string]$script:Risk
+    # a search looks at every category; with nothing typed the list shows the category that is picked in the side menu
+    $pageCat = ''
+    if ($text -eq '') { $pageCat = [string]$script:NavCat }
+    $infoPage = [bool](Test-InfoPage $pageCat)
+    if ($infoPage) { $mode = 'All settings'; $risk = 'Any risk' }   # the filter buttons do not apply to a page of read-outs
+    $script:Filtering = [bool]($text -ne '' -or $mode -ne 'All settings' -or $risk -ne 'Any risk')
+    $script:Single = [bool]($pageCat -ne '')
+    $byCat = @{}
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        $row.Item = $null
+        $row.Visible = $false
+        if ($pageCat -ne '' -and [string]$row.T.Cat -ne $pageCat) { continue }
+        if (-not (Test-RowVisible $row $text $mode $risk)) { continue }
+        $cat = [string]$row.T.Cat
+        if (-not $byCat.ContainsKey($cat)) { $byCat[$cat] = New-Object System.Collections.ArrayList }
+        $rb = Get-RiskBadge $row.T
+        $nrWhy = Get-NotRecReason $row.T
+        $e = @{ Kind = 'row'; Id = [string]$id; Key = [string]$id; Cat = $cat; Name = [string]$row.T.Name; Desc = (Get-ShortDesc $row.T); X = 0; W = 0; Y = 0; H = 0; Idx = 0
+                Checked = $false; Enabled = $false; State = ''; Action = ''; StateText = ''; NextText = ''; HeadText = ''; Tint = ''
+                StateKey = 'Sub'; NextKey = 'Sub'; HeadKey = 'Sub'; ChipText = ''; ChipKey = 'Sub'; Failed = $false
+                Risk = [string]$rb.Text; RiskKey = [string]$rb.Key; Tags = @(Get-CardTags $row.T)
+                NotRec = [bool]$nrWhy; NotRecWhy = [string]$nrWhy
+                Choices = $null; Pick = ''; Now = '' }
+        if ($row.T.Choices) { $e.Choices = @($row.T.Choices | ForEach-Object { @{ Key = [string]$_.Key; Short = [string]$_.Short; Label = [string]$_.Label } }) }
+        $row.Item = $e
+        $row.Visible = $true
+        Ui-FillEntry $row
+        [void]$byCat[$cat].Add($e)
+    }
+    $groups = New-Object System.Collections.ArrayList
+    foreach ($cat in $script:Cats) {
+        # the Display page shows its live cards on top of its settings (not while a filter is narrowing the settings down)
+        $info = @()
+        if ([string]$cat -eq $pageCat -and -not $script:Filtering) { $info = @(Get-PageCards $pageCat) }
+        if (-not $byCat.ContainsKey($cat) -and $info.Count -eq 0) { continue }
+        $rows = $byCat[$cat]
+        if (-not $rows) { $rows = New-Object System.Collections.ArrayList }
+        $head = @{ Kind = 'head'; Key = ('#' + $cat); Cat = [string]$cat; Title = (Split-CatName $cat).Short; CountText = ''; X = 0; W = 0; Y = 0; H = 0; Idx = 0; Open = $true }
+        [void]$groups.Add(@{ Cat = [string]$cat; Head = $head; Rows = $rows; Info = $info })
+    }
+    if ($infoPage) {
+        $head = @{ Kind = 'head'; Key = ('#' + $pageCat); Cat = [string]$pageCat; Title = (Split-CatName $pageCat).Short; CountText = ''; X = 0; W = 0; Y = 0; H = 0; Idx = 0; Open = $true }
+        [void]$groups.Add(@{ Cat = [string]$pageCat; Head = $head; Rows = (New-Object System.Collections.ArrayList); Info = @(Get-PageCards $pageCat) })
+    }
+    $script:Groups = $groups
+    $script:HotEntry = $null
+    $script:HotZone = ''
+    Ui-FillHeads
+    Ui-Layout
+    # keep the selection while its line is still there
+    if ($script:SelKey) {
+        $found = $false
+        foreach ($e in $script:View) { if ($e.Key -eq $script:SelKey) { $found = $true; break } }
+        if (-not $found) { $script:SelKey = '' }
+    }
+    $script:DList = $true
+    $script:DCounts = $true
+    $script:DDetail = $true
+    $script:DNav = $true
+    Ui-Flush
+}
+
+# the search text or a filter button changed: show the matches from the top
+function Ui-OnFilterChanged {
+    Ui-RebuildList
+    Ui-ScrollTo 0
+}
+
+function Ui-StyleChips {
+    foreach ($b in @($script:UI.chips)) {
+        $k = 'tab'
+        # two rows of buttons: the state filter and the risk filter, each with its own one that is on
+        if ($script:RiskNames -contains [string]$b.Name) {
+            if ([string]$b.Name -eq $script:Risk) { $k = 'tabon' }
+        } elseif ([string]$b.Name -eq $script:Mode) { $k = 'tabon' }
+        $b.Tag = $k
+        Ui-StyleBtn $b
+    }
+}
+
+function Ui-SetMode {
+    param([string]$mode)
+    if ($script:RiskNames -contains $mode) { $script:Risk = $mode } else { $script:Mode = $mode }
+    Ui-StyleChips
+    Ui-OnFilterChanged
+}
+
+# ----------------------------------------------------------- painting ---------------
+# The switch. $w and $h default to the size used in the list. On: purple with a dark knob. Off: grey with an outline and a light knob.
+function Ui-DrawToggle {
+    param($g, [int]$x, [int]$y, [bool]$on, [bool]$enabled, [int]$w = 0, [int]$h = 0)
+    $Th = $script:Th
+    $M = $script:M
+    if ($w -le 0) { $w = $M.TogW }
+    if ($h -le 0) { $h = $M.TogH }
+    $track = $Th.Track
+    $knob = $Th.KnobOff
+    $edge = $Th.TrackEdge
+    if (-not $enabled) { $track = $Th.TrackOff; $knob = $Th.KnobDim; $edge = $null }
+    elseif ($on) { $track = $Th.Accent; $knob = $Th.KnobOn; $edge = $null }
+    Ui-FillRound $g $track $x $y $w $h ([int]($h / 2))
+    if ($edge) { Ui-StrokeRound $g $edge 1 $x $y $w $h ([int]($h / 2)) }
+    $pad = [Math]::Max(3, [int]($h / 5))
+    $d = $h - 2 * $pad
+    if ($on -and $enabled) { $d += [Math]::Max(1, [int]($h / 12)) }       # a slightly bigger knob when on, like Windows 11
+    $kx = $x + $pad
+    if ($on) { $kx = $x + $w - $d - $pad }
+    Ui-FillOval $g $knob $kx ($y + [int](($h - $d) / 2)) $d $d
+}
+
+function Ui-PaintHead {
+    param($g, $e, [int]$y)
+    $Th = $script:Th
+    $M = $script:M
+    $Cl = $script:Col
+    $TF = $script:TF
+    $sel = ($e.Key -eq $script:SelKey)
+    $hot = ($script:HotEntry -and $script:HotEntry.Key -eq $e.Key)
+    $top = Px 16
+    $hh = $e.H - $top
+    $ty = $y + $top
+    # the little arrow: pointing down when open, right when closed
+    $cx = Px 9
+    $cy = $ty + [int]($hh / 2)
+    $d = Px 4
+    $d2 = Px 2
+    $ac = $Th.Mute
+    if ($sel -or $hot) { $ac = $Th.Accent }
+    if ($e.Open) {
+        Ui-Line $g $ac 1.6 ($cx - $d) ($cy - $d2) $cx ($cy + $d2)
+        Ui-Line $g $ac 1.6 $cx ($cy + $d2) ($cx + $d) ($cy - $d2)
+    } else {
+        Ui-Line $g $ac 1.6 ($cx - $d2) ($cy - $d) ($cx + $d2) $cy
+        Ui-Line $g $ac 1.6 ($cx + $d2) $cy ($cx - $d2) ($cy + $d)
+    }
+    $tx0 = Px 26
+    # the heading only carries its title and the count: "Turn all on" and "Turn all off" are the two buttons at the top right of the window
+    Ui-Text $g $e.Title (Ui-Font 'head') $Th.Text $tx0 $ty ($Cl.Right - $M.CountW - $tx0 - (Px 6)) $hh $TF.L
+    if ($e.CountText) {
+        Ui-Text $g $e.CountText (Ui-Font 'small') $Th.Mute ($Cl.Right - $M.CountW) $ty $M.CountW $hh $TF.R
+    }
+}
+
+# the colour a chip is filled with, for the colour key of its text
+function Ui-SoftKey {
+    param([string]$key)
+    switch ($key) {
+        'Accent' { return 'AccentSoft' }
+        'Warn'   { return 'WarnSoft' }
+        'Good'   { return 'GoodSoft' }
+        'Bad'    { return 'BadSoft' }
+    }
+    return 'Raised'
+}
+
+# Where the "Not recommended" label sits on a card: on the bottom line right after the risk badge, when it fits before the buttons
+# on the right. On a narrow card (a small window) it goes to the top right corner instead, above the title, where nothing is drawn;
+# if even that has no room it is left out (the details and the tooltip still say it). Top = $true says which of the two it is.
+# Returns $null when the setting is not marked or there is no room. $riskW is the width of the risk badge when the painter has
+# just measured it.
+function Ui-NotRecRect {
+    param($e, [int]$riskW = -1)
+    if (-not $e -or -not $e.NotRec) { return $null }
+    $M = $script:M
+    $font = Ui-Font 'smallb'
+    if ($riskW -lt 0) { $riskW = (Ui-TextWidth ([string]$e.Risk) $font) + (Px 22) }
+    $nw = (Ui-TextWidth ([string]$script:NotRecText) $font) + (Px 22)
+    $nx = [int]$e.X + $M.Pad + $riskW + (Px 6)
+    $right = [int]$e.X + [int]$e.W
+    $viewX = $right - $M.Pad - $M.TogW - $M.ViewGap - $M.ViewW
+    if ($e.Choices) { $viewX = $right - $M.Pad - $M.ViewW }
+    if (($nx + $nw) -le ($viewX - (Px 8))) { return @{ X = $nx; W = $nw; Top = $false } }
+    # the top right corner, clear of the id text at the left
+    $tx = $right - $M.Pad - $nw
+    $idEnd = [int]$e.X + $M.Pad + (Ui-TextWidth ([string]$e.Id) (Ui-Font 'cardId')) + (Px 10)
+    if ($tx -ge $idEnd) { return @{ X = $tx; W = $nw; Top = $true } }
+    return $null
+}
+
+function Ui-PaintRow {
+    param($g, $e, [int]$y)
+    $Th = $script:Th
+    $M = $script:M
+    $TF = $script:TF
+    $sel = ($e.Key -eq $script:SelKey)
+    $hot = ($script:HotEntry -and $script:HotEntry.Key -eq $e.Key)
+    $x = [int]$e.X
+    $cw = [int]$e.W
+    $ch = $e.H - $M.Gap                                   # the card is a little shorter than its line: that is the gap
+    $fill = $Th.Card
+    $edge = $Th.Edge
+    if ($e.Tint) {
+        $fill = $Th[$e.Tint]
+        $edge = $Th[([string]$e.Tint).Replace('Tint', 'Edge')]
+    }
+    if ($sel) {
+        $edge = $Th.Accent
+        if ($e.Tint) { $fill = $Th[$e.Tint + 'Sel'] } else { $fill = $Th.CardSel }
+    } elseif ($hot -and -not $e.Tint) {
+        $fill = $Th.CardHot
+        $edge = $Th.EdgeHot
+    }
+    Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
+    Ui-StrokeRound $g $edge 1 $x $y $cw $ch $M.Radius
+    if ($e.Tint) {
+        # a change waiting to be made: a short bar at the left edge (purple to turn on, orange to turn off) instead of a loud outline
+        $bar = $Th.Accent
+        if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
+        Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 18)) (Px 3) ($ch - (Px 36)) (Px 1)
+    }
+    $ix = $x + $M.Pad
+    $iw = $cw - 2 * $M.Pad
+    $nameCol = $Th.Text
+    $descCol = $Th.Sub
+    $idCol = $Th.Dim
+    if (-not $e.Enabled) { $nameCol = $Th.Dim; $descCol = $Th.Dim }
+    # the id (what -Apply and -Undo call it), the title, the tags
+    Ui-Text $g $e.Id (Ui-Font 'cardId') $idCol $ix ($y + (Px 14)) $iw (Px 14) $TF.L
+    Ui-Text $g $e.Name (Ui-Font 'cardName') $nameCol $ix ($y + (Px 30)) $iw (Px 26) $TF.L
+    $tx = $ix
+    $ty = $y + (Px 62)
+    $tagH = Px 22
+    $tagFont = Ui-Font 'smallb'
+    foreach ($tg in @($e.Tags)) {
+        $tw = (Ui-Measure $g ([string]$tg) $tagFont) + (Px 18)
+        if (($tx + $tw) -gt ($ix + $iw)) { break }
+        Ui-FillRound $g $Th.Tag $tx $ty $tw $tagH (Px 6)
+        Ui-Text $g ([string]$tg) $tagFont $Th.TagText $tx $ty $tw $tagH $TF.C
+        $tx += $tw + (Px 6)
+    }
+    # the description, wrapped to two lines (the details panel shows all of it). A card with options has its option buttons
+    # there instead (the description is one click away on "View description").
+    if ($e.Choices) { Ui-DrawChoices $g $e $ix ($y + $M.ChoiceY) $iw $M.ChoiceH }
+    elseif ($e.Desc) { Ui-Text $g $e.Desc (Ui-Font 'cardDesc') $descCol $ix ($y + (Px 92)) $iw (Px 40) $TF.W }
+    # the bottom line: risk badge and status chip on the left; on the right "View description", then the switch
+    $by = $y + $ch - (Px 12) - (Px 24)
+    $bx = $ix
+    $bh = Px 24
+    $bw = (Ui-Measure $g ([string]$e.Risk) $tagFont) + (Px 22)
+    $fk = $e.RiskKey + 'Fill'
+    $tk = $e.RiskKey + 'Text'
+    if (-not $e.Enabled) { $fk = 'Raised'; $tk = 'Dim' }
+    Ui-FillRound $g $Th[$fk] $bx $by $bw $bh (Px 6)
+    Ui-Text $g ([string]$e.Risk) $tagFont $Th[$tk] $bx $by $bw $bh $TF.C
+    # "Not recommended": an outlined label next to the risk badge (outlined, so it cannot be mistaken for the solid risk colours)
+    $nextX = $bx + $bw
+    $nrr = Ui-NotRecRect $e $bw
+    if ($nrr) {
+        $nc = $Th.Bad
+        if (-not $e.Enabled) { $nc = $Th.Dim }
+        $ny = $by
+        $nh = $bh
+        if ($nrr.Top) { $ny = $y + (Px 8); $nh = Px 22 }          # a narrow card: the top right corner
+        Ui-StrokeRound $g $nc 1 $nrr.X $ny $nrr.W $nh (Px 6)
+        Ui-Text $g ([string]$script:NotRecText) $tagFont $nc $nrr.X $ny $nrr.W $nh $TF.C
+        if (-not $nrr.Top) { $nextX = $nrr.X + $nrr.W }
+    }
+    $togX = $x + $cw - $M.Pad - $M.TogW
+    $viewX = $togX - $M.ViewGap - $M.ViewW
+    if ($e.Choices) { $viewX = $x + $cw - $M.Pad - $M.ViewW }          # no switch on this card: the button goes to the right end
+    if ($e.ChipText) {
+        $cx = $nextX + (Px 10)
+        $cwid = (Ui-Measure $g ([string]$e.ChipText) $tagFont) + (Px 22)
+        if (($cx + $cwid) -le ($viewX - (Px 8))) {
+            Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] $cx $by $cwid $bh (Px 6)
+            Ui-Text $g ([string]$e.ChipText) $tagFont $Th[$e.ChipKey] $cx $by $cwid $bh $TF.C
+        }
+    }
+    # "View description": an outlined button (it fills in when the pointer is over it)
+    $vhot = ($hot -and $script:HotZone -eq 'view')
+    $vcol = $Th.Sub
+    if ($vhot) { Ui-FillRound $g $Th.Raised $viewX $by $M.ViewW $bh (Px 6); $vcol = $Th.Text }
+    Ui-StrokeRound $g $Th.Border 1 $viewX $by $M.ViewW $bh (Px 6)
+    Ui-Text $g 'View description' $tagFont $vcol $viewX $by $M.ViewW $bh $TF.C
+    if (-not $e.Choices) { Ui-DrawToggle $g $togX ($by + [int](($bh - $M.TogH) / 2)) ([bool]$e.Checked) ([bool]$e.Enabled) }
+}
+
+# The option buttons of a card with options: one pill split in equal parts. The picked part is filled, the option that is in force
+# (when it is not the picked one) has a green outline, the part under the pointer lights up.
+function Ui-DrawChoices {
+    param($g, $e, [int]$x, [int]$y, [int]$w, [int]$h)
+    $Th = $script:Th
+    $TF = $script:TF
+    $font = Ui-Font 'smallb'
+    $list = @($e.Choices)
+    $n = $list.Count
+    if ($n -lt 1) { return }
+    $on = [bool]$e.Enabled
+    $hot = ($script:HotEntry -and $script:HotEntry.Key -eq $e.Key)
+    Ui-FillRound $g $Th.Raised $x $y $w $h ([int]($h / 2))
+    Ui-StrokeRound $g $Th.Border 1 $x $y $w $h ([int]($h / 2))
+    $inset = Px 3
+    $segW = [int][Math]::Floor($w / $n)
+    for ($i = 0; $i -lt $n; $i++) {
+        $c = $list[$i]
+        $sx = $x + $i * $segW
+        $sw = $segW
+        if ($i -eq ($n - 1)) { $sw = $w - $i * $segW }
+        $px = $sx + $inset
+        $pw = $sw - 2 * $inset
+        $py = $y + $inset
+        $ph = $h - 2 * $inset
+        $rad = [int]($ph / 2)
+        $isPick = ($on -and [string]$c.Key -eq [string]$e.Pick)
+        $isNow = ($on -and [string]$c.Key -eq [string]$e.Now)
+        $isHot = ($on -and $hot -and $script:HotZone -eq ('seg' + $i))
+        $col = $Th.Sub
+        if ($isPick) {
+            Ui-FillRound $g $Th.Accent $px $py $pw $ph $rad
+            $col = $Th.BtnText
+        } else {
+            if ($isHot) { Ui-FillRound $g $Th.CardHot $px $py $pw $ph $rad; $col = $Th.Text }
+            if ($isNow) { Ui-StrokeRound $g $Th.Good 1 $px $py $pw $ph $rad; $col = $Th.Text }
+            if (-not $on) { $col = $Th.Dim }
+        }
+        Ui-Text $g ([string]$c.Short) $font $col $px $py $pw $ph $TF.C
+    }
+}
+
+function Ui-Thumb {
+    $vh = $script:ListH
+    $tot = [Math]::Max($script:Total, 1)
+    $thumbH = [Math]::Max((Px 36), [int]($vh * $vh / $tot))
+    if ($thumbH -gt $vh) { $thumbH = $vh }
+    $range = $tot - $vh
+    $ty = 0
+    if ($range -gt 0) { $ty = [int](($vh - $thumbH) * $script:ScrollY / $range) }
+    return @{ Y = $ty; H = $thumbH }
+}
+
+function Ui-PaintScroll {
+    param($g)
+    if ($script:Total -le $script:ListH) { return }
+    $t = Ui-Thumb
+    Ui-PaintThumb $g ($script:ListW - (Px 3)) 0 $script:ListH $t.Y $t.H ([bool]($script:HotZone -eq 'sb')) ([bool]($script:DragOff -ge 0))
+}
+
+# Draw the part of the list between two heights of the control
+function Ui-PaintList {
+    param($g, [int]$clipTop, [int]$clipBottom)
+    $v = $script:View
+    $n = $v.Count
+    $sy = $script:ScrollY
+    Ui-Fill $g $script:Th.Bg 0 $clipTop $script:ListW ($clipBottom - $clipTop)
+    if ($n -eq 0) {
+        Ui-Text $g 'No settings match.' (Ui-Font 'row') $script:Th.Sub 0 (Px 40) $script:ListW (Px 30) $script:TF.C
+        return
+    }
+    $i = Ui-FirstAt ($sy + $clipTop)
+    while ($i -lt $n) {
+        $e = $v[$i]
+        $y = $e.Y - $sy
+        if ($y -ge $clipBottom) { break }
+        if ($e.Kind -eq 'head') { Ui-PaintHead $g $e $y }
+        elseif ($e.Kind -eq 'info') { Ui-PaintInfo $g $e $y }
+        else { Ui-PaintRow $g $e $y }
+        $i++
+    }
+    Ui-PaintScroll $g
+}
+
+function Ui-OnPaint {
+    param($pe)
+    $g = $pe.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $clip = $pe.ClipRectangle
+    Ui-PaintList $g $clip.Top $clip.Bottom
+}
+
+# ----------------------------------------------------------- the mouse ----------------
+# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | row | head | ''
+function Ui-Zone {
+    param([int]$x, [int]$y)
+    $M = $script:M
+    if ($x -lt 0 -or $y -lt 0 -or $x -ge $script:ListW -or $y -ge $script:ListH) { return @{ Zone = ''; Entry = $null } }
+    if ($script:Total -gt $script:ListH -and $x -ge ($script:ListW - $M.Sb)) { return @{ Zone = 'sb'; Entry = $null } }
+    $ly = $y + $script:ScrollY
+    $i = Ui-HitIndex $ly $x
+    if ($i -lt 0) { return @{ Zone = ''; Entry = $null } }
+    $e = $script:View[$i]
+    if ($e.Kind -eq 'info') { return @{ Zone = ''; Entry = $null } }          # a read-out: nothing to click
+    if ($e.Kind -eq 'row') {
+        # the "Not recommended" label in the top right corner (only on a card too narrow for it on the bottom line)
+        $nrr = Ui-NotRecRect $e
+        if ($nrr -and $nrr.Top -and $ly -ge ($e.Y + (Px 8)) -and $ly -lt ($e.Y + (Px 30)) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
+        # the bottom line of the card: the switch at the right end (a little more than the switch itself) turns it on or off,
+        # and the "View description" button just left of it opens the full text
+        $cardBottom = $e.Y + $e.H - $M.Gap
+        if ($e.Choices) {
+            # the option buttons: seg0, seg1, ... from the left
+            $cl = $e.X + $M.Pad
+            $cwid = $e.W - 2 * $M.Pad
+            $ctop = $e.Y + $M.ChoiceY
+            if ($ly -ge $ctop -and $ly -lt ($ctop + $M.ChoiceH) -and $x -ge $cl -and $x -lt ($cl + $cwid)) {
+                $cn = @($e.Choices).Count
+                $k = [int][Math]::Floor(($x - $cl) * $cn / [double]$cwid)
+                if ($k -ge $cn) { $k = $cn - 1 }
+                return @{ Zone = ('seg' + $k); Entry = $e }
+            }
+        }
+        if ($ly -ge ($cardBottom - $M.BandH) -and $ly -lt $cardBottom) {
+            $right = $e.X + $e.W
+            if ($nrr -and -not $nrr.Top -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
+            if ($e.Choices) {
+                if ($x -ge ($right - $M.Pad - $M.ViewW - (Px 4)) -and $x -lt $right) { return @{ Zone = 'view'; Entry = $e } }
+                return @{ Zone = 'row'; Entry = $e }
+            }
+            if ($x -ge ($right - $M.TogZone) -and $x -lt $right) { return @{ Zone = 'toggle'; Entry = $e } }
+            $viewLeft = $right - $M.Pad - $M.TogW - $M.ViewGap - $M.ViewW
+            if ($x -ge ($viewLeft - (Px 4)) -and $x -lt ($right - $M.TogZone)) { return @{ Zone = 'view'; Entry = $e } }
+        }
+        return @{ Zone = 'row'; Entry = $e }
+    }
+    return @{ Zone = 'head'; Entry = $e }
+}
+
+function Ui-SetCursor {
+    param([string]$kind)
+    $l = $script:UI.list
+    if (-not $l -or $script:CursorIs -eq $kind) { return }
+    $script:CursorIs = $kind
+    if ($kind -eq 'hand') { $l.Cursor = [System.Windows.Forms.Cursors]::Hand } else { $l.Cursor = [System.Windows.Forms.Cursors]::Default }
+}
+
+# The tooltip of the list. Over a card's title it gives the full title, but only when the card cuts the title off (a title that is
+# fully on show needs no tooltip: it would only repeat what is under the pointer). Over the "View description" button it says what
+# the button does, and over one part of an option selector it gives that option's full name.
+$script:TipText = ''
+# A long tooltip text broken into lines of about $width characters (at spaces), so it does not run across the whole screen
+function Format-TipLines {
+    param([string]$text, [int]$width = 64)
+    $lines = New-Object System.Collections.ArrayList
+    $cur = ''
+    foreach ($w in @($text -split '\s+')) {
+        if (-not $w) { continue }
+        if ($cur -and ($cur.Length + 1 + $w.Length) -gt $width) { [void]$lines.Add($cur); $cur = $w }
+        elseif ($cur) { $cur += ' ' + $w }
+        else { $cur = $w }
+    }
+    if ($cur) { [void]$lines.Add($cur) }
+    return ($lines -join "`r`n")
+}
+function Ui-SetTip {
+    param($e, [string]$zone = '')
+    $tip = $script:UI.tip
+    $l = $script:UI.list
+    if (-not $tip -or -not $l) { return }
+    $t = ''
+    if ($e -and $e.Kind -eq 'row') {
+        if ($zone -eq 'view') { $t = 'Read the full description and see exactly what this setting changes.' }
+        elseif ($zone -eq 'notrec') { $t = Format-TipLines ([string]$script:NotRecText + ': ' + [string]$e.NotRecWhy) 64 }
+        elseif ($zone -like 'seg*' -and $e.Choices) {
+            $k = [int]$zone.Substring(3)
+            $cs = @($e.Choices)
+            if ($k -ge 0 -and $k -lt $cs.Count) { $t = [string]$cs[$k].Label }
+        } else {
+            $room = [int]$e.W - 2 * [int]$script:M.Pad
+            if ($room -gt 0 -and (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) -gt $room) { $t = [string]$e.Name }
+        }
+    }
+    if ($t -eq $script:TipText) { return }
+    $script:TipText = $t
+    try { $tip.SetToolTip($l, $t) } catch { }
+}
+
+function Ui-UpdateHot {
+    param([int]$x, [int]$y)
+    $z = Ui-Zone $x $y
+    $old = $script:HotEntry
+    $new = $z.Entry
+    $oldKey = ''; if ($old) { $oldKey = [string]$old.Key }
+    $newKey = ''; if ($new) { $newKey = [string]$new.Key }
+    if ($z.Zone -eq $script:HotZone -and $newKey -eq $oldKey) { return }
+    $oldZone = $script:HotZone
+    $script:HotEntry = $new
+    $script:HotZone = $z.Zone
+    if ($newKey -ne $oldKey -or $z.Zone -ne $oldZone) { Ui-SetTip $new ([string]$z.Zone) }
+    if ($old) { Ui-InvalidateEntry $old }
+    if ($new -and $newKey -ne $oldKey) { Ui-InvalidateEntry $new }
+    if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
+    $hand = 'arrow'
+    if ($z.Zone -eq 'toggle' -or $z.Zone -eq 'view' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head') { $hand = 'hand' }
+    Ui-SetCursor $hand
+}
+
+function Ui-OnMouseMove {
+    param([int]$x, [int]$y)
+    $script:MX = $x
+    $script:MY = $y
+    if ($script:DragOff -ge 0) { Ui-DragTo $y; return }
+    Ui-UpdateHot $x $y
+}
+
+function Ui-OnMouseLeave {
+    if ($script:DragOff -ge 0) { return }
+    $script:MX = -1
+    $script:MY = -1
+    Ui-UpdateHot -1 -1
+}
+
+function Ui-OnMouseUp {
+    if ($script:DragOff -ge 0) {
+        $script:DragOff = -1
+        Ui-InvalidateAll
+    }
+}
+
+function Ui-OnWheel {
+    param([int]$delta)
+    $step = [int]($delta / 120.0 * $script:M.Wheel)
+    if ($step -eq 0) { return }
+    Ui-ScrollTo ($script:ScrollY - $step)
+    if ($script:MX -ge 0) { Ui-UpdateHot $script:MX $script:MY }
+}
+
+function Ui-ScrollbarDown {
+    param([int]$y)
+    $t = Ui-Thumb
+    if ($y -ge $t.Y -and $y -lt ($t.Y + $t.H)) {
+        $script:DragOff = $y - $t.Y
+        Ui-InvalidateAll
+        return
+    }
+    $page = [Math]::Max($script:M.Row, $script:ListH - $script:M.Row)
+    if ($y -lt $t.Y) { Ui-ScrollTo ($script:ScrollY - $page) } else { Ui-ScrollTo ($script:ScrollY + $page) }
+}
+
+function Ui-DragTo {
+    param([int]$y)
+    $t = Ui-Thumb
+    $range = $script:Total - $script:ListH
+    $travel = $script:ListH - $t.H
+    if ($range -le 0 -or $travel -le 0) { return }
+    $ty = $y - $script:DragOff
+    if ($ty -lt 0) { $ty = 0 }
+    if ($ty -gt $travel) { $ty = $travel }
+    Ui-ScrollTo ([int]($ty * $range / $travel))
+}
+
+function Ui-OnMouseDown {
+    param([int]$x, [int]$y, [string]$button)
+    if ($button -ne 'Left') { return }
+    $z = Ui-Zone $x $y
+    $zone = [string]$z.Zone
+    if ($zone -eq 'sb') { Ui-ScrollbarDown $y; return }
+    if ($zone -eq 'toggle') { Ui-Select $z.Entry; Ui-ToggleRow $z.Entry }
+    elseif ($zone.StartsWith('seg')) { Ui-Select $z.Entry; Ui-PickRow $z.Entry ([int]$zone.Substring(3)) }
+    elseif ($zone -eq 'view') { Ui-Select $z.Entry; Ui-Flush; Ui-ShowInfo ([string]$z.Entry.Id) }
+    elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
+    elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
+    Ui-Flush
+}
+
+# ----------------------------------------------------------- selection and keys --------
+function Ui-Select {
+    param($e)
+    if (-not $e) { return }
+    if ([string]$e.Key -eq $script:SelKey) { return }
+    $script:SelKey = [string]$e.Key
+    $script:DList = $true
+    $script:DDetail = $true
+}
+
+function Ui-SelIndex {
+    $v = $script:View
+    for ($i = 0; $i -lt $v.Count; $i++) {
+        if ($v[$i].Key -eq $script:SelKey) { return $i }
+    }
+    return -1
+}
+
+# scroll so that the whole entry can be seen
+function Ui-EnsureVisible {
+    param($e)
+    if (-not $e -or $e.Y -lt 0) { return }
+    if ($e.Y -lt $script:ScrollY) {
+        $to = $e.Y
+        if ($e.Idx -le $script:FirstSel) { $to = 0 }                    # the first line: show the space above it (and any read-outs) too
+        Ui-ScrollTo $to
+    } elseif (($e.Y + $e.H) -gt ($script:ScrollY + $script:ListH)) {
+        $to = $e.Y + $e.H - $script:ListH
+        if ($e.Idx -eq ($script:View.Count - 1)) { $to = $script:Total - $script:ListH }     # the last line: show the space below it too
+        Ui-ScrollTo $to
+    }
+}
+
+# A read-out cannot be selected: go on to the nearest entry that can, looking in direction $dir first, then the other way
+function Ui-Selectable {
+    param([int]$i, [int]$dir)
+    $v = $script:View
+    $n = $v.Count
+    if ($i -ge 0 -and $i -lt $n -and $v[$i].Kind -ne 'info') { return $i }
+    for ($k = $i; $k -ge 0 -and $k -lt $n; $k += $dir) { if ($v[$k].Kind -ne 'info') { return $k } }
+    for ($k = $i; $k -ge 0 -and $k -lt $n; $k -= $dir) { if ($v[$k].Kind -ne 'info') { return $k } }
+    return -1
+}
+
+function Ui-SelectIdx {
+    param([int]$i, [int]$dir = 1)
+    $n = $script:View.Count
+    if ($n -eq 0) { return }
+    if ($i -lt 0) { $i = 0 }
+    if ($i -ge $n) { $i = $n - 1 }
+    $i = Ui-Selectable $i $dir
+    if ($i -lt 0) { return }
+    $e = $script:View[$i]
+    Ui-Select $e
+    Ui-EnsureVisible $e
+}
+
+# open or close a group (not while a search or a filter is hiding rows: then everything that matches is shown)
+function Ui-ToggleHead {
+    param($e)
+    if ($script:Filtering) { return }
+    if ($script:Single) { return }
+    $cat = [string]$e.Cat
+    $script:Collapsed[$cat] = -not [bool]$script:Collapsed[$cat]
+    Ui-Layout
+    $script:DList = $true
+}
+
+# the first and last index of the entries that share one line of the list (one entry in a single column, up to two in a grid)
+function Ui-LineSpan {
+    param([int]$i)
+    $v = $script:View
+    $y = $v[$i].Y
+    $a = $i
+    while ($a -gt 0 -and $v[$a - 1].Y -eq $y) { $a-- }
+    $b = $i
+    while ($b -lt ($v.Count - 1) -and $v[$b + 1].Y -eq $y) { $b++ }
+    return @{ First = $a; Last = $b }
+}
+
+# the index one line down (dir = 1) or up (dir = -1) from entry i, staying in the same column when the line has one
+function Ui-StepLine {
+    param([int]$i, [int]$dir)
+    $v = $script:View
+    $cur = $v[$i]
+    $sp = Ui-LineSpan $i
+    if ($dir -gt 0) { $k = $sp.Last + 1 } else { $k = $sp.First - 1 }
+    if ($k -lt 0 -or $k -ge $v.Count) { return $i }
+    if ($v[$k].Kind -eq 'head') { return $k }
+    $s2 = Ui-LineSpan $k
+    $pick = $s2.Last
+    for ($j = $s2.First; $j -le $s2.Last; $j++) { if ($v[$j].X -eq $cur.X) { $pick = $j; break } }
+    return $pick
+}
+
+function Test-ListKey {
+    param([string]$k)
+    return (@('Up', 'Down', 'Left', 'Right', 'Prior', 'Next', 'PageUp', 'PageDown', 'Home', 'End') -contains $k)
+}
+
+# On a page of read-outs nothing can be selected: the keys scroll. Returns $true when the key was used.
+function Ui-ScrollKey {
+    param([string]$key)
+    $line = Px 60
+    $page = [Math]::Max($script:M.Row, $script:ListH - $script:M.Row)
+    if ($key -eq 'Down') { Ui-ScrollTo ($script:ScrollY + $line) }
+    elseif ($key -eq 'Up') { Ui-ScrollTo ($script:ScrollY - $line) }
+    elseif ($key -eq 'Next' -or $key -eq 'PageDown') { Ui-ScrollTo ($script:ScrollY + $page) }
+    elseif ($key -eq 'Prior' -or $key -eq 'PageUp') { Ui-ScrollTo ($script:ScrollY - $page) }
+    elseif ($key -eq 'Home') { Ui-ScrollTo 0 }
+    elseif ($key -eq 'End') { Ui-ScrollTo $script:Total }
+    else { return $false }
+    return $true
+}
+
+# A key was pressed in the list. Returns $true when it was used.
+function Ui-OnKey {
+    param([string]$key)
+    $n = $script:View.Count
+    if ($n -eq 0) { return $false }
+    if ($script:FirstSel -lt 0) { return (Ui-ScrollKey $key) }
+    $i = Ui-SelIndex
+    $page = [Math]::Max(1, [int][Math]::Floor($script:ListH / $script:M.Row) - 1)
+    $cur = $null
+    if ($i -ge 0) { $cur = $script:View[$i] }
+    $done = $true
+    if ($key -eq 'Down') { if ($i -lt 0) { Ui-SelectIdx 0 } else { Ui-SelectIdx (Ui-StepLine $i 1) } }
+    elseif ($key -eq 'Up') { if ($i -lt 0) { Ui-SelectIdx 0 } else { Ui-SelectIdx (Ui-StepLine $i -1) -1 } }
+    elseif ($key -eq 'Next' -or $key -eq 'PageDown') {
+        if ($i -lt 0) { Ui-SelectIdx 0 } else { $k = $i; for ($m = 0; $m -lt $page; $m++) { $k = Ui-StepLine $k 1 }; Ui-SelectIdx $k }
+    }
+    elseif ($key -eq 'Prior' -or $key -eq 'PageUp') {
+        if ($i -lt 0) { Ui-SelectIdx 0 } else { $k = $i; for ($m = 0; $m -lt $page; $m++) { $k = Ui-StepLine $k -1 }; Ui-SelectIdx $k -1 }
+    }
+    elseif ($key -eq 'Home') { Ui-SelectIdx 0 }
+    elseif ($key -eq 'End') { Ui-SelectIdx ($n - 1) -1 }
+    elseif ($key -eq 'Space' -or $key -eq 'Return' -or $key -eq 'Enter') {
+        if ($cur) {
+            if ($cur.Kind -eq 'row') { Ui-ToggleRow $cur } else { Ui-ToggleHead $cur }
+        }
+    }
+    elseif ($key -eq 'Left') {
+        if ($cur -and $cur.Kind -eq 'head') {
+            if ($cur.Open) { Ui-ToggleHead $cur }
+        } elseif ($cur -and $i -gt 0 -and $script:View[$i - 1].Y -eq $cur.Y) {
+            Ui-SelectIdx ($i - 1)                                   # the card to the left in a grid
+        } elseif ($cur) {
+            for ($j = $i - 1; $j -ge 0; $j--) {
+                if ($script:View[$j].Kind -eq 'head') { Ui-SelectIdx $j; break }
+            }
+        }
+    }
+    elseif ($key -eq 'Right') {
+        if ($cur -and $cur.Kind -eq 'head') {
+            if (-not $cur.Open) { Ui-ToggleHead $cur } else { Ui-SelectIdx ($i + 1) }
+        } elseif ($cur -and ($i + 1) -lt $n -and $script:View[$i + 1].Y -eq $cur.Y) {
+            Ui-SelectIdx ($i + 1)                                   # the card to the right in a grid
+        }
+    }
+    else { $done = $false }
+    if ($done) { Ui-Flush }
+    return $done
+}
+
+# =============================================================================
+# THE WINDOW, part 3: buttons, the details panel, what the user can do, and the background job.
+# Things that change on screen only set a "needs updating" flag (Ui-RefreshRow, Handle-Event); Ui-Flush then
+# brings the screen up to date once. User actions end with Ui-Flush, the timer calls it after every batch of events.
+# =============================================================================
+$script:StartScanPending = $false
+
+# ----------------------------------------------------------- buttons ------------
+function Ui-Buttons {
+    $c = Get-Counts
+    $busy = ($script:Scanning -or $script:Applying -or ($c.Checking -gt 0))
+    Ui-SetEnabled $script:UI.apply ((-not $busy) -and (($c.Apply + $c.Undo) -gt 0))
+    Ui-SetEnabled $script:UI.stop ([bool]$script:Applying)
+    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll', 'latency') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
+}
+
+function Ui-Counts {
+    $c = Get-Counts
+    $n = $c.Apply + $c.Undo
+    $verb = 'Apply'
+    if ($script:UI.dry -and $script:UI.dry.Checked) { $verb = 'Preview' }
+    $label = $verb + ' changes'
+    if ($n -eq 1) { $label = $verb + ' 1 change' }
+    elseif ($n -gt 1) { $label = ('{0} {1} changes' -f $verb, $n) }
+    if ([string]$script:UI.apply.Text -ne $label) { $script:UI.apply.Text = $label }
+    Ui-Buttons
+}
+
+# ----------------------------------------------------------- details panel -----------
+$script:DetailHint = "Click a setting to read what it does and exactly what it changes. Press 'View description' on a setting to read the same text in a window of its own.`r`n`r`nUse the switch on the right of a setting to turn it on or off. Nothing is changed until you press the Apply button at the bottom."
+
+# which font and colour a piece of the details text gets
+function Ui-PartStyle {
+    param($p)
+    $Th = $script:Th
+    switch ([string]$p.S) {
+        'title' { return @{ F = 'detTitle'; C = $Th.Text } }
+        'sub'   { return @{ F = 'small'; C = $Th.Sub } }
+        'now'   {
+            $c = $Th.Sub
+            if ($p.C -eq 'good') { $c = $Th.Good } elseif ($p.C -eq 'warn') { $c = $Th.Warn }
+            return @{ F = 'uib'; C = $c }
+        }
+        'wait'  { return @{ F = 'uib'; C = $Th.Accent } }
+        'last'  { return @{ F = 'ui'; C = $Th.Sub } }
+        'body'  { return @{ F = 'body'; C = $Th.Text } }
+        'warn'  { return @{ F = 'ui'; C = $Th.Warn } }
+        'note'  { return @{ F = 'ui'; C = $Th.Dim } }
+        'head'  { return @{ F = 'uib'; C = $Th.Sub } }
+        'mono'  { return @{ F = 'monoS'; C = $Th.Mute } }
+        # the latency results: a rating is green / orange / red, a measurement's name is bold
+        'good'   { return @{ F = 'uib'; C = $Th.Good } }
+        'goodl'  { return @{ F = 'ui'; C = $Th.Good } }
+        'ok'     { return @{ F = 'uib'; C = $Th.Warn } }
+        'poor'   { return @{ F = 'uib'; C = $Th.Bad } }
+        'none'   { return @{ F = 'ui'; C = $Th.Sub } }
+        'metric' { return @{ F = 'uib'; C = $Th.Text } }
+    }
+    return @{ F = 'ui'; C = $Th.Text }
+}
+
+# put the pieces of a description into a rich text box, each in its own font and colour
+function Ui-FillRich {
+    param($d, $parts)
+    Ui-Redraw $d $false
+    try {
+        $d.Clear()
+        foreach ($p in $parts) {
+            $st = Ui-PartStyle $p
+            $d.SelectionStart = $d.TextLength
+            $d.SelectionLength = 0
+            $d.SelectionFont = (Ui-Font $st.F)
+            $d.SelectionColor = $st.C
+            $d.AppendText([string]$p.T)
+        }
+        $d.SelectionStart = 0
+        $d.SelectionLength = 0
+        $d.ScrollToCaret()
+    } finally {
+        Ui-Redraw $d $true
+    }
+}
+
+# "View description" on a card: everything the details panel shows for the setting (what it does, side effects, and the exact
+# registry values, services and tasks it touches), in a window of its own that can be made bigger
+function Ui-ShowInfo {
+    param([string]$id)
+    if (-not $id -or -not $script:Rows.Contains($id)) { return }
+    $row = $script:Rows[$id]
+    $Th = $script:Th
+    $f = New-Object System.Windows.Forms.Form
+    try {
+        $f.Text = [string]$row.T.Name
+        $f.Font = (Ui-Font 'ui')
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+        $f.MaximizeBox = $false
+        $f.MinimizeBox = $false
+        $f.ShowInTaskbar = $false
+        $f.BackColor = $Th.Panel
+        $wa = Ui-WorkArea
+        $w = [Math]::Min((Px 720), ([int]$wa.Width - (Px 40)))
+        $h = [Math]::Min((Px 640), ([int]$wa.Height - (Px 40)))
+        $f.ClientSize = New-Object System.Drawing.Size($w, $h)
+        $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 420), $w), [Math]::Min((Px 320), $h))
+
+        $strip = New-Object System.Windows.Forms.Panel
+        $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+        $strip.Height = (Px 3)
+        $strip.BackColor = $Th.Accent
+
+        $bar = New-Object System.Windows.Forms.Panel
+        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $bar.Height = (Px 64)
+        $bar.BackColor = $Th.Bg
+        $close = New-Btn 'Close' 96 'primary' '' 36
+        $close.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $close.Dock = [System.Windows.Forms.DockStyle]::Right
+        $bar.Padding = New-Object System.Windows.Forms.Padding((Px 20), (Px 14), (Px 20), (Px 14))
+        $bar.Controls.Add($close)
+
+        $body = New-Object System.Windows.Forms.Panel
+        $body.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $body.BackColor = $Th.Panel
+        $body.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 18), (Px 12), (Px 8))
+        $rb = New-Rich $Th.Panel $Th.Text 'body'
+        $body.Controls.Add($rb)
+
+        # the one added first fills what is left; each one added later is laid out before it
+        $f.Controls.Add($body)
+        $f.Controls.Add($bar)
+        $f.Controls.Add($strip)
+        $f.AcceptButton = $close
+        $f.CancelButton = $close
+        $f.ActiveControl = $close
+        $f.Tag = @{ Rich = $rb; Parts = (Get-DetailParts $row) }
+        $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+        # the text goes in once the window exists (formatting a rich text box needs its handle), before it is shown
+        $f.Add_Load({ param($s, $e) try { Ui-FillRich $s.Tag.Rich $s.Tag.Parts } catch { Ui-Fail $_ } })
+        $owner = $script:UI.form
+        if ($owner) { [void]$f.ShowDialog($owner) } else { [void]$f.ShowDialog() }
+    } finally {
+        try { $f.Dispose() } catch { }
+    }
+}
+
+function Ui-ShowDetails {
+    $d = $script:UI.detail
+    if (-not $d) { return }
+    $row = $null
+    if ($script:SelKey -and $script:Rows.Contains($script:SelKey)) { $row = $script:Rows[$script:SelKey] }
+    if ($row) {
+        $parts = Get-DetailParts $row
+    } else {
+        $parts = New-Object System.Collections.ArrayList
+        [void]$parts.Add(@{ S = 'title'; C = ''; T = "Settings`r`n" })
+        [void]$parts.Add(@{ S = 'body'; C = ''; T = "`r`n" + $script:DetailHint })
+    }
+    Ui-FillRich $d $parts
+    $fb = $script:UI.forceBtn
+    if ($fb) {
+        $show = [bool]($row -and ($row.State -eq 'Partial' -or $row.State -eq 'Unknown') -and -not $row.T.OneWay)
+        if ([bool]$fb.Visible -ne $show) { $fb.Visible = $show }
+    }
+}
+
+# ----------------------------------------------------------- keeping the screen up to date ----
+# A row changed: copy it into its line and remember what has to be redrawn
+function Ui-RefreshRow {
+    param([string]$id)
+    $row = $script:Rows[$id]
+    if (-not $row -or -not $row.Item) { return }
+    Ui-FillEntry $row
+    $script:DList = $true
+    $script:DHead = $true
+    $script:DCounts = $true
+    if ($script:SelKey -eq $id) { $script:DDetail = $true }
+}
+
+function Ui-RefreshAll {
+    foreach ($id in @($script:Rows.Keys)) { Ui-RefreshRow $id }
+    $script:DList = $true
+    $script:DHead = $true
+    $script:DCounts = $true
+    $script:DDetail = $true
+    Ui-Flush
+}
+
+function Ui-Reveal {
+    param([string]$id)
+    $row = $script:Rows[$id]
+    if ($row -and $row.Item) { Ui-EnsureVisible $row.Item }
+}
+
+# Bring the screen up to date: group counts, buttons, details, progress, the list (one repaint), the log.
+# Every part has its own try, so a problem in one never keeps the others from updating.
+function Ui-Flush {
+    try { if ($script:DHead) { $script:DHead = $false; $script:DNav = $true; Ui-FillHeads } } catch { Ui-Fail $_ }
+    try { if ($script:DNav) { $script:DNav = $false; Ui-FillNav; Ui-UpdatePage } } catch { Ui-Fail $_ }
+    try { if ($script:DCounts) { $script:DCounts = $false; Ui-Counts } } catch { Ui-Fail $_ }
+    try { if ($script:DDetail) { $script:DDetail = $false; Ui-ShowDetails } } catch { Ui-Fail $_ }
+    try {
+        if ($script:DProg) {
+            $script:DProg = $false
+            Ui-ApplyBar
+            if ($script:Scanning -and $script:ProgB -gt 1) {
+                $line = 'Checking your PC...  {0} of {1}' -f $script:ProgA, $script:ProgB
+                if ($script:WaitText) { $line += '   (still waiting for Windows: ' + $script:WaitText + ')' }
+                Ui-Status $line
+            }
+        }
+    } catch { Ui-Fail $_ }
+    try { if ($script:DList) { $script:DList = $false; Ui-InvalidateAll } } catch { Ui-Fail $_ }
+    try { Ui-FlushLog } catch { Ui-Fail $_ }
+}
+
+# ----------------------------------------------------------- user actions -------
+# A switch was clicked (or Space was pressed on the line; on a card with options Space goes to the next option)
+function Ui-ToggleRow {
+    param($e)
+    if (-not $e -or $e.Kind -ne 'row') { return }
+    $id = [string]$e.Id
+    $row = $script:Rows[$id]
+    if (-not $row) { return }
+    if ($row.T.Choices) {
+        # no switch on this card: Space goes to the next option (the Windows default, then each option in turn)
+        $keys = @($row.T.Choices | ForEach-Object { [string]$_.Key })
+        $at = [array]::IndexOf($keys, [string]$row.Pick)
+        $next = [string]$keys[(($at + 1) % $keys.Count)]
+        if ($at -lt 0) { $next = [string]$keys[1] }
+        $msg = Try-SetPick $id $next
+    } else {
+        $msg = Try-SetWant $id (-not [bool]$row.Want)
+    }
+    Ui-RefreshRow $id          # also puts the switch back if the change was refused
+    if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
+    Ui-Flush
+}
+
+# One of the option buttons of a card with options was clicked ($index counts from the left)
+function Ui-PickRow {
+    param($e, [int]$index)
+    if (-not $e -or $e.Kind -ne 'row') { return }
+    $id = [string]$e.Id
+    $row = $script:Rows[$id]
+    if (-not $row -or -not $row.T.Choices) { return }
+    $list = @($row.T.Choices)
+    if ($index -lt 0 -or $index -ge $list.Count) { return }
+    $msg = Try-SetPick $id ([string]$list[$index].Key)
+    Ui-RefreshRow $id
+    if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
+    Ui-Flush
+}
+
+# "Turn all on" / "Turn all off" (the two buttons at the top right). $cat is the page that is open, '' for "All settings".
+# They only tick the switches: nothing is changed on the PC until Apply changes is pressed (and confirmed).
+function Ui-GroupTick {
+    param([string]$cat, [bool]$want)
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $left = @(Get-GroupLeftOut $cat)
+    $n = Set-GroupWant $cat $want
+    if ($cat) { foreach ($id in @($script:Rows.Keys)) { if ($script:Rows[$id].T.Cat -eq $cat) { Ui-RefreshRow $id } } }
+    else { Ui-RefreshAll }
+    $where = 'All settings'; if ($cat) { $where = (Split-CatName $cat).Short }
+    $s = ('{0} setting(s) on "{1}" changed.  ' -f $n, $where)
+    if ($want -and $left.Count -gt 0) { $s += ('{0} left out on purpose (the ones "Apply all" leaves out too: switch them on yourself).  ' -f $left.Count) }
+    Ui-Status ($s + (Get-SummaryText))
+    Ui-Flush
+}
+
+# "Put this one fully back (undo)" for the selected setting
+function Ui-ForceUndo {
+    $id = [string]$script:SelKey
+    if (-not $id -or -not $script:Rows.Contains($id)) { Ui-Status 'Click a setting first.'; return }
+    $msg = Try-ForceUndo $id
+    Ui-RefreshRow $id
+    if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
+    Ui-Flush
+}
+
+# What the window "Select Optimization Preset" does with the choice that was made in it (see Ui-ShowPresets): Confirm changes was pressed
+# there, after the window showed what is already enabled and what will be changed. Advanced Debloat asks its warning first. The preset's
+# settings that are not on yet are ticked and applied (after the questions some settings ask). $key = recommended | advanced | personal
+function Ui-DoPreset {
+    param([string]$key = 'recommended')
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $name = [string]$script:PresetNames[$key]
+    if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) {
+        Ui-Status 'There is no saved Custom Preset yet. Open Select Optimization Preset, choose Custom Preset, and save one first.'
+        return
+    }
+    if ($key -eq 'advanced') {
+        # a warning before anything is lined up: Advanced Debloat is meant for gaming PCs
+        if (-not (Ui-Ask $script:AdvancedWarning 'Advanced Debloat warning' $true)) {
+            Ui-Status 'Nothing was changed.'
+            return
+        }
+    }
+    Ui-LineUpPreset $key
+}
+
+# Tick the settings of a preset and apply them (the preset window's Confirm changes was pressed). $key = recommended | advanced | personal
+function Ui-LineUpPreset {
+    param([string]$key)
+    $name = [string]$script:PresetNames[$key]
+    $before = @(Get-Pending).Count
+    $n = Select-PresetKey $key
+    Ui-RefreshAll
+    $plan = @(Get-Pending)
+    if ($plan.Count -eq 0) {
+        Ui-Status ('Everything in "{0}" is already on (or not available on this PC).' -f $name)
+        Ui-Flush
+        return
+    }
+    $note = { param($p) Get-PresetNote $key $p $before }.GetNewClosure()
+    # the preset window already showed what is enabled and what will be changed, and Confirm changes was pressed there; only when
+    # other changes had been lined up before (they were not in that window) is the list of changes shown as well
+    Ui-DoApply $note ($name + '?') $true ($before -eq 0)
+    if ($script:ApplyCancelled) {
+        Ui-Status ('Nothing was changed. {0} setting(s) stay marked "Will turn on" - press Apply changes to go ahead, or Clear changes to remove them.' -f $n)
+        Ui-Flush
+    }
+}
+
+# "Apply all": tick everything on this page (every page when "All settings" is open), then go through the usual Apply,
+# which asks first. If you say no, the settings stay ticked ("Will turn on") and Apply / Discard work as always.
+function Ui-DoApplyAll {
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $cat = ''
+    if ($script:Single) { $cat = [string]$script:NavCat }
+    $where = 'All settings'
+    if ($cat) { $where = (Split-CatName $cat).Short }
+    $r = Select-ApplyAll $cat
+    Ui-RefreshAll
+    $plan = @(Get-Pending)
+    if ($plan.Count -eq 0) {
+        Ui-Status ('Everything on "{0}" is already on (or not available on this PC).' -f $where)
+        Ui-Flush
+        return
+    }
+    $left = $r.Left
+    $note = { param($p) Get-ApplyAllNote $p $left $where }.GetNewClosure()
+    Ui-DoApply $note 'Apply all?' $true
+    if ($script:ApplyCancelled) {
+        Ui-Status ('Nothing was changed. {0} setting(s) stay marked "Will turn on" - press Apply changes to go ahead, or Discard to clear them.' -f $r.Ticked)
+        Ui-Flush
+    }
+}
+
+function Ui-DoDiscard {
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    Reset-Ticks
+    Ui-RefreshAll
+    Ui-Status ('Waiting changes cleared.  ' + (Get-SummaryText))
+}
+
+function Ui-DoRescan {
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $c = Get-Counts
+    if (($c.Apply + $c.Undo) -gt 0) {
+        if (-not (Ui-Ask 'Checking again clears the changes you have lined up. Go ahead?' 'Check again')) { return }
+    }
+    Ui-StartScan
+}
+
+function Ui-DoOpenLog {
+    if ($log -and (Test-Path -LiteralPath $log)) {
+        try { Start-Process -FilePath 'notepad.exe' -ArgumentList ('"' + $log + '"') } catch { Ui-Status ('Could not open the log: ' + $_.Exception.Message) }
+    } else {
+        Ui-Status 'There is no log yet - it is created when the first changes are made.'
+    }
+}
+
+function Ui-DoRestart {
+    if (-not (Ui-Ask "Restart the PC in 15 seconds?`r`nSave your work first." 'Restart' $true)) { return }
+    try {
+        Start-Process -FilePath 'shutdown.exe' -ArgumentList '/r', '/t', '15', '/c', 'Restart after Headroom changes'
+        Ui-Status 'Restarting in 15 seconds. To cancel, open a command prompt and type:  shutdown /a'
+    } catch { Ui-Status ('Could not start the restart: ' + $_.Exception.Message) }
+}
+
+function Ui-ShowLog {
+    param([bool]$on)
+    $card = $script:UI.logCard
+    if ($card -and [bool]$card.Visible -ne $on) { $card.Visible = $on }
+    $b = $script:UI.logBtn
+    if ($b) {
+        if ($on) { $b.Text = 'Hide log' } else { $b.Text = 'Show log' }
+    }
+}
+
+function Ui-ToggleLog {
+    $card = $script:UI.logCard
+    if (-not $card) { return }
+    Ui-ShowLog (-not [bool]$card.Visible)
+    Ui-ListSize
+}
+
+# The questions some settings ask before they are turned on (anti-cheat, printing). Each one that is answered No is left alone:
+# it is unticked and dropped from the plan. Returns the plan that is left; the names left alone go in $script:GuardKept.
+function Ui-AskGuards {
+    param($plan)
+    $script:GuardKept = @()
+    $drop = @()
+    foreach ($q in @(Get-GuardQuestions $plan)) {
+        if (-not (Ui-Ask (Get-GuardText $q) $q.Title $true)) {
+            $drop += @($q.Ids)
+            $script:GuardKept += @($q.Names)
+        }
+    }
+    if ($drop.Count -eq 0) { return $plan }
+    foreach ($id in $drop) { [void](Try-SetWant ([string]$id) $false) }
+    return @(Remove-FromPlan $plan $drop)
+}
+
+# $Extra is a text for the top of the confirmation, or a script block that is given the plan (after the questions) and returns it
+function Ui-DoApply {
+    param($Extra = '', [string]$Title = 'Make these changes?', [bool]$Warn = $false, [bool]$ListShown = $false)
+    # $ListShown: the list of changes was already shown and confirmed (the preset window's Confirm changes), so it is not asked again
+    $script:ApplyCancelled = $false
+    $script:GuardKept = @()
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $plan = @(Get-Pending)
+    if ($plan.Count -eq 0) { Ui-Status 'Nothing to do - switch some settings on or off first.'; return }
+    $dry = [bool]$script:UI.dry.Checked
+    if (-not $dry) {
+        $plan = @(Ui-AskGuards $plan)
+        if (@($script:GuardKept).Count -gt 0) { Ui-RefreshAll }
+        if ($plan.Count -eq 0) {
+            Ui-Status ('Nothing was changed: you chose to leave {0} as it is.' -f ((@($script:GuardKept) | ForEach-Object { '"' + $_ + '"' }) -join ', '))
+            Ui-Flush
+            return
+        }
+        if (-not $ListShown) {
+            if ($Extra -is [scriptblock]) { $x = [string](& $Extra $plan) } else { $x = [string]$Extra }
+            if (-not (Ui-Ask (Get-ConfirmText $plan $x) $Title $Warn)) { $script:ApplyCancelled = $true; return }
+        }
+    }
+    foreach ($p in $plan) { $r = $script:Rows[[string]$p.Id]; $r.Note = 'Waiting...'; $r.NoteDetail = '' }
+    $script:Applying = $true
+    Ui-ShowLog $true
+    Ui-RefreshAll
+    Ui-Progress 0 1
+    if (@($script:GuardKept).Count -gt 0) { Ui-Note ('Left as it is because you answered No: ' + ((@($script:GuardKept)) -join '; ')) 'Yellow' }
+    if ($dry) { Ui-Status 'Preview running - nothing is changed...' } else { Ui-Status 'Making changes... (the log below shows each step)' }
+    try {
+        Start-EngineJob 'apply' $plan $dry
+    } catch {
+        $script:Applying = $false
+        foreach ($p in $plan) { $script:Rows[[string]$p.Id].Note = '' }
+        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red'
+        Ui-RefreshAll
+        Ui-Status 'Could not start - see the log.'
+    }
+    Ui-Flush
+}
+
+function Ui-DoStop {
+    if (-not $script:Applying -or -not $script:Job) { return }
+    $script:Job.Stopping = $true
+    try { [void]$script:Job.PS.BeginStop($null, $null) } catch { }
+    Ui-Status 'Stopping after the step that is running...'
+    Ui-SetEnabled $script:UI.stop $false
+}
+
+function Ui-OnClosing {
+    param($e)
+    if ($script:Applying) {
+        if (-not (Ui-Ask "Changes are still being made.`r`nClosing now stops them half-way. Close anyway?" 'Still working' $true)) { $e.Cancel = $true }
+        return
+    }
+    if ($script:Scanning) { return }
+    $c = Get-Counts
+    $n = $c.Apply + $c.Undo
+    if ($n -gt 0) {
+        if (-not (Ui-Ask ("You have {0} change(s) lined up that were not applied.`r`nClose anyway?" -f $n) 'Close' $false)) { $e.Cancel = $true }
+    }
+}
+
+# ----------------------------------------------------------- the background job ----
+# A fresh runspace for a worker. First try with scripts/modules allowed whatever the machine's policy says (the worker only
+# runs our own text); if this PowerShell does not support that setting, try again with the plain defaults.
+function Open-WorkerRunspace {
+    $rs = $null
+    $openErr = $null
+    foreach ($bypass in $true, $false) {
+        try {
+            $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+            if ($bypass) { $iss.ExecutionPolicy = [Microsoft.PowerShell.ExecutionPolicy]::Bypass }
+            $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace($iss)
+            $rs.Open()
+            break
+        } catch {
+            $openErr = $_
+            if ($rs) { try { $rs.Dispose() } catch { } }
+            $rs = $null
+        }
+    }
+    if (-not $rs) { throw $openErr }
+    return $rs
+}
+
+function Start-EngineJob {
+    param([string]$Kind, $Plan, [bool]$Dry)
+    $script:LastErr = ''
+    if ($script:Job) { Finish-Job }     # tidy up a worker that has already said it is done
+    $rs = Open-WorkerRunspace
+    $rs.SessionStateProxy.SetVariable('DryRun', $Dry)
+    $rs.SessionStateProxy.SetVariable('log', $log)
+    $rs.SessionStateProxy.SetVariable('StorePath', $StorePath)
+    $rs.SessionStateProxy.SetVariable('Q', $script:Q)
+    $call = 'Invoke-Scan'
+    if ($Kind -eq 'apply') {
+        $rs.SessionStateProxy.SetVariable('Plan', $Plan)
+        $call = 'Invoke-Plan -Plan $Plan'
+    }
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($engine.ToString() + "`r`n" + $call)
+    $async = $ps.BeginInvoke()
+    $script:Job = @{ PS = $ps; RS = $rs; Async = $async; Kind = $Kind; Stopping = $false }
+}
+
+function Ui-StartScan {
+    if ($script:Scanning -or $script:Applying) { return }
+    if ($script:StartupSynced) {
+        $script:StartupSynced = $false      # the list was read a moment ago when the window was made
+    } else {
+        try { Sync-StartupRows } catch { Ui-Note ('Could not read the startup list: ' + $_.Exception.Message) 'Yellow' }
+    }
+    foreach ($id in @($script:Rows.Keys)) {
+        $r = $script:Rows[$id]
+        $r.State = 'Checking'; $r.Detail = 'Checking...'; $r.Want = $false; $r.Force = ''; $r.Choice = ''; $r.Pick = ''; $r.Note = ''; $r.NoteDetail = ''
+    }
+    $script:Scanning = $true
+    $script:WaitText = ''
+    Ui-RebuildList
+    Ui-Status 'Checking your PC...'
+    Ui-Progress 0 1
+    try {
+        Start-EngineJob 'scan' $null $false
+    } catch {
+        $script:Scanning = $false
+        foreach ($id in @($script:Rows.Keys)) { $script:Rows[$id].State = 'Unknown'; $script:Rows[$id].Detail = 'Could not be checked' }
+        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red'
+        Ui-ScanFinished
+    }
+    Ui-Flush
+}
+
+function Ui-ScanFinished {
+    Ui-RebuildList
+    Ui-Progress 0 1
+    Ui-Status (Get-SummaryText)
+}
+
+function Ui-RunFinished {
+    param($ev)
+    $script:DHead = $true
+    $script:DCounts = $true
+    Ui-Progress 1 1
+    $s = [string]$ev.Detail
+    if ($ev.Text) { $s += '  Restart the PC for: ' + [string]$ev.Text + '.' }
+    Ui-Status $s
+    Ui-Counts
+}
+
+# The worker finished (or died): collect it, and tidy up if it never said it was done
+function Finish-Job {
+    $j = $script:Job
+    $script:Job = $null
+    if (-not $j) { return }
+    $err = ''
+    try { [void]$j.PS.EndInvoke($j.Async) } catch {
+        $err = $_.Exception.Message
+        if ($_.Exception.InnerException) { $err = $_.Exception.InnerException.Message }
+    }
+    try { $j.PS.Dispose() } catch { }
+    try { $j.RS.Close(); $j.RS.Dispose() } catch { }
+    if ($j.Kind -eq 'scan' -and $script:Scanning) {
+        $script:Scanning = $false
+        foreach ($id in @($script:Rows.Keys)) {
+            $r = $script:Rows[$id]
+            if ($r.State -eq 'Checking') { $r.State = 'Unknown'; $r.Detail = 'Could not be checked' }
+        }
+        Ui-Note ('The check of your PC stopped early: ' + $err) 'Yellow'
+        Ui-ScanFinished
+    }
+    if ($j.Kind -eq 'apply' -and $script:Applying) {
+        $script:Applying = $false
+        if ($j.Stopping) { Ui-Note 'Stopped. Checking what state everything is in now...' 'Yellow' }
+        else { Ui-Note ('The run ended unexpectedly: ' + $err) 'Red' }
+        Ui-StartScan
+    }
+}
+
+# Called by the timer: take what the worker has reported, then update the screen once
+function Ui-Tick {
+    if ($script:StartScanPending) {
+        $script:StartScanPending = $false
+        try { Ui-StartScan } catch { Ui-Fail $_ }
+    }
+    $n = 0
+    $ev = $null
+    while ($n -lt 300 -and $script:Q.TryDequeue([ref]$ev)) {
+        $n++
+        try { Handle-Event $ev } catch { Ui-Fail $_ }
+    }
+    if ($script:Job -and $script:Job.Async.IsCompleted -and $script:Q.IsEmpty) {
+        try { Finish-Job } catch { Ui-Fail $_ }
+    }
+    try { Ui-SysTick } catch { Ui-Fail $_ }
+    try { Ui-WelcomeTick } catch { Ui-Fail $_ }
+    Ui-Flush
+}
+
+# =============================================================================
+# THE WINDOW, part 5: the side menu, and what changes when another page is picked.
+# The side menu is one custom-drawn control, like the list: the app name, "All settings", one line per category (with how many
+# are applied). "Home" (at the top) is a page of read-outs, not of settings (see Test-InfoPage).
+# The rows are roomy and keep their height: when they do not all fit, the pages scroll (mouse wheel, the thin rounded scroll bar at
+# the right, or the keys) under the app name, which stays where it is.
+# The "Select Optimization Preset" button is below the menu (a real button, see Ui-Build).
+# A "nav entry" is a hashtable:  Kind ('item' | 'label')  Key  Cat  Title  CountText  Pending  CY (its place in the whole list)  Y (its
+# place on screen: CY less the scroll)  H
+# Names used for local variables in this file: $Th = colours, $M = sizes, $TF = text flags.
+# =============================================================================
+$script:NavItems = New-Object System.Collections.ArrayList
+$script:NavHot = ''                 # key of the entry under the mouse
+$script:NavW = 244
+$script:NavH = 700
+$script:NavRowH = 40
+$script:NavCursor = ''
+$script:NavScroll = 0               # how far the pages are scrolled up (pixels); the app name at the top does not scroll
+$script:NavMaxScroll = 0            # how far they can be scrolled (0 when they all fit)
+$script:NavContentH = 0             # the height of the head and every entry, with a little room at the end
+$script:NavDrag = -1                # >= 0 while the scroll thumb is being dragged (where in the thumb it was grabbed)
+$script:NavSbHot = $false           # the pointer is on the scroll bar
+$script:NavMX = -1
+$script:NavMY = -1
+$script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
+$script:AppBuild = '70'             # the number in the small pill beside the name (the version of this file)
+$script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
+
+function Ui-InvalidateNav {
+    $n = $script:UI.nav
+    if ($n) { $n.Invalidate() }
+}
+
+# Build the entries again from the rows (names, counts), then lay them out
+function Ui-FillNav {
+    $gc = Get-GroupCounts
+    $pend = @{}
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if (Get-Action $row) { $pend[[string]$row.T.Cat] = $true }
+    }
+    $allOn = 0; $allTot = 0; $allCk = 0
+    foreach ($cat in $script:Cats) {
+        $g = $gc[[string]$cat]
+        if ($g) { $allOn += $g.On; $allTot += $g.Total; $allCk += $g.Checking }
+    }
+    $items = New-Object System.Collections.ArrayList
+    $ct = ''
+    if ($allCk -eq 0 -and $allTot -gt 0) { $ct = ('{0}/{1}' -f $allOn, $allTot) }
+    [void]$items.Add(@{ Kind = 'label'; Key = 'nav-label-general'; Cat = ''; Title = 'General'; CountText = ''; Pending = $false; CY = 0; Y = 0; H = 0 })
+    [void]$items.Add(@{ Kind = 'item'; Key = ('nav:' + $script:PageHome); Cat = [string]$script:PageHome; Title = 'Home'; CountText = ''; Pending = $false; CY = 0; Y = 0; H = 0 })
+    [void]$items.Add(@{ Kind = 'item'; Key = 'nav:'; Cat = ''; Title = 'All settings'; CountText = $ct; Pending = [bool]($pend.Count -gt 0); CY = 0; Y = 0; H = 0 })
+    [void]$items.Add(@{ Kind = 'label'; Key = 'nav-label'; Cat = ''; Title = 'Categories'; CountText = ''; Pending = $false; CY = 0; Y = 0; H = 0 })
+    foreach ($cat in $script:Cats) {
+        $g = $gc[[string]$cat]
+        $ct = ''
+        if ($g -and $g.Checking -eq 0 -and $g.Total -gt 0) { $ct = ('{0}/{1}' -f $g.On, $g.Total) }
+        [void]$items.Add(@{ Kind = 'item'; Key = ('nav:' + $cat); Cat = [string]$cat; Title = (Get-NavTitle $cat); CountText = $ct; Pending = [bool]$pend[[string]$cat]; CY = 0; Y = 0; H = 0 })
+    }
+    $script:NavItems = $items
+    Ui-NavLayout
+    if ($script:NavReveal) { $script:NavReveal = $false; Ui-NavRevealCurrent }
+    Ui-InvalidateNav
+}
+
+# Where each entry goes. The rows keep their height; CY is the place in the whole list and Y the place on screen (CY less the scroll).
+function Ui-NavLayout {
+    $M = $script:M
+    $c = $script:UI.nav
+    if ($c) {
+        $cs = $c.ClientSize
+        if ([int]$cs.Width -gt 0) { $script:NavW = [int]$cs.Width }
+        if ([int]$cs.Height -gt 0) { $script:NavH = [int]$cs.Height }
+    }
+    $rowH = [int]$M.NavRow
+    $labelH = [int]$M.NavLabel
+    $script:NavRowH = $rowH
+    $y = [int]$M.NavTop
+    foreach ($e in $script:NavItems) {
+        $e.CY = $y
+        if ($e.Kind -eq 'label') { $e.H = $labelH } else { $e.H = $rowH }
+        $y += $e.H
+    }
+    $script:NavContentH = $y + (Px 14)
+    $max = [Math]::Max(0, [int]($script:NavContentH - $script:NavH))
+    $script:NavMaxScroll = $max
+    if ($script:NavScroll -gt $max) { $script:NavScroll = $max }
+    if ($script:NavScroll -lt 0) { $script:NavScroll = 0 }
+    foreach ($e in $script:NavItems) { $e.Y = $e.CY - $script:NavScroll }
+}
+
+# Scroll the pages to this position (pixels from the top, kept between 0 and the most there is)
+function Ui-NavSetScroll {
+    param([int]$to)
+    $to = [Math]::Max(0, [Math]::Min([int]$to, [int]$script:NavMaxScroll))
+    if ($to -eq [int]$script:NavScroll) { return }
+    $script:NavScroll = $to
+    foreach ($e in $script:NavItems) { $e.Y = $e.CY - $to }
+    if ($script:NavMX -ge 0 -and $script:NavDrag -lt 0) { Ui-NavMove $script:NavMX $script:NavMY }      # another line is now under a pointer that did not move
+    Ui-InvalidateNav
+}
+
+# Scroll so that this page is whole on screen (with its heading, when it is the first one under that heading)
+function Ui-NavReveal {
+    param([string]$cat)
+    $target = $null
+    $prev = $null
+    foreach ($e in $script:NavItems) {
+        if ($e.Kind -eq 'item' -and [string]$e.Cat -eq $cat) { $target = $e; break }
+        $prev = $e
+    }
+    if (-not $target) { return }
+    $top = [int]$target.CY
+    if ($prev -and $prev.Kind -eq 'label') { $top = [int]$prev.CY }
+    $viewTop = [int]$script:M.NavTop
+    $viewBottom = [int]$script:NavH
+    $pad = Px 8
+    $s = [int]$script:NavScroll
+    if (($top - $s) -lt ($viewTop + $pad)) { $s = $top - $viewTop - $pad }
+    elseif (($target.CY + $target.H - $s) -gt ($viewBottom - $pad)) { $s = $target.CY + $target.H - $viewBottom + $pad }
+    Ui-NavSetScroll $s
+}
+function Ui-NavRevealCurrent {
+    $cat = ''
+    if ($script:Single) { $cat = [string]$script:NavCat }
+    Ui-NavReveal $cat
+}
+
+# The scroll thumb: where it is in the strip at the right of the pages (null when everything fits)
+function Ui-NavThumb {
+    if ([int]$script:NavMaxScroll -le 0) { return $null }
+    $top = [int]$script:M.NavTop + (Px 4)
+    $trackH = [int]$script:NavH - $top - (Px 6)
+    if ($trackH -lt (Px 24)) { return $null }
+    $view = [double]($script:NavH - $script:M.NavTop)
+    $whole = [double]($script:NavContentH - $script:M.NavTop)
+    $thumbH = [int][Math]::Round($trackH * $view / [Math]::Max($whole, 1.0))
+    $thumbH = [Math]::Max((Px 36), [Math]::Min($thumbH, $trackH))
+    $travel = $trackH - $thumbH
+    $ty = $top
+    if ($script:NavMaxScroll -gt 0) { $ty = $top + [int][Math]::Round($travel * [double]$script:NavScroll / [double]$script:NavMaxScroll) }
+    return @{ Top = $top; TrackH = $trackH; Y = $ty; H = $thumbH; Travel = $travel }
+}
+
+function Ui-OnNavResize {
+    Ui-NavLayout
+    Ui-InvalidateNav
+}
+
+# ----------------------------------------------------------- painting ---------------
+# The Headroom mark: a light purple rounded square holding a tall meter that is only part full, with a chevron pointing at the free space
+# above the fill (that free space is the headroom). $x, $y, $s = the top-left corner of the square and its size.
+# The meter is laid out on a grid of 120 units that is 74% as tall as the square; its outline is 55 x 103 units wide and tall.
+# At small sizes the outline, the gap and the chevron keep a minimum thickness so that they stay clear.
+function Ui-PaintLogo {
+    param($g, [int]$x, [int]$y, [int]$s)
+    $Th = $script:Th
+    Ui-FillRound $g $Th.Accent $x $y $s $s ([int]($s * 0.29))
+    $b = $s * 0.74
+    $u = $b / 120.0
+    $ox = $x + ($s - $b) / 2.0
+    $oy = $y + ($s - $b) / 2.0
+    $pw = 55.0 * $u
+    $ph = 103.0 * $u
+    $px = $ox + 32.5 * $u
+    $py = $oy + 8.5 * $u
+    $t = [Math]::Max(1.6, 7.0 * $u)              # the outline
+    $gap = [Math]::Max(1.4, 6.5 * $u)            # between the outline and the fill
+    Ui-StrokeRound $g $Th.KnobOn $t ([int][Math]::Round($px)) ([int][Math]::Round($py)) ([int][Math]::Round($pw)) ([int][Math]::Round($ph)) ([int][Math]::Round($pw / 2.0))
+    $fw = $pw - 2.0 * ($t + $gap)
+    $fh = [Math]::Max($fw, 0.5 * ($ph - 2.0 * ($t + $gap)))
+    $fx = $px + $t + $gap
+    $fy = $py + $ph - $t - $gap - $fh
+    Ui-FillRound $g $Th.KnobOn ([int][Math]::Round($fx)) ([int][Math]::Round($fy)) ([int][Math]::Round($fw)) ([int][Math]::Round($fh)) ([int][Math]::Round($fw / 2.0))
+    $cx = $ox + 60.0 * $u
+    $cw = [Math]::Max(1.4, 6.0 * $u)
+    $dim = Blend-Color $Th.Accent $Th.KnobOn 0.6
+    Ui-StrokePoly $g $dim $cw @(@(($cx - 10.0 * $u), ($oy + 42.0 * $u)), @($cx, ($oy + 32.0 * $u)), @(($cx + 10.0 * $u), ($oy + 42.0 * $u)))
+}
+# The window's icon (title bar, taskbar, Alt+Tab): the same mark, drawn once into a small picture. Returns $null when that does not work;
+# the window then keeps the plain default icon.
+function Ui-MakeAppIcon {
+    try {
+        $n = 64
+        $bmp = New-Object System.Drawing.Bitmap($n, $n, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        try {
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            Ui-PaintLogo $g 0 0 $n
+        } finally { $g.Dispose() }
+        $icon = [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
+        $bmp.Dispose()
+        return $icon
+    } catch { return $null }
+}
+# The little line icons of the side menu. Each is a list of drawing steps on a 24 x 24 grid:
+#   p = a line through points (x1,y1, x2,y2, ...)   c = the same, closed   r = rounded square (x,y,w,h,radius)   o = oval outline (x,y,w,h)
+#   d = a dot (centre x, centre y, radius)   a = an arc (centre x, centre y, radius, start angle, sweep in degrees)
+#   k = short rays around a centre (centre x, centre y, inner radius, outer radius, how many, first angle)
+$script:NavIcons = @{
+    '_'                   = @(, @('o', 5, 5, 14, 14))
+    'Home'                = @(@('p', 3, 11, 12, 3, 21, 11), @('p', 5, 9.5, 5, 20, 19, 20, 19, 9.5), @('p', 10, 20, 10, 14, 14, 14, 14, 20))
+    'All settings'        = @(@('r', 4, 4, 7, 7, 2), @('r', 13, 4, 7, 7, 2), @('r', 4, 13, 7, 7, 2), @('r', 13, 13, 7, 7, 2))
+    'Privacy'             = @(@('c', 2, 12, 6, 7.5, 12, 5.5, 18, 7.5, 22, 12, 18, 16.5, 12, 18.5, 6, 16.5), @('o', 9, 9, 6, 6))
+    'Cloud and OneDrive'  = @(, @('c', 7, 18, 4.5, 17.5, 3, 15.5, 3, 13, 5, 11, 7.2, 10.5, 8, 8, 10, 6, 13, 5.5, 15.5, 7, 16.5, 9.5, 19, 10, 21, 12.5, 21, 15.5, 19.5, 17.5, 17.5, 18))
+    'Remote and VPN'      = @(@('c', 12, 3, 20, 6, 20, 12, 12, 21, 4, 12, 4, 6), @('p', 8.5, 12, 11, 14.5, 15.5, 9.5))
+    'Network sharing'     = @(@('o', 9.5, 3, 5, 5), @('o', 3, 15, 5, 5), @('o', 16, 15, 5, 5), @('p', 12, 8, 12, 12), @('p', 5.5, 15, 5.5, 12, 18.5, 12, 18.5, 15))
+    'Adapters and USB'    = @(@('p', 12, 5, 12, 18), @('p', 9.5, 7, 12, 4.5, 14.5, 7), @('p', 12, 10.5, 7, 10.5, 7, 8.5), @('d', 7, 7, 1.5), @('p', 12, 14, 17, 14, 17, 12), @('d', 17, 11, 1.5), @('d', 12, 19.5, 2.2))
+    'Power and startup'   = @(@('a', 12, 13, 8, -60, 300), @('p', 12, 3, 12, 12))
+    'Startup apps'        = @(@('r', 3, 4, 18, 16, 3), @('p', 3, 9, 21, 9), @('c', 10, 12, 10, 17.5, 15, 14.75))
+    'Gaming'              = @(@('r', 2.5, 7, 19, 11, 5.5), @('p', 8, 10.5, 8, 14.5), @('p', 6, 12.5, 10, 12.5), @('d', 15, 11.5, 1.1), @('d', 17.5, 13.5, 1.1))
+    'Display'             = @(@('r', 3, 4, 18, 12, 2), @('p', 12, 16, 12, 20), @('p', 8, 20, 16, 20))
+    'Placebo Tweaks'      = @(@('c', 9, 3, 9, 9, 4.5, 18, 5.2, 20, 18.8, 20, 19.5, 18, 15, 9, 15, 3), @('p', 8, 3, 16, 3), @('p', 7.5, 14, 16.5, 14))
+    'Security prompts'    = @(@('r', 5, 11, 14, 10, 2.5), @('a', 12, 11, 4, 180, 180), @('d', 12, 16, 1.2))
+    'Other services'      = @(@('o', 6, 6, 12, 12), @('o', 9.5, 9.5, 5, 5), @('k', 12, 12, 6, 9, 8, 22.5))
+    'Storage and clean-up' = @(@('p', 4, 6, 20, 6), @('p', 9, 6, 9, 4, 15, 4, 15, 6), @('p', 6, 6, 7, 20, 17, 20, 18, 6), @('p', 10, 10, 10, 16), @('p', 14, 10, 14, 16))
+    'Look and feel'       = @(@('o', 3, 3, 18, 18), @('d', 8, 10, 1.3), @('d', 12, 7.5, 1.3), @('d', 16, 10, 1.3), @('d', 9, 15, 1.3))
+    'File Explorer'       = @(, @('c', 3, 6, 9.5, 6, 11.5, 8.5, 21, 8.5, 21, 19, 3, 19))
+    'AI features'         = @(@('c', 12, 3, 14, 10, 21, 12, 14, 14, 12, 21, 10, 14, 3, 12, 10, 10), @('p', 19, 3, 19, 7), @('p', 17, 5, 21, 5))
+    'Microsoft Edge'      = @(@('o', 3, 3, 18, 18), @('o', 8, 3, 8, 18), @('p', 3, 12, 21, 12))
+    'Remove apps'         = @(@('r', 4, 4, 16, 16, 3), @('p', 9, 9, 15, 15), @('p', 15, 9, 9, 15))
+    'Legacy features'     = @(@('o', 3, 3, 18, 18), @('p', 12, 7, 12, 12, 15.5, 14))
+    'Testing'             = @(, @('p', 2, 12, 7, 12, 9.5, 5, 14, 19, 16.5, 12, 22, 12))
+}
+# the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
+function Get-IconPts {
+    param($op, [double]$x, [double]$y, [double]$k, [bool]$close)
+    $pts = @()
+    for ($i = 1; $i -lt ($op.Count - 1); $i += 2) { $pts += , @(($x + [double]$op[$i] * $k), ($y + [double]$op[$i + 1] * $k)) }
+    if ($close -and $pts.Count -gt 0) { $pts += , @($pts[0][0], $pts[0][1]) }
+    return $pts
+}
+# Draws the icon called $name at $x, $y, $size pixels square, in one colour
+function Ui-PaintIcon {
+    param($g, [string]$name, [double]$x, [double]$y, [double]$size, $color)
+    $ops = $script:NavIcons[$name]
+    if (-not $ops) { $ops = $script:NavIcons['_'] }
+    $k = $size / 24.0
+    $wd = [Math]::Max(1.3, 1.7 * $k)
+    foreach ($op in @($ops)) {
+        switch ([string]$op[0]) {
+            'p' { Ui-StrokePoly $g $color $wd (Get-IconPts $op $x $y $k $false) }
+            'c' { Ui-StrokePoly $g $color $wd (Get-IconPts $op $x $y $k $true) }
+            'r' { Ui-StrokeRound $g $color $wd ([int][Math]::Round($x + $op[1] * $k)) ([int][Math]::Round($y + $op[2] * $k)) ([int][Math]::Round($op[3] * $k)) ([int][Math]::Round($op[4] * $k)) ([int][Math]::Max(1, [Math]::Round($op[5] * $k))) }
+            'o' { Ui-StrokeOval $g $color $wd ($x + $op[1] * $k) ($y + $op[2] * $k) ($op[3] * $k) ($op[4] * $k) }
+            'd' {
+                $r = [Math]::Max(1.0, $op[3] * $k)
+                Ui-FillOval $g $color ([int][Math]::Round($x + $op[1] * $k - $r)) ([int][Math]::Round($y + $op[2] * $k - $r)) ([int][Math]::Round(2 * $r)) ([int][Math]::Round(2 * $r))
+            }
+            'a' {
+                $pts = @()
+                $steps = [int][Math]::Max(6, [Math]::Ceiling([Math]::Abs([double]$op[5]) / 12))
+                for ($i = 0; $i -le $steps; $i++) {
+                    $ang = ([double]$op[4] + [double]$op[5] * $i / $steps) * [Math]::PI / 180.0
+                    $pts += , @(($x + ($op[1] + $op[3] * [Math]::Cos($ang)) * $k), ($y + ($op[2] + $op[3] * [Math]::Sin($ang)) * $k))
+                }
+                Ui-StrokePoly $g $color $wd $pts
+            }
+            'k' {
+                for ($i = 0; $i -lt [int]$op[5]; $i++) {
+                    $ang = ([double]$op[6] + 360.0 * $i / [int]$op[5]) * [Math]::PI / 180.0
+                    $c = [Math]::Cos($ang); $sn = [Math]::Sin($ang)
+                    Ui-StrokePoly $g $color $wd @(@(($x + ($op[1] + $op[3] * $c) * $k), ($y + ($op[2] + $op[3] * $sn) * $k)), @(($x + ($op[1] + $op[4] * $c) * $k), ($y + ($op[2] + $op[4] * $sn) * $k)))
+                }
+            }
+        }
+    }
+}
+function Ui-PaintNav {
+    param($g)
+    $Th = $script:Th
+    $M = $script:M
+    $TF = $script:TF
+    $w = $script:NavW
+    $h = $script:NavH
+    Ui-Fill $g $Th.Side 0 0 $w $h
+    # the pages (while a search is showing, every setting is in the list, so "All settings" is the one that is lit)
+    $curCat = ''
+    if ($script:Single) { $curCat = [string]$script:NavCat }
+    $ix = Px 12
+    $iw = $w - 2 * $ix
+    foreach ($e in $script:NavItems) {
+        if (($e.Y + $e.H) -le ($M.NavTop - (Px 2)) -or $e.Y -ge $h) { continue }          # scrolled out of sight (under the app name, or below the menu)
+        if ($e.Kind -eq 'label') {
+            Ui-Text $g $e.Title (Ui-Font 'small') $Th.Dim (Px 24) ($e.Y + $e.H - (Px 22)) ($w - (Px 40)) (Px 18) $TF.L
+            continue
+        }
+        $sel = ([string]$e.Cat -eq $curCat)
+        $hot = ($script:NavHot -eq $e.Key)
+        $ih = $e.H - (Px 2)
+        if ($sel) {
+            Ui-FillRound $g $Th.SideSel $ix $e.Y $iw $ih (Px 10)
+        } elseif ($hot) {
+            Ui-FillRound $g $Th.SideHot $ix $e.Y $iw $ih (Px 10)
+        }
+        $col = $Th.Mute
+        $icol = $Th.Dim
+        $font = Ui-Font 'nav'
+        if ($sel) { $col = $Th.Text; $icol = $Th.Accent; $font = Ui-Font 'navb' } elseif ($hot) { $col = $Th.Text; $icol = $Th.Sub }
+        # the icon, then the name; a fixed column for the count at the right edge, the name gets what is left
+        $isz = [int][Math]::Min((Px 18), [Math]::Max((Px 12), $ih - (Px 6)))
+        $ixx = $ix + (Px 12)
+        Ui-PaintIcon $g ([string]$e.Title) $ixx ($e.Y + [int](($ih - $isz) / 2)) $isz $icol
+        $tx2 = $ixx + $isz + (Px 11)
+        $cw = Px 40
+        $right = $w - $ix - (Px 12)
+        $limit = $right - $cw - (Px 6)
+        Ui-Text $g $e.Title $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
+        if ($e.CountText) {
+            $cc = $Th.Dim
+            if ($sel) { $cc = $Th.Sub }
+            Ui-Text $g $e.CountText (Ui-Font 'small') $cc ($right - $cw + (Px 4)) $e.Y $cw $ih $TF.R
+        }
+    }
+    # the app name stays put: it is drawn over the pages that have scrolled under it
+    Ui-Fill $g $Th.Side 0 0 $w $M.NavTop
+    # the app name, with its mark, and the version in a small pill at the right
+    $lx = Px 20
+    $ly = Px 26
+    $ls = Px 34
+    Ui-PaintLogo $g $lx $ly $ls
+    $tx = $lx + $ls + (Px 12)
+    $pillT = 'v' + [string]$script:AppBuild
+    $pw = (Ui-Measure $g $pillT (Ui-Font 'small')) + (Px 18)
+    $ph = Px 22
+    $px = $w - (Px 18) - $pw
+    Ui-Text $g 'Headroom' (Ui-Font 'brand') $Th.Text $tx ($ly - (Px 2)) ($px - $tx - (Px 6)) (Px 22) $TF.L
+    Ui-Text $g 'Debloat Tool' (Ui-Font 'small') $Th.Mute $tx ($ly + (Px 18)) ($px - $tx - (Px 6)) (Px 16) $TF.L
+    Ui-FillRound $g $Th.Card $px ($ly + [int](($ls - $ph) / 2)) $pw $ph ([int]($ph / 2))
+    Ui-StrokeRound $g $Th.Edge 1 $px ($ly + [int](($ls - $ph) / 2)) $pw $ph ([int]($ph / 2))
+    Ui-Text $g $pillT (Ui-Font 'small') $Th.Mute $px ($ly + [int](($ls - $ph) / 2)) $pw $ph $TF.C
+    if ($script:NavScroll -gt 0) { Ui-Line $g $Th.Edge 1 (Px 16) ($M.NavTop - 1) ($w - (Px 16)) ($M.NavTop - 1) }
+    # the scroll bar (only when the pages do not all fit)
+    $t = Ui-NavThumb
+    if ($t) { Ui-PaintThumb $g ($w - (Px 4)) $t.Top $t.TrackH ($t.Y - $t.Top) $t.H ([bool]$script:NavSbHot) ([bool]($script:NavDrag -ge 0)) }
+}
+
+function Ui-OnNavPaint {
+    param($pe)
+    $g = $pe.Graphics
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    Ui-PaintNav $g
+}
+
+# ----------------------------------------------------------- the mouse and keys ----------
+function Ui-NavInSb {
+    param([int]$x, [int]$y)
+    return [bool]([int]$script:NavMaxScroll -gt 0 -and $x -ge ($script:NavW - $script:M.NavSb) -and $x -lt $script:NavW -and $y -ge $script:M.NavTop -and $y -lt $script:NavH)
+}
+
+function Ui-NavHit {
+    param([int]$x, [int]$y)
+    if ($x -lt 0 -or $x -ge $script:NavW) { return $null }
+    if ($y -lt $script:M.NavTop -or $y -ge $script:NavH) { return $null }          # the app name does not click, and nothing outside the menu does
+    if (Ui-NavInSb $x $y) { return $null }
+    foreach ($e in $script:NavItems) {
+        if ($e.Kind -ne 'item') { continue }
+        if ($y -ge $e.Y -and $y -lt ($e.Y + $e.H - (Px 2))) { return $e }
+    }
+    return $null
+}
+
+function Ui-NavMove {
+    param([int]$x, [int]$y)
+    $script:NavMX = $x
+    $script:NavMY = $y
+    if ($script:NavDrag -ge 0) { Ui-NavDragTo $y; return }
+    $sb = [bool](Ui-NavInSb $x $y)
+    $e = Ui-NavHit $x $y
+    $k = ''
+    if ($e) { $k = [string]$e.Key }
+    $changed = $false
+    if ($sb -ne [bool]$script:NavSbHot) { $script:NavSbHot = $sb; $changed = $true }
+    if ($k -ne $script:NavHot) { $script:NavHot = $k; $changed = $true }
+    if ($changed) { Ui-InvalidateNav }
+    $c = $script:UI.nav
+    $want = 'arrow'
+    if ($k) { $want = 'hand' }
+    if ($c -and $script:NavCursor -ne $want) {
+        $script:NavCursor = $want
+        if ($want -eq 'hand') { $c.Cursor = [System.Windows.Forms.Cursors]::Hand } else { $c.Cursor = [System.Windows.Forms.Cursors]::Default }
+    }
+}
+
+function Ui-NavLeave {
+    if ($script:NavDrag -ge 0) { return }
+    Ui-NavMove -1 -1
+}
+
+function Ui-NavDown {
+    param([int]$x, [int]$y, [string]$button)
+    if ($button -ne 'Left') { return }
+    if (Ui-NavInSb $x $y) { Ui-NavScrollbarDown $y; return }
+    $e = Ui-NavHit $x $y
+    if ($e) { Ui-SetNav ([string]$e.Cat); Ui-Flush }
+}
+
+# A press on the scroll bar: on the thumb it starts a drag, above or below it the pages move a screenful
+function Ui-NavScrollbarDown {
+    param([int]$y)
+    $t = Ui-NavThumb
+    if (-not $t) { return }
+    if ($y -ge $t.Y -and $y -lt ($t.Y + $t.H)) {
+        $script:NavDrag = $y - $t.Y
+        Ui-InvalidateNav
+        return
+    }
+    $page = [Math]::Max((Px 80), [int]($script:NavH - $script:M.NavTop - (Px 40)))
+    if ($y -lt $t.Y) { Ui-NavSetScroll ($script:NavScroll - $page) } else { Ui-NavSetScroll ($script:NavScroll + $page) }
+}
+
+function Ui-NavDragTo {
+    param([int]$y)
+    $t = Ui-NavThumb
+    if (-not $t -or $t.Travel -le 0) { return }
+    $ty = $y - $script:NavDrag - $t.Top
+    if ($ty -lt 0) { $ty = 0 }
+    if ($ty -gt $t.Travel) { $ty = $t.Travel }
+    Ui-NavSetScroll ([int][Math]::Round($ty * [double]$script:NavMaxScroll / [double]$t.Travel))
+}
+
+function Ui-NavUp {
+    if ($script:NavDrag -lt 0) { return }
+    $script:NavDrag = -1
+    Ui-InvalidateNav
+    if ($script:NavMX -ge 0) { Ui-NavMove $script:NavMX $script:NavMY }
+}
+
+# The mouse wheel over the menu
+function Ui-NavWheel {
+    param([int]$delta)
+    if ([int]$script:NavMaxScroll -le 0) { return }
+    $step = [int]($delta / 120.0 * $script:M.NavWheel)
+    if ($step -eq 0) { return }
+    Ui-NavSetScroll ($script:NavScroll - $step)
+}
+
+# Up / Down / Home / End change the page. Returns $true when the key was used.
+function Ui-NavKey {
+    param([string]$key)
+    $items = @($script:NavItems | Where-Object { $_.Kind -eq 'item' })
+    if ($items.Count -eq 0) { return $false }
+    $i = 0
+    for ($j = 0; $j -lt $items.Count; $j++) { if ([string]$items[$j].Cat -eq [string]$script:NavCat) { $i = $j; break } }
+    if ($key -eq 'Down') { $i++ }
+    elseif ($key -eq 'Up') { $i-- }
+    elseif ($key -eq 'Home') { $i = 0 }
+    elseif ($key -eq 'End') { $i = $items.Count - 1 }
+    else { return $false }
+    if ($i -lt 0) { $i = 0 }
+    if ($i -ge $items.Count) { $i = $items.Count - 1 }
+    Ui-SetNav ([string]$items[$i].Cat)
+    Ui-Flush
+    return $true
+}
+
+# ----------------------------------------------------------- changing the page ----------
+# Show another category (or all settings). A search that is typed in is cleared: picking a page leaves the search.
+function Ui-SetNav {
+    param([string]$cat)
+    $changed = ($cat -ne [string]$script:NavCat)
+    $script:NavCat = $cat
+    $f = $script:UI.find
+    $hadText = $false
+    if ($f -and ([string]$f.Text).Trim() -ne '') {
+        $hadText = $true
+        $script:HoldFilter = $true
+        try { $f.Text = '' } finally { $script:HoldFilter = $false }
+    }
+    if (-not $changed -and -not $hadText) { return }
+    $script:NavReveal = $true
+    $script:DNav = $true
+    Ui-OnFilterChanged
+}
+
+# The big title, the line under it, the numbers on the filter buttons and the "turn all" buttons
+function Ui-UpdatePage {
+    $ui = $script:UI
+    $text = ''
+    if ($ui.find) { $text = ([string]$ui.find.Text).Trim() }
+    $shown = 0
+    foreach ($id in @($script:Rows.Keys)) { if ($script:Rows[$id].Visible) { $shown++ } }
+    $info = Get-PageInfo ([string]$script:NavCat) $text $shown
+    if ($ui.title -and [string]$ui.title.Text -ne [string]$info.Title) { $ui.title.Text = [string]$info.Title; Ui-FitTitle }
+    if ($ui.sub -and [string]$ui.sub.Text -ne [string]$info.Sub) { $ui.sub.Text = [string]$info.Sub }
+    $cat = [string]$script:NavCat
+    if ($text) { $cat = '' }
+    $mc = Get-ModeCounts $cat $text ([string]$script:Mode) ([string]$script:Risk)
+    foreach ($b in @($ui.chips)) {
+        $n = ''
+        if ($mc.Checking -eq 0) { $n = [string]$mc[[string]$b.Name] }
+        if ([string]$script:ChipCount[[string]$b.Name] -ne $n) {
+            $script:ChipCount[[string]$b.Name] = $n
+            $b.Invalidate()
+        }
+    }
+    $page = [string]$script:NavCat
+    if ($text) { $page = '' }
+    $isInfo = [bool](Test-InfoPage $page)
+    # "Turn all on / off" are at the top right of every page that has a list of settings (All settings too), not while a search is showing
+    $showAll = [bool](-not $text -and -not $isInfo)
+    foreach ($k in 'allOn', 'allOff') {
+        $b = $ui[$k]
+        if ($b -and [bool]$b.Visible -ne $showAll) { $b.Visible = $showAll }
+    }
+    $showApplyAll = [bool](Test-ApplyAllPage ([string]$script:NavCat) $text)
+    $b = $ui.applyAll
+    if ($b -and [bool]$b.Visible -ne $showApplyAll) { $b.Visible = $showApplyAll }
+    # a page of read-outs has no filter buttons, no details card (the list takes the whole width) and no settings to turn on
+    foreach ($k in 'segBox', 'detCard', 'gap') {
+        $c = $ui[$k]
+        if ($c -and [bool]$c.Visible -eq $isInfo) { $c.Visible = (-not $isInfo) }
+    }
+    # without the filter buttons the header is shorter, so the cards start higher
+    $hh = [int]$script:M.HeaderH
+    if ($isInfo) { $hh = [int]$script:M.HeaderInfoH }
+    if ($ui.header -and [int]$ui.header.Height -ne $hh) { $ui.header.Height = $hh }
+    # the button that belongs to the page (Display settings / Start HWiNFO), left of the search box
+    $pb = $ui.pageBtn
+    if ($pb) {
+        $pt = Ui-PageButtonText $page
+        $want = [bool]($pt -ne '')
+        if ($want -and [string]$pb.Text -ne $pt) { $pb.Text = $pt }
+        if ([bool]$pb.Visible -ne $want) { $pb.Visible = $want }
+        Ui-PlacePageBtn
+    }
+    Ui-OnPageShown
+}
+
+# =============================================================================
+# THE WINDOW, part 4: building the form and showing it.
+# The form has two parts side by side: the side menu (docked left) and the main area (fills the rest). The main area holds
+# the header (title, search, filter buttons), the list and the details card, the log and the footer (status and buttons).
+# Docking rule used below: the control added FIRST fills what is left; each docked control added later is laid out before it.
+# Positions of things on the right-hand side are set in Ui-PlaceBars (not with Anchor), so they are right at every size.
+# =============================================================================
+function New-Pnl {
+    param([string]$dock, [int]$size, $back)
+    $p = New-Object System.Windows.Forms.Panel
+    $p.BackColor = $back
+    if ($dock -eq 'Top') { $p.Dock = [System.Windows.Forms.DockStyle]::Top; $p.Height = $size }
+    elseif ($dock -eq 'Bottom') { $p.Dock = [System.Windows.Forms.DockStyle]::Bottom; $p.Height = $size }
+    elseif ($dock -eq 'Right') { $p.Dock = [System.Windows.Forms.DockStyle]::Right; $p.Width = $size }
+    elseif ($dock -eq 'Left') { $p.Dock = [System.Windows.Forms.DockStyle]::Left; $p.Width = $size }
+    elseif ($dock -eq 'Fill') { $p.Dock = [System.Windows.Forms.DockStyle]::Fill }
+    return $p
+}
+
+function New-Lbl {
+    param([string]$text, [string]$font, $fore, $back, [int]$x, [int]$y)
+    $l = New-Object System.Windows.Forms.Label
+    $l.Text = $text
+    $l.Font = (Ui-Font $font)
+    $l.ForeColor = $fore
+    $l.BackColor = $back
+    $l.AutoSize = $true
+    $l.Location = New-Object System.Drawing.Point($x, $y)
+    return $l
+}
+
+function New-Rich {
+    param($back, $fore, [string]$font)
+    $r = New-Object System.Windows.Forms.RichTextBox
+    $r.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $r.ReadOnly = $true                  # (before the colours: ReadOnly resets the back colour)
+    $r.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $r.BackColor = $back
+    $r.ForeColor = $fore
+    $r.Font = (Ui-Font $font)
+    $r.ScrollBars = [System.Windows.Forms.RichTextBoxScrollBars]::Vertical
+    $r.WordWrap = $true
+    $r.DetectUrls = $false
+    $r.HideSelection = $false
+    $r.TabStop = $false
+    $r.Add_HandleCreated({ param($s, $e) try { Ui-DarkScroll $s } catch { } })
+    return $r
+}
+
+function Ui-StyleDry {
+    $d = $script:UI.dry
+    if (-not $d) { return }
+    $d.BackColor = $script:Th.Card
+    if ($d.Checked) { $d.ForeColor = $script:Th.Accent } else { $d.ForeColor = $script:Th.Sub }
+    $d.Invalidate()
+}
+
+# Things that sit against the right edge, and things as wide as the window
+function Ui-PlaceBars {
+    $ui = $script:UI
+    $M = $script:M
+    if (-not $ui.form) { return }
+    $fw = [int]$ui.form.ClientSize.Width
+    if ($fw -lt (Px 300)) { return }       # minimised
+    $mw = $fw - $M.Side                    # the width of the main area
+    $g = $M.Gutter
+    $wv = $ui.welcome
+    if ($wv -and [bool]$wv.Visible) { $wv.Size = $ui.form.ClientSize }
+    $ui.searchBox.Left = $mw - $g - $ui.searchBox.Width
+    $ui.allOff.Left = $mw - $g - $ui.allOff.Width
+    $ui.allOn.Left = $ui.allOff.Left - (Px 4) - $ui.allOn.Width
+    $ui.applyAll.Left = $ui.allOn.Left - (Px 8) - $ui.applyAll.Width         # the three page buttons are one group on the tab row
+    Ui-PlacePageBtn
+    $ui.barTrack.Width = $mw
+    $ui.status.Width = $mw - 2 * $g
+    $x = $mw - $g
+    foreach ($k in 'apply', 'stop', 'discard', 'restart') {
+        $b = $ui[$k]
+        $x -= $b.Width
+        $b.Left = $x
+        $x -= (Px 8)
+    }
+    Ui-ApplyBar
+}
+
+# The button that belongs to the page sits left of the search box, level with it; the title and the line under it stop before them
+function Ui-PlacePageBtn {
+    $ui = $script:UI
+    $M = $script:M
+    $sb = $ui.searchBox
+    if (-not $sb -or -not $ui.form -or -not $ui.title) { return }
+    $fw = [int]$ui.form.ClientSize.Width
+    if ($fw -lt (Px 300)) { return }
+    $limit = $sb.Left
+    $pb = $ui.pageBtn
+    if ($pb) {
+        $pb.Left = $sb.Left - (Px 10) - $pb.Width
+        $pb.Top = $sb.Top + [int](($sb.Height - $pb.Height) / 2)
+        if ([bool]$pb.Visible) { $limit = $pb.Left }
+    }
+    $ui.title.Width = [Math]::Max((Px 100), ($limit - $M.Gutter - (Px 16)))
+    $ui.sub.Width = [Math]::Max((Px 100), ($sb.Left - $M.Gutter - (Px 16)))
+    Ui-FitTitle
+}
+
+function Ui-Build {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    Ui-InitNative                                   # also makes the process DPI-aware: must come before the first window
+    try { [System.Windows.Forms.Application]::EnableVisualStyles() } catch { }
+    $script:Scale = Ui-GetScale
+    Ui-InitMetrics
+    Ui-InitTheme
+    Ui-InitFlags
+    $script:Fonts = @{}
+    $script:Brushes = @{}
+    $script:Pens = @{}
+    $script:ChipCount = @{}
+    $script:TitleFont = 'title'
+    $script:BtnHot = $null
+    $script:BtnDown = $null
+    $Th = $script:Th
+    $M = $script:M
+    $script:UI = @{}
+    $script:UI.tip = New-Object System.Windows.Forms.ToolTip
+
+    # --- the window
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Headroom'
+    $appIcon = Ui-MakeAppIcon
+    if ($appIcon) { try { $form.Icon = $appIcon } catch { } }
+    $form.Font = (Ui-Font 'ui')
+    $form.BackColor = $Th.Side
+    $form.ForeColor = $Th.Text
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.KeyPreview = $true
+    $wa = Ui-WorkArea
+    $w = [Math]::Min((Px 1480), ([int]$wa.Width - (Px 40)))
+    $h = [Math]::Min((Px 900), ([int]$wa.Height - (Px 40)))
+    $minW = [Math]::Min((Px 1060), $w)
+    $minH = [Math]::Min((Px 720), $h)       # (the side menu scrolls when its pages do not fit; 720 leaves a good part of it, and the block under it, in view)
+    $form.ClientSize = New-Object System.Drawing.Size($w, $h)
+    $form.MinimumSize = New-Object System.Drawing.Size($minW, $minH)
+    $script:UI.form = $form
+    $mw = $w - $M.Side                                # width of the main area
+
+    # --- side menu: the pages (drawn by us), then the two app-wide controls at the bottom
+    $side = New-Pnl 'Left' $M.Side $Th.Side
+    $nav = New-Object System.Windows.Forms.Control
+    $nav.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $nav.BackColor = $Th.Side
+    $nav.TabStop = $true
+    Ui-DoubleBuffer $nav
+    $sideBottom = New-Pnl 'Bottom' (Px 140) $Th.Side
+    $btnPresets = New-Btn 'Select Optimization Preset' 220 'accent' 'Choose how to set up this PC: Recommended Debloat, Advanced Debloat, or your own Custom Preset. Each one shows what it changes first, and nothing is changed until you confirm.' 40
+    $btnPresets.Location = New-Object System.Drawing.Point((Px 12), (Px 6))
+    $dry = New-Object System.Windows.Forms.CheckBox
+    $dry.Appearance = [System.Windows.Forms.Appearance]::Button
+    $dry.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $dry.UseVisualStyleBackColor = $false
+    $dry.Text = 'Preview only'
+    $dry.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $dry.Font = (Ui-Font 'btn')
+    $dry.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $dry.Size = New-Object System.Drawing.Size(($M.Side - (Px 24)), (Px 40))
+    $dry.Location = New-Object System.Drawing.Point((Px 12), (Px 52))
+    $dry.FlatAppearance.BorderSize = 0
+    $dry.FlatAppearance.CheckedBackColor = $Th.Card
+    $dry.FlatAppearance.MouseOverBackColor = $Th.Card
+    $dry.FlatAppearance.MouseDownBackColor = $Th.Card
+    $dry.Checked = [bool]$DryRun
+    Ui-DoubleBuffer $dry
+    Ui-WireBtn $dry 'switch'
+    $script:UI.tip.SetToolTip($dry, 'When on, the Apply button only lists what would happen and changes nothing.')
+    $btnRescan = New-Btn 'Check again' 100 'ghost' 'Look at the PC again and show what is applied now.' 38
+    $btnRescan.Location = New-Object System.Drawing.Point((Px 12), (Px 98))
+    $btnLatency = New-Btn 'Latency tests' 100 'ghost' 'Measure how responsive your PC is, rated for your monitor. Nothing is changed.' 38
+    $btnLatency.Location = New-Object System.Drawing.Point((Px 120), (Px 98))
+    $sideBottom.Controls.Add($btnPresets)
+    $sideBottom.Controls.Add($dry)
+    $sideBottom.Controls.Add($btnRescan)
+    $sideBottom.Controls.Add($btnLatency)
+    $side.Controls.Add($nav)
+    $side.Controls.Add($sideBottom)
+    $script:UI.sideBottom = $sideBottom
+    $script:UI.side = $side
+    $script:UI.nav = $nav
+    $script:UI.dry = $dry
+    $script:UI.presetBtn = $btnPresets            # Select Optimization Preset (opens the window with the three presets)
+    $script:UI.rescan = $btnRescan
+    $script:UI.latency = $btnLatency
+
+    # --- header: page title, search, the filter buttons
+    $header = New-Pnl 'Top' $M.HeaderH $Th.Bg
+    $title = New-Lbl 'All settings' 'title' $Th.Text $Th.Bg $M.Gutter (Px 20)
+    $title.AutoSize = $false
+    $title.AutoEllipsis = $true
+    $title.Size = New-Object System.Drawing.Size((Px 400), (Px 38))
+    $sub = New-Lbl '' 'sub' $Th.Sub $Th.Bg ($M.Gutter + (Px 2)) (Px 62)
+    $sub.AutoSize = $false
+    $sub.AutoEllipsis = $true
+    $sub.Size = New-Object System.Drawing.Size((Px 400), (Px 22))
+    $btnApplyAll = New-Btn 'Apply all' 128 'accent' 'Switches on every setting on this page and applies them. You are asked to confirm first.' 34
+    $btnApplyAll.Top = (Px 141)            # in the same row as "Turn all on" and "Turn all off": the three page actions sit together
+    $btnApplyAll.Visible = $false
+    $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), or open Windows display settings (Display).' 32
+    $btnPage.Top = (Px 24)
+    $btnPage.Visible = $false
+    $searchBox = Ui-NewCard $Th.Card $Th.Edge $M.Radius 'search'
+    $searchBox.Size = New-Object System.Drawing.Size((Px 250), (Px 40))
+    $searchBox.Top = (Px 20)
+    $find = New-Object System.Windows.Forms.TextBox
+    $find.BorderStyle = [System.Windows.Forms.BorderStyle]::None
+    $find.BackColor = $Th.Card
+    $find.ForeColor = $Th.Text
+    $find.Font = (Ui-Font 'row')
+    $find.Location = New-Object System.Drawing.Point((Px 40), (Px 11))
+    $find.Width = (Px 250) - (Px 40) - (Px 12)
+    $searchBox.Controls.Add($find)
+    $script:UI.find = $find
+    $script:UI.searchBox = $searchBox
+
+    # the filter tabs are plain text with the number next to it; the open one is white with a purple bar under it.
+    # Two rows: the state of the setting (top) and its risk (below); one tab is open in each row and they work together.
+    $chipClick = { param($s, $e) try { Ui-SetMode ([string]$s.Name) } catch { Ui-Fail $_ } }
+    $chipRows = @(
+        @(
+            @('All settings', 'All', 70),
+            @('Applied', 'Applied', 96),
+            @('Not applied', 'Not applied', 118),
+            @('Waiting to change', 'Waiting', 98),
+            @('Recommended', 'Recommended', 124),
+            @('Personal', 'Custom', 92)
+        ),
+        @(
+            @('Any risk', 'Any risk', 100),
+            @('Low risk', 'Low risk', 100),
+            @('Medium risk', 'Medium risk', 118),
+            @('Risky', 'Risky', 84)
+        )
+    )
+    $segBox = Ui-NewCard $Th.Bg $Th.Bg 0
+    $chips = New-Object System.Collections.ArrayList
+    $rowTop = 0
+    $segW = 0
+    foreach ($chipDefs in $chipRows) {
+        $x = 0
+        foreach ($cd in $chipDefs) {
+            $cb = New-Btn ([string]$cd[1]) ([int]$cd[2]) 'tab' '' 38
+            $cb.Name = [string]$cd[0]
+            $cb.Location = New-Object System.Drawing.Point($x, $rowTop)
+            $cb.Add_Click($chipClick)
+            $segBox.Controls.Add($cb)
+            [void]$chips.Add($cb)
+            $x += $cb.Width + (Px 2)
+        }
+        if ($x -gt $segW) { $segW = $x }
+        $rowTop += (Px 40)
+    }
+    $segBox.Size = New-Object System.Drawing.Size($segW, ($rowTop - (Px 2)))
+    $segBox.Location = New-Object System.Drawing.Point(($M.Gutter - (Px 4)), (Px 98))
+    $script:UI.chips = $chips
+    $script:UI.segBox = $segBox
+    $btnAllOn = New-Btn 'Turn all on' 100 'secondary' 'Switch on every setting on this page (the ones Apply all leaves out stay as they are). Nothing is changed until you press Apply changes.' 34
+    $btnAllOff = New-Btn 'Turn all off' 104 'secondary' 'Switch off every setting on this page. Nothing is changed until you press Apply changes.' 34
+    $btnAllOn.Top = (Px 141)               # level with the second row of tabs (the risk tabs), which is short: the first row would run into them in a narrow window
+    $btnAllOff.Top = (Px 141)
+    $btnAllOn.Visible = $false
+    $btnAllOff.Visible = $false
+    foreach ($hc in $title, $sub, $searchBox, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
+    $script:UI.header = $header
+    $script:UI.title = $title
+    $script:UI.sub = $sub
+    $script:UI.applyAll = $btnApplyAll
+    $script:UI.pageBtn = $btnPage
+    $script:UI.allOn = $btnAllOn
+    $script:UI.allOff = $btnAllOff
+
+    # --- middle: the list on the left, the details card on the right
+    $mid = New-Pnl 'Fill' 0 $Th.Bg
+    $mid.Padding = New-Object System.Windows.Forms.Padding($M.Gutter, (Px 4), $M.Gutter, (Px 10))
+    $lst = New-Object System.Windows.Forms.Control
+    $lst.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $lst.BackColor = $Th.Bg
+    $lst.TabStop = $true
+    Ui-DoubleBuffer $lst
+    $gap = New-Pnl 'Right' (Px 16) $Th.Bg
+    $detCard = Ui-NewCard $Th.Card $Th.Edge $M.Radius
+    $detCard.Dock = [System.Windows.Forms.DockStyle]::Right
+    $detCard.Width = $M.Details
+    $detCard.Padding = New-Object System.Windows.Forms.Padding((Px 22), (Px 20), (Px 12), (Px 16))
+    $detail = New-Rich $Th.Card $Th.Text 'body'
+    $forceBtn = New-Btn 'Put this one fully back (undo)' 200 'secondary' 'Turn this setting fully off and put your earlier values back.' 38
+    $forceBtn.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $forceBtn.Visible = $false
+    $detCard.Controls.Add($detail)
+    $detCard.Controls.Add($forceBtn)
+    $mid.Controls.Add($lst)
+    $mid.Controls.Add($gap)
+    $mid.Controls.Add($detCard)
+    $script:UI.list = $lst
+    $script:UI.gap = $gap
+    $script:UI.detCard = $detCard
+    $script:UI.detail = $detail
+    $script:UI.forceBtn = $forceBtn
+
+    # --- log
+    $logCard = New-Pnl 'Bottom' (Px 176) $Th.Bg
+    $logCard.Padding = New-Object System.Windows.Forms.Padding($M.Gutter, 0, $M.Gutter, (Px 12))
+    $logBorder = Ui-NewCard $Th.LogBg $Th.Edge $M.Radius
+    $logBorder.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $logBorder.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 12), (Px 10), (Px 12))
+    $logBox = New-Rich $Th.LogBg (Rgb 196 200 214) 'mono'
+    $logBorder.Controls.Add($logBox)
+    $logCard.Controls.Add($logBorder)
+    $script:UI.logCard = $logCard
+    $script:UI.log = $logBox
+
+    # --- footer: progress line, status text, buttons
+    $footer = New-Pnl 'Bottom' $M.FooterH $Th.Bg
+    $barTrack = New-Pnl 'None' 0 $Th.Edge
+    $barTrack.Location = New-Object System.Drawing.Point(0, 0)
+    $barTrack.Size = New-Object System.Drawing.Size($mw, (Px 2))
+    $barFill = New-Pnl 'None' 0 $Th.Accent
+    $barFill.Location = New-Object System.Drawing.Point(0, 0)
+    $barFill.Size = New-Object System.Drawing.Size(0, (Px 2))
+    $barTrack.Controls.Add($barFill)
+    $status = New-Lbl '' 'ui' $Th.Sub $Th.Bg $M.Gutter (Px 16)
+    $status.AutoSize = $false
+    $status.AutoEllipsis = $true
+    $status.Size = New-Object System.Drawing.Size(($mw - 2 * $M.Gutter), (Px 22))
+    $btnLog = New-Btn 'Hide log' 86 'ghost' 'Show or hide the log below the list.' 36
+    $btnOpenLog = New-Btn 'Open log' 92 'ghost' 'Open the log file in Notepad.' 36
+    $btnRestart = New-Btn 'Restart PC...' 124 'secondary' 'Restart Windows (asks first).' 36
+    $btnDiscard = New-Btn 'Clear changes' 120 'secondary' 'Forget the changes you have lined up (the switches go back to how the PC is now).' 36
+    $btnStop = New-Btn 'Stop' 72 'secondary' 'Stop after the step that is running, then check the PC again.' 36
+    $btnApply = New-Btn 'Apply changes' 176 'primary' 'Make the changes you lined up. A restore point is created first.' 36
+    $btnApply.Enabled = $false
+    Ui-StyleBtn $btnApply
+    $btnStop.Enabled = $false
+    Ui-StyleBtn $btnStop
+    $rowTop = Px 44
+    foreach ($fb in $btnLog, $btnOpenLog, $btnRestart, $btnDiscard, $btnStop, $btnApply) { $fb.Top = $rowTop }
+    $btnLog.Left = $M.Gutter - (Px 8)
+    $btnOpenLog.Left = $btnLog.Left + $btnLog.Width + (Px 4)
+    foreach ($fc in $barTrack, $status, $btnLog, $btnOpenLog, $btnRestart, $btnDiscard, $btnStop, $btnApply) { $footer.Controls.Add($fc) }
+    $script:UI.footer = $footer
+    $script:UI.barTrack = $barTrack
+    $script:UI.barFill = $barFill
+    $script:UI.status = $status
+    $script:UI.logBtn = $btnLog
+    $script:UI.openlog = $btnOpenLog
+    $script:UI.restart = $btnRestart
+    $script:UI.discard = $btnDiscard
+    $script:UI.stop = $btnStop
+    $script:UI.apply = $btnApply
+
+    # Docking: the Fill control first, then the edge panels (the last one added ends up outermost)
+    $main = New-Pnl 'Fill' 0 $Th.Bg
+    $main.Controls.Add($mid)
+    $main.Controls.Add($logCard)
+    $main.Controls.Add($footer)
+    $main.Controls.Add($header)
+    $form.Controls.Add($main)
+    $form.Controls.Add($side)
+    $script:UI.main = $main
+    Ui-PlaceBars
+    Ui-StyleDry
+    Ui-StyleChips
+
+    # --- events (every handler is wrapped so a mistake never crashes the window)
+    $lst.Add_Paint({ param($s, $e) try { Ui-OnPaint $e } catch { Ui-Fail $_ } })
+    $lst.Add_Resize({ try { Ui-OnListResize } catch { Ui-Fail $_ } })
+    $lst.Add_MouseMove({ param($s, $e) try { Ui-OnMouseMove $e.X $e.Y } catch { Ui-Fail $_ } })
+    $lst.Add_MouseDown({ param($s, $e) try { [void]$s.Focus(); Ui-OnMouseDown $e.X $e.Y ([string]$e.Button) } catch { Ui-Fail $_ } })
+    $lst.Add_MouseUp({ param($s, $e) try { Ui-OnMouseUp } catch { Ui-Fail $_ } })
+    $lst.Add_MouseLeave({ try { Ui-OnMouseLeave } catch { Ui-Fail $_ } })
+    $lst.Add_MouseEnter({ param($s, $e) try { [void]$s.Focus() } catch { } })
+    $lst.Add_MouseWheel({ param($s, $e) try { Ui-OnWheel $e.Delta } catch { Ui-Fail $_ } })
+    $lst.Add_PreviewKeyDown({ param($s, $e) try { if (Test-ListKey ([string]$e.KeyCode)) { $e.IsInputKey = $true } } catch { Ui-Fail $_ } })
+    $lst.Add_KeyDown({ param($s, $e) try { if (Ui-OnKey ([string]$e.KeyCode)) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
+    $nav.Add_Paint({ param($s, $e) try { Ui-OnNavPaint $e } catch { Ui-Fail $_ } })
+    $nav.Add_Resize({ try { Ui-OnNavResize } catch { Ui-Fail $_ } })
+    $nav.Add_MouseMove({ param($s, $e) try { Ui-NavMove $e.X $e.Y } catch { Ui-Fail $_ } })
+    $nav.Add_MouseLeave({ try { Ui-NavLeave } catch { Ui-Fail $_ } })
+    $nav.Add_MouseUp({ try { Ui-NavUp } catch { Ui-Fail $_ } })
+    $nav.Add_MouseWheel({ param($s, $e) try { Ui-NavWheel $e.Delta } catch { Ui-Fail $_ } })
+    $nav.Add_MouseDown({ param($s, $e) try { [void]$s.Focus(); Ui-NavDown $e.X $e.Y ([string]$e.Button) } catch { Ui-Fail $_ } })
+    $nav.Add_PreviewKeyDown({ param($s, $e) try { if (@('Up', 'Down', 'Home', 'End') -contains [string]$e.KeyCode) { $e.IsInputKey = $true } } catch { Ui-Fail $_ } })
+    $nav.Add_KeyDown({ param($s, $e) try { if (Ui-NavKey ([string]$e.KeyCode)) { $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
+    $find.Add_TextChanged({ try { if (-not $script:HoldFilter) { Ui-OnFilterChanged } } catch { Ui-Fail $_ } })
+    $find.Add_KeyDown({ param($s, $e) try { if ([string]$e.KeyCode -eq 'Escape') { $s.Text = ''; $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
+    $find.Add_Enter({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Accent; $script:UI.searchBox.Invalidate() } catch { } })
+    $find.Add_Leave({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Edge; $script:UI.searchBox.Invalidate() } catch { } })
+    $find.Add_HandleCreated({ param($s, $e) try { Ui-Cue $s 'Search settings' } catch { } })
+    $dry.Add_CheckedChanged({ try { Ui-StyleDry; Ui-Counts } catch { Ui-Fail $_ } })
+    $forceBtn.Add_Click({ try { Ui-ForceUndo } catch { Ui-Fail $_ } })
+    $btnApply.Add_Click({ try { Ui-DoApply } catch { Ui-Fail $_ } })
+    $btnStop.Add_Click({ try { Ui-DoStop } catch { Ui-Fail $_ } })
+    $btnPresets.Add_Click({ try { Ui-ShowPresets } catch { Ui-Fail $_ } })
+    $btnApplyAll.Add_Click({ try { Ui-DoApplyAll } catch { Ui-Fail $_ } })
+    $btnPage.Add_Click({ try { Ui-DoPageButton } catch { Ui-Fail $_ } })
+    $btnDiscard.Add_Click({ try { Ui-DoDiscard } catch { Ui-Fail $_ } })
+    $btnRescan.Add_Click({ try { Ui-DoRescan } catch { Ui-Fail $_ } })
+    $btnLatency.Add_Click({ try { Ui-ShowLatency } catch { Ui-Fail $_ } })
+    $btnOpenLog.Add_Click({ try { Ui-DoOpenLog } catch { Ui-Fail $_ } })
+    $btnRestart.Add_Click({ try { Ui-DoRestart } catch { Ui-Fail $_ } })
+    $btnLog.Add_Click({ try { Ui-ToggleLog } catch { Ui-Fail $_ } })
+    $btnAllOn.Add_Click({ try { Ui-GroupTick ($(if ($script:Single) { [string]$script:NavCat } else { '' })) $true } catch { Ui-Fail $_ } })
+    $btnAllOff.Add_Click({ try { Ui-GroupTick ($(if ($script:Single) { [string]$script:NavCat } else { '' })) $false } catch { Ui-Fail $_ } })
+    $form.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s; Ui-TitleColor $s } catch { } })
+    $form.Add_Resize({ try { Ui-PlaceBars } catch { Ui-Fail $_ } })
+    $form.Add_FormClosing({ param($s, $e) try { Ui-OnClosing $e } catch { Ui-Fail $_ } })
+    $form.Add_KeyDown({ param($s, $e) try { if ($e.Control -and [string]$e.KeyCode -eq 'F' -and -not (Test-WelcomeShowing)) { [void]$script:UI.find.Focus(); $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { } })
+    $form.Add_Shown({
+        try {
+            Ui-PlaceBars
+            Ui-ListSize
+            Ui-NavLayout
+            if (Test-WelcomeShowing) { Ui-WelcomeFocus } else { $script:UI.form.ActiveControl = $script:UI.list }
+            Ui-InvalidateAll
+            Ui-InvalidateNav
+        } catch { Ui-Fail $_ }
+        $script:StartScanPending = $true       # the first check starts on the next tick, after the window has been painted
+    })
+
+    $timer = New-Object System.Windows.Forms.Timer
+    $timer.Interval = 80
+    $timer.Add_Tick({ try { Ui-Tick } catch { Ui-Fail $_ } })
+    $script:UI.timer = $timer
+    Ui-BuildWelcome                                  # the welcome screen, on top of everything until Begin / Skip
+}
+
+function Show-Window {
+    $script:Q = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    New-Rows
+    Load-Personal                       # the saved Personal Preset, if there is one
+    $script:StartupSynced = $true       # the catalog was just built from this PC, so the first check need not read the startup list again
+    Ui-Build
+    $script:NavCat = $script:PageHome   # the app opens to the Home page
+    try { Start-SysWorker } catch { $script:SysShared = $null; $script:SysWorker = $null; Ui-Note ('The system information could not be read: ' + $_.Exception.Message) 'Yellow' }
+    Ui-ShowLog $false                   # the log starts folded away (the list gets the room); Apply opens it, or use the button
+    Ui-RebuildList
+    Ui-Log ('Log file: ' + $log) 'DarkGray'
+    Ui-Flush
+    $script:UI.timer.Start()
+    try {
+        [void]$script:UI.form.ShowDialog()
+    } finally {
+        try { $script:UI.timer.Stop(); $script:UI.timer.Dispose() } catch { }
+        try { $script:UI.wtimer.Stop(); $script:UI.wtimer.Dispose() } catch { }
+        try { Stop-SysWorker } catch { }
+        if ($script:Job) {
+            try { $script:Job.PS.Stop() } catch { }
+            try { $script:Job.RS.Close() } catch { }
+            $script:Job = $null
+        }
+        try { $script:UI.form.Dispose() } catch { }
+        foreach ($d in (@($script:Brushes.Values) + @($script:Pens.Values) + @($script:Fonts.Values))) { try { $d.Dispose() } catch { } }
+    }
+}
+
+# =============================================================================
+# THE WINDOW, part 6: the "Latency tests" window (opened from the side menu).
+# It is a window of its own, like "View description". The measuring code is in e4-latency.ps1; this file only runs it and shows it:
+#   - the PC latency test runs in a background worker (a runspace, like the settings check) and reports through a queue
+# Names used here start with Lat / Ui-Lat. $script:LatWin holds the controls of the open window ($null when it is closed).
+# =============================================================================
+$script:LatWin = $null
+$script:LatEvents = $null        # the queue the worker reports through
+$script:LatJob = $null           # the running worker: PS, RS, Async
+$script:LatSpecs = $null         # this PC's hardware
+$script:LatPc = @()              # results of the PC latency test
+$script:LatWhen = ''
+$script:LatMode = 'idle'         # idle | specs | pc
+
+# the clipboard (kept apart so a test can stand in for it)
+function Ui-SetClipboard {
+    param([string]$text)
+    try { [System.Windows.Forms.Clipboard]::SetText($text); return $true } catch { return $false }
+}
+
+function Ui-LatNowText {
+    return (Get-Date).ToString('yyyy-MM-dd HH:mm')
+}
+
+# ----------------------------------------------------------- what is on screen ----
+function Ui-LatRender {
+    $w = $script:LatWin
+    if (-not $w) { return }
+    Ui-FillRich $w.Rich (Get-LatParts $script:LatSpecs $script:LatPc $script:LatWhen)
+}
+
+# the line under the buttons and the thin bar below it ($pct below 0 leaves the bar as it is)
+function Ui-LatStatus {
+    param([string]$text, [double]$pct = -1)
+    $w = $script:LatWin
+    if (-not $w) { return }
+    $w.Status.Text = $text
+    if ($pct -ge 0) {
+        $tw = [int]$w.Track.Width
+        $w.Fill.Width = [int][Math]::Round($tw * [Math]::Min(100.0, $pct) / 100.0)
+    }
+}
+
+function Ui-LatButtons {
+    $w = $script:LatWin
+    if (-not $w) { return }
+    $m = $script:LatMode
+    $idle = ($m -eq 'idle')
+    Ui-SetEnabled $w.BtnPc $idle
+    Ui-SetEnabled $w.BtnCopy ($idle -and @($script:LatPc).Count -gt 0)
+    # how often the window looks at what is happening: rarely while measuring, so that it does not disturb the measurement
+    $iv = 200
+    if ($m -eq 'pc') { $iv = 250 }
+    if ($w.Timer -and [int]$w.Timer.Interval -ne $iv) { $w.Timer.Interval = $iv }
+}
+
+# ----------------------------------------------------------- the background worker ----
+function Start-LatJob {
+    param([string]$Call)
+    if ($script:LatJob) { Finish-LatJob }
+    $rs = Open-WorkerRunspace
+    $rs.SessionStateProxy.SetVariable('LatQ', $script:LatEvents)
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($latEngine.ToString() + "`r`n" + $Call)
+    $async = $ps.BeginInvoke()
+    $script:LatJob = @{ PS = $ps; RS = $rs; Async = $async }
+}
+
+# The worker is done (or died): collect it. If it never said it was done, say so.
+function Finish-LatJob {
+    $j = $script:LatJob
+    $script:LatJob = $null
+    if (-not $j) { return }
+    $err = ''
+    try { [void]$j.PS.EndInvoke($j.Async) } catch {
+        $err = $_.Exception.Message
+        if ($_.Exception.InnerException) { $err = $_.Exception.InnerException.Message }
+    }
+    try { $j.PS.Dispose() } catch { }
+    try { $j.RS.Close(); $j.RS.Dispose() } catch { }
+    if ($script:LatMode -eq 'pc') {
+        $script:LatMode = 'idle'
+        $t = 'The test stopped early.'
+        if ($err) { $t = 'The test stopped early: ' + $err }
+        Ui-LatStatus $t 0
+    } elseif ($script:LatMode -eq 'specs') {
+        $script:LatMode = 'idle'
+        Ui-LatStatus 'Ready. Pick a test.' 0
+    }
+    Ui-LatButtons
+}
+
+# Stop a worker that is still running because the window is closing; it is not waited for
+function Stop-LatJob {
+    $j = $script:LatJob
+    $script:LatJob = $null
+    if (-not $j) { return }
+    try { [void]$j.PS.BeginStop($null, $null) } catch { }
+}
+
+function Handle-LatEvent {
+    param($ev)
+    switch ([string]$ev.T) {
+        'specs' {
+            $script:LatSpecs = $ev.Specs
+            Ui-LatRender
+        }
+        'progress' {
+            Ui-LatStatus ([string]$ev.Text) ([double]$ev.Pct)
+        }
+        'done' {
+            $script:LatSpecs = $ev.Specs
+            $script:LatPc = @($ev.Results)
+            $script:LatWhen = Ui-LatNowText
+            $script:LatMode = 'idle'
+            Ui-LatStatus 'PC latency test finished. Scroll down for the results of each check.' 100
+            Ui-LatRender
+            Ui-LatButtons
+        }
+        'error' {
+            if ($script:LatMode -eq 'pc') { $script:LatMode = 'idle' }
+            Ui-LatStatus ('Could not finish: ' + [string]$ev.Text) 0
+            Ui-LatButtons
+        }
+    }
+}
+
+function Ui-LatTick {
+    if (-not $script:LatWin -or -not $script:LatEvents) { return }
+    $n = 0
+    $ev = $null
+    while ($n -lt 100 -and $script:LatEvents.TryDequeue([ref]$ev)) {
+        $n++
+        try { Handle-LatEvent $ev } catch { Ui-Fail $_ }
+    }
+    $j = $script:LatJob
+    if ($j -and $j.Async.IsCompleted -and $script:LatEvents.IsEmpty) {
+        try { Finish-LatJob } catch { Ui-Fail $_ }
+    }
+}
+
+# ----------------------------------------------------------- the tests ----
+function Ui-LatStartSpecs {
+    if ($script:LatMode -ne 'idle') { return }
+    $script:LatMode = 'specs'
+    Ui-LatStatus 'Reading your PC''s hardware...' 0
+    Ui-LatButtons
+    try {
+        Start-LatJob 'Invoke-LatSpecsJob'
+    } catch {
+        $script:LatMode = 'idle'
+        Ui-LatStatus ('Could not read the hardware: ' + $_.Exception.Message) 0
+        Ui-LatButtons
+    }
+}
+
+function Ui-LatStartPc {
+    if ($script:LatMode -ne 'idle') { return }
+    $script:LatMode = 'pc'
+    Ui-LatStatus 'Starting the PC latency test. Keep the mouse still and leave other windows alone...' 0
+    Ui-LatButtons
+    try {
+        Start-LatJob 'Invoke-LatPcTestJob'
+    } catch {
+        $script:LatMode = 'idle'
+        Ui-LatStatus ('Could not start the test: ' + $_.Exception.Message) 0
+        Ui-LatButtons
+    }
+}
+
+function Ui-LatCopy {
+    $t = Get-LatText $script:LatSpecs $script:LatPc $script:LatWhen
+    if (Ui-SetClipboard $t) { Ui-LatStatus 'The results are copied. Paste them anywhere.' } else { Ui-LatStatus 'Could not copy to the clipboard.' }
+}
+
+# the window is closing: stop whatever is still running
+function Ui-LatCleanup {
+    Stop-LatJob
+    $script:LatMode = 'idle'
+    $w = $script:LatWin
+    $script:LatWin = $null
+    if ($w -and $w.Timer) { try { $w.Timer.Stop(); $w.Timer.Dispose() } catch { } }
+}
+
+# ----------------------------------------------------------- the window ----
+# Builds the window and its controls (not shown yet): $script:LatWin holds them, and its Form is the window.
+function Ui-LatBuild {
+    $Th = $script:Th
+    $script:LatEvents = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+    $script:LatMode = 'idle'
+    $f = New-Object System.Windows.Forms.Form
+    try {
+        $f.Text = 'Latency tests'
+        $f.Font = (Ui-Font 'ui')
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+        $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+        $f.MaximizeBox = $true
+        $f.MinimizeBox = $false
+        $f.ShowInTaskbar = $false
+        $f.BackColor = $Th.Panel
+        $wa = Ui-WorkArea
+        $w = [Math]::Min((Px 900), ([int]$wa.Width - (Px 40)))
+        $h = [Math]::Min((Px 780), ([int]$wa.Height - (Px 40)))
+        $f.ClientSize = New-Object System.Drawing.Size($w, $h)
+        $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 620), $w), [Math]::Min((Px 520), $h))
+
+        $strip = New-Object System.Windows.Forms.Panel
+        $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+        $strip.Height = (Px 3)
+        $strip.BackColor = $Th.Accent
+
+        # title
+        $head = New-Object System.Windows.Forms.Panel
+        $head.Dock = [System.Windows.Forms.DockStyle]::Top
+        $head.Height = (Px 70)
+        $head.BackColor = $Th.Panel
+        $head.Controls.Add((New-Lbl 'Latency tests' 'detTitle' $Th.Text $Th.Panel (Px 24) (Px 12)))
+        $head.Controls.Add((New-Lbl 'Measures your PC and rates the results for your monitor. It does not change any setting.' 'small' $Th.Sub $Th.Panel (Px 26) (Px 44)))
+
+        # the test button
+        $actions = New-Object System.Windows.Forms.Panel
+        $actions.Dock = [System.Windows.Forms.DockStyle]::Top
+        $actions.Height = (Px 58)
+        $actions.BackColor = $Th.Panel
+        $btnPc = New-Btn 'Run PC latency test' 200 'primary' 'Timer jitter, CPU stalls, interrupt load and screen refresh steadiness (about 12 seconds). Keep the mouse still.' 38
+        $btnPc.Location = New-Object System.Drawing.Point((Px 24), (Px 8))
+        $actions.Controls.Add($btnPc)
+
+        # status line and progress bar
+        $stat = New-Object System.Windows.Forms.Panel
+        $stat.Dock = [System.Windows.Forms.DockStyle]::Top
+        $stat.Height = (Px 52)
+        $stat.BackColor = $Th.Panel
+        $stat.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 2), (Px 24), (Px 8))
+        $track = New-Object System.Windows.Forms.Panel
+        $track.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $track.Height = (Px 6)
+        $track.BackColor = $Th.Raised
+        $fill = New-Object System.Windows.Forms.Panel
+        $fill.Dock = [System.Windows.Forms.DockStyle]::Left
+        $fill.Width = 0
+        $fill.BackColor = $Th.Accent
+        $track.Controls.Add($fill)
+        $status = New-Object System.Windows.Forms.Label
+        $status.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $status.AutoSize = $false
+        $status.Font = (Ui-Font 'ui')
+        $status.ForeColor = $Th.Sub
+        $status.BackColor = $Th.Panel
+        $status.Text = ''
+        $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+        $stat.Controls.Add($status)
+        $stat.Controls.Add($track)
+
+        # bottom bar
+        $bar = New-Object System.Windows.Forms.Panel
+        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom
+        $bar.Height = (Px 64)
+        $bar.BackColor = $Th.Bg
+        $bar.Padding = New-Object System.Windows.Forms.Padding((Px 20), (Px 14), (Px 20), (Px 14))
+        $close = New-Btn 'Close' 96 'primary' '' 36
+        $close.DialogResult = [System.Windows.Forms.DialogResult]::OK
+        $close.Dock = [System.Windows.Forms.DockStyle]::Right
+        $btnCopy = New-Btn 'Copy results' 130 'secondary' 'Copy everything in the results box as text.' 36
+        $btnCopy.Dock = [System.Windows.Forms.DockStyle]::Left
+        $bar.Controls.Add($close)
+        $bar.Controls.Add($btnCopy)
+
+        # the results
+        $body = New-Object System.Windows.Forms.Panel
+        $body.Dock = [System.Windows.Forms.DockStyle]::Fill
+        $body.BackColor = $Th.Panel
+        $body.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 8), (Px 12), (Px 8))
+        $rb = New-Rich $Th.Panel $Th.Text 'body'
+        $body.Controls.Add($rb)
+
+        # the one added first fills what is left; each one added later is laid out before it
+        $f.Controls.Add($body)
+        $f.Controls.Add($bar)
+        $f.Controls.Add($stat)
+        $f.Controls.Add($actions)
+        $f.Controls.Add($head)
+        $f.Controls.Add($strip)
+        $f.AcceptButton = $close
+        $f.CancelButton = $close
+        $f.ActiveControl = $close
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 200
+        $script:LatWin = @{ Form = $f; Rich = $rb; Status = $status; Track = $track; Fill = $fill
+                            BtnPc = $btnPc; BtnCopy = $btnCopy; BtnClose = $close; Timer = $timer }
+        $btnPc.Add_Click({ try { Ui-LatStartPc } catch { Ui-Fail $_ } })
+        $btnCopy.Add_Click({ try { Ui-LatCopy } catch { Ui-Fail $_ } })
+        $timer.Add_Tick({ try { Ui-LatTick } catch { Ui-Fail $_ } })
+        $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+        # the text goes in once the window exists (formatting a rich text box needs its handle), before it is shown
+        $f.Add_Load({ try { Ui-LatRender; Ui-LatButtons; $script:LatWin.Timer.Start() } catch { Ui-Fail $_ } })
+        $f.Add_Shown({ try { Ui-LatStartSpecs } catch { Ui-Fail $_ } })
+        $f.Add_FormClosing({ try { Ui-LatCleanup } catch { } })
+    } catch {
+        try { $f.Dispose() } catch { }
+        throw
+    }
+}
+
+function Ui-ShowLatency {
+    $f = $null
+    try {
+        Ui-LatBuild | Out-Null
+        $f = $script:LatWin.Form
+        $owner = $script:UI.form
+        if ($owner) { [void]$f.ShowDialog($owner) } else { [void]$f.ShowDialog() }
+    } finally {
+        try { Ui-LatCleanup } catch { }
+        if ($f) { try { $f.Dispose() } catch { } }
+    }
+}
+
+# =============================================================================
+# THE WINDOW, part 6: the Home page and the live cards on the Display page.
+# These pages show read-outs, not settings. A read-out is an "info card": one entry of the list (Kind = 'info') that is drawn
+# like a settings card but has no switch and cannot be selected. What the cards say comes from a background reader ($sysEngine in
+# e5-sys.ps1) that fills $script:SysShared; this file only turns that data into cards and draws them.
+#   info card:  Kind='info'  Key Cat Title Sub Lines NoteLines Note Chip ChipKey Span Top X W Y H Idx
+#               Lines = list of @{ L = label; V = value; K = colour name; Bar = $null or 0..100 }
+# Names used for local variables here: $Th = colours, $M = sizes, $TF = text flags, $d = the data (static, live).
+# =============================================================================
+$script:SysShared = $null            # what the background reader writes (a synchronized hashtable); $null before it starts
+$script:SysWorker = $null            # the background reader that runs while the window is open
+$script:SysSeen = -1
+$script:Deg = [string][char]0xB0
+
+# ----------------------------------------------------------- numbers as text ----
+function Fmt-N {
+    param($v, [int]$dec = 0)
+    if ($null -eq $v) { return '' }
+    return ([double]$v).ToString(('N' + $dec), [Globalization.CultureInfo]::InvariantCulture)
+}
+function Fmt-Gb {
+    param($mb, [int]$dec = 1)
+    if ($null -eq $mb) { return '' }
+    return ((Fmt-N ([double]$mb / 1024.0) $dec) + ' GB')
+}
+# seconds -> "2 d 3 h 12 min"
+function Fmt-Span {
+    param($sec)
+    if ($null -eq $sec) { return '' }
+    $s = [int]$sec
+    $d = [int][Math]::Floor($s / 86400); $h = [int][Math]::Floor(($s % 86400) / 3600); $m = [int][Math]::Floor(($s % 3600) / 60)
+    if ($d -gt 0) { return ('{0} d {1} h {2} min' -f $d, $h, $m) }
+    if ($h -gt 0) { return ('{0} h {1} min' -f $h, $m) }
+    if ($m -gt 0) { return ('{0} min' -f $m) }
+    return 'under a minute'
+}
+# Windows keeps its edition under an internal name ("Core" is Home, "Professional" is Pro); this is the name Settings shows.
+# A name that is not known is shown as it is.
+function Fmt-Edition {
+    param([string]$Id)
+    $k = ([string]$Id).Trim()
+    if (-not $k) { return '' }
+    $map = @{
+        'core' = 'Home'; 'coren' = 'Home N'; 'coresinglelanguage' = 'Home Single Language'; 'corecountryspecific' = 'Home China'
+        'professional' = 'Pro'; 'professionaln' = 'Pro N'; 'professionalworkstation' = 'Pro for Workstations'; 'professionalworkstationn' = 'Pro N for Workstations'
+        'professionaleducation' = 'Pro Education'; 'professionaleducationn' = 'Pro Education N'
+        'education' = 'Education'; 'educationn' = 'Education N'; 'enterprise' = 'Enterprise'; 'enterprisen' = 'Enterprise N'
+        'enterprises' = 'Enterprise LTSC'; 'enterprisesn' = 'Enterprise N LTSC'; 'iotenterprise' = 'IoT Enterprise'; 'iotenterprises' = 'IoT Enterprise LTSC'
+    }
+    $v = $map[$k.ToLowerInvariant()]
+    if ($v) { return [string]$v }
+    return $k
+}
+function Fmt-Day {
+    param($d)
+    if ($null -eq $d -or -not $d) { return '' }
+    try { return ([datetime]$d).ToString('yyyy-MM-dd', [Globalization.CultureInfo]::InvariantCulture) } catch { return '' }
+}
+# Windows writes an NVIDIA driver as 32.0.15.8180; the number NVIDIA's page and installer show is 581.80 (the last digit of the third
+# part and the whole fourth part, with a point after the third digit)
+function Info-NvDriver {
+    param([string]$Win)
+    $p = @(([string]$Win).Trim() -split '\.')
+    if ($p.Count -ne 4) { return [string]$Win }
+    $a = [string]$p[2]; $b = [string]$p[3]
+    if (-not $a -or $b.Length -lt 3) { return [string]$Win }
+    $t = $a.Substring($a.Length - 1) + $b
+    if ($t.Length -lt 5) { return [string]$Win }
+    return ($t.Substring(0, $t.Length - 2) + '.' + $t.Substring($t.Length - 2))
+}
+
+# ----------------------------------------------------------- building cards ----
+function Info-Card {
+    param([string]$Key, [string]$Title, [string]$Sub = '', $Lines = @(), [string]$Note = '', [string]$Chip = '', [string]$ChipKey = 'Sub', [int]$Span = 1)
+    return @{ Kind = 'info'; Key = $Key; Id = $Key; Cat = ''; Title = $Title; Sub = $Sub; Lines = @($Lines); Note = $Note; NoteLines = @(); Chip = $Chip; ChipKey = $ChipKey
+              Span = $Span; Top = 0; X = 0; W = 0; Y = 0; H = 0; Idx = 0 }
+}
+function Info-Line {
+    param([string]$L, [string]$V, [string]$K = 'Text', $Bar = $null)
+    return @{ L = $L; V = $V; K = $K; Bar = $Bar }
+}
+function Info-Reading { return (Info-Line 'Status' 'Reading your PC...' 'Dim') }
+
+# what the background reader has so far
+function Info-Data {
+    $d = @{ Static = $null; Live = $null }
+    $s = $script:SysShared
+    if ($s) { $d.Static = $s.Static; $d.Live = $s.Live }
+    return $d
+}
+# a temperature as a line: green is not used, only a warning when it is hot
+function Info-TempLine {
+    param([string]$Label, $T, [string]$Missing)
+    if ($null -eq $T) { return (Info-Line $Label $Missing 'Dim') }
+    $k = 'Text'
+    if ([double]$T -ge 90) { $k = 'Bad' } elseif ([double]$T -ge 80) { $k = 'Warn' }
+    return (Info-Line $Label ((Fmt-N $T 0) + ' ' + $script:Deg + 'C') $k)
+}
+function Info-UsageKey {
+    param($Pct)
+    if ($null -eq $Pct) { return 'Text' }
+    if ([double]$Pct -ge 95) { return 'Bad' }
+    if ([double]$Pct -ge 85) { return 'Warn' }
+    return 'Text'
+}
+
+$script:NeedSensors = 'needs HWiNFO or LibreHardwareMonitor'
+
+function Info-OsCard {
+    param($d)
+    $o = $null; if ($d.Static) { $o = $d.Static.Os }
+    if (-not $o) { return (Info-Card 'info:os' 'Windows' '' @((Info-Reading))) }
+    $lv = $d.Live
+    $sub = [string]$o.Name
+    if ($o.Display) { $sub += ' ' + [string]$o.Display }
+    $up = $null
+    if ($lv -and $null -ne $lv.Uptime) { $up = [int]$lv.Uptime }
+    elseif ($o.Boot) { try { $up = [int]((Get-Date) - [datetime]$o.Boot).TotalSeconds } catch { } }
+    $lines = @()
+    $build = [string]$o.Full; if (-not $build) { $build = '-' }
+    $lines += , (Info-Line 'Version' $(if ($o.Display) { [string]$o.Display } else { '-' }))
+    $lines += , (Info-Line 'OS build' $build)
+    $lines += , (Info-Line 'Edition' $(if ($o.Edition) { Fmt-Edition ([string]$o.Edition) } else { '-' }))
+    if ($o.Arch) { $lines += , (Info-Line 'Architecture' ([string]$o.Arch)) }
+    $day = Fmt-Day $o.Installed
+    if ($day) { $lines += , (Info-Line 'Installed' $day) }
+    if ($null -ne $up) { $lines += , (Info-Line 'Running for' (Fmt-Span $up)) }
+    if ($lv -and $null -ne $lv.Procs) { $lines += , (Info-Line 'Processes' (Fmt-N $lv.Procs 0)) } else { $lines += , (Info-Line 'Processes' 'Reading...' 'Dim') }
+    if ($lv -and $null -ne $lv.Threads) { $lines += , (Info-Line 'Threads' (Fmt-N $lv.Threads 0)) }
+    return (Info-Card 'info:os' 'Windows' $sub $lines)
+}
+
+function Info-CpuCard {
+    param($d)
+    $c = $null; if ($d.Static) { $c = $d.Static.Cpu }
+    if (-not $c) { return (Info-Card 'info:cpu' 'Processor' '' @((Info-Reading))) }
+    $lv = $d.Live
+    $sn = $null; if ($lv) { $sn = $lv.Sensors }
+    $lines = @()
+    if ($lv -and $null -ne $lv.CpuUsage) { $lines += , (Info-Line 'Usage' ((Fmt-N $lv.CpuUsage 0) + ' %') (Info-UsageKey $lv.CpuUsage) $lv.CpuUsage) }
+    else { $lines += , (Info-Line 'Usage' 'Reading...' 'Dim') }
+    if ($lv -and $null -ne $lv.CpuClockMHz) {
+        $t = (Fmt-N $lv.CpuClockMHz 0) + ' MHz'
+        if ($c.BaseMHz -gt 0) { $t += '   (base ' + (Fmt-N $c.BaseMHz 0) + ')' }
+        $lines += , (Info-Line 'Clock speed' $t)
+    } else { $lines += , (Info-Line 'Clock speed' 'Reading...' 'Dim') }
+    $temp = $null; $pow = $null; if ($sn) { $temp = $sn.CpuTemp; $pow = $sn.CpuPower }
+    $lines += , (Info-TempLine 'Temperature' $temp $script:NeedSensors)
+    if ($null -ne $pow) { $lines += , (Info-Line 'Power' ((Fmt-N $pow 1) + ' W')) } else { $lines += , (Info-Line 'Power' $script:NeedSensors 'Dim') }
+    if ($c.Cores -gt 0) { $lines += , (Info-Line 'Cores' ('{0} cores, {1} threads' -f $c.Cores, $c.Threads)) }
+    if ($c.L3MB -gt 0) { $lines += , (Info-Line 'L3 cache' ((Fmt-N $c.L3MB 0) + ' MB')) }
+    $chip = ''; $ck = 'Sub'
+    if ($sn -and $sn.Source) { $chip = 'Sensors: ' + [string]$sn.Source; $ck = 'Good' }
+    return (Info-Card 'info:cpu' 'Processor' ([string]$c.Name) $lines '' $chip $ck)
+}
+
+function Info-GpuCard {
+    param($d)
+    $g = $null; if ($d.Static) { $g = $d.Static.Gpu }
+    if (-not $g) { return (Info-Card 'info:gpu' 'Graphics card' '' @((Info-Reading))) }
+    $lv = $d.Live
+    $x = $null; if ($lv) { $x = $lv.Gpu }
+    $name = [string]$g.Name
+    if (-not $name -and $x -and $x.Name) { $name = [string]$x.Name }
+    if (-not $name) { $name = 'No graphics card found' }
+    $lines = @()
+    if ($x -and $null -ne $x.Usage) { $lines += , (Info-Line 'Usage' ((Fmt-N $x.Usage 0) + ' %') (Info-UsageKey $x.Usage) $x.Usage) }
+    elseif ($lv) { $lines += , (Info-Line 'Usage' 'not available' 'Dim') }
+    else { $lines += , (Info-Line 'Usage' 'Reading...' 'Dim') }
+    $nv = ($x -and $x.Source -eq 'nvidia-smi')
+    $missing = 'needs nvidia-smi'
+    if ($nv -and $null -ne $x.ClockMHz) {
+        $t = (Fmt-N $x.ClockMHz 0) + ' MHz'
+        if ($null -ne $x.ClockMaxMHz) { $t += '   (up to ' + (Fmt-N $x.ClockMaxMHz 0) + ')' }
+        $lines += , (Info-Line 'Clock speed' $t)
+    } else { $lines += , (Info-Line 'Clock speed' $missing 'Dim') }
+    $tmp = $null; if ($nv) { $tmp = $x.Temp }
+    $lines += , (Info-TempLine 'Temperature' $tmp $missing)
+    if ($nv -and $null -ne $x.Power) {
+        $t = (Fmt-N $x.Power 1) + ' W'
+        if ($null -ne $x.PowerLimit) { $t += '   (limit ' + (Fmt-N $x.PowerLimit 0) + ' W)' }
+        $lines += , (Info-Line 'Power' $t)
+    } else { $lines += , (Info-Line 'Power' $missing 'Dim') }
+    if ($x -and $null -ne $x.MemUsedMB) {
+        $tot = $null
+        if ($null -ne $x.MemTotalMB) { $tot = [double]$x.MemTotalMB } elseif ($g.VramMB -gt 0) { $tot = [double]$g.VramMB }
+        if ($tot -and $tot -gt 0) {
+            $pct = [Math]::Round(100.0 * [double]$x.MemUsedMB / $tot, 0)
+            $lines += , (Info-Line 'Video memory' ((Fmt-N $x.MemUsedMB 0) + ' of ' + (Fmt-N $tot 0) + ' MB') 'Text' $pct)
+        } else { $lines += , (Info-Line 'Video memory' ((Fmt-N $x.MemUsedMB 0) + ' MB in use')) }
+    } elseif ($g.VramMB -gt 0) { $lines += , (Info-Line 'Video memory' ((Fmt-N $g.VramMB 0) + ' MB')) }
+    if ($nv -and $null -ne $x.Fan) { $lines += , (Info-Line 'Fan' ((Fmt-N $x.Fan 0) + ' %')) }
+    $drv = ''
+    if ($nv -and $x.Driver) { $drv = [string]$x.Driver }
+    elseif ($g.Driver) { $drv = [string]$g.Driver; if ($g.Vendor -eq 'NVIDIA') { $drv = Info-NvDriver $drv } }
+    if ($drv) { $lines += , (Info-Line 'Driver' $drv) }
+    $chip = ''; $ck = 'Sub'
+    if ($nv) { $chip = 'Sensors: nvidia-smi'; $ck = 'Good' }
+    elseif ($lv) { $chip = 'Windows counters only'; $ck = 'Dim' }
+    return (Info-Card 'info:gpu' 'Graphics card' $name $lines '' $chip $ck)
+}
+
+# the memory timings as the usual four numbers, "30-36-36-96", or '' when HWiNFO has not given them
+function Info-Timings {
+    param($sn)
+    if (-not $sn) { return '' }
+    foreach ($k in 'Tcas', 'Trcd', 'Trp', 'Tras') { if ($null -eq $sn[$k]) { return '' } }
+    return ('{0}-{1}-{2}-{3}' -f [int]$sn.Tcas, [int]$sn.Trcd, [int]$sn.Trp, [int]$sn.Tras)
+}
+# The memory controller clock against the memory clock: Mode is "1:1" when they are equal (what a Ryzen runs best at), "1:2" when the
+# controller runs at half the memory clock (usual above about DDR5-6400), "Other" for anything else. Each clock in MHz; the memory clock
+# is half the transfer rate (DDR5-6000 = 3000 MHz). A few percent of difference is measuring noise. $null when either clock is missing or
+# impossible. (This is window code: the functions of the background reader are not available here.)
+function Info-MemMode {
+    param($Mclk, $Uclk)
+    if ($null -eq $Mclk -or $null -eq $Uclk) { return $null }
+    $m = [double]$Mclk; $u = [double]$Uclk
+    if ([double]::IsNaN($m) -or [double]::IsNaN($u) -or $m -lt 100 -or $m -gt 6000 -or $u -lt 100 -or $u -gt 6000) { return $null }
+    $ratio = $u / $m
+    $mode = 'Other'
+    if ([Math]::Abs($ratio - 1.0) -le 0.03) { $mode = '1:1' }
+    elseif ([Math]::Abs($ratio - 0.5) -le 0.03) { $mode = '1:2' }
+    return @{ Mode = $mode; Ratio = [Math]::Round($ratio, 3) }
+}
+# The memory controller clock set against the memory clock: the "Memory controller" line, e.g. "3,000 MHz   1:1 with the memory clock".
+# The memory clock comes from HWiNFO, else from the speed Windows reports (DDR: half the transfer rate).
+function Info-CtrlLine {
+    param($sn, $r, $lv)
+    $u = $null; if ($sn -and $null -ne $sn.RamUclk) { $u = [double]$sn.RamUclk }
+    if ($null -eq $u) {
+        if (-not $lv) { return (Info-Line 'Memory controller' 'Reading...' 'Dim') }
+        if ($lv.Hwi -and [string]$lv.HwiVia) { return (Info-Line 'Memory controller' 'no controller clock row in HWiNFO' 'Dim') }
+        return (Info-Line 'Memory controller' 'needs HWiNFO running' 'Dim')
+    }
+    $m = $null
+    if ($sn -and $null -ne $sn.RamMclk) { $m = [double]$sn.RamMclk }
+    elseif ($r -and [double]$r.SpeedMT -gt 0) { $m = [double]$r.SpeedMT / 2.0 }
+    $t = (Fmt-N $u 0) + ' MHz'
+    $mode = Info-MemMode $m $u
+    if (-not $mode) { return (Info-Line 'Memory controller' $t 'Text') }
+    if ($mode.Mode -eq '1:1') { return (Info-Line 'Memory controller' ($t + '   1:1 with the memory clock') 'Good') }
+    if ($mode.Mode -eq '1:2') { return (Info-Line 'Memory controller' ($t + '   1:2 (half the memory clock)') 'Sub') }
+    return (Info-Line 'Memory controller' ($t + '   not 1:1 or 1:2 (memory clock ' + (Fmt-N $m 0) + ' MHz)') 'Warn')
+}
+# The "DRAM voltage" line
+function Info-VoltLine {
+    param($sn, $lv)
+    if ($sn -and $null -ne $sn.Vdimm) {
+        $t = (Fmt-N $sn.Vdimm 2) + ' V'
+        if ($sn.VdimmIo) { $t += '   (the CPU''s memory I/O reading)' }
+        return (Info-Line 'DRAM voltage' $t 'Text')
+    }
+    if (-not $lv) { return (Info-Line 'DRAM voltage' 'Reading...' 'Dim') }
+    if ($lv.Hwi -and [string]$lv.HwiVia) { return (Info-Line 'DRAM voltage' 'no DRAM voltage row in HWiNFO' 'Dim') }
+    return (Info-Line 'DRAM voltage' 'needs HWiNFO running' 'Dim')
+}
+function Info-RamCard {
+    param($d)
+    $r = $null; if ($d.Static) { $r = $d.Static.Ram }
+    if (-not $r) { return (Info-Card 'info:ram' 'Memory' '' @((Info-Reading))) }
+    $lv = $d.Live
+    $sn = $null; if ($lv) { $sn = $lv.Sensors }
+    $mods = @($r.Modules)
+    $sub = (Fmt-N $r.TotalGB 0) + ' GB'
+    if ($r.Type) { $sub += ' ' + [string]$r.Type }
+    if ($mods.Count -gt 0) { $sub += ('   ({0} x {1} GB)' -f $mods.Count, (Fmt-N $mods[0].GB 0)) }
+    $lines = @()
+    if ($lv -and $null -ne $lv.RamUsedMB -and $null -ne $lv.RamTotalMB -and [double]$lv.RamTotalMB -gt 0) {
+        $pct = [Math]::Round(100.0 * [double]$lv.RamUsedMB / [double]$lv.RamTotalMB, 0)
+        $lines += , (Info-Line 'In use' ((Fmt-Gb $lv.RamUsedMB) + ' of ' + (Fmt-Gb $lv.RamTotalMB)) (Info-UsageKey $pct) $pct)
+    } else { $lines += , (Info-Line 'In use' 'Reading...' 'Dim') }
+    if ($r.SpeedMT -gt 0) {
+        $t = (Fmt-N $r.SpeedMT 0) + ' MT/s'
+        if ($r.Type) { $t = [string]$r.Type + '-' + [string][int]$r.SpeedMT + '   (' + (Fmt-N $r.SpeedMT 0) + ' MT/s)' }
+        if ($sn -and $null -ne $sn.RamMclk) { $t += '   memory clock ' + (Fmt-N $sn.RamMclk 0) + ' MHz' }
+        $lines += , (Info-Line 'Speed' $t)
+        if ($r.RatedMT -gt 0 -and $r.RatedMT -ne $r.SpeedMT) { $lines += , (Info-Line 'Module rating' ((Fmt-N $r.RatedMT 0) + ' MT/s')) }
+    } else { $lines += , (Info-Line 'Speed' 'not reported by Windows' 'Dim') }
+    $tm = Info-Timings $sn
+    if ($tm) {
+        $t = $tm
+        if ($null -ne $sn.Trc -and $null -ne $sn.Trfc) { $t += ('   tRC {0}  tRFC {1}' -f [int]$sn.Trc, [int]$sn.Trfc) }
+        if ($sn.Cr) { $t += '   ' + [string]$sn.Cr }
+        $lines += , (Info-Line 'Timings' $t)
+    } else { $lines += , (Info-Line 'Timings' 'needs HWiNFO running' 'Dim') }
+    $lines += , (Info-CtrlLine $sn $r $lv)
+    $lines += , (Info-VoltLine $sn $lv)
+    $shown = 0
+    foreach ($m in $mods) {
+        if ($shown -ge 4) { break }
+        $txt = (Fmt-N $m.GB 0) + ' GB'
+        $who = (([string]$m.Maker + ' ' + [string]$m.Part).Trim())
+        if ($who) { $txt += '   ' + $who }
+        $slot = [string]$m.Slot; if (-not $slot) { $slot = 'Module' }
+        $lines += , (Info-Line $slot $txt 'Sub')
+        $shown++
+    }
+    $chip = ''; $ck = 'Sub'
+    if ($tm) { $chip = 'Timings: HWiNFO'; $ck = 'Good' }
+    return (Info-Card 'info:ram' 'Memory' $sub $lines '' $chip $ck)
+}
+
+# a drive size the way the makers write it (decimal): 2000398934016 -> "2.0 TB", 512110190592 -> "512 GB"
+function Fmt-Drive {
+    param($Bytes)
+    if ($null -eq $Bytes -or [double]$Bytes -le 0) { return '' }
+    $b = [double]$Bytes
+    if ($b -ge 1e12) { return ((Fmt-N ($b / 1e12) 1) + ' TB') }
+    return ((Fmt-N ($b / 1e9) 0) + ' GB')
+}
+# "NVMe SSD", "SATA HDD": the connection and the kind of drive, as far as Windows says
+function Fmt-DriveKind {
+    param([string]$Bus, [string]$Media)
+    $k = @()
+    if ($Bus -and $Bus -notmatch '^(Unknown|RAID|Virtual|Spaces|File Backed Virtual)$') { $k += $Bus }
+    if ($Media -and $Media -notmatch '^(Unspecified|Unknown)$') { $k += $Media }
+    return ($k -join ' ')
+}
+function Info-StorageCard {
+    param($d)
+    $st = $null; if ($d.Static) { $st = $d.Static.Storage }
+    if (-not $d.Static) { return (Info-Card 'info:storage' 'Storage' '' @((Info-Reading)) '' '' 'Sub' 2) }
+    $drives = @($st)
+    if ($null -eq $st -or $drives.Count -eq 0) {
+        return (Info-Card 'info:storage' 'Storage' '' @((Info-Line 'Drives' 'Windows did not list any here' 'Dim')) '' '' 'Sub' 2)
+    }
+    $lv = $d.Live
+    $nums = $null; if ($lv) { $nums = $lv.Storage }
+    $lines = @()
+    $n = 0
+    $worst = ''
+    foreach ($x in $drives) {
+        $n++
+        if ($n -gt 4) { break }
+        $t = ([string]$x.Name); if (-not $t) { $t = 'Drive ' + $n }
+        $kind = Fmt-DriveKind ([string]$x.Bus) ([string]$x.Media)
+        $sz = Fmt-Drive $x.Bytes
+        $v = $t
+        if ($sz) { $v += '   ' + $sz }
+        if ($kind) { $v += '   ' + $kind }
+        $lines += , (Info-Line ('Drive ' + $n) $v)
+        $m = $null; if ($nums -and $nums.ContainsKey([string]$x.Id)) { $m = $nums[[string]$x.Id] }
+        $temp = $null; if ($m) { $temp = $m.Temp }
+        if ($null -ne $temp -or $nums) { $lines += , (Info-TempLine 'Temperature' $temp 'not reported by this drive') }
+        else { $lines += , (Info-Line 'Temperature' 'Reading...' 'Dim') }
+        if ($m -and ($null -ne $m.Wear -or $null -ne $m.Hours)) {
+            $w = @()
+            $wk = 'Text'
+            if ($null -ne $m.Wear) { $w += ((Fmt-N $m.Wear 0) + ' % of its life used'); if ([double]$m.Wear -ge 90) { $wk = 'Bad' } elseif ([double]$m.Wear -ge 70) { $wk = 'Warn' } }
+            if ($null -ne $m.Hours) { $w += ((Fmt-N $m.Hours 0) + ' h powered on') }
+            $lines += , (Info-Line 'Wear' ($w -join '   ') $wk)
+        }
+        $h = [string]$x.Health
+        if ($h -and $h -ne 'Healthy') {
+            $hk = 'Warn'; if ($h -match 'Unhealthy') { $hk = 'Bad' }
+            $lines += , (Info-Line 'Health' $h $hk)
+            if ($hk -eq 'Bad') { $worst = 'Bad' } elseif (-not $worst) { $worst = 'Warn' }
+        }
+    }
+    if ($drives.Count -gt 4) { $lines += , (Info-Line 'More' (('and {0} more drive' -f ($drives.Count - 4)) + $(if ($drives.Count - 4 -gt 1) { 's' } else { '' })) 'Dim') }
+    $chip = ''; $ck = 'Sub'
+    if ($worst -eq 'Bad') { $chip = 'A drive is unhealthy'; $ck = 'Bad' }
+    elseif ($worst -eq 'Warn') { $chip = 'Check a drive'; $ck = 'Warn' }
+    else { $chip = 'All drives healthy'; $ck = 'Good' }
+    $sub = '{0} drive{1}' -f $drives.Count, $(if ($drives.Count -eq 1) { '' } else { 's' })
+    return (Info-Card 'info:storage' 'Storage' $sub $lines '' $chip $ck 2)
+}
+
+function Info-BoardCard {
+    param($d)
+    $b = $null; if ($d.Static) { $b = $d.Static.Board }
+    if (-not $b) { return (Info-Card 'info:board' 'Motherboard' '' @((Info-Reading))) }
+    # the title line is the model alone (the maker's full name is long and has its own line below)
+    $sub = ([string]$b.Product).Trim()
+    if (-not $sub) { $sub = ([string]$b.Maker).Trim() }
+    if (-not $sub) { $sub = 'Not reported by the firmware' }
+    $lines = @()
+    if ($b.Maker) { $lines += , (Info-Line 'Maker' ([string]$b.Maker)) }
+    if ($b.Version -and $b.Version -notmatch '^(Default string|To be filled|None|Not Applicable|x\.x)') { $lines += , (Info-Line 'Revision' ([string]$b.Version)) }
+    $v = [string]$b.BiosVersion; if (-not $v) { $v = '-' }
+    $lines += , (Info-Line 'BIOS version' $v)
+    $day = Fmt-Day $b.BiosDate
+    if ($day) { $lines += , (Info-Line 'BIOS date' $day) }
+    if ($b.BiosVendor) { $lines += , (Info-Line 'BIOS maker' ([string]$b.BiosVendor)) }
+    return (Info-Card 'info:board' 'Motherboard' $sub $lines)
+}
+
+# One card per screen. $compact = the short version for the Home page.
+function Info-DisplayCards {
+    param($d, [bool]$compact)
+    $lv = $d.Live
+    $disp = $null; if ($lv) { $disp = $lv.Displays }
+    if (-not $disp) {
+        $msg = 'Reading your screens...'
+        if ($lv) { $msg = 'Not read yet' }
+        return @((Info-Card 'info:disp' 'Display' '' @((Info-Line 'Status' $msg 'Dim'))))
+    }
+    if ($disp.Why -and -not @($disp.List).Count) {
+        return @((Info-Card 'info:disp' 'Display' '' @() ('The screens could not be read: ' + [string]$disp.Why)))
+    }
+    $cards = @()
+    $n = 0
+    foreach ($s in @($disp.List)) {
+        $n++
+        $sm = $s.Summary
+        $title = 'Display ' + $n
+        if ($s.Primary) { $title += ' (main)' }
+        $name = [string]$s.Name; if (-not $name) { $name = 'Screen ' + $n }
+        $lines = @()
+        $lines += , (Info-Line 'Resolution' ('{0} x {1}' -f $sm.W, $sm.H))
+        $hz = [string]$sm.Hz + ' Hz'
+        $chip = ''; $ck = 'Sub'
+        $rk = 'Text'
+        $atMax = ($sm.MaxHzHere -gt 0 -and $sm.Hz -ge $sm.MaxHzHere)
+        if ($sm.MaxHzHere -gt 0 -and $sm.Hz -lt $sm.MaxHzHere) {
+            $rk = 'Warn'; $chip = 'Below its top rate'; $ck = 'Warn'
+            $hz += ('   (up to {0} Hz)' -f $sm.MaxHzHere)
+        } elseif ($atMax) { $rk = 'Good'; $chip = 'At its top rate'; $ck = 'Good' }
+        $lines += , (Info-Line 'Refresh rate' $hz $rk)
+        if ($s.HzExact -and [Math]::Abs([double]$s.HzExact - [double]$sm.Hz) -ge 0.01) { $lines += , (Info-Line 'Exact rate' ('{0} Hz' -f (Fmt-N $s.HzExact 3))) }
+        $hdr = 'unknown'; $hk = 'Dim'
+        switch ([string]$s.Hdr) { 'on' { $hdr = 'On'; $hk = 'Good' } 'off' { $hdr = 'Off'; $hk = 'Text' } 'none' { $hdr = 'Not supported'; $hk = 'Dim' } }
+        $lines += , (Info-Line 'HDR' $hdr $hk)
+        if (-not $compact) {
+            if ($sm.MaxHzHere -gt 0) { $lines += , (Info-Line 'Highest at this size' ([string]$sm.MaxHzHere + ' Hz')) }
+            if ($sm.TopHz -gt 0) { $lines += , (Info-Line 'Highest it lists' ('{0} Hz at {1} x {2}' -f $sm.TopHz, $sm.TopW, $sm.TopH)) }
+            $rates = @($sm.RatesHere)
+            if ($rates.Count -gt 0) {
+                $shown = @($rates | Select-Object -Last 8)
+                $t = ($shown -join ', ') + ' Hz'
+                if ($rates.Count -gt $shown.Count) { $t = '... ' + $t }
+                $lines += , (Info-Line 'Rates at this size' $t)
+            }
+            if ($sm.Biggest) { $lines += , (Info-Line 'Biggest picture' ('{0} x {1}' -f $sm.Biggest.W, $sm.Biggest.H)) }
+            $lines += , (Info-Line 'Modes listed' ([string]$sm.ModeCount))
+        }
+        $cards += , (Info-Card ('info:disp' + $n) $title $name $lines '' $chip $ck)
+    }
+    if ($cards.Count -eq 0) { $cards += , (Info-Card 'info:disp' 'Display' '' @() 'No screen was found.') }
+    return $cards
+}
+
+function Info-SensorCard {
+    param($d)
+    $lv = $d.Live
+    if (-not $lv) { return (Info-Card 'info:sensors' 'Sensors' '' @((Info-Reading)) '' '' 'Sub' 2) }
+    $sn = $lv.Sensors
+    $lines = @()
+    $g = $lv.Gpu
+    if ($g -and $g.Source -eq 'nvidia-smi') { $lines += , (Info-Line 'nvidia-smi' ('found: ' + [string]$lv.Smi) 'Good') }
+    else { $lines += , (Info-Line 'nvidia-smi' 'not found (GPU temperature, power and clock need it)' 'Dim') }
+    $hv = [string]$lv.HwiVia
+    if ($lv.Hwi -and $hv) { $lines += , (Info-Line 'HWiNFO' ('running, readings from its ' + $hv) 'Good') }
+    elseif ($lv.Hwi -and [string]$lv.HwiWhy -eq 'stale') { $lines += , (Info-Line 'HWiNFO' 'running, but its readings are frozen (its Sensors window is closed or paused)' 'Warn') }
+    elseif ($lv.Hwi) { $lines += , (Info-Line 'HWiNFO' 'running, but not sharing its readings' 'Warn') }
+    else { $lines += , (Info-Line 'HWiNFO' 'not running' 'Dim') }
+    # which HWiNFO / LibreHardwareMonitor rows the CPU numbers were taken from, so they can be compared with that program
+    if ($sn -and [string]$sn.CpuTempFrom) { $lines += , (Info-Line 'CPU temperature' ('from the row "' + [string]$sn.CpuTempFrom + '"') 'Sub') }
+    if ($sn -and [string]$sn.CpuPowerFrom) { $lines += , (Info-Line 'CPU power' ('from the row "' + [string]$sn.CpuPowerFrom + '"') 'Sub') }
+    if ($sn -and [string]$sn.UclkFrom) { $lines += , (Info-Line 'Memory controller' ('from the row "' + [string]$sn.UclkFrom + '"') 'Sub') }
+    elseif ($hv) { $lines += , (Info-Line 'Memory controller' 'no row named "Memory Controller Clock" in HWiNFO' 'Dim') }
+    if ($sn -and [string]$sn.VdimmFrom) { $lines += , (Info-Line 'DRAM voltage' ('from the row "' + [string]$sn.VdimmFrom + '"') 'Sub') }
+    elseif ($hv) { $lines += , (Info-Line 'DRAM voltage' 'no row named DRAM, DIMM, VDIMM or CPU VDDIO in HWiNFO' 'Dim') }
+    if ($lv.Lhm) { $lines += , (Info-Line 'LibreHardwareMonitor' 'running' 'Good') } else { $lines += , (Info-Line 'LibreHardwareMonitor' 'not running' 'Dim') }
+    $missing = ($null -eq $sn -or ($null -eq $sn.CpuTemp -or $null -eq $sn.CpuPower -or -not (Info-Timings $sn)))
+    $note = ''
+    if ($missing) {
+        $note = 'Windows itself does not report the CPU temperature, the CPU power or the memory timings: they sit behind a driver that only a hardware monitor loads, and this app installs none. '
+        if ($lv.Hwi -and -not $hv) {
+            if ([string]$lv.HwiWhy -eq 'denied') {
+                $note += 'HWiNFO is running but Windows refused this app access to the readings it shares: start both with the same rights (both as administrator).'
+            } elseif ([string]$lv.HwiWhy -eq 'stale') {
+                $note += 'HWiNFO is running but has stopped updating the readings it shares, so they are not shown (they would be old numbers). Press "Start HWiNFO" at the top to restart it with its Sensors window running, or open HWiNFO''s Sensors window yourself and let it run (it can be minimised); a paused Sensors window freezes them.'
+            } else {
+                $note += 'HWiNFO is running but is not sharing its readings. Press "Start HWiNFO" at the top: it restarts HWiNFO with "Shared Memory Support" turned on and its Sensors window running (the free HWiNFO switches it off again after 12 hours, so press it again then). By hand: in HWiNFO open Settings and turn on "Shared Memory Support", and keep its Sensors window running (it can be minimised). The other way is to tick "Report value in Gadget" on the CPU temperature, CPU package power and memory timing rows.'
+            }
+        } elseif (-not $lv.Hwi) {
+            $note += 'Press "Start HWiNFO" at the top: it starts HWiNFO (free) with its sensors on and "Shared Memory Support" turned on in its settings file. The graphics card (through nvidia-smi), the processor usage and clock, the memory speed and the drives are read without it.'
+        } else {
+            $note += 'HWiNFO is sharing its readings, but it has no row this app recognises for the missing numbers. The CPU rows are matched by their usual HWiNFO names, such as "CPU (Tctl/Tdie)" and "CPU Package Power".'
+        }
+    }
+    return (Info-Card 'info:sensors' 'Sensors' '' $lines $note '' 'Sub' 2)
+}
+
+# The note on the Display page: there is no switch that forces a refresh rate
+function Info-RateNote {
+    param([int]$Span)
+    $t = 'There is no Windows setting or registry switch that forces a refresh rate, so this app has none to offer. What Windows uses is the rate chosen under Settings > System > Display > Advanced display; it is kept after a restart. Check the cards: "At its top rate" means the screen is running the highest rate it lists for that picture size. ' +
+         'A game can still ask for a lower rate. With an NVIDIA card, NVIDIA Control Panel > Manage 3D settings > Preferred refresh rate > Highest available stops that; NVIDIA keeps that option in its own driver profiles, not in the Windows registry, so this app does not change it. ' +
+         'A lower rate than expected is usually the cable or port (use DisplayPort or the HDMI port the monitor says supports its top rate) or the monitor menu.'
+    return (Info-Card 'info:ratenote' 'Keeping the full refresh rate' '' @() $t '' 'Sub' $Span)
+}
+
+# The cards of an info page, or the live cards on top of a settings page (Display)
+function Get-PageCards {
+    param([string]$cat)
+    $list = @()
+    if ($cat -eq $script:PageHome) {
+        $d = Info-Data
+        $list += , (Info-OsCard $d)
+        $list += , (Info-CpuCard $d)
+        $list += , (Info-GpuCard $d)
+        $list += , (Info-RamCard $d)
+        $list += , (Info-BoardCard $d)
+        foreach ($c in @(Info-DisplayCards $d $true)) { $list += , $c }
+        $list += , (Info-StorageCard $d)
+        $list += , (Info-SensorCard $d)
+    } elseif ($cat -eq $script:DisplayCat) {
+        $d = Info-Data
+        $cards = @(Info-DisplayCards $d $false)
+        foreach ($c in $cards) { $list += , $c }
+        $span = 1; if (($cards.Count % 2) -eq 0) { $span = 2 }
+        $list += , (Info-RateNote $span)
+    }
+    foreach ($c in $list) { $c.Cat = $cat }
+    return $list
+}
+
+# ----------------------------------------------------------- size and painting ----
+# Break a text into lines no wider than $Width pixels
+function Info-Wrap {
+    param([string]$Text, $Font, [int]$Width)
+    $out = @()
+    foreach ($para in ([string]$Text -split "`n")) {
+        $line = ''
+        foreach ($word in ($para -split ' ')) {
+            if (-not $word) { continue }
+            $try = $word
+            if ($line) { $try = $line + ' ' + $word }
+            if ($line -and (Ui-TextWidth $try $Font) -gt $Width) { $out += $line; $line = $word } else { $line = $try }
+        }
+        if ($line) { $out += $line }
+    }
+    return $out
+}
+
+# Work out the height of a card that is $w wide (the gap below it included) and wrap its note
+function Info-Prepare {
+    param($e, [int]$w)
+    $M = $script:M
+    $iw = $w - 2 * $M.Pad
+    $top = Px 40
+    if ($e.Sub) { $top = Px 64 }
+    $h = $top
+    foreach ($l in @($e.Lines)) { if ($null -ne $l.Bar) { $h += Px 32 } else { $h += Px 22 } }
+    $e.NoteLines = @()
+    if ($e.Note) {
+        $e.NoteLines = @(Info-Wrap ([string]$e.Note) (Ui-Font 'cardDesc') $iw)
+        $h += (Px 8) + (@($e.NoteLines).Count * (Px 18))
+    }
+    $h += Px 16
+    $e.Top = $top
+    $e.W = $w
+    $e.H = $h + $M.Gap
+}
+
+function Ui-PaintInfo {
+    param($g, $e, [int]$y)
+    $Th = $script:Th
+    $M = $script:M
+    $TF = $script:TF
+    $x = [int]$e.X
+    $cw = [int]$e.W
+    $ch = $e.H - $M.Gap
+    Ui-FillRound $g $Th.Card $x $y $cw $ch $M.Radius
+    Ui-StrokeRound $g $Th.Edge 1 $x $y $cw $ch $M.Radius
+    $ix = $x + $M.Pad
+    $iw = $cw - 2 * $M.Pad
+    $chipW = 0
+    if ($e.Chip) {
+        $font = Ui-Font 'smallb'
+        $chipW = (Ui-Measure $g ([string]$e.Chip) $font) + (Px 22)
+        $cx = $ix + $iw - $chipW
+        $key = [string]$e.ChipKey
+        Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx ($y + (Px 10)) $chipW (Px 22) (Px 6)
+        Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx ($y + (Px 10)) $chipW (Px 22) $TF.C
+    }
+    $tw = $iw
+    if ($chipW -gt 0) { $tw = $iw - $chipW - (Px 8) }
+    Ui-Text $g ([string]$e.Title).ToUpperInvariant() (Ui-Font 'cap') $Th.Dim $ix ($y + (Px 14)) $tw (Px 14) $TF.L
+    if ($e.Sub) { Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $ix ($y + (Px 30)) $iw (Px 26) $TF.L }
+    $ly = $y + [int]$e.Top
+    $lw = [Math]::Min((Px 150), [int]($iw * 0.42))
+    foreach ($l in @($e.Lines)) {
+        $ck = [string]$l.K
+        if (-not $ck) { $ck = 'Text' }
+        Ui-Text $g ([string]$l.L) (Ui-Font 'small') $Th.Mute $ix $ly $lw (Px 20) $TF.L
+        Ui-Text $g ([string]$l.V) (Ui-Font 'uib') $Th[$ck] ($ix + $lw) $ly ($iw - $lw) (Px 20) $TF.L
+        if ($null -ne $l.Bar) {
+            $by = $ly + (Px 23)
+            $bh = Px 5
+            Ui-FillRound $g $Th.Raised $ix $by $iw $bh 2
+            $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$l.Bar))
+            if ($pct -gt 0) {
+                $fw = [Math]::Max($bh, [int]($iw * $pct / 100.0))
+                $bc = $Th.Accent
+                if ($pct -ge 95) { $bc = $Th.Bad } elseif ($pct -ge 85) { $bc = $Th.Warn }
+                Ui-FillRound $g $bc $ix $by $fw $bh 2
+            }
+            $ly += Px 32
+        } else {
+            $ly += Px 22
+        }
+    }
+    $ny = $ly + (Px 6)
+    foreach ($nl in @($e.NoteLines)) {
+        Ui-Text $g ([string]$nl) (Ui-Font 'cardDesc') $Th.Mute $ix $ny $iw (Px 18) $TF.L
+        $ny += Px 18
+    }
+}
+
+# ----------------------------------------------------------- the background reader ----
+# The one place that starts a worker for the system information. $Kind = 'loop' (the live numbers, until the window closes).
+# Tests replace this function.
+function Start-SysJob {
+    param([string]$Kind)
+    $sh = $script:SysShared
+    if (-not $sh) { throw 'the system reader has no shared state' }
+    $rs = Open-WorkerRunspace
+    $rs.SessionStateProxy.SetVariable('SysShared', $sh)
+    $call = 'Invoke-SysLoop'
+    $ps = [System.Management.Automation.PowerShell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($sysEngine.ToString() + "`r`n" + $call)
+    $async = $ps.BeginInvoke()
+    return @{ PS = $ps; RS = $rs; Async = $async; Kind = $Kind }
+}
+
+function Start-SysWorker {
+    if ($script:SysWorker) { return }
+    $script:SysShared = [hashtable]::Synchronized(@{ Stop = $false; Active = $false; Force = $false; Ver = 0; Static = $null; Live = $null })
+    $script:SysSeen = -1
+    $script:SysWorker = Start-SysJob 'loop'
+}
+
+# end the background reader without waiting for the call it is in the middle of
+function Stop-SysWorker {
+    $sh = $script:SysShared
+    if ($sh) { $sh.Stop = $true }
+    $j = $script:SysWorker
+    if ($j) {
+        try { [void]$j.PS.BeginStop($null, $null) } catch { }
+        try { $j.RS.CloseAsync() } catch { }
+    }
+    $script:SysWorker = $null
+}
+
+# The page that is showing needs the live numbers
+function Ui-OnPageShown {
+    $sh = $script:SysShared
+    if (-not $sh) { return }
+    $text = ''
+    if ($script:UI.find) { $text = ([string]$script:UI.find.Text).Trim() }
+    $page = [string]$script:NavCat
+    if ($text) { $page = '' }
+    $live = ($page -eq $script:PageHome -or $page -eq $script:DisplayCat)
+    if ([bool]$sh.Active -ne $live) {
+        $sh.Active = $live
+        if ($live) { $sh.Force = $true }
+    }
+}
+
+# Called by the timer: when the reader has something new, redraw the cards that show it
+function Ui-SysTick {
+    $sh = $script:SysShared
+    if (-not $sh) { return }
+    $redo = $false
+    if ([int]$sh.Ver -ne $script:SysSeen) { $script:SysSeen = [int]$sh.Ver; $redo = $true }
+    if ($redo) { Ui-RefreshInfo }
+}
+
+# Make the cards of the page that is showing again from the newest data
+function Ui-RefreshInfo {
+    $text = ''
+    if ($script:UI.find) { $text = ([string]$script:UI.find.Text).Trim() }
+    if ($text) { return }
+    $page = [string]$script:NavCat
+    $has = (Test-InfoPage $page) -or ($page -eq $script:DisplayCat -and -not $script:Filtering)
+    if (-not $has) { return }
+    foreach ($g in $script:Groups) {
+        if ([string]$g.Cat -eq $page) { $g.Info = @(Get-PageCards $page) }
+    }
+    Ui-Layout
+    $script:DList = $true
+}
+
+# ----------------------------------------------------------- the page button ----
+# One button in the header that belongs to the page: "Display settings" on Display, "Start HWiNFO" on Home
+function Ui-PageButtonText {
+    param([string]$page)
+    if ($page -eq $script:DisplayCat) { return 'Display settings' }
+    if ($page -eq $script:PageHome) { return 'Start HWiNFO' }
+    return ''
+}
+function Ui-DoPageButton {
+    $page = [string]$script:NavCat
+    if ($page -eq $script:DisplayCat) {
+        try { Start-Process -FilePath 'ms-settings:display-advanced' } catch { Ui-Status ('Could not open Settings: ' + $_.Exception.Message) }
+        return
+    }
+    if ($page -eq $script:PageHome) { Ui-StartHwinfo }
+}
+
+# ----------------------------------------------------------- start HWiNFO ----
+# HWiNFO is what gives this app the CPU temperature, the CPU power and the memory timings (Windows has no readings for them). It shares them
+# only while "Shared Memory Support" is on AND its Sensors window is running. HWiNFO keeps its general options in a settings file next to the
+# program, HWiNFO64.INI (HWiNFO32.INI for the 32-bit one), in a [Settings] section; the keys used here are the ones that file is known to hold:
+#   SensorsSM = 1           Shared Memory Support on
+#   SensorsOnly = 1         start with only the Sensors window (so the readings run without anybody opening it)
+#   MinimalizeSensors = 1   keep that window minimised (HWiNFO spells it this way)
+#   OpenSensors = 1         open the Sensors window when HWiNFO starts ("Show Sensors on Startup")
+#   ShowWelcomeAndProgress = 0   do not show the Welcome screen: without this HWiNFO waits at it for a click on "Run" every time it starts
+# HWiNFO reads the file when it starts, so a copy that is running has to be closed first. Only those five lines are touched, every other line
+# stays as it was, and the first time a copy of the file as it was is kept next to it. The file is only edited when there is one to edit or the
+# program is found; nothing is written anywhere else.
+$script:HwiKeys = [ordered]@{ SensorsSM = '1'; SensorsOnly = '1'; MinimalizeSensors = '1'; OpenSensors = '1'; ShowWelcomeAndProgress = '0' }
+$script:HwiKeyInfo = [ordered]@{ SensorsSM = 'Shared Memory Support on'; SensorsOnly = 'start with only the Sensors window'; MinimalizeSensors = 'keep that window minimised'; OpenSensors = 'open the Sensors window at start'; ShowWelcomeAndProgress = 'no Welcome screen, so nothing has to be clicked' }
+$script:HwiBackupSuffix = '.before-Headroom'
+$script:HwiBackupSuffixOld = '.before-FasterWin'     # the copy made by the builds from before the app was called Headroom: when it is there it is the copy
+# where the copy of the settings file is kept (next to it): the old name when that copy exists, so that a second copy of a file that was
+# already changed is never made, otherwise the new name
+function Hwi-BackupPath {
+    param([string]$Ini)
+    $old = $Ini + $script:HwiBackupSuffixOld
+    if (Test-Path -LiteralPath $old) { return $old }
+    return ($Ini + $script:HwiBackupSuffix)
+}
+$script:HwiDownload = 'https://www.hwinfo.com/download/'
+
+# where a HWiNFO program could be, best guess first: the copy that is running, then the places the installer and the usual ways of
+# installing it leave a trace (the uninstall list, App Paths, the usual folders, shortcuts in the Start menu and on the desktop)
+function Hwi-Candidates {
+    $c = New-Object System.Collections.ArrayList
+    $names = @('HWiNFO64.exe', 'HWiNFO32.exe')
+    if (-not [Environment]::Is64BitOperatingSystem) { $names = @('HWiNFO32.exe', 'HWiNFO64.exe') }
+    foreach ($pn in 'HWiNFO64', 'HWiNFO32') {
+        try {
+            foreach ($p in @([System.Diagnostics.Process]::GetProcessesByName($pn))) {
+                try { if ($p.MainModule.FileName) { [void]$c.Add([string]$p.MainModule.FileName) } } catch { } finally { try { $p.Dispose() } catch { } }
+            }
+        } catch { }
+    }
+    foreach ($root in 'HKLM', 'HKCU') {
+        foreach ($sub in 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall', 'SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall') {
+            try {
+                if ($root -eq 'HKLM') { $r = [Microsoft.Win32.Registry]::LocalMachine } else { $r = [Microsoft.Win32.Registry]::CurrentUser }
+                $k = $r.OpenSubKey($sub)
+                if (-not $k) { continue }
+                try {
+                    foreach ($n in @($k.GetSubKeyNames())) {
+                        $s = $k.OpenSubKey($n)
+                        if (-not $s) { continue }
+                        try {
+                            if (([string]$s.GetValue('DisplayName', '')) -notlike 'HWiNFO*') { continue }
+                            $loc = ([string]$s.GetValue('InstallLocation', '')).Trim().Trim('"')
+                            if ($loc) { foreach ($nm in $names) { [void]$c.Add((Join-Path $loc $nm)) } }
+                            $ico = ([string]$s.GetValue('DisplayIcon', '')).Trim().Trim('"')
+                            $ico = ($ico -replace ',\s*-?\d+$', '').Trim().Trim('"')
+                            if ($ico) { [void]$c.Add($ico) }
+                        } finally { $s.Close() }
+                    }
+                } finally { $k.Close() }
+            } catch { }
+        }
+        foreach ($nm in $names) {
+            try {
+                if ($root -eq 'HKLM') { $r = [Microsoft.Win32.Registry]::LocalMachine } else { $r = [Microsoft.Win32.Registry]::CurrentUser }
+                $k = $r.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\' + $nm)
+                if ($k) { try { $v = ([string]$k.GetValue('', '')).Trim().Trim('"'); if ($v) { [void]$c.Add($v) } } finally { $k.Close() } }
+            } catch { }
+        }
+    }
+    $dirs = @()
+    foreach ($e in 'ProgramFiles', 'ProgramFiles(x86)') {
+        $b = [Environment]::GetEnvironmentVariable($e)
+        if ($b) { $dirs += (Join-Path $b 'HWiNFO64'); $dirs += (Join-Path $b 'HWiNFO32'); $dirs += (Join-Path $b 'HWiNFO') }
+    }
+    $la = [Environment]::GetFolderPath('LocalApplicationData')
+    if ($la) {
+        $dirs += (Join-Path $la 'Programs\HWiNFO64'); $dirs += (Join-Path $la 'Programs\HWiNFO32')
+        $dirs += (Join-Path $la 'Microsoft\WinGet\Links')
+        try { foreach ($d in @(Get-ChildItem -LiteralPath (Join-Path $la 'Microsoft\WinGet\Packages') -Directory -Filter 'REALiX.HWiNFO*' -ErrorAction Stop)) { $dirs += $d.FullName } } catch { }
+    }
+    $up = [Environment]::GetEnvironmentVariable('USERPROFILE')
+    if ($up) { $dirs += (Join-Path $up 'scoop\apps\hwinfo\current') }
+    foreach ($d in $dirs) { foreach ($nm in $names) { [void]$c.Add((Join-Path $d $nm)) } }
+    # shortcuts (the Start menu folders two levels down, and the desktops), read with Windows' own shortcut reader
+    $lnks = @()
+    foreach ($f in 'CommonPrograms', 'Programs') {
+        try { $d = [Environment]::GetFolderPath($f); if ($d) { $lnks += @(Get-ChildItem -LiteralPath $d -Recurse -Depth 2 -Filter 'HWiNFO*.lnk' -ErrorAction Stop) } } catch { }
+    }
+    foreach ($f in 'Desktop', 'CommonDesktopDirectory') {
+        try { $d = [Environment]::GetFolderPath($f); if ($d) { $lnks += @(Get-ChildItem -LiteralPath $d -Filter 'HWiNFO*.lnk' -ErrorAction Stop) } } catch { }
+    }
+    if ($lnks.Count -gt 0) {
+        $sh = $null
+        try {
+            $sh = New-Object -ComObject WScript.Shell
+            foreach ($l in $lnks) { try { $t = [string]$sh.CreateShortcut($l.FullName).TargetPath; if ($t) { [void]$c.Add($t) } } catch { } }
+        } catch { } finally { if ($sh) { try { [void][System.Runtime.InteropServices.Marshal]::ReleaseComObject($sh) } catch { } } }
+    }
+    return @($c)
+}
+
+# The first candidate that is the 64-bit HWiNFO program (HWiNFO64.exe), or ''. On a 32-bit Windows (which has no 64-bit program) it is the 32-bit one.
+function Hwi-FindExe {
+    $want = 'HWiNFO32.exe'
+    if ([Environment]::Is64BitOperatingSystem) { $want = 'HWiNFO64.exe' }
+    foreach ($p in @(Hwi-Candidates)) {
+        $s = [string]$p
+        if (-not $s) { continue }
+        try {
+            if ((Split-Path -Leaf $s) -ne $want) { continue }
+            if (Test-Path -LiteralPath $s -PathType Leaf) { return $s }
+        } catch { }
+    }
+    return ''
+}
+
+function Hwi-IsRunning {
+    foreach ($pn in 'HWiNFO64', 'HWiNFO32') {
+        try {
+            $l = @([System.Diagnostics.Process]::GetProcessesByName($pn))
+            $n = $l.Count
+            foreach ($p in $l) { try { $p.Dispose() } catch { } }
+            if ($n -gt 0) { return $true }
+        } catch { }
+    }
+    return $false
+}
+
+# Closes a running HWiNFO: politely first, and by force after a few seconds. $true when none is left.
+function Hwi-Close {
+    foreach ($pn in 'HWiNFO64', 'HWiNFO32') {
+        $list = @()
+        try { $list = @([System.Diagnostics.Process]::GetProcessesByName($pn)) } catch { }
+        foreach ($p in $list) {
+            try {
+                try { [void]$p.CloseMainWindow() } catch { }
+                if (-not $p.WaitForExit(3000)) { $p.Kill(); [void]$p.WaitForExit(3000) }
+            } catch { } finally { try { $p.Dispose() } catch { } }
+        }
+    }
+    Start-Sleep -Milliseconds 400
+    return (-not (Hwi-IsRunning))
+}
+
+function Hwi-Launch {
+    param([string]$Exe)
+    Start-Process -FilePath $Exe -WorkingDirectory (Split-Path -Parent $Exe)
+}
+
+# The settings file that belongs to a program: HWiNFO64.exe -> HWiNFO64.INI in the same folder
+function Hwi-IniPath {
+    param([string]$Exe)
+    return (Join-Path (Split-Path -Parent $Exe) (([System.IO.Path]::GetFileNameWithoutExtension($Exe)) + '.INI'))
+}
+
+# $Text with the keys of $Keys set in its [Settings] section. Every other line, and the file's own line endings, stay as they are; a key
+# that is already right is left alone. Returns @{ Text; Changes } where Changes says what was different ('SensorsSM: 0 -> 1').
+function Hwi-IniMerge {
+    param([string]$Text, $Keys)
+    $nl = "`r`n"
+    if ($Text.IndexOf("`r`n", [System.StringComparison]::Ordinal) -lt 0 -and $Text.IndexOf("`n", [System.StringComparison]::Ordinal) -ge 0) { $nl = "`n" }
+    $lines = New-Object System.Collections.ArrayList
+    if ($Text.Length -gt 0) {
+        foreach ($l in ($Text -split "\r?\n")) { [void]$lines.Add([string]$l) }
+        if ($Text.EndsWith("`n", [System.StringComparison]::Ordinal) -and $lines.Count -gt 0 -and [string]$lines[$lines.Count - 1] -eq '') { $lines.RemoveAt($lines.Count - 1) }
+    }
+    $changes = @()
+    $hdr = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) { if ([string]$lines[$i] -match '^\s*\[Settings\]\s*$') { $hdr = $i; break } }
+    if ($hdr -lt 0) {
+        if ($lines.Count -gt 0 -and ([string]$lines[$lines.Count - 1]).Trim() -ne '') { [void]$lines.Add('') }
+        [void]$lines.Add('[Settings]')
+        foreach ($k in $Keys.Keys) { [void]$lines.Add($k + '=' + [string]$Keys[$k]); $changes += ($k + ': (not set) -> ' + [string]$Keys[$k]) }
+    } else {
+        foreach ($k in $Keys.Keys) {
+            $want = [string]$Keys[$k]
+            $end = $lines.Count
+            for ($i = $hdr + 1; $i -lt $lines.Count; $i++) { if ([string]$lines[$i] -match '^\s*\[') { $end = $i; break } }
+            $found = $false
+            $re = '^\s*' + [regex]::Escape($k) + '\s*=\s*(.*?)\s*$'
+            for ($i = $hdr + 1; $i -lt $end; $i++) {
+                $m = [regex]::Match([string]$lines[$i], $re, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if (-not $m.Success) { continue }
+                $found = $true
+                if ([string]$m.Groups[1].Value -ne $want) {
+                    $changes += ($k + ': ' + [string]$m.Groups[1].Value + ' -> ' + $want)
+                    $lines[$i] = $k + '=' + $want
+                }
+            }
+            if (-not $found) {
+                $pos = $end
+                while ($pos -gt ($hdr + 1) -and ([string]$lines[$pos - 1]).Trim() -eq '') { $pos-- }
+                $lines.Insert($pos, ($k + '=' + $want))
+                $changes += ($k + ': (not set) -> ' + $want)
+            }
+        }
+    }
+    $out = (@($lines) -join $nl) + $nl
+    if ($changes.Count -eq 0) { $out = $Text }
+    return @{ Text = $out; Changes = @($changes) }
+}
+
+# The settings file as text with the encoding it had (plain text read as Latin-1, which turns every byte into one character and back, so
+# lines this app does not touch keep their bytes whatever the PC's code page; or UTF-8 / UTF-16 when it starts with a byte-order mark), so it
+# is written back the same way. $null when it cannot be read.
+function Hwi-IniRead {
+    param([string]$Path)
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        $enc = [System.Text.Encoding]::GetEncoding(28591)
+        $skip = 0
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $enc = New-Object System.Text.UTF8Encoding($true); $skip = 3 }
+        elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { $enc = New-Object System.Text.UnicodeEncoding($false, $true); $skip = 2 }
+        elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return $null }
+        return @{ Text = $enc.GetString($bytes, $skip, $bytes.Length - $skip); Enc = $enc }
+    } catch { return $null }
+}
+
+# What would be written for this program: @{ Ini; Existed; Text; Enc; Changes; Error }. Nothing is written here.
+function Hwi-Plan {
+    param([string]$Exe)
+    $ini = Hwi-IniPath $Exe
+    $plan = @{ Ini = $ini; Existed = $false; Text = ''; Enc = [System.Text.Encoding]::GetEncoding(28591); Changes = @(); Error = '' }
+    $txt = ''
+    if (Test-Path -LiteralPath $ini -PathType Leaf) {
+        $plan.Existed = $true
+        $r = Hwi-IniRead $ini
+        if (-not $r) { $plan.Error = 'the settings file could not be read (or is in a form this app does not edit)'; return $plan }
+        $txt = [string]$r.Text
+        $plan.Enc = $r.Enc
+    }
+    $m = Hwi-IniMerge $txt $script:HwiKeys
+    $plan.Text = [string]$m.Text
+    $plan.Changes = @($m.Changes)
+    return $plan
+}
+
+# Writes a plan: a copy of the file as it was (once), then the file. Returns '' or the reason it failed.
+function Hwi-Write {
+    param($Plan)
+    if (@($Plan.Changes).Count -eq 0) { return '' }
+    try {
+        $bak = Hwi-BackupPath ([string]$Plan.Ini)
+        if ($Plan.Existed -and -not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $Plan.Ini -Destination $bak -ErrorAction Stop }
+        $enc = $Plan.Enc
+        $bytes = @($enc.GetPreamble()) + @($enc.GetBytes([string]$Plan.Text))
+        [System.IO.File]::WriteAllBytes([string]$Plan.Ini, [byte[]]$bytes)
+        return ''
+    } catch { return [string]$_.Exception.Message }
+}
+
+function Hwi-PlanText {
+    param($Plan)
+    $t = "These options are kept in HWiNFO's settings file:`r`n  " + [string]$Plan.Ini + "`r`n"
+    foreach ($c in @($Plan.Changes)) {
+        $k = ([string]$c -split ':')[0]
+        $note = ''
+        if ($script:HwiKeyInfo.Contains($k)) { $note = '   (' + [string]$script:HwiKeyInfo[$k] + ')' }
+        $t += '    ' + $c + $note + "`r`n"
+    }
+    if ($Plan.Existed) { $t += 'A copy of the file as it is now is kept next to it as ' + (Split-Path -Leaf (Hwi-BackupPath ([string]$Plan.Ini))) + ". No other line is touched.`r`n" }
+    else { $t += "The file does not exist yet, so it is created with only these lines.`r`n" }
+    return $t
+}
+
+# What "Start HWiNFO" would do, worked out without changing anything and without asking anything. Returns @{ Code; Text; Exe; Running; Plan; Edits }:
+#   notfound   the 64-bit program was not found            busy      HWiNFO runs and this app has not read its first values yet
+#   shared     HWiNFO already runs and shares its readings  planerror the settings file cannot be edited
+#   ready      go ahead (Running = a copy has to be closed first, Edits = the settings file needs changes)
+function Hwi-Prepare {
+    $sh = $script:SysShared
+    $lv = $null
+    if ($sh) { $lv = $sh.Live }
+    $r = @{ Code = ''; Text = ''; Exe = ''; Running = $false; Plan = $null; Edits = $false }
+    $exe = Hwi-FindExe
+    if (-not $exe) { $r.Code = 'notfound'; $r.Text = 'HWiNFO was not found on this PC.'; return $r }
+    $r.Exe = $exe
+    $running = Hwi-IsRunning
+    $r.Running = $running
+    if ($running -and -not $lv) { $r.Code = 'busy'; $r.Text = 'Still reading your PC: press the button again in a moment.'; return $r }
+    if ($running -and [string]$lv.HwiVia) { $r.Code = 'shared'; $r.Text = 'HWiNFO is already running and sharing its readings with this app.'; return $r }
+    $plan = Hwi-Plan $exe
+    if ($plan.Error) { $r.Code = 'planerror'; $r.Text = ('HWiNFO was not started: ' + [string]$plan.Error + '.'); return $r }
+    $r.Plan = $plan
+    $r.Edits = (@($plan.Changes).Count -gt 0)
+    $r.Code = 'ready'
+    return $r
+}
+
+# Does what Hwi-Prepare found ('ready'): closes a running copy, writes the settings lines, starts HWiNFO. Returns @{ Code; Text } with Code
+# closefail | launchfail | started | restarted | startednote (started, but the settings file could not be changed: Text says so).
+function Hwi-Execute {
+    param($Prep)
+    $sh = $script:SysShared
+    $exe = [string]$Prep.Exe
+    $plan = $Prep.Plan
+    $edits = [bool]$Prep.Edits
+    $closed = $false
+    $err = ''
+    if ($Prep.Running) {
+        if (-not (Hwi-Close)) { return @{ Code = 'closefail'; Text = 'HWiNFO did not close, so nothing was changed. Close it from its tray icon and press the button again.' } }
+        $closed = $true
+        # HWiNFO saves its settings file again when it closes (window positions, anything changed in this session), so the lines are
+        # worked out again from the file as it is NOW. The plan made before the close would put the old text back and lose what it just saved.
+        $plan = Hwi-Plan $exe
+        if ($plan.Error) { $err = [string]$plan.Error; $edits = $false } else { $edits = (@($plan.Changes).Count -gt 0) }
+    }
+    if ($edits) { $err = Hwi-Write $plan }
+    try {
+        Hwi-Launch $exe
+    } catch {
+        return @{ Code = 'launchfail'; Text = ('HWiNFO could not be started: ' + $_.Exception.Message) }
+    }
+    if ($sh) { $sh.Force = $true }
+    if ($err) { return @{ Code = 'startednote'; Text = ('HWiNFO started, but its settings file could not be changed (' + $err + '). Turn on "Shared Memory Support" in its Settings by hand.') } }
+    if ($closed) { return @{ Code = 'restarted'; Text = 'HWiNFO restarted with Shared Memory Support on. Its readings should show here in a few seconds.' } }
+    return @{ Code = 'started'; Text = 'HWiNFO started with Shared Memory Support on. Its readings should show here in a few seconds.' }
+}
+
+# The "Start HWiNFO" button on Home
+function Ui-StartHwinfo {
+    $prep = Hwi-Prepare
+    if ($prep.Code -eq 'notfound') {
+        Ui-Status ([string]$prep.Text)
+        $q = "HWiNFO (the 64-bit program, HWiNFO64.exe) was not found on this PC.`r`n`r`nHWiNFO (free) is the program that gives this app the CPU temperature, the CPU power and the memory timings. Install it, then press this button again.`r`n`r`nOpen its download page (" + $script:HwiDownload + ') in your browser?'
+        if (Ui-Ask $q 'HWiNFO not found') {
+            try { Start-Process -FilePath $script:HwiDownload } catch { Ui-Status ('Could not open the browser: ' + $_.Exception.Message) }
+        }
+        return
+    }
+    if ($prep.Code -ne 'ready') { Ui-Status ([string]$prep.Text); return }
+    $running = [bool]$prep.Running
+    $edits = [bool]$prep.Edits
+    if ($running -or $edits) {
+        if ($running) {
+            $q = "HWiNFO is running, but it is not sharing its readings with this app.`r`n`r`nHWiNFO reads its settings file when it starts, so it has to be closed and started again.`r`n`r`n"
+        } else {
+            $q = "Start HWiNFO so that this app can show the CPU temperature, the CPU power and the memory timings?`r`n`r`n"
+        }
+        if ($edits) { $q += (Hwi-PlanText $prep.Plan) + "`r`n" } else { $q += "Its options are already set the way this needs.`r`n`r`n" }
+        $q += 'The free HWiNFO switches Shared Memory Support off again after about 12 hours: press this button again then.'
+        if ($running) { $q += "`r`n`r`nClose HWiNFO now and start it again?" }
+        $title = 'Start HWiNFO'
+        if ($running) { $title = 'Restart HWiNFO' }
+        if (-not (Ui-Ask $q $title $running)) { return }
+    }
+    if ($running) {
+        Ui-Status 'Closing HWiNFO...'
+        try { $script:UI.status.Refresh() } catch { }       # show it now: closing can keep the window busy for a few seconds
+    }
+    $res = Hwi-Execute $prep
+    Ui-Status ([string]$res.Text)
+}
+
+# =============================================================================
+# THE WELCOME SCREEN: shown every time the window opens, on top of everything else.
+#   Page 1 ("begin"):  the name, one line, a Begin button.
+#   Page 2 ("hwinfo"): Start HWiNFO (the 64-bit program) with its sensor sharing switched on, or Skip. Whatever happens is said right
+#                      there, and Continue opens the app.
+# The first check of the PC keeps running underneath, so the app is ready when the screen goes away.
+# It is one plain control that paints itself (like the side menu) with three buttons on it; the move from page 1 to page 2 is a short
+# slide and fade (a quick timer that only runs during the move).
+# =============================================================================
+# Page = begin | hwinfo.   Sub (page 2) = idle | working | notfound | needclose | ok | shared | warn | error.   Kind = '' | good | warn | bad
+$script:Welcome = @{ Page = 'begin'; From = ''; Sub = 'idle'; Text = ''; Kind = ''; Prep = $null; Anim = 1.0; T0 = 0; Done = $false }
+$script:WelcomeActs = @{ P = ''; S = ''; T = '' }
+$script:WelcomeMoveMs = 380
+
+# $a mixed with $b: $t = 0 is $a, 1 is $b
+function Blend-Color {
+    param($a, $b, [double]$t)
+    if ($t -lt 0) { $t = 0 } elseif ($t -gt 1) { $t = 1 }
+    $r = [int][Math]::Round($a.R + ($b.R - $a.R) * $t)
+    $g = [int][Math]::Round($a.G + ($b.G - $a.G) * $t)
+    $bl = [int][Math]::Round($a.B + ($b.B - $a.B) * $t)
+    return (Rgb $r $g $bl)
+}
+
+# Where things go on a page of the given size: LogoX/Y/S, then the Y of each line, then the width of a text block
+function Get-WelcomeLayout {
+    param([string]$page, [int]$W, [int]$H)
+    $L = @{}
+    $L.BlockW = [Math]::Min((Px 580), ($W - (Px 80)))
+    $L.BlockX = [int](($W - $L.BlockW) / 2)
+    if ($page -eq 'begin') {
+        $s = Px 92
+        $block = $s + (Px 28) + (Px 52) + (Px 8) + (Px 30) + (Px 50) + (Px 56)
+        $top = [int](($H - $block) / 2) - (Px 14)
+        if ($top -lt (Px 16)) { $top = Px 16 }
+        $L.LogoS = $s; $L.LogoY = $top
+        $y = $top + $s + (Px 28)
+        $L.TitleY = $y
+        $L.SubY = $y + (Px 60)
+        $L.BtnY = $y + (Px 60) + (Px 30) + (Px 50)
+        $L.CapY = 0; $L.BodyY = 0; $L.StatusY = 0
+    } else {
+        $s = Px 52
+        $block = $s + (Px 24) + (Px 18) + (Px 6) + (Px 52) + (Px 12) + (Px 96) + (Px 26) + (Px 56) + (Px 22) + (Px 60)
+        $top = [int](($H - $block) / 2) - (Px 8)
+        if ($top -lt (Px 16)) { $top = Px 16 }
+        $L.LogoS = $s; $L.LogoY = $top
+        $y = $top + $s + (Px 24)
+        $L.CapY = $y
+        $L.TitleY = $y + (Px 24)
+        $L.BodyY = $L.TitleY + (Px 64)
+        $L.BtnY = $L.BodyY + (Px 96) + (Px 26)
+        $L.StatusY = $L.BtnY + (Px 56) + (Px 22)
+        $L.SubY = 0
+    }
+    $L.LogoX = [int](($W - $L.LogoS) / 2)
+    return $L
+}
+
+# ----------------------------------------------------------- the text and what the buttons do ----------
+$script:WelcomeBody = 'Headroom reads your CPU temperature, power and memory timings from HWiNFO, because Windows does not provide them. ' +
+    'Press Start HWiNFO and Headroom turns on sensor sharing in HWiNFO''s settings file, then starts the 64-bit HWiNFO for you.'
+$script:WelcomeTagline = 'Give your games room to run.'
+
+# The buttons for the page and state shown now: @{ P = @(text, action); S = ...; T = ... } (only the ones that are there)
+function Get-WelcomeButtons {
+    $w = $script:Welcome
+    if ($w.Page -eq 'begin') { return @{ P = @('Begin', 'begin') } }
+    switch ([string]$w.Sub) {
+        'working'   { return @{} }
+        'notfound'  { return @{ P = @('Download HWiNFO', 'download'); S = @('Try again', 'start'); T = @('Continue without it', 'finish') } }
+        'needclose' { return @{ P = @('Restart HWiNFO', 'restart'); S = @('Skip for now', 'finish') } }
+        'ok'        { return @{ P = @('Continue', 'finish') } }
+        'shared'    { return @{ P = @('Continue', 'finish') } }
+        'warn'      { return @{ P = @('Continue', 'finish') } }
+        'error'     { return @{ P = @('Try again', 'start'); S = @('Skip for now', 'finish') } }
+    }
+    return @{ P = @('Start HWiNFO', 'start'); S = @('Skip for now', 'finish') }
+}
+
+# Put the buttons where the shown page wants them, centred in a row
+function Ui-WelcomeLayout {
+    $ui = $script:UI
+    $ov = $ui.welcome
+    if (-not $ov) { return }
+    $st = $script:Welcome
+    $W = [int]$ov.Width
+    $H = [int]$ov.Height
+    $L = Get-WelcomeLayout ([string]$st.Page) $W $H
+    $moving = ([double]$st.Anim -lt 1.0)
+    $set = Get-WelcomeButtons
+    $btns = @()
+    $acts = @{ P = ''; S = ''; T = '' }
+    foreach ($k in 'P', 'S', 'T') {
+        $b = $ui[('wb' + $k)]
+        if (-not $b) { continue }
+        if ($set.ContainsKey($k) -and -not $moving) {
+            $b.Text = [string]$set[$k][0]
+            $b.Width = [Math]::Max((Px 180), ((Px 40) + (Px 12) * ([string]$set[$k][0]).Length))
+            $acts[$k] = [string]$set[$k][1]
+            $btns += $b
+            if (-not [bool]$b.Visible) { $b.Visible = $true }
+        } else {
+            if ([bool]$b.Visible) { $b.Visible = $false }
+        }
+    }
+    $script:WelcomeActs = $acts
+    $gap = Px 14
+    $total = 0
+    foreach ($b in $btns) { $total += [int]$b.Width }
+    if ($btns.Count -gt 1) { $total += $gap * ($btns.Count - 1) }
+    $x = [int](($W - $total) / 2)
+    foreach ($b in $btns) {
+        $b.Top = [int]$L.BtnY
+        $b.Left = $x
+        $x += [int]$b.Width + $gap
+    }
+    $ov.Invalidate()
+}
+
+# ----------------------------------------------------------- painting ----------
+# One page of text, faded towards the background by $alpha (1 = fully shown) and moved $dy pixels
+function Ui-PaintWelcomePage {
+    param($g, [string]$page, [double]$alpha, [int]$dy, [int]$W, [int]$H)
+    if ($alpha -lt 0.03) { return }
+    $Th = $script:Th
+    $TF = $script:TF
+    $bg = $Th.Side
+    $L = Get-WelcomeLayout $page $W $H
+    $x = $L.BlockX
+    $bw = $L.BlockW
+    if ($page -eq 'begin') {
+        Ui-Text $g 'Headroom' (Ui-Font 'hero') (Blend-Color $bg $Th.Text $alpha) 0 ($L.TitleY + $dy) $W (Px 52) $TF.C
+        Ui-Text $g $script:WelcomeTagline (Ui-Font 'heroSub') (Blend-Color $bg $Th.Sub $alpha) $x ($L.SubY + $dy) $bw (Px 30) $TF.C
+        return
+    }
+    $st = $script:Welcome
+    Ui-Text $g 'LIVE SENSORS' (Ui-Font 'stepcap') (Blend-Color $bg $Th.Accent $alpha) 0 ($L.CapY + $dy) $W (Px 18) $TF.C
+    Ui-Text $g 'Start HWiNFO' (Ui-Font 'hero') (Blend-Color $bg $Th.Text $alpha) 0 ($L.TitleY + $dy) $W (Px 52) $TF.C
+    Ui-Text $g $script:WelcomeBody (Ui-Font 'wbody') (Blend-Color $bg $Th.Sub $alpha) $x ($L.BodyY + $dy) $bw (Px 96) $TF.CW
+    if ([string]$st.Text) {
+        $col = $Th.Sub
+        if ($st.Kind -eq 'good') { $col = $Th.Good } elseif ($st.Kind -eq 'warn') { $col = $Th.Warn } elseif ($st.Kind -eq 'bad') { $col = $Th.Bad }
+        Ui-Text $g ([string]$st.Text) (Ui-Font 'wbody') (Blend-Color $bg $col $alpha) $x ($L.StatusY + $dy) $bw (Px 64) $TF.CW
+    }
+}
+
+function Ui-PaintWelcome {
+    param($g, [int]$W, [int]$H)
+    $Th = $script:Th
+    $TF = $script:TF
+    $st = $script:Welcome
+    $bg = $Th.Side
+    Ui-Fill $g $bg 0 0 $W $H
+    $to = Get-WelcomeLayout ([string]$st.Page) $W $H
+    $from = $to
+    $e = [double]$st.Anim
+    if ($e -lt 1.0 -and [string]$st.From) { $from = Get-WelcomeLayout ([string]$st.From) $W $H }
+    # the mark moves and shrinks from one page to the next; a soft glow sits behind it
+    $s = [int][Math]::Round($from.LogoS + ($to.LogoS - $from.LogoS) * $e)
+    $ly = [int][Math]::Round($from.LogoY + ($to.LogoY - $from.LogoY) * $e)
+    $lx = [int](($W - $s) / 2)
+    $cx = [int]($W / 2)
+    $cy = $ly + [int]($s / 2)
+    foreach ($ring in @(@(210, 0.020), @(170, 0.030), @(130, 0.045), @(96, 0.065))) {
+        $r = Px $ring[0]
+        Ui-FillOval $g (Blend-Color $bg $Th.Accent $ring[1]) ($cx - $r) ($cy - $r) (2 * $r) (2 * $r)
+    }
+    Ui-PaintLogo $g $lx $ly $s
+    # the two pages: the old one slides up and fades out while the new one comes up from below
+    $lift = Px 22
+    if ($e -lt 1.0 -and [string]$st.From) {
+        Ui-PaintWelcomePage $g ([string]$st.From) (1.0 - $e) (-[int]($lift * $e)) $W $H
+        Ui-PaintWelcomePage $g ([string]$st.Page) $e ([int]($lift * (1.0 - $e))) $W $H
+    } else {
+        Ui-PaintWelcomePage $g ([string]$st.Page) 1.0 0 $W $H
+    }
+    # which page this is
+    $d = Px 8
+    $dg = Px 14
+    $dx = [int](($W - (2 * $d + $dg)) / 2)
+    $dyy = $H - (Px 40)
+    $first = $Th.Raised
+    $second = $Th.Raised
+    if ($st.Page -eq 'begin') { $first = $Th.Accent } else { $second = $Th.Accent }
+    Ui-FillOval $g $first $dx $dyy $d $d
+    Ui-FillOval $g $second ($dx + $d + $dg) $dyy $d $d
+}
+
+# ----------------------------------------------------------- building ----------
+function Ui-BuildWelcome {
+    $ui = $script:UI
+    $form = $ui.form
+    $Th = $script:Th
+    if (-not $form) { return }
+    $ov = New-Object System.Windows.Forms.Control
+    $ov.BackColor = $Th.Side
+    $ov.TabStop = $false
+    $ov.Location = New-Object System.Drawing.Point(0, 0)
+    $ov.Size = $form.ClientSize
+    Ui-DoubleBuffer $ov
+    $bp = New-Btn 'Begin' 180 'bigprimary' '' 54
+    $bs = New-Btn 'Skip for now' 180 'bigghost' '' 54
+    $bt = New-Btn 'Continue without it' 260 'bigghost' '' 54
+    foreach ($b in $bp, $bs, $bt) {
+        $b.Add_PreviewKeyDown({ param($s, $e) try { if ([string]$e.KeyCode -eq 'Tab') { $e.IsInputKey = $true } } catch { } })
+        $b.Add_KeyDown({ param($s, $e) try { if ([string]$e.KeyCode -eq 'Tab') { Ui-WelcomeTab ([bool]$e.Shift); $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
+    }
+    $bs.Visible = $false
+    $bt.Visible = $false
+    $ov.Controls.Add($bp)
+    $ov.Controls.Add($bs)
+    $ov.Controls.Add($bt)
+    $ov.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintWelcome $e.Graphics ([int]$s.Width) ([int]$s.Height) } catch { Ui-Fail $_ } })
+    $ov.Add_Resize({ try { Ui-WelcomeLayout } catch { Ui-Fail $_ } })
+    $bp.Add_Click({ try { Ui-WelcomeClick 'P' } catch { Ui-Fail $_ } })
+    $bs.Add_Click({ try { Ui-WelcomeClick 'S' } catch { Ui-Fail $_ } })
+    $bt.Add_Click({ try { Ui-WelcomeClick 'T' } catch { Ui-Fail $_ } })
+    $form.Controls.Add($ov)
+    $ov.BringToFront()
+    $tm = New-Object System.Windows.Forms.Timer
+    $tm.Interval = 16
+    $tm.Add_Tick({ try { Ui-WelcomeStep } catch { Ui-Fail $_ } })
+    $ui.welcome = $ov
+    $ui.wbP = $bp
+    $ui.wbS = $bs
+    $ui.wbT = $bt
+    $ui.wtimer = $tm
+    $script:Welcome = @{ Page = 'begin'; From = ''; Sub = 'idle'; Text = ''; Kind = ''; Prep = $null; Anim = 1.0; T0 = 0; Done = $false }
+    Ui-WelcomeLayout
+}
+
+function Test-WelcomeShowing {
+    $ov = $script:UI.welcome
+    return [bool]($ov -and [bool]$ov.Visible -and -not $script:Welcome.Done)
+}
+
+# ----------------------------------------------------------- moving between pages ----------
+function Ui-WelcomeGo {
+    param([string]$page)
+    $w = $script:Welcome
+    if ($w.Page -eq $page) { return }
+    $w.From = [string]$w.Page
+    $w.Page = $page
+    $w.Anim = 0.0
+    $w.T0 = [Environment]::TickCount
+    Ui-WelcomeLayout                       # hides the buttons during the move
+    $tm = $script:UI.wtimer
+    if ($tm) { $tm.Start() }
+}
+
+# One frame of the move. $Elapsed (milliseconds since it began) is only given by tests.
+function Ui-WelcomeStep {
+    param([int]$Elapsed = -1)
+    $w = $script:Welcome
+    if ([double]$w.Anim -ge 1.0) { $tm = $script:UI.wtimer; if ($tm) { $tm.Stop() }; return }
+    if ($Elapsed -lt 0) { $Elapsed = [int]([Environment]::TickCount - [int]$w.T0) }
+    $t = $Elapsed / [double]$script:WelcomeMoveMs
+    if ($t -ge 1.0) {
+        $w.Anim = 1.0
+        $w.From = ''
+        $tm = $script:UI.wtimer
+        if ($tm) { $tm.Stop() }
+        Ui-WelcomeLayout
+        Ui-WelcomeFocus
+        return
+    }
+    if ($t -lt 0) { $t = 0.0 }
+    $w.Anim = 1.0 - [Math]::Pow((1.0 - $t), 3)        # eases out
+    $ov = $script:UI.welcome
+    if ($ov) { $ov.Invalidate() }
+}
+
+function Ui-WelcomeFocus {
+    $b = $script:UI.wbP
+    if ($b -and [bool]$b.Visible) { try { [void]$b.Focus() } catch { } }
+}
+
+# Tab / Shift+Tab stay on the screen's own buttons (the app underneath is hidden and must not take the focus)
+function Ui-WelcomeTab {
+    param([bool]$back)
+    $list = @()
+    foreach ($k in 'wbP', 'wbS', 'wbT') { $b = $script:UI[$k]; if ($b -and [bool]$b.Visible) { $list += $b } }
+    if ($list.Count -eq 0) { return }
+    $at = -1
+    for ($i = 0; $i -lt $list.Count; $i++) { if ($list[$i].Focused -eq $true) { $at = $i } }
+    if ($back) { $at = $at - 1; if ($at -lt 0) { $at = $list.Count - 1 } } else { $at = ($at + 1) % $list.Count }
+    try { [void]$list[$at].Focus() } catch { }
+}
+
+# ----------------------------------------------------------- what the buttons do ----------
+function Ui-WelcomeSet {
+    param([string]$sub, [string]$text, [string]$kind)
+    $w = $script:Welcome
+    $w.Sub = $sub
+    $w.Text = $text
+    $w.Kind = $kind
+    Ui-WelcomeLayout
+    $ov = $script:UI.welcome
+    if ($ov) { try { $ov.Update() } catch { } }          # draw it now: starting or closing HWiNFO can keep the window busy for a moment
+    Ui-WelcomeFocus
+}
+
+function Ui-WelcomeClick {
+    param([string]$which)
+    $act = [string]$script:WelcomeActs[$which]
+    switch ($act) {
+        'begin'    { Ui-WelcomeBegin }
+        'start'    { Ui-WelcomeStart }
+        'restart'  { Ui-WelcomeRun }
+        'download' { Ui-WelcomeDownload }
+        'finish'   { Ui-WelcomeFinish }
+    }
+}
+
+# Begin: on to the HWiNFO page. If HWiNFO is already running and sharing, the page says so at once.
+function Ui-WelcomeBegin {
+    $w = $script:Welcome
+    $w.Sub = 'idle'; $w.Text = ''; $w.Kind = ''
+    $sh = $script:SysShared
+    $lv = $null
+    if ($sh) { $lv = $sh.Live }
+    $running = $false
+    try { $running = [bool](Hwi-IsRunning) } catch { }
+    if ($running -and $lv -and [string]$lv.HwiVia) {
+        $w.Sub = 'shared'; $w.Kind = 'good'
+        $w.Text = 'HWiNFO is already running and sharing its sensors with Headroom. You are all set.'
+    }
+    Ui-WelcomeGo 'hwinfo'
+}
+
+# Start HWiNFO (also "Try again")
+function Ui-WelcomeStart {
+    $prep = Hwi-Prepare
+    $script:Welcome.Prep = $prep
+    switch ([string]$prep.Code) {
+        'notfound'  { Ui-WelcomeSet 'notfound' 'HWiNFO64.exe was not found on this PC. Install the free HWiNFO, then press Try again, or carry on without it (the Home page can start it later).' 'warn' }
+        'busy'      { Ui-WelcomeSet 'error' 'Headroom is still reading your PC for the first time. Try again in a moment.' 'warn' }
+        'shared'    { Ui-WelcomeSet 'shared' 'HWiNFO is already running and sharing its sensors with Headroom. You are all set.' 'good' }
+        'planerror' { Ui-WelcomeSet 'error' ([string]$prep.Text) 'bad' }
+        'ready' {
+            if ($prep.Running) {
+                Ui-WelcomeSet 'needclose' 'HWiNFO is already running, but it is not sharing its sensors. It has to be closed and started again for the setting to take effect. Restart it now?' 'warn'
+            } else {
+                Ui-WelcomeRun
+            }
+        }
+        default     { Ui-WelcomeSet 'error' 'HWiNFO could not be started.' 'bad' }
+    }
+}
+
+# Closes a running HWiNFO if need be, switches the sensor setting on, starts it
+function Ui-WelcomeRun {
+    $prep = $script:Welcome.Prep
+    if (-not $prep -or [string]$prep.Code -ne 'ready') { Ui-WelcomeStart; return }
+    if ($prep.Running) { Ui-WelcomeSet 'working' 'Closing HWiNFO...' '' } else { Ui-WelcomeSet 'working' 'Starting HWiNFO...' '' }
+    $res = Hwi-Execute $prep
+    switch ([string]$res.Code) {
+        'started'     { Ui-WelcomeSet 'ok' 'HWiNFO is starting with sensor sharing on. Waiting for its first readings...' 'good' }
+        'restarted'   { Ui-WelcomeSet 'ok' 'HWiNFO restarted with sensor sharing on. Waiting for its first readings...' 'good' }
+        'startednote' { Ui-WelcomeSet 'warn' ([string]$res.Text) 'warn' }
+        default       { Ui-WelcomeSet 'error' ([string]$res.Text) 'bad' }
+    }
+}
+
+function Ui-WelcomeDownload {
+    try { Start-Process -FilePath $script:HwiDownload } catch { Ui-WelcomeSet 'notfound' ('Could not open the browser: ' + $_.Exception.Message) 'bad' }
+}
+
+# Continue / Skip: the screen goes away and the app is there
+function Ui-WelcomeFinish {
+    $w = $script:Welcome
+    $w.Done = $true
+    $tm = $script:UI.wtimer
+    if ($tm) { try { $tm.Stop() } catch { } }
+    $ov = $script:UI.welcome
+    if ($ov) { $ov.Visible = $false }
+    try { $script:UI.form.ActiveControl = $script:UI.list } catch { }
+    try { Ui-InvalidateAll; Ui-InvalidateNav } catch { }
+}
+
+# Called by the window's timer: notices when HWiNFO's readings arrive
+function Ui-WelcomeTick {
+    if (-not (Test-WelcomeShowing)) { return }
+    $w = $script:Welcome
+    $changed = $false
+    if ($w.Sub -eq 'ok') {
+        $sh = $script:SysShared
+        $lv = $null
+        if ($sh) { $lv = $sh.Live }
+        if ($lv -and [string]$lv.HwiVia) {
+            $w.Sub = 'shared'; $w.Kind = 'good'
+            $w.Text = 'Connected: HWiNFO is sharing its sensors with Headroom.'
+            $changed = $true
+        }
+    }
+    if ($changed) { $ov = $script:UI.welcome; if ($ov) { $ov.Invalidate() } }
+}
+
+# =============================================================================
+# THE WINDOW, part 8: "Select Optimization Preset" - a window of its own (like "View description") with three choices:
+#   Recommended Debloat   what it is, what it changes, and a button to apply it
+#   Advanced Debloat      the same, with its warning (it is only for PCs that are used mainly for gaming)
+#   Custom Preset  what is applied on this PC and what is not, save that to a file, open a saved file, apply it again
+# The window only shows things and saves / opens the configuration file. Applying a preset closes it and goes through the usual
+# steps in the main window (Ui-DoPreset): the questions, the list of changes, the confirmation. Nothing is changed from in here.
+# Names used for locals: $Th = colours, $pw = $script:PW (the open window's state).
+# =============================================================================
+$script:PW = $null                  # the open window: Form, Rich, Key, Result, Opt (the three choices), Act (the buttons below), Status, Changed
+
+$script:PresetDesc = @{
+    recommended = 'The recommended set for a gaming PC. It removes telemetry and tracking, turns off network sharing and power saving, tunes Windows for games, tidies how Windows looks and switches off AI and Edge extras. It does not uninstall any app. You see the full list of changes first, and each change can be undone from this app.'
+    custom = 'Your own configuration. Below is what is applied on this PC right now and what is not. Save it to a file and keep the file somewhere safe (a USB drive or a cloud folder): after you wipe this PC and install Windows again, open Headroom, come back to this window, press Open configuration and then Confirm changes, and every one of those settings that is not on yet is applied. The window shows what is already enabled and what will be changed first.'
+}
+
+# What Recommended Debloat does, in plain words and grouped by area (the exact list of settings follows it in the window).
+# Short lines on purpose: the text box has no hanging indent, so a long line would wrap under its dash.
+$script:RecommendedSummary = @(
+    @{ H = 'Privacy and telemetry'; L = @(
+        'Telemetry and error reporting off, with its services and scheduled tasks',
+        'Advertising ID, activity history, feedback pop-ups and app-launch tracking off',
+        'Defender sample sending and Defender Core telemetry off',
+        'Store apps cannot run in the background; clipboard history (Win+V) off',
+        'Location services stay as they are') }
+    @{ H = 'Network'; L = @(
+        'File and printer sharing, network discovery and UPnP off',
+        'Old name lookups (LLMNR, mDNS, NetBIOS), SMB1 and connection sharing off',
+        'Power saving off on network adapters and on all USB devices') }
+    @{ H = 'Performance for games'; L = @(
+        'Ultimate Performance power plan, set as the active plan',
+        'Game Mode, HAGS and Optimizations for windowed games on',
+        'Game Bar and mouse acceleration off',
+        'Windows Security scans only while the PC is idle',
+        'Sticky, Filter, Toggle and Mouse Keys and High Contrast shortcuts off') }
+    @{ H = 'Services'; L = @(
+        'Rarely used services and the data usage meter off',
+        'Windows Health and Optimized Experiences, troubleshooting and diagnostics off',
+        'Program Compatibility Assistant off',
+        'Service Host processes merged (about 50 fewer svchost.exe)') }
+    @{ H = 'Look and feel'; L = @(
+        'Dark mode, solid black desktop, no transparency or visual effects',
+        'Taskbar icons on the left; End task in the taskbar menu',
+        'Widgets, Chat, search and Task View taskbar buttons hidden',
+        'Start menu Recommended section hidden; Dynamic Lighting off',
+        'Notifications, ads and suggestions off; no web results in Start search',
+        'Copilot and Microsoft account cards hidden in Settings',
+        'File Explorer: classic right-click menu; Home and Gallery removed from the side pane') }
+    @{ H = 'AI features'; L = @(
+        'Copilot, Recall, Click to Do and AI in Notepad and Paint off',
+        'Text and image generation for apps and voice activation off',
+        'AI components page hidden in Settings') }
+    @{ H = 'Microsoft Edge'; L = @(
+        'Copilot sidebar, AI features, telemetry and sync off',
+        'Startup boost, background running, first-run page, rewards and other nags off',
+        'Update services on demand; background update tasks off') }
+)
+# What Advanced Debloat does on top of Recommended Debloat, in plain words and grouped by area (the exact list of settings follows it).
+# Short lines on purpose, as for Recommended: the text box has no hanging indent.
+$script:AdvancedSummary = @(
+    @{ H = 'Cloud, sync and OneDrive'; L = @(
+        'Settings sync, cloud clipboard, nearby sharing and Offline Files off',
+        'Contacts, mail and calendar sync services and Windows Update sharing off',
+        'OneDrive blocked and uninstalled') }
+    @{ H = 'Remote access and VPN'; L = @(
+        'Remote Desktop, Remote Assistance, PowerShell remoting, remote management off',
+        'Windows built-in VPN services off; Quick Assist removed') }
+    @{ H = 'Network adapters, power plan and startup'; L = @(
+        'Windows powering down network adapters off',
+        'All other power plans deleted; Fast Startup and hibernation off') }
+    @{ H = 'Gaming and performance'; L = @(
+        'Windows Update does not replace drivers (WPBT stays on)') }
+    @{ H = 'Security prompts (lowers protection)'; L = @(
+        'UAC prompts and the UAC engine off (Settings and Calculator can stop opening)',
+        'Memory Integrity and hypervisor off; asks first because of FACEIT and Vanguard',
+        'BitLocker and automatic device encryption are left alone') }
+    @{ H = 'Services and scheduled tasks'; L = @(
+        'Search indexer on demand; smart card and Xbox services off',
+        'Printing off (it asks first)',
+        'SMS Router, Smart Card Removal Policy, Biometric and both Sensor services off',
+        'Software Quality Metrics, Maps update, Family Safety, Power Diagnostics tasks off') }
+    @{ H = 'File Explorer and AI'; L = @(
+        'File Explorer opens to This PC',
+        'Windows AI core package removed') }
+    @{ H = 'Apps removed (cannot be put back from this app)'; L = @(
+        'Copilot and Cortana, News, Weather, Maps, Bing Search',
+        'Mail, Calendar, Outlook, People, Teams, Phone Link',
+        'Media Player, Movies & TV, Sticky Notes, To Do, OneNote, Whiteboard',
+        'Power Automate, Help, Tips, Feedback Hub, Clipchamp, Solitaire and other extras',
+        'Widgets, promo apps (LinkedIn, Disney+, Spotify, TikTok...), Dolby Access',
+        'Game Bar app, Clock, Start Experiences, Camera, Paint, Sound Recorder') }
+    @{ H = 'Left as they are'; L = @(
+        'Location services, WPBT, BitLocker and automatic device encryption',
+        'Microsoft Store (app and policy), Snipping Tool, Xbox app and Xbox sign-in') }
+)
+function Add-AdvancedSummary {
+    param($parts)
+    $nl = "`r`n"
+    $n = @($script:Catalog | Where-Object { $_.Preset }).Count
+    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + 'Everything in Recommended Debloat' + $nl })
+    [void]$parts.Add(@{ S = 'line'; C = ''; T = ('  - All {0} of its changes, Game Mode, HAGS and windowed games included' -f $n) + $nl })
+    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + 'And on top of that' + $nl })
+    foreach ($g in $script:AdvancedSummary) {
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + [string]$g.H + $nl })
+        foreach ($l in @($g.L)) { [void]$parts.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$l + $nl }) }
+    }
+}
+function Add-RecommendedSummary {
+    param($parts)
+    $nl = "`r`n"
+    foreach ($g in $script:RecommendedSummary) {
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + [string]$g.H + $nl })
+        foreach ($l in @($g.L)) { [void]$parts.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$l + $nl }) }
+    }
+}
+
+# the settings of a preset, in catalog order (run-once clean-ups are never part of a preset)
+function Get-PresetWinRows {
+    param([string]$key)
+    $out = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ($row.T.Once) { continue }
+        if (Test-InPreset $row $key) { $out += $row }
+    }
+    return $out
+}
+
+# One line per setting, under its page's name. $mark = a script block that gives text to put after a row's name ('' for none).
+# $style / $markStyle = the look of the name and of the text after it (the already-enabled list is quieter than the one to change).
+function Add-PresetCatLines {
+    param($parts, $rows, $mark, [string]$style = 'line', [string]$markStyle = 'last')
+    $nl = "`r`n"
+    $rows = @($rows)
+    foreach ($cat in @($script:Cats)) {
+        $in = @($rows | Where-Object { [string]$_.T.Cat -eq [string]$cat })
+        if ($in.Count -eq 0) { continue }
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Split-CatName ([string]$cat)).Short + $nl })
+        foreach ($r in $in) {
+            [void]$parts.Add(@{ S = $style; C = ''; T = '  - ' + [string]$r.T.Name })
+            $m = ''
+            if ($mark) { $m = [string](& $mark $r) }
+            if ($m) { [void]$parts.Add(@{ S = $markStyle; C = ''; T = '   (' + $m + ')' }) }
+            [void]$parts.Add(@{ S = $style; C = ''; T = $nl })
+        }
+    }
+}
+
+# Which settings of a preset are already enabled on this PC and which will be changed. $key = recommended | advanced | personal.
+# Rows = every setting of the preset, Avail = the ones this PC has, Na = how many it does not have, On = already enabled,
+# Change = will be changed (a setting with options counts as enabled only when the saved option is the one in force).
+function Get-PresetSplit {
+    param([string]$key)
+    $rows = @(Get-PresetWinRows $key)
+    $avail = @($rows | Where-Object { $_.State -ne 'NA' })
+    $saved = $script:Personal.Picks
+    $on = @(); $chg = @()
+    foreach ($r in $avail) {
+        $isOn = ($r.State -eq 'On')
+        if ($isOn -and $key -eq 'personal' -and $r.T.Choices) {
+            $pick = [string]$saved[[string]$r.T.Id]
+            if ($pick -and [string]$r.Choice -ne $pick) { $isOn = $false }
+        }
+        if ($isOn) { $on += $r } else { $chg += $r }
+    }
+    return @{ Rows = $rows; Avail = $avail; Na = ($rows.Count - $avail.Count); On = $on; Change = $chg; Checking = @($avail | Where-Object { $_.State -eq 'Checking' }).Count }
+}
+
+# What is written after a setting that will be changed: the things to know before confirming
+function Get-PresetChangeMark {
+    param($r)
+    $m = @()
+    if ($r.T.OneWay) { $m += 'cannot be put back' }
+    if (Get-NotRecReason $r.T) { $m += 'not recommended' }
+    if ($r.T.Ask) { $m += 'asks first' }
+    if ($r.T.Choices -and $script:Personal.Picks.ContainsKey([string]$r.T.Id)) {
+        $k = [string]$script:Personal.Picks[[string]$r.T.Id]
+        $c = @($r.T.Choices | Where-Object { [string]$_.Key -eq $k } | Select-Object -First 1)
+        if ($c.Count -and [string]$c[0].Short) { $m += ('option: ' + [string]$c[0].Short) }
+    }
+    return ($m -join ', ')
+}
+
+# The list of what will be changed (to look at before pressing Confirm changes), grouped under the pages' names
+function Add-PresetChangeList {
+    param($p, $sp)
+    $nl = "`r`n"
+    if ($sp.Change.Count -gt 0) {
+        [void]$p.Add(@{ S = 'wait'; C = ''; T = $nl + ('Will be changed ({0})' -f $sp.Change.Count) + $nl })
+        Add-PresetCatLines $p $sp.Change { param($r) Get-PresetChangeMark $r }
+    } elseif ($sp.Checking -eq 0 -and $sp.Avail.Count -gt 0) {
+        [void]$p.Add(@{ S = 'good'; C = ''; T = $nl + 'Nothing to change: everything in this preset is already enabled on this PC.' + $nl })
+    }
+}
+
+# The list of what is already enabled on this PC (in green), grouped under the pages' names
+function Add-PresetOnList {
+    param($p, $sp)
+    $nl = "`r`n"
+    if ($sp.On.Count -gt 0) {
+        [void]$p.Add(@{ S = 'good'; C = ''; T = $nl + ('Already enabled ({0})' -f $sp.On.Count) + $nl })
+        Add-PresetCatLines $p $sp.On $null 'goodl' 'note'
+    } elseif ($sp.Checking -eq 0 -and $sp.Avail.Count -gt 0) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'None of the settings in this preset is enabled on this PC yet.' + $nl })
+    }
+}
+
+# The warning for FACEIT and Riot Vanguard players: the settings of the list that ask the anti-cheat question ('' when none)
+function Get-PresetAntiCheatText {
+    param($chg)
+    $plan = @(@($chg) | ForEach-Object { @{ Id = [string]$_.T.Id; Action = 'Apply' } })
+    $ac = @(Get-AntiCheatNames $plan)
+    if ($ac.Count -eq 0) { return '' }
+    return ('WARNING for FACEIT and Riot Vanguard (Valorant, League of Legends) players: this list includes {0}, which those anti-cheats can refuse to run without. You are asked about it before it is switched on.' -f ($ac -join ', '))
+}
+
+# The text of the two list views of a preset ($view = change | enabled): the settings that will be changed, or the ones already enabled
+function Get-PresetViewParts {
+    param([string]$key, [string]$view)
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    $sp = Get-PresetSplit $key
+    [void]$p.Add(@{ S = 'title'; C = ''; T = ([string]$script:PresetNames[$key]) + $nl })
+    if ($sp.Checking -gt 0 -or $script:Scanning) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Still checking your PC...' + $nl })
+        return $p
+    }
+    $avail = $sp.Avail.Count
+    if ($view -eq 'change') {
+        [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings will be changed when you press Confirm changes' -f $sp.Change.Count, $avail) + $nl })
+        $ac = Get-PresetAntiCheatText $sp.Change
+        if ($ac) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $ac + $nl }) }
+        Add-PresetChangeList $p $sp
+        if ($sp.Change.Count -gt 0) {
+            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+        }
+    } else {
+        [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings are already enabled on this PC' -f $sp.On.Count, $avail) + $nl })
+        if ($sp.On.Count -gt 0) {
+            [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + 'Confirm changes leaves these as they are.' + $nl })
+        }
+        Add-PresetOnList $p $sp
+    }
+    if ($sp.Na -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + ('Not available on this PC, so skipped: {0}.' -f $sp.Na) + $nl }) }
+    return $p
+}
+
+# The text of the window for one choice: recommended | advanced | personal. Pieces like the details panel's (see Ui-PartStyle).
+function Get-PresetWinParts {
+    param([string]$key, [string]$view = 'overview')
+    if ($key -eq 'personal') { return (Get-CustomWinParts $view) }
+    if ($view -eq 'change' -or $view -eq 'enabled') { return (Get-PresetViewParts $key $view) }
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    $name = [string]$script:PresetNames[$key]
+    $sp = Get-PresetSplit $key
+    $avail = @($sp.Avail)
+    $chg = @($sp.Change)
+    [void]$p.Add(@{ S = 'title'; C = ''; T = $name + $nl })
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} settings' -f $avail.Count) + $nl })
+    $desc = [string]$script:PresetDesc.recommended
+    if ($key -eq 'advanced') {
+        if (@($script:AdvancedExtra).Count -eq 0) {
+            $desc = 'A deeper clean-up for a PC that is used mainly for gaming. It starts from the Recommended list and is meant to go further, by also switching off services and features that other uses of a PC may need. Right now it makes exactly the same changes as Recommended Debloat; the extra settings are still to come.'
+        } else {
+            $desc = ('A deeper clean-up for a PC that is used mainly for gaming. It makes all the changes of Recommended Debloat and {0} more that go further, switching off services and features that other uses of a PC may need.' -f @($script:AdvancedExtra).Count)
+        }
+    }
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + $desc + $nl })
+    if ($key -eq 'recommended') { Add-RecommendedSummary $p }
+    if ($key -eq 'advanced') {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Warning' + $nl })
+        [void]$p.Add(@{ S = 'warn'; C = ''; T = [string]$script:AdvancedWarningText + $nl })
+        if (@($script:AdvancedExtra).Count -gt 0) { Add-AdvancedSummary $p }
+    }
+    # how far it is on this PC: what is already enabled and what will be changed
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'On this PC right now' + $nl })
+    if ($sp.Checking -gt 0 -or $script:Scanning) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Still checking your PC...' + $nl })
+    } else {
+        $t = ('{0} of {1} settings are already enabled; {2} will be changed.' -f $sp.On.Count, $avail.Count, $chg.Count)
+        if ($sp.Na -gt 0) { $t += (' Not available on this PC, so skipped: {0}.' -f $sp.Na) }
+        [void]$p.Add(@{ S = 'line'; C = ''; T = $t + $nl })
+        if ($sp.Change.Count -gt 0 -or $sp.On.Count -gt 0) {
+            [void]$p.Add(@{ S = 'note'; C = ''; T = 'Open "Will be changed" or "Already enabled" above to see which settings they are.' + $nl })
+        }
+    }
+    # FACEIT and Riot: the settings that ask the anti-cheat question
+    $acText = Get-PresetAntiCheatText $chg
+    if ($acText) {
+        [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $acText + $nl })
+    }
+    $nr = @($chg | Where-Object { Get-NotRecReason $_.T } | ForEach-Object { [string]$_.T.Name })
+    if ($nr.Count) {
+        [void]$p.Add(@{ S = 'last'; C = ''; T = $nl + ('{0} of these carry a "{1}" mark; each one''s description says why:' -f $nr.Count, $script:NotRecText) + $nl + (Format-NameList $nr 12) })
+    }
+    # the ones that cannot be put back from this app (removing apps, OneDrive...): named before anything is applied
+    $one = @($chg | Where-Object { $_.T.OneWay } | ForEach-Object { [string]$_.T.Name })
+    if ($one.Count) {
+        [void]$p.Add(@{ S = 'last'; C = ''; T = $nl + ('{0} of these cannot be put back from this app (removed apps can usually be installed again from the Microsoft Store):' -f $one.Count) + $nl + (Format-NameList $one 20) })
+    }
+    $rb = @($chg | Where-Object { $_.T.Reboot } | ForEach-Object { [string]$_.T.Name })
+    if ($rb.Count) {
+        $more = ''
+        if ($rb.Count -gt 6) { $more = ', ...' }
+        [void]$p.Add(@{ S = 'last'; C = ''; T = $nl + ('A restart is needed afterwards for {0} of these: {1}{2}' -f $rb.Count, (($rb | Select-Object -First 6) -join ', '), $more) + $nl })
+    }
+    if ($chg.Count -gt 0) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+    }
+    return $p
+}
+
+# The text of the Custom Preset part: the saved configuration, what is applied now, what is not
+function Get-CustomWinParts {
+    param([string]$view = 'overview')
+    if (($view -eq 'change' -or $view -eq 'enabled') -and @($script:Personal.Picks.Keys).Count -gt 0) { return (Get-PresetViewParts 'personal' $view) }
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    [void]$p.Add(@{ S = 'title'; C = ''; T = ([string]$script:PresetNames['personal']) + $nl })
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = 'Your own set of settings, kept in a file you can take with you' + $nl })
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + [string]$script:PresetDesc.custom + $nl })
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Saved configuration' + $nl })
+    if (@($script:Personal.Picks.Keys).Count -eq 0) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'None yet. Press "Save configuration..." to keep everything that is switched on in the app right now (settings that are applied, and ones you have lined up) in a file.' + $nl })
+    } else {
+        $info = Get-PersonalInfo
+        $t = ('{0} settings, saved {1}.' -f $info.Names.Count, $info.Saved) + $nl
+        if ($info.Source) { $t += ('File: {0}' -f $info.Source) + $nl }
+        [void]$p.Add(@{ S = 'line'; C = ''; T = $t })
+        if ($info.NotOn.Count -gt 0) {
+            [void]$p.Add(@{ S = 'line'; C = ''; T = ('{0} of them are not on right now: Confirm changes applies them. They are marked "in your saved configuration" in the list of what is not applied below.' -f $info.NotOn.Count) + $nl })
+        } else {
+            [void]$p.Add(@{ S = 'line'; C = ''; T = 'All of them are on right now.' + $nl })
+        }
+        if ($info.Na -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Not available on this PC, so skipped: {0}.' -f $info.Na) + $nl }) }
+        $sp = Get-PresetSplit 'personal'
+        if ($sp.Checking -eq 0 -and -not $script:Scanning) {
+            [void]$p.Add(@{ S = 'line'; C = ''; T = $nl + ('Of the saved settings, {0} are already enabled on this PC; {1} will be changed.' -f $sp.On.Count, $sp.Change.Count) + $nl })
+            [void]$p.Add(@{ S = 'note'; C = ''; T = 'Open "Will be changed" or "Already enabled" above to see which settings they are.' + $nl })
+        }
+        if ($sp.Change.Count -gt 0) {
+            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+        }
+    }
+    $rows = @()
+    foreach ($id in @($script:Rows.Keys)) { if (-not $script:Rows[$id].T.Once) { $rows += $script:Rows[$id] } }
+    $applied = @($rows | Where-Object { $_.State -eq 'On' })
+    $not = @($rows | Where-Object { $_.State -eq 'Off' -or $_.State -eq 'Partial' -or $_.State -eq 'Unknown' })
+    $na = @($rows | Where-Object { $_.State -eq 'NA' }).Count
+    $lined = @(Get-Pending).Count
+    if ($script:Scanning) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Still checking your PC...' + $nl })
+    }
+    if ($lined -gt 0) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + ('{0} change(s) are lined up in the app and not applied yet. A saved configuration includes the ones that switch something on.' -f $lined) + $nl })
+    }
+    $saved = $script:Personal.Picks
+    $markOn = {
+        param($r)
+        $m = @()
+        if ((Get-Action $r) -eq 'Undo') { $m += 'lined up to turn off' }
+        if ($r.T.Choices -and $saved.ContainsKey([string]$r.T.Id) -and [string]$r.Choice -ne [string]$saved[[string]$r.T.Id]) { $m += 'your saved configuration uses another option' }
+        return ($m -join ', ')
+    }
+    $markOff = {
+        param($r)
+        $m = @()
+        $a = Get-Action $r
+        if ($a -eq 'Apply') { $m += 'lined up to turn on' } elseif ($r.State -eq 'Partial') { $m += 'partly applied' }
+        if ($saved.ContainsKey([string]$r.T.Id)) { $m += 'in your saved configuration' }
+        return ($m -join ', ')
+    }
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + ('Applied on this PC now ({0})' -f $applied.Count) })
+    Add-PresetCatLines $p $applied $markOn
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + $nl + ('Not applied ({0})' -f $not.Count) })
+    Add-PresetCatLines $p $not $markOff
+    if ($na -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + ('{0} more settings are not available on this PC and are not listed.' -f $na) + $nl }) }
+    return $p
+}
+
+# ----------------------------------------------------------- the file boxes ----------
+# The boxes that ask where to save the configuration and which file to open. They return the chosen path, or '' when cancelled.
+function Ui-PickSaveFile {
+    $d = New-Object System.Windows.Forms.SaveFileDialog
+    try {
+        $d.Title = 'Save your configuration'
+        $d.Filter = 'Headroom configuration (*.json)|*.json|All files (*.*)|*.*'
+        $d.DefaultExt = 'json'
+        $d.AddExtension = $true
+        $d.OverwritePrompt = $true
+        $d.FileName = 'Headroom-configuration.json'
+        $docs = ''
+        try { $docs = [Environment]::GetFolderPath('MyDocuments') } catch { }
+        if ($docs) { $d.InitialDirectory = $docs }
+        $owner = $null
+        if ($script:PW) { $owner = $script:PW.Form }
+        if ($owner) { $r = $d.ShowDialog($owner) } else { $r = $d.ShowDialog() }
+        if ($r -eq [System.Windows.Forms.DialogResult]::OK) { return [string]$d.FileName }
+        return ''
+    } finally {
+        try { $d.Dispose() } catch { }
+    }
+}
+
+function Ui-PickOpenFile {
+    $d = New-Object System.Windows.Forms.OpenFileDialog
+    try {
+        $d.Title = 'Open a saved configuration'
+        $d.Filter = 'Headroom configuration (*.json)|*.json|All files (*.*)|*.*'
+        $d.CheckFileExists = $true
+        $d.Multiselect = $false
+        $docs = ''
+        try { $docs = [Environment]::GetFolderPath('MyDocuments') } catch { }
+        if ($docs) { $d.InitialDirectory = $docs }
+        $owner = $null
+        if ($script:PW) { $owner = $script:PW.Form }
+        if ($owner) { $r = $d.ShowDialog($owner) } else { $r = $d.ShowDialog() }
+        if ($r -eq [System.Windows.Forms.DialogResult]::OK) { return [string]$d.FileName }
+        return ''
+    } finally {
+        try { $d.Dispose() } catch { }
+    }
+}
+
+# ----------------------------------------------------------- the window ----------
+function Ui-PresetWinStatus {
+    param([string]$text)
+    $pw = $script:PW
+    if ($pw -and $pw.Status) { $pw.Status.Text = $text }
+}
+
+# The three tabs above the text (Overview, Will be changed, Already enabled): the numbers on them, which one is open,
+# and whether they show at all (not for a Custom Preset with nothing saved yet)
+function Ui-PresetWinTabs {
+    $pw = $script:PW
+    if (-not $pw -or -not $pw.Tabs) { return }
+    $key = [string]$pw.Key
+    $show = $true
+    if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) { $show = $false }
+    if ([bool]$pw.Tabs.Panel.Visible -ne $show) { $pw.Tabs.Panel.Visible = $show }
+    if (-not $show) { return }
+    $sp = Get-PresetSplit $key
+    $nChg = '...'; $nOn = '...'
+    if ($sp.Checking -eq 0 -and -not $script:Scanning) {
+        $nChg = [string]$sp.Change.Count
+        $nOn = [string]$sp.On.Count
+    }
+    $view = [string]$pw.View
+    foreach ($t in @(@('pv-over', 'overview', ''), @('pv-chg', 'change', $nChg), @('pv-on', 'enabled', $nOn))) {
+        $b = $pw.Tabs[[string]$t[0]]
+        if ([string]$script:ChipCount[[string]$t[0]] -ne [string]$t[2]) {
+            $script:ChipCount[[string]$t[0]] = [string]$t[2]
+            $b.Invalidate()
+        }
+        $kind = 'tab'
+        if ($view -eq [string]$t[1]) { $kind = 'tabon' }
+        if ([string]$b.Tag -ne $kind) { $b.Tag = $kind; Ui-StyleBtn $b }
+    }
+}
+
+# The line under the text that says what Confirm changes will do (shown when a choice is opened)
+function Get-PresetConfirmHint {
+    param([string]$key)
+    $sp = Get-PresetSplit $key
+    if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) { return '' }
+    if ($sp.Checking -gt 0 -or $script:Scanning) { return 'Still checking your PC...' }
+    if ($sp.Change.Count -eq 0) { return 'Everything in this preset is already enabled on this PC, so there is nothing to confirm.' }
+    return ('Confirm changes applies the {0} settings on the "Will be changed" tab. Settings that are already enabled ({1}) are left as they are.' -f $sp.Change.Count, $sp.On.Count)
+}
+
+# The text on the right for the choice that is open
+function Ui-PresetWinFill {
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $view = [string]$pw.View
+    if ($view -ne 'change' -and $view -ne 'enabled') { $view = 'overview' }
+    if ([string]$pw.Key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) { $view = 'overview' }   # no tabs to switch with yet
+    $pw.View = $view
+    Ui-PresetWinTabs
+    Ui-FillRich $pw.Rich (Get-PresetWinParts ([string]$pw.Key) $view)
+}
+
+# One of the tabs was pressed (by its name)
+function Ui-PresetWinTabClick {
+    param([string]$name)
+    $view = 'overview'
+    if ($name -eq 'pv-chg') { $view = 'change' } elseif ($name -eq 'pv-on') { $view = 'enabled' }
+    Ui-PresetWinView $view
+}
+
+# Show that list (overview | change | enabled)
+function Ui-PresetWinView {
+    param([string]$view)
+    $pw = $script:PW
+    if (-not $pw) { return }
+    if ($view -ne 'change' -and $view -ne 'enabled') { $view = 'overview' }
+    $pw.View = $view
+    Ui-PresetWinFill
+}
+
+# Show / hide the buttons under the text for the choice that is open, and put the visible ones in a row
+function Ui-PresetWinButtons {
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $show = @()
+    switch ([string]$pw.Key) {
+        'recommended' { $show = @('act-recommended') }
+        'advanced'    { $show = @('act-advanced') }
+        'personal'    { $show = @('act-save', 'act-open', 'act-apply') }
+    }
+    $busy = [bool](Get-BusyReason)
+    $x = Px 24
+    foreach ($k in @($pw.Act.Keys)) {
+        $b = $pw.Act[$k]
+        $v = ($show -contains $k)
+        if ([bool]$b.Visible -ne $v) { $b.Visible = $v }
+        if ($v) {
+            $b.Left = $x
+            $x += $b.Width + (Px 10)
+        }
+        $en = (-not $busy)
+        if ($k -eq 'act-recommended' -or $k -eq 'act-advanced' -or $k -eq 'act-apply') {
+            # Confirm changes: only when there is something to change on this PC
+            $kk = [string]$pw.Key
+            if ($k -eq 'act-apply') { $kk = 'personal' }
+            $spb = Get-PresetSplit $kk
+            $en = ($en -and $spb.Change.Count -gt 0 -and $spb.Checking -eq 0)
+            if ($k -eq 'act-apply') { $en = ($en -and @($script:Personal.Picks.Keys).Count -gt 0) }
+        }
+        Ui-SetEnabled $b $en
+    }
+}
+
+# Open one of the three choices: highlight its button, show its text and its buttons
+function Ui-PresetWinSelect {
+    param([string]$key)
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $pw.Key = $key
+    $pw.View = 'overview'
+    foreach ($k in @($pw.Opt.Keys)) {
+        $b = $pw.Opt[$k]
+        $kind = 'secondary'
+        if ($k -eq $key) { $kind = 'accent' }
+        if ([string]$b.Tag -ne $kind) { $b.Tag = $kind; Ui-StyleBtn $b }
+    }
+    Ui-PresetWinFill
+    Ui-PresetWinButtons
+    Ui-PresetWinStatus (Get-PresetConfirmHint $key)
+}
+
+# A button under the text was pressed
+function Ui-PresetWinAct {
+    param([string]$name)
+    $pw = $script:PW
+    if (-not $pw) { return }
+    switch ($name) {
+        'act-recommended' { Ui-PresetWinFinish 'recommended' }
+        'act-advanced'    { Ui-PresetWinFinish 'advanced' }
+        'act-apply'       { Ui-PresetWinFinish 'personal' }
+        'act-save'        { Ui-PresetWinSave }
+        'act-open'        { Ui-PresetWinOpen }
+    }
+}
+
+# Confirm changes: close the window and let the main window apply this preset (after the questions some settings ask)
+function Ui-PresetWinFinish {
+    param([string]$key)
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $b = Get-BusyReason
+    if ($b) { Ui-PresetWinStatus $b; return }
+    if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) {
+        Ui-PresetWinStatus 'There is no saved configuration yet. Save one, or open a saved file, first.'
+        return
+    }
+    if ((Get-PresetSplit $key).Change.Count -eq 0) {
+        Ui-PresetWinStatus 'Everything in this preset is already enabled on this PC, so there is nothing to confirm.'
+        return
+    }
+    $pw.Result = $key
+    $pw.Form.DialogResult = [System.Windows.Forms.DialogResult]::OK
+}
+
+# Save configuration...: ask where, write the file, keep a copy inside the app too
+function Ui-PresetWinSave {
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $cap = Get-PersonalCapture
+    if (@($cap.Keys).Count -eq 0) {
+        Ui-PresetWinStatus 'Nothing is switched on in the app yet, so there is nothing to save. Apply some settings first.'
+        return
+    }
+    $path = Ui-PickSaveFile
+    if (-not $path) { Ui-PresetWinStatus 'Nothing was saved.'; return }
+    $r = Save-Configuration $path $cap
+    if ($r.Error) {
+        Ui-PresetWinStatus ('The file could not be written, so nothing was saved: ' + [string]$r.Error)
+        return
+    }
+    $pw.Changed = $true
+    Ui-PresetWinFill
+    Ui-PresetWinButtons
+    $t = ('Saved {0} settings to {1}. Keep that file somewhere safe (a USB drive or a cloud folder): after a clean install of Windows, open it here and press Confirm changes.' -f $r.Count, $path)
+    if ($r.PersonalError) { $t += (' (The app could not keep a copy of its own: {0})' -f $r.PersonalError) }
+    Ui-PresetWinStatus $t
+}
+
+# Open configuration...: ask which file, read it, make it the Custom Preset
+function Ui-PresetWinOpen {
+    $pw = $script:PW
+    if (-not $pw) { return }
+    $path = Ui-PickOpenFile
+    if (-not $path) { Ui-PresetWinStatus 'Nothing was opened.'; return }
+    $r = Open-Configuration $path
+    if (-not $r.Ok) {
+        Ui-PresetWinStatus ('That file could not be used: ' + [string]$r.Error)
+        return
+    }
+    $pw.Changed = $true
+    Ui-PresetWinFill
+    Ui-PresetWinButtons
+    $info = Get-PersonalInfo
+    $t = ('Opened {0}: {1} settings, {2} of them not on yet. Press Confirm changes to apply them; the lists show what is already enabled and what will be changed first.' -f [IO.Path]::GetFileName($path), $r.Count, $info.NotOn.Count)
+    if ($r.Skipped -gt 0) { $t += (' {0} in the file are not available on this PC (or not known to this version of Headroom) and were skipped.' -f $r.Skipped) }
+    if ($r.PersonalError) { $t += (' (The app could not keep a copy of its own: {0})' -f $r.PersonalError) }
+    Ui-PresetWinStatus $t
+}
+
+# Build the window (not shown yet). Returns the form; the state is in $script:PW.
+function Ui-BuildPresetWindow {
+    $Th = $script:Th
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Select Optimization Preset'
+    $f.Font = (Ui-Font 'ui')
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $f.MaximizeBox = $true
+    $f.MinimizeBox = $false
+    $f.ShowInTaskbar = $false
+    $f.BackColor = $Th.Panel
+    $wa = Ui-WorkArea
+    $w = [Math]::Min((Px 1000), ([int]$wa.Width - (Px 40)))
+    $h = [Math]::Min((Px 740), ([int]$wa.Height - (Px 90)))   # (the title bar and borders are on top of the client size)
+    $f.ClientSize = New-Object System.Drawing.Size($w, $h)
+    $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 820), $w), [Math]::Min((Px 520), $h))
+
+    $strip = New-Object System.Windows.Forms.Panel
+    $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+    $strip.Height = (Px 3)
+    $strip.BackColor = $Th.Accent
+
+    # left: the heading, the three choices, Close
+    $left = New-Pnl 'Left' (Px 280) $Th.Side
+    $head = New-Object System.Windows.Forms.Label
+    $head.Text = 'Select Optimization Preset'
+    $head.Font = (Ui-Font 'detTitle')
+    $head.ForeColor = $Th.Text
+    $head.BackColor = $Th.Side
+    $head.AutoSize = $false
+    $head.Location = New-Object System.Drawing.Point((Px 20), (Px 22))
+    $head.Size = New-Object System.Drawing.Size((Px 244), (Px 62))
+    $hint = New-Object System.Windows.Forms.Label
+    $hint.Text = 'Pick one to see what it does, what is already enabled and what will be changed. Nothing is changed until you press Confirm changes.'
+    $hint.Font = (Ui-Font 'small')
+    $hint.ForeColor = $Th.Mute
+    $hint.BackColor = $Th.Side
+    $hint.AutoSize = $false
+    $hint.Location = New-Object System.Drawing.Point((Px 20), (Px 86))
+    $hint.Size = New-Object System.Drawing.Size((Px 244), (Px 50))
+    $left.Controls.Add($head)
+    $left.Controls.Add($hint)
+    $opts = [ordered]@{}
+    $y = 150
+    $optDefs = @(
+        @('recommended', 'Recommended Debloat', 'The recommended set for a gaming PC. See what it changes.'),
+        @('advanced', 'Advanced Debloat', 'A deeper clean-up for PCs used mainly for gaming. Read the warning first.'),
+        @('personal', 'Custom Preset', 'What is applied here, and your own saved configuration to apply again after a wipe.')
+    )
+    foreach ($d in $optDefs) {
+        $b = New-Btn ([string]$d[1]) 244 'secondary' ([string]$d[2]) 48
+        $b.Name = [string]$d[0]
+        $b.Location = New-Object System.Drawing.Point((Px 18), (Px $y))
+        $b.Add_Click({ param($s, $e) try { Ui-PresetWinSelect ([string]$s.Name) } catch { Ui-Fail $_ } })
+        $left.Controls.Add($b)
+        $opts[[string]$d[0]] = $b
+        $y += 58
+    }
+    $lbar = New-Pnl 'Bottom' (Px 64) $Th.Side
+    $close = New-Btn 'Close' 100 'secondary' 'Close this window. Nothing is changed.' 36
+    $close.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $close.Location = New-Object System.Drawing.Point((Px 18), (Px 14))
+    $lbar.Controls.Add($close)
+    $left.Controls.Add($lbar)
+
+    # right: the text, a line for what just happened, and the buttons of the open choice
+    $bar = New-Pnl 'Bottom' (Px 64) $Th.Bg
+    $acts = [ordered]@{}
+    $actDefs = @(
+        @('act-recommended', 'Confirm changes', 190, 'primary', 'Apply the Recommended Debloat settings that are not enabled yet. A restore point is created first.'),
+        @('act-advanced', 'Confirm changes', 190, 'primary', 'Apply the Advanced Debloat settings that are not enabled yet. The warning is shown first, and a restore point is created first.'),
+        @('act-save', 'Save configuration...', 190, 'secondary', 'Save everything that is switched on in the app right now to a file you keep.'),
+        @('act-open', 'Open configuration...', 190, 'secondary', 'Open a configuration file you saved earlier (for example after installing Windows again).'),
+        @('act-apply', 'Confirm changes', 190, 'primary', 'Apply the settings of the saved configuration that are not enabled yet. A restore point is created first.')
+    )
+    foreach ($d in $actDefs) {
+        $b = New-Btn ([string]$d[1]) ([int]$d[2]) ([string]$d[3]) ([string]$d[4]) 36
+        $b.Name = [string]$d[0]
+        $b.Top = (Px 14)
+        $b.Visible = $false
+        $b.Add_Click({ param($s, $e) try { Ui-PresetWinAct ([string]$s.Name) } catch { Ui-Fail $_ } })
+        $bar.Controls.Add($b)
+        $acts[[string]$d[0]] = $b
+    }
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $status.Height = (Px 56)
+    $status.Font = (Ui-Font 'ui')
+    $status.ForeColor = $Th.Sub
+    $status.BackColor = $Th.Panel
+    $status.AutoSize = $false
+    $status.TextAlign = [System.Drawing.ContentAlignment]::TopLeft
+    $status.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 6), (Px 12), (Px 4))
+    $status.Text = ''
+
+    $body = New-Object System.Windows.Forms.Panel
+    $body.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $body.BackColor = $Th.Panel
+    $body.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 18), (Px 12), (Px 8))
+    $rb = New-Rich $Th.Panel $Th.Text 'body'
+    $body.Controls.Add($rb)
+    # three tabs above the text: Overview, Will be changed (purple) and Already enabled (green); a hairline under them
+    $tabsP = New-Object System.Windows.Forms.Panel
+    $tabsP.Dock = [System.Windows.Forms.DockStyle]::Top
+    $tabsP.Height = (Px 46)
+    $tabsP.BackColor = $Th.Panel
+    $hair = New-Object System.Windows.Forms.Panel
+    $hair.Dock = [System.Windows.Forms.DockStyle]::Bottom
+    $hair.Height = 1
+    $hair.BackColor = $Th.Edge
+    $tabsP.Controls.Add($hair)
+    $script:TabAccent['pv-over'] = $Th.Sub
+    $script:TabAccent['pv-chg'] = $Th.Accent
+    $script:TabAccent['pv-on'] = $Th.Good
+    $tabs = @{ Panel = $tabsP }
+    $tabX = 0
+    $tabDefs = @(
+        @('pv-over', 'Overview', 104, 'overview', 'What this preset is for and how far it is on this PC.'),
+        @('pv-chg', 'Will be changed', 176, 'change', 'The settings this preset will change on this PC when you press Confirm changes.'),
+        @('pv-on', 'Already enabled', 176, 'enabled', 'The settings of this preset that are already enabled on this PC. They are left as they are.')
+    )
+    foreach ($d in $tabDefs) {
+        $tb = New-Btn ([string]$d[1]) ([int]$d[2]) 'tab' ([string]$d[4]) 40
+        $tb.Name = [string]$d[0]
+        $tb.Location = New-Object System.Drawing.Point((Px $tabX), (Px 2))
+        $tb.Add_Click({ param($s, $e) try { Ui-PresetWinTabClick ([string]$s.Name) } catch { Ui-Fail $_ } })
+        $tabsP.Controls.Add($tb)
+        $tabs[[string]$d[0]] = $tb
+        $tabX += [int]$d[2] + 6
+    }
+    $spacer = New-Object System.Windows.Forms.Panel
+    $spacer.Dock = [System.Windows.Forms.DockStyle]::Top
+    $spacer.Height = (Px 10)
+    $spacer.BackColor = $Th.Panel
+    $body.Controls.Add($spacer)
+    $body.Controls.Add($tabsP)
+
+    # the one added first fills what is left; each one added later is laid out before it
+    $f.Controls.Add($body)
+    $f.Controls.Add($status)
+    $f.Controls.Add($bar)
+    $f.Controls.Add($left)
+    $f.Controls.Add($strip)
+    $f.CancelButton = $close
+    $f.ActiveControl = $opts['recommended']
+    $script:PW = @{ Form = $f; Rich = $rb; Key = 'recommended'; Result = ''; Opt = $opts; Act = $acts; Status = $status; Bar = $bar; Close = $close; Changed = $false; View = 'overview'; Tabs = $tabs }
+    $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+    # the text goes in once the window exists (formatting a rich text box needs its handle), before it is shown
+    $f.Add_Load({ param($s, $e) try { Ui-PresetWinSelect 'recommended' } catch { Ui-Fail $_ } })
+    return $f
+}
+
+# The "Select Optimization Preset" button: open the window; when a preset was chosen in it, go on with that preset
+function Ui-ShowPresets {
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    $f = Ui-BuildPresetWindow
+    if (-not $f) { return }
+    $res = ''
+    $changed = $false
+    try {
+        $owner = $script:UI.form
+        if ($owner) { [void]$f.ShowDialog($owner) } else { [void]$f.ShowDialog() }
+        if ($script:PW) { $res = [string]$script:PW.Result; $changed = [bool]$script:PW.Changed }
+    } finally {
+        try { $f.Dispose() } catch { }
+        $script:PW = $null
+    }
+    # the Custom tab of the list shows the saved configuration: it may have changed in the window
+    if ($changed -and [string]$script:Mode -eq 'Personal') { Ui-OnFilterChanged }
+    if ($res) { Ui-DoPreset $res }
+}
+
+# =============================================================================
+# START
+# =============================================================================
+# A 32-bit PowerShell on 64-bit Windows would write HKLM\SOFTWARE settings to the wrong (WOW6432Node) place
+if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+    Write-Host 'This is a 32-bit PowerShell. Start the 64-bit one ("Windows PowerShell", not "(x86)") as administrator, or double-click Start-Headroom.bat.' -ForegroundColor Red
+    exit 1
+}
+
+. $engine      # the catalog and the engine, in this process too
+
+$useConsole = ($NoGui -or $List -or $Preset -or (@(Split-Ids $Apply).Count -gt 0) -or (@(Split-Ids $Undo).Count -gt 0))
+$code = 0
+if ($useConsole) {
+    $code = @(Start-ConsoleMode -ShowList ([bool]$List) -UsePreset ([bool]$Preset) -ApplyIds $Apply -UndoIds $Undo)[-1]
+    if ($code -isnot [int]) { $code = 0 }
+} else {
+    try {
+        Show-Window
+    } catch {
+        $code = 1
+        $msg = $_.Exception.Message
+        Write-Host ('The window could not be opened: ' + $msg) -ForegroundColor Red
+        Write-Host 'You can still use everything from this console: run the script again with -NoGui (for example  -NoGui -List).' -ForegroundColor Yellow
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            [void][System.Windows.Forms.MessageBox]::Show(("The window could not be opened:`r`n{0}`r`n`r`nRun the script with -NoGui to use it from the console." -f $msg), 'Headroom')
+        } catch { }
+    }
+}
+exit $code
