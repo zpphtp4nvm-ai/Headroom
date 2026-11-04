@@ -1454,33 +1454,6 @@ function Take-Snapshot {
     return $snap
 }
 
-# A record made by an older version of this app lacks the values the setting has gained since. Before they are set, what is there now
-# is added to the record, so that switching the setting off puts those back as well (the values already in the record are left as
-# they were saved: they are the originals). Only registry values and services: their record can tell "already set before" apart.
-# Returns $true when something was added.
-function Add-MissingSnapshot {
-    param($t, $snap)
-    $added = $false
-    foreach ($p in (Expand-Parts $t)) {
-        if ($p.T -eq 'reg' -and $snap.Reg -is [hashtable]) {
-            $k = "$($p.Path)|$($p.Name)"
-            if ($snap.Reg.ContainsKey($k)) { continue }
-            $c = Reg-Read $p.Path $p.Name
-            $already = ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type))
-            $snap.Reg[$k] = @{ Exists = $c.Exists; Value = $c.Value; Kind = $c.Kind; Unknown = $already }
-            $added = $true
-        } elseif ($p.T -eq 'svc' -and $snap.Svc -is [hashtable]) {
-            if ($snap.Svc.ContainsKey($p.Name)) { continue }
-            $c = Svc-Read $p.Name
-            if ($null -ne $c) {
-                $snap.Svc[$p.Name] = @{ Start = $c.Start; Delayed = $c.Delayed; Unknown = (Svc-IsApplied $c $p) }
-                $added = $true
-            }
-        }
-    }
-    return $added
-}
-
 # --------------------------------------------------------------- apply -------
 function Apply-Part {
     param($p, $snap)
@@ -1556,9 +1529,8 @@ function Invoke-TweakApply {
     $store = Get-Store
     $snap = $store[$t.Id]
     if (-not $snap) { $snap = Take-Snapshot $t; $store[$t.Id] = $snap; Save-Store $store }
-    elseif (Add-MissingSnapshot $t $snap) { $store[$t.Id] = $snap; Save-Store $store }
     if ($c) {
-        # this option's values are set; the values that only another option sets go back to what they were before (the saved record)
+        # this option's values are set; the values that only another option sets go back to the Windows default
         $mine = @{}
         foreach ($p in @($c.Parts)) { $mine[(Get-PartId $p)] = $true }
         foreach ($p in (Expand-Parts $t)) {
@@ -2445,7 +2417,9 @@ function Nic-PropReset {
     param([string]$name, $x)
     if ($DryRun) { return }
     if ($x.Kind -eq 'pm') {
-        Nic-AdvReset $name 'kw' ('*' + [string]$x.Key)
+        # only a keyword the driver lists is reset (Windows would report an error for one it does not)
+        $kw = '*' + [string]$x.Key
+        if (@(Nic-AdvList $name | Where-Object { $_.Keyword -eq $kw }).Count -gt 0) { Nic-AdvReset $name 'kw' $kw }
         $now = Nic-PmRead $name
         if ($now -and [string]$x.Key -eq 'SelectiveSuspend' -and [string]$now.SelectiveSuspend -eq 'Disabled') { Nic-PmWrite $name 'SelectiveSuspend' 'Enabled' }
     } else { Nic-AdvReset $name $x.Kind $x.Key }
@@ -4009,7 +3983,7 @@ Add-Tweak -Id 'wu-auto' -Cat $cGame -Risk 'security' -Name 'Stop Store app and M
            'Choose one of three options on the card. Automatic (Windows default): nothing is set. Store and MRT off: the Microsoft Store stops downloading and installing app updates by itself (AutoDownload = 2), and Windows Update stops offering the monthly Malicious Software Removal Tool, MRT (DontOfferThroughWUAU = 1); Windows Security is not affected. ' +
            'No auto-updates: the same two values and NoAutoUpdate = 1 (the "Configure Automatic Updates" policy set to Disabled). Windows then no longer downloads and installs updates by itself: open Settings > Windows Update and press Check for updates when you want them, and do it at least once a month, or the PC goes without security fixes. ' +
            'Limits: a manual check in the Store or in Windows Update still installs updates. It is not confirmed that Windows Home obeys the NoAutoUpdate policy, so on Home that option may change nothing; look at Settings > Windows Update after a restart. Nothing says which editions obey the MRT value. ' +
-           'Changing the option or choosing Automatic again puts back the values you had before; a value that was not there before is removed.') `
+           'Changing the option or choosing Automatic again removes the values that no longer apply, which is how Windows ships (Windows sets none of the three).') `
     -Choices @(
         @{ Key = 'default'; Label = 'Automatic (Windows default)'; Short = 'Automatic (default)'; Parts = @() }
         @{ Key = 'apps'; Label = 'Store app and MRT updates off'; Short = 'Store and MRT off'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1) ) }
@@ -9926,7 +9900,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '72'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '73'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {

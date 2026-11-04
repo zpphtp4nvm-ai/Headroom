@@ -4,7 +4,7 @@ Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single Po
 
 There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
 
-The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running. There’s also a latency test that measures how responsive the PC is.
+The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running.
 
 ## Requirements
 
