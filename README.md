@@ -1,8 +1,10 @@
 # Headroom
 
-A Windows 11 debloat and gaming tune-up tool. About 160 settings in 20 groups, and every one is its own switch. Each setting says what it does and exactly which registry values, services, tasks, features or apps it touches, and shows its current state on your PC.
+Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 160 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything.
 
-Nothing changes until you switch a setting on and apply it. Before the first change Headroom creates a restore point and saves your old values, so switching a setting off puts your own values back. Settings that remove apps cannot be undone from the tool.
+There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
+
+The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running. There’s also a latency test that measures how responsive the PC is.
 
 ## Requirements
 
@@ -10,19 +12,9 @@ Nothing changes until you switch a setting on and apply it. Before the first cha
 - Windows PowerShell 5.1 (already included in Windows 11), the 64-bit one
 - An administrator account
 
-Headroom installs no driver and downloads nothing.
+Headroom does not install on the device.
 
 ## Run it
-
-Replace `zpphtp4nvm-ai` with the GitHub user or organization that hosts this repository.
-
-### One line (asks for administrator permission)
-
-Paste this into any PowerShell window. Windows shows the permission box, then the Headroom window opens.
-
-```powershell
-Start-Process powershell -Verb RunAs -ArgumentList '-NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/zpphtp4nvm-ai/Headroom/main/Headroom.ps1 | iex"'
-```
 
 ### From an administrator PowerShell
 
@@ -90,6 +82,16 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 | `-Preset` | Console: turn on the Recommended preset. |
 | `-Apply` | Console: turn on these setting ids (see `-List`). A setting with options takes one as `id=option`. |
 | `-Undo` | Console: turn these setting ids back off. |
+
+## Switching a setting off
+
+Switching a setting off puts the Windows default back for everything that setting changed: registry values (deleted where Windows sets none), service start types, scheduled tasks, firewall rules (as Windows ships them), adapter bindings and driver options (the driver's own default), the power plan (Balanced) and the boot setting for the hypervisor. It does not put back what your PC had before Headroom changed it, so a value that another tool had set earlier also ends up at the Windows default.
+
+A few settings are handled differently:
+
+- Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
+- Settings whose Windows default is already the on state (Game Mode on, Optimizations for windowed games on) are switched off by writing an explicit 0, because deleting the value would leave them on.
+- Settings that remove apps cannot be undone from Headroom.
 
 ## Where things are kept
 

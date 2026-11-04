@@ -6,8 +6,9 @@
 .DESCRIPTION
     Opens a window with about 160 settings in 20 groups. Each setting shows what it does and exactly which registry values,
     services, tasks, features or apps it touches, and reads its current state from this PC. Nothing changes until you switch
-    a setting on and apply it. Before the first change a restore point is created and the old values are saved, so switching
-    a setting off puts your own values back. Settings that remove apps cannot be undone from here.
+    a setting on and apply it. Before the first change a restore point is created. Switching a setting off puts the Windows
+    default back for everything that setting changed (not the values the PC had before Headroom). Settings that remove apps
+    cannot be undone from here.
 
     The window opens on a welcome screen and then on Home, which shows the PC as it is right now: Windows, processor, graphics
     card, memory, motherboard, displays and drives. Windows does not report CPU temperature, CPU power or memory timings, so
@@ -47,7 +48,8 @@
     one as id=option (for example mpo=full); without an option the first one is used. id=default is the same as -Undo id.
 
 .PARAMETER Undo
-    Console: turn these setting ids back off (a setting with options goes back to the Windows default).
+    Console: turn these setting ids back off. Every value the setting changed goes back to the Windows default (a setting with
+    options goes back to its Windows default option).
 
 .EXAMPLE
     .\Headroom.ps1                                    # opens the window
@@ -120,8 +122,10 @@ function Emit {
 }
 
 # --------------------------------------------------- the undo record (store) --
-# Before a setting is changed for the first time, what it was is saved here, so that
-# switching it off again puts back YOUR old values instead of guessing Windows' defaults.
+# Before a setting is changed for the first time, what it was is saved here. Switching the setting off does NOT replay those values: it
+# puts the Windows default back. The record only tells "changed by this app" from "already like this", and it is the fallback for what
+# Windows has no fixed default for (optional features and capabilities, firewall rules when Windows' own list cannot be read) and for
+# what this app created itself (a power plan).
 function Get-Store {
     $s = @{}
     try {
@@ -716,6 +720,23 @@ function Fw-EnableNames {
     if ($DryRun) { Say "  [dry] firewall rules back on: $group ($($names.Count) rule(s))" 'DarkGray'; return }
     Enable-NetFirewallRule -Name $names -ErrorAction SilentlyContinue
     Say "  firewall rules back on: $group ($($names.Count) rule(s))" 'DarkGray'
+}
+# Windows' own list of its firewall rules as they ship (the one "restore defaults" uses; one text per rule, with Active=TRUE or Active=FALSE).
+# Returns the names of the rules of this group that ship switched on (an empty list when none does), or $null when the list cannot be read
+# or does not know any rule of the group: then nothing is known about how they ship. Rules of the group that Windows did not ship are left out.
+function Fw-DefaultOn {
+    param([string]$group)
+    $root = 'HKLM:\SYSTEM\CurrentControlSet\Services\SharedAccess\Defaults\FirewallPolicy\FirewallRules'
+    if (-not (Reg-KeyExists $root)) { return $null }
+    $on = @(); $known = 0
+    foreach ($r in @(Fw-Rules $group)) {
+        $c = Reg-Read $root ([string]$r.Name)
+        if (-not $c.Exists) { continue }
+        $known++
+        if ([string]$c.Value -match '(?i)\|Active=TRUE\|') { $on += [string]$r.Name }
+    }
+    if ($known -eq 0) { return $null }
+    return ,$on
 }
 
 # ------------------------------------------------------ adapter bindings -----
@@ -1513,19 +1534,10 @@ function Apply-Part {
         }
     }
 }
-# Puts one value of a setting with options back: the saved original, except when that original is itself one of the option values
-# (the option was already set before this app saw the PC), because then "back" would just set the option again: the Windows default is used.
+# Puts one value of a setting with options back: the Windows default (the value is removed, as Windows does not set it)
 function Revert-ChoicePart {
     param($t, $p, $snap)
-    $s = $null; if ($snap -and $snap.Reg) { $s = $snap.Reg[(Get-PartId $p)] }
-    if ($s -and -not $s.Unknown -and $s.Exists) {
-        foreach ($c in @($t.Choices)) {
-            foreach ($cp in @($c.Parts)) {
-                if ((Get-PartId $cp) -eq (Get-PartId $p) -and (Reg-Equal $s.Value $cp.Value $cp.Type)) { $s = $null }
-            }
-        }
-    }
-    if ($null -eq $s) { Revert-Part $p $null } else { Revert-Part $p $snap }
+    Revert-Part $p $null
 }
 function Invoke-TweakApply {
     # $Choice: for a setting with options, the key of the option to set ('' = the first one that changes something)
@@ -1564,10 +1576,9 @@ function Revert-Part {
     param($p, $snap)
     switch ($p.T) {
         'reg' {
-            $s = $null; if ($snap -and $snap.Reg) { $s = $snap.Reg["$($p.Path)|$($p.Name)"] }
-            if ($s -and -not $s.Unknown) {
-                if ($s.Exists) { [void](Reg-Write $p.Path $p.Name $s.Value $s.Kind -Soft:([bool]$p.Soft)) } else { [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft)) }
-            } elseif ($null -eq $p.Default) {
+            # Switching a setting off puts the Windows default back, never the value the PC had before this app changed it:
+            # a value that Windows does not set is deleted, one that Windows sets is written with its default.
+            if ($null -eq $p.Default) {
                 [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft))
             } else {
                 [void](Reg-Write $p.Path $p.Name $p.Default $p.Type -Soft:([bool]$p.Soft))
@@ -1576,32 +1587,31 @@ function Revert-Part {
         'key' { [void](Reg-KeyRemove $p.Root) }
         'svc' {
             if ($null -eq (Svc-Read $p.Name)) { return }
-            $s = $null; if ($snap -and $snap.Svc) { $s = $snap.Svc[$p.Name] }
-            if ($s -and -not $s.Unknown) { Svc-Write $p.Name @{ Start = [int]$s.Start; Delayed = [int]$s.Delayed } }
-            else { Svc-Write $p.Name (Svc-Decode $p.Default) }
+            Svc-Write $p.Name (Svc-Decode $p.Default)
         }
         'task' {
+            # Windows ships these tasks switched on
             $c = Task-Read $p.Path
             if ($null -eq $c -or $c.Enabled) { return }
-            # a task that was already off before this setting was applied stays off (a record from an older version has no task list: then every task is switched back on)
-            $s = $null; if ($snap -and $snap.Task) { $s = $snap.Task[$p.Path] }
-            if ($s -and -not [bool]$s.Enabled) { return }
             Task-Write $p.Path $true
         }
         'fw' {
-            if ($snap -and $snap.Fw -and $snap.Fw.ContainsKey($p.Group)) {
+            # Windows keeps a list of its own firewall rules as they ship (the list "restore defaults" uses). Each built-in rule of the
+            # group that ships switched on is switched on again; the ones that ship off stay off. Only when that list cannot be read are
+            # the rules that were on when this app first changed the group used instead.
+            $def = Fw-DefaultOn $p.Group
+            if ($null -ne $def) {
+                if ($def.Count) { Fw-EnableNames $p.Group $def } else { Say "  firewall group '$($p.Group)': Windows ships these rules switched off, so they stay off" 'DarkGray' }
+            } elseif ($snap -and $snap.Fw -and $snap.Fw.ContainsKey($p.Group)) {
                 $names = @($snap.Fw[$p.Group])
                 if ($names.Count) { Fw-EnableNames $p.Group $names } else { Say "  firewall group '$($p.Group)': its rules were already off before, so they stay off" 'DarkGray' }
             } else {
-                Say "  firewall group '$($p.Group)': no record of which rules were on, so none were switched back on (Windows Security > Firewall can do it)" 'Yellow'
+                Say "  firewall group '$($p.Group)': Windows' list of its default rules could not be read and there is no record, so no rule was switched back on (Windows Security > Firewall can do it)" 'Yellow'
             }
         }
         'bind' {
-            if ($snap -and $snap.Bind -and $snap.Bind.ContainsKey($p.Comp)) {
-                foreach ($n in @($snap.Bind[$p.Comp])) { Bind-Set $n $p.Comp $true }
-            } else {
-                foreach ($b in @(Bind-Read $p.Comp)) { if (-not $b.Enabled) { Bind-Set $b.Name $p.Comp $true } }
-            }
+            # Windows binds every adapter to these components: switch every one that is off back on
+            foreach ($b in @(Bind-Read $p.Comp)) { if (-not $b.Enabled) { Bind-Set $b.Name $p.Comp $true } }
         }
         'feat' {
             $s = Feat-State $p.Name
@@ -1628,7 +1638,8 @@ function Invoke-TweakRevert {
     $script:CurTweak = $t
     $store = Get-Store
     $snap = $store[$t.Id]
-    if (-not $snap) { Say "  (no saved record for this one - it was applied outside this app, so Windows' default values are used where they are known)" 'Yellow' }
+    # The record is only consulted for what Windows has no fixed default for (see Revert-Part: optional features, Windows capabilities,
+    # the firewall fallback) and for what this app created itself (a power plan); every value goes back to the Windows default.
     foreach ($p in (Expand-Parts $t)) { if ($t.Choices) { Revert-ChoicePart $t $p $snap } else { Revert-Part $p $snap } }
 }
 function Remove-Snapshot {
@@ -1649,7 +1660,7 @@ function Describe-Tweak {
     param($t)
     $lines = @()
     if ($t.Choices) {
-        $lines += ((Get-ChoiceLabel $t 'default') + ': none of the values below is set    (choosing it puts back the values you had, or removes a value that already was one of the options below)')
+        $lines += ((Get-ChoiceLabel $t 'default') + ': none of the values below is set    (choosing it removes the values of the options below, which is how Windows ships)')
         foreach ($c in @($t.Choices)) {
             if ([string]$c.Key -eq 'default') { continue }
             $lines += ([string]$c.Label + ':')
@@ -2021,14 +2032,12 @@ function Custom-Ultimate-Apply {
 }
 function Custom-Ultimate-Revert {
     param($p, $mine)
-    if ($DryRun) { Say '  [dry] switch back to the plan you had before (or Balanced)' 'DarkGray'; return }
+    if ($DryRun) { Say '  [dry] switch back to the Balanced plan (the Windows default) and delete the plan this app made' 'DarkGray'; return }
     $plans = @(Pwr-Plans)
+    # the Windows default is the Balanced plan, not the plan that was active before this app changed it
     $target = ''
-    if ($mine -and $mine.Orig) { foreach ($x in $plans) { if ($x.Guid -eq $mine.Orig) { $target = $x.Guid } } }
-    if (-not $target) {
-        foreach ($x in $plans) { if ($x.Guid -eq $script:BalancedTemplate) { $target = $x.Guid } }
-        if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
-    }
+    foreach ($x in $plans) { if ($x.Guid -eq $script:BalancedTemplate) { $target = $x.Guid } }
+    if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
     if ($target) {
         [void](Pwr '/setactive' $target); Say "  power plan $target is the active one again" 'DarkGray'
         # The plan this app made is not kept: once another plan is the active one it is deleted, so the list of plans is as it was.
@@ -2175,15 +2184,10 @@ function Custom-UsbPower-Revert {
         $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($i.Id)\Device Parameters"
         $s = $null; if ($mine -and $mine.Dev) { $s = $mine.Dev[$i.Id] }
         if ($DryRun) { Say ("  [dry] {0} : power saving back on" -f $ids[$i.Id]) 'DarkGray'; continue }
-        $want = $true; if ($s -and $null -ne $s.Enable) { $want = [bool]$s.Enable }
-        Pm-Set $i.Id $want
-        if (Fs-Exists $key) {
-            foreach ($rn in $script:UsbRegNames) {
-                if ($s -and $s.Reg -and $s.Reg[$rn] -and $s.Reg[$rn].Exists) { [void](Reg-Write $key $rn $s.Reg[$rn].Value 'DWord' -Quiet) }
-                else { [void](Reg-Remove $key $rn -Quiet) }
-            }
-        }
-        Say ("  {0} : power saving restored" -f $ids[$i.Id]) 'DarkGray'
+        # the Windows default: "allow the computer to turn off this device" on, and no value of ours left in the device's settings
+        Pm-Set $i.Id $true
+        if (Fs-Exists $key) { foreach ($rn in $script:UsbRegNames) { [void](Reg-Remove $key $rn -Quiet) } }
+        Say ("  {0} : power saving back to the Windows default" -f $ids[$i.Id]) 'DarkGray'
     }
 }
 
@@ -2264,6 +2268,13 @@ function Nic-AdvWrite {
     if ($kind -eq 'kw') { Set-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $key -RegistryValue $value -NoRestart -ErrorAction SilentlyContinue }
     else                { Set-NetAdapterAdvancedProperty -Name $name -DisplayName $key -DisplayValue $value -NoRestart -ErrorAction SilentlyContinue }
 }
+# Puts one driver property back to the value its driver ships with (Windows' own reset; nothing happens for a property the driver does not list)
+function Nic-AdvReset {
+    param([string]$name, [string]$kind, [string]$key)
+    if ($DryRun) { return }
+    if ($kind -eq 'kw') { Reset-NetAdapterAdvancedProperty -Name $name -RegistryKeyword $key -NoRestart -ErrorAction SilentlyContinue }
+    else                { Reset-NetAdapterAdvancedProperty -Name $name -DisplayName $key -NoRestart -ErrorAction SilentlyContinue }
+}
 $script:NicPowerRx = 'Energy.?Efficient|Green Ethernet|Power Sav|\bEEE\b|Ultra Low Power|Gigabit Lite|Reduce Speed|Auto Disable|Link Speed Battery'
 $script:OffValueRx = '^(Disabled|Off|Maximum Performance|No|Never)$'
 
@@ -2320,23 +2331,18 @@ function Custom-NicTurnOff-Revert {
     param($p, $mine)
     foreach ($n in @(Nic-List)) {
         Say "  $($n.Name) ($($n.Desc))" 'Gray'
-        if ($DryRun) { Say '    [dry] power-saving box back as before' 'DarkGray'; continue }
-        $s = $null; if ($mine -and $mine.Nic) { $s = $mine.Nic[$n.Guid] }
+        if ($DryRun) { Say '    [dry] power-saving box back to the Windows default (on)' 'DarkGray'; continue }
         $ck = Nic-ClassKey $n.Guid
         if ($ck) {
-            if ($s) {
-                if ($s.PnPExists) { [void](Reg-Write $ck 'PnPCapabilities' ([int]$s.PnPValue) 'DWord' -Quiet) } else { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) }
-            } else {
-                $c = Reg-Read $ck 'PnPCapabilities'
-                if ($c.Exists) {
-                    $v = [int]$c.Value -band (-bnot 0x18)
-                    if ($v -eq 0) { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) } else { [void](Reg-Write $ck 'PnPCapabilities' $v 'DWord' -Quiet) }
-                }
+            # only the two "turn off this device" bits are cleared, so a wake setting you chose (0x100) is kept; with none left the value is deleted (the Windows default)
+            $c = Reg-Read $ck 'PnPCapabilities'
+            if ($c.Exists) {
+                $v = [int]$c.Value -band (-bnot 0x18)
+                if ($v -eq 0) { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) } else { [void](Reg-Write $ck 'PnPCapabilities' $v 'DWord' -Quiet) }
             }
         }
-        $want = $true; if ($s -and $null -ne $s.Enable) { $want = [bool]$s.Enable }
-        Pm-Set $n.PnpId $want
-        Say '    "Allow the computer to turn off this device" restored' 'DarkGray'
+        Pm-Set $n.PnpId $true
+        Say '    "Allow the computer to turn off this device" is back on (the Windows default)' 'DarkGray'
     }
 }
 
@@ -2395,16 +2401,15 @@ function Custom-NicEee-Apply {
 function Custom-NicEee-Revert {
     param($p, $mine)
     foreach ($n in @(Nic-List)) {
-        $saved = $null; if ($mine -and $mine.Nic) { $saved = $mine.Nic[$n.Guid] }
-        if (-not $saved) {
-            if (@(Nic-EeeProps $n.Name).Count) { Say "  $($n.Name): no record of the old driver values - set them on the adapter's Advanced tab if you want them back" 'Yellow' }
-            continue
-        }
-        foreach ($x in @($saved)) {
-            Say "    $($x.Key) -> $($x.Cur)" 'DarkGray'
-            Nic-AdvWrite $n.Name $x.Kind $x.Key $x.Cur
+        $props = @(Nic-EeeProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        foreach ($x in $props) {
+            Say "    $($x.Key) -> the driver's default" 'DarkGray'
+            Nic-AdvReset $n.Name $x.Kind $x.Key
         }
     }
+    Say '  (driver settings take effect after the restart)' 'DarkGray'
 }
 
 # 3) USB adapter selective suspend + sleep-on-disconnect
@@ -2433,6 +2438,17 @@ function Nic-SuspendProps {
 function Nic-PropWrite {
     param([string]$name, $x, [string]$value)
     if ($x.Kind -eq 'pm') { Nic-PmWrite $name $x.Key $value } else { Nic-AdvWrite $name $x.Kind $x.Key $value }
+}
+# One property back to its default: the driver's own value; selective suspend, which Windows ships switched on, is switched on when the
+# driver does not list it as a property of its own (the power-management switches have no reset of their own)
+function Nic-PropReset {
+    param([string]$name, $x)
+    if ($DryRun) { return }
+    if ($x.Kind -eq 'pm') {
+        Nic-AdvReset $name 'kw' ('*' + [string]$x.Key)
+        $now = Nic-PmRead $name
+        if ($now -and [string]$x.Key -eq 'SelectiveSuspend' -and [string]$now.SelectiveSuspend -eq 'Disabled') { Nic-PmWrite $name 'SelectiveSuspend' 'Enabled' }
+    } else { Nic-AdvReset $name $x.Kind $x.Key }
 }
 function Custom-NicSuspend-Detect {
     param($p)
@@ -2473,14 +2489,12 @@ function Custom-NicSuspend-Apply {
 function Custom-NicSuspend-Revert {
     param($p, $mine)
     foreach ($n in @(Nic-List)) {
-        $saved = $null; if ($mine -and $mine.Nic) { $saved = $mine.Nic[$n.Guid] }
-        if (-not $saved) {
-            if (@(Nic-SuspendProps $n.Name).Count) { Say "  $($n.Name): no record of the old values - set them on the adapter's Advanced / Power Management tab if you want them back" 'Yellow' }
-            continue
-        }
-        foreach ($x in @($saved)) {
-            Say "    $($x.Key) -> $($x.Cur)" 'DarkGray'
-            Nic-PropWrite $n.Name $x $x.Cur
+        $props = @(Nic-SuspendProps $n.Name)
+        if ($props.Count -eq 0) { continue }
+        Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        foreach ($x in $props) {
+            Say "    $($x.Key) -> the default" 'DarkGray'
+            Nic-PropReset $n.Name $x
         }
     }
 }
@@ -2553,14 +2567,8 @@ function Live-Animations {
     Live-AnimationValues $all
     Say '  animation settings updated in the running session' 'DarkGray'
 }
-function Live-AnimationsRestore {
-    param($saved)
-    if ($DryRun) { Say '  [dry] put the animation settings of the running session back as they were' 'DarkGray'; return }
-    Live-AnimationValues $saved
-    Say '  animation settings of the running session put back as they were' 'DarkGray'
-}
 function Custom-AnimLive-Detect { param($p) return 'Skip' }
-# What the running session had before: undo hands exactly that back (a setting that was already off stays off)
+# What the running session had before (kept in the record; undo does not use it: it puts back the Windows default)
 function Custom-AnimLive-Snapshot {
     param($p)
     $saved = $null
@@ -2573,16 +2581,8 @@ function Custom-AnimLive-Snapshot {
     return @{ Saved = $saved; Unknown = $allOff }
 }
 function Custom-AnimLive-Apply  { param($p, $mine) Live-Animations $false }
-function Custom-AnimLive-Revert {
-    param($p, $mine)
-    if ($mine -and -not $mine.Unknown -and $mine.Saved) {
-        # a record from before shadows under windows and window dragging were part of this setting does not know them: Windows' own default (on)
-        $vals = @{}
-        foreach ($k in @($mine.Saved.Keys)) { $vals[[string]$k] = $mine.Saved[$k] }
-        foreach ($k in '4133', 'Drag') { if (-not $vals.ContainsKey($k)) { $vals[$k] = 1 } }
-        Live-AnimationsRestore $vals
-    } else { Live-Animations $true }
-}
+# Windows' own default for the running session: every animation and effect on
+function Custom-AnimLive-Revert { param($p, $mine) Live-Animations $true }
 
 function Custom-MouseLive-Detect { param($p) return 'Skip' }
 function Custom-MouseLive-Apply {
@@ -2669,15 +2669,10 @@ function Custom-Hypervisor-Apply {
 }
 function Custom-Hypervisor-Revert {
     param($p, $mine)
-    if ($DryRun) { Say '  [dry] put the hypervisor launch setting back' 'DarkGray'; return }
-    $was = ''; if ($mine -and -not $mine.Unknown) { $was = [string]$mine.Was }
-    if ($was) {
-        [void](Bcd '/set' 'hypervisorlaunchtype' $was)
-        Say "  bcdedit /set hypervisorlaunchtype $was" 'DarkGray'
-    } else {
-        [void](Bcd '/deletevalue' 'hypervisorlaunchtype')
-        Say '  bcdedit /deletevalue hypervisorlaunchtype   (Windows decides again)' 'DarkGray'
-    }
+    if ($DryRun) { Say '  [dry] bcdedit /deletevalue hypervisorlaunchtype' 'DarkGray'; return }
+    # the Windows default is no value at all, so Windows decides again
+    [void](Bcd '/deletevalue' 'hypervisorlaunchtype')
+    Say '  bcdedit /deletevalue hypervisorlaunchtype   (Windows decides again)' 'DarkGray'
 }
 
 # ----------------------------------------- Windows Security scans: idle only -----
@@ -2705,8 +2700,7 @@ function Custom-DefenderIdle-Apply {
 function Custom-DefenderIdle-Revert {
     param($p, $mine)
     $idle = $true; $low = $false; $cpu = 50          # Windows' own defaults
-    if ($mine -and -not $mine.Unknown) { $idle = [bool]$mine.Idle; $low = [bool]$mine.LowPri; $cpu = [int]$mine.Cpu }
-    if ($DryRun) { Say '  [dry] Windows Security scan settings back as they were' 'DarkGray'; return }
+    if ($DryRun) { Say '  [dry] Windows Security scan settings back to the Windows defaults' 'DarkGray'; return }
     if (Mp-Write $idle $low $cpu) { Say ('  Windows Security scans: idle only = {0}, low priority = {1}, CPU limit {2}%' -f $idle, $low, $cpu) 'DarkGray' }
 }
 
@@ -2978,9 +2972,8 @@ function Custom-DxGlobal-Revert {
     if (Vrr-Missing $key) { return }
     $want = Dx-Want $key
     $val = $null
-    if ($mine -and $mine.Had -and -not $mine.Unknown) { $val = [string]$mine.Was }
-    elseif ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
-    # otherwise the entry is removed again, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
+    if ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
+    # otherwise the entry is removed, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
     [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
 }
 
@@ -3029,18 +3022,7 @@ function Custom-GameMode-Apply {
 }
 function Custom-GameMode-Revert {
     param($p, $mine)
-    if ($mine -and -not [bool]$mine.On) {
-        foreach ($n in $script:GmNames) {
-            $s = $mine.$n
-            if ($s -and [bool]$s.Had) {
-                $k = [string]$s.Kind; if (-not $k) { $k = 'DWord' }
-                [void](Reg-Write $script:GmPath $n $s.Was $k)
-            } else { [void](Reg-Remove $script:GmPath $n) }
-        }
-        return
-    }
-    # no record, or Game Mode was already on before this app saw it: switching it off needs an explicit 0 (removing the entries would
-    # leave Windows' default, which is on)
+    # Windows' default is Game Mode on, so removing the entries would leave this setting reading as on: switching it off needs an explicit 0
     foreach ($n in $script:GmNames) { [void](Reg-Write $script:GmPath $n 0 'DWord') }
 }
 
@@ -3285,9 +3267,9 @@ function Custom-Startup-Revert {
     $e = $p.Data
     if ($DryRun) { Say ("  [dry] {0}: switched back on in the Startup apps list" -f $e.Show) 'DarkGray'; return }
     $path = Appr-Path 'HKCU' $e.Appr
-    if ($mine -and -not $mine.Unknown) {
-        if ($mine.Exists) { [void](Reg-Write $path $e.ApprName $mine.Bytes 'Binary' -Quiet) } else { [void](Reg-Remove $path $e.ApprName -Quiet) }
-    } else {
+    # the Windows default is no record of its own for the entry (it runs); only when a machine-wide record still keeps it off is an "on" record written for your account
+    [void](Reg-Remove $path $e.ApprName -Quiet)
+    if (Startup-Disabled $e) {
         $b = Appr-Bytes $false
         [void](Reg-Write $path $e.ApprName $b 'Binary' -Quiet)
     }
@@ -3324,7 +3306,7 @@ function Add-StartupTweaks {
                 'What it runs: ' + $e.Cmd + $nl + $nl +
                 'If this belongs to a driver or hardware tool (audio, mouse or keyboard software, RGB lighting, a printer, antivirus), its tray icon, shortcuts and profiles will not work until you open it yourself. ' +
                 'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.'
-        $info = 'Startup apps switch for "' + $e.Show + '": HKCU\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: put back as it was)'
+        $info = 'Startup apps switch for "' + $e.Show + '": HKCU\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: the entry is removed, so it starts with Windows again)'
         Add-Tweak -Id $id -Cat $script:StartupCat -Name ($shown + ' does not start with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
         $at++
     }
@@ -3591,8 +3573,8 @@ function Custom-TempClean-Revert { param($p, $mine) Say '  (removing temporary f
 
 # =============================================================================
 # THE CATALOG. One entry per setting you can switch on.
-#   pReg  path name value [undo-value]  : undo-value $null = delete the value (Windows default is "not set")
-#   pSvc  name Disabled|Manual  undo-start-type
+#   pReg  path name value [undo-value]  : undo-value = the WINDOWS DEFAULT that switching the setting off puts back; $null = delete the value (Windows default is "not set")
+#   pSvc  name Disabled|Manual  undo-start-type  : the Windows default start type, put back when the setting is switched off
 # "Preset" = part of Recommended Debloat (everything the original script did, except the UAC engine switch).
 # =============================================================================
 $cPriv   = 'Privacy and telemetry'
@@ -4052,7 +4034,7 @@ Add-Tweak -Id 'mpo' -Cat $cDisplay -Reboot -Name 'Multiplane Overlay (MPO)' -Not
     -Desc ('Fix for screen flicker and stutter; not a speed-up. Multiplane Overlay lets the graphics hardware combine the game, the desktop and overlays itself, instead of Windows blending them into one picture. On some graphics card, driver and monitor combinations, switching between those layers is reported to cause flicker, black flashes or stutter, and turning MPO off makes Windows blend everything itself again. ' +
            'That comes from user reports, not measurements, and it is not a speed-up: leave it on Enabled unless you see those problems. ' +
            'Choose one of three options on the card. Enabled (Windows default): nothing is set. Disabled: OverlayTestMode = 5, the usual fix. Fully disabled: OverlayTestMode = 5 and DisableOverlays = 1 (the second value is what the Fully Disabled option of Chris Titus Tech''s WinUtil sets). ' +
-           'No Microsoft documentation for either value was found; they come from community guides and tools like WinUtil. Needs a restart. Changing the option or choosing Enabled again puts back the values you had before; a value that already had one of these settings before this app saw it is removed instead (neither value is set by default).') `
+           'No Microsoft documentation for either value was found; they come from community guides and tools like WinUtil. Needs a restart. Changing the option or choosing Enabled again removes the values that no longer apply, which is how Windows ships (neither value is set by default).') `
     -Choices @(
         @{ Key = 'default'; Label = 'Enabled (Windows default)'; Short = 'Enabled (default)'; Parts = @() }
         @{ Key = 'disabled'; Label = 'Disabled'; Short = 'Disabled'; Parts = @( (pReg $mpoDwm 'OverlayTestMode' 5) ) }
@@ -4062,7 +4044,7 @@ Add-Tweak -Id 'mpo' -Cat $cDisplay -Reboot -Name 'Multiplane Overlay (MPO)' -Not
 Add-Tweak -Id 'defender-idle' -Cat $cGame -Preset -Name 'Windows Security scans only when the PC is idle (low priority, low CPU)' `
     -Desc 'Windows Security keeps protecting you in real time exactly as before. Only its scheduled scans change: they run only while the PC is idle, at low priority, and use at most 20% of the CPU. Scans take longer to finish. Shown as not available on PCs where Windows Security is turned off or replaced by another antivirus.' `
     -Parts @(
-        pCustom 'DefenderIdle' 'Set-MpPreference: ScanOnlyIfIdleEnabled = on, EnableLowCpuPriority = on, ScanAvgCPULoadFactor = 20    (undo: your earlier values, else on / off / 50)'
+        pCustom 'DefenderIdle' 'Set-MpPreference: ScanOnlyIfIdleEnabled = on, EnableLowCpuPriority = on, ScanAvgCPULoadFactor = 20    (undo: the Windows defaults: on / off / 50)'
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Preset -Name 'Disable Sticky Keys shortcut (Shift pressed 5 times)' `
@@ -4093,21 +4075,21 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys short
 # games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
 # keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
 Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -Name 'Optimizations for windowed games on' `
-    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here writes an explicit 0. Undo puts back what was there before.' `
+    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here writes an explicit 0 on those builds (on older builds the entry is removed, which Windows reads as off).' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: your earlier value; with none, the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
+        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
     )
 
 Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Disable variable refresh rate for DirectX 11 full-screen games' `
-    -Desc 'Windows 10 version 2004 and newer. Turns off the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Microsoft describes that switch as adding variable refresh rate (G-SYNC, FreeSync, Adaptive-Sync) to DirectX 11 games in full screen that were not written for it; with it off those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games", the setting above. Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (greyed out, nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information that each screen reports about itself (its EDID, which Windows keeps) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as not turned off yet, and turning this on writes an explicit 0 (off). An entry of 0 is shown as on here and an entry of 1 as off. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Undo puts back what was there before; with nothing recorded it removes the entry again, which leaves the Windows default.' `
+    -Desc 'Windows 10 version 2004 and newer. Turns off the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Microsoft describes that switch as adding variable refresh rate (G-SYNC, FreeSync, Adaptive-Sync) to DirectX 11 games in full screen that were not written for it; with it off those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games", the setting above. Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (greyed out, nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information that each screen reports about itself (its EDID, which Windows keeps) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as not turned off yet, and turning this on writes an explicit 0 (off). An entry of 0 is shown as on here and an entry of 1 as off. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Undo removes the entry again, which leaves the Windows default.' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: your earlier value; with none, the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
+        pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
     )
 
 Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -Name 'Game Mode on' `
-    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off turns Game Mode off. A missing entry is shown as on, because that is what Windows does when nothing has been changed; undo puts back what was there before, and with nothing recorded it writes an explicit 0 (Game Mode off). Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
+    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off turns Game Mode off. A missing entry is shown as on, because that is what Windows does when nothing has been changed; switching this off writes an explicit 0 (Game Mode off), because removing the entries would leave Windows'' default, which is on. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
     -Parts @(
-        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: your earlier values; with none recorded, both are set to 0, which is Game Mode off)'
+        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are set to 0, which is Game Mode off)'
     )
 
 # ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
@@ -4129,19 +4111,19 @@ Add-Tweak -Id 'power-throttle' -Cat $cNothing -Reboot -Unproven -Name 'Disable p
 
 $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
 Add-Tweak -Id 'netthrottle' -Cat $cNothing -Unproven -Name 'Disable network throttling' `
-    -Desc 'Should not change your ping: it only limits incoming traffic while media plays, and a game receives far fewer packets than the limit. Windows applies the limit only while a media-playback program is being boosted, and then caps received traffic at 10 packets per millisecond (about 15 MB/s, roughly 120 Mbps), so turning it off only matters for fast downloads while media plays. The one published measurement found (a Windows latency trace, build not stated) showed slightly higher network-driver latency with it off, and no measured ping gain was found. Microsoft''s current multimedia scheduler documentation does not mention this value, and it is not confirmed that Windows 11 still enforces it. Switch on: sets NetworkThrottlingIndex to 0xFFFFFFFF (throttling off). Switch off: puts your previous value back (Windows'' default of 10 if you never changed it).' `
+    -Desc 'Should not change your ping: it only limits incoming traffic while media plays, and a game receives far fewer packets than the limit. Windows applies the limit only while a media-playback program is being boosted, and then caps received traffic at 10 packets per millisecond (about 15 MB/s, roughly 120 Mbps), so turning it off only matters for fast downloads while media plays. The one published measurement found (a Windows latency trace, build not stated) showed slightly higher network-driver latency with it off, and no measured ping gain was found. Microsoft''s current multimedia scheduler documentation does not mention this value, and it is not confirmed that Windows 11 still enforces it. Switch on: sets NetworkThrottlingIndex to 0xFFFFFFFF (throttling off). Switch off: puts Windows'' default of 10 back.' `
     -Parts @(
         pReg $mm 'NetworkThrottlingIndex' ([uint32]4294967295) 10
     )
 
 Add-Tweak -Id 'sysresp' -Cat $cNothing -Unproven -Name 'Set system responsiveness to 10% (multimedia scheduler)' `
-    -Desc 'May change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the Windows multimedia scheduler. It lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use it (a game''s audio threads, say) can take more when the CPU is completely busy. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows. Switch on: sets SystemResponsiveness to 10. Switch off: puts your previous value back (Windows'' default of 20 if you never changed it).' `
+    -Desc 'May change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the Windows multimedia scheduler. It lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use it (a game''s audio threads, say) can take more when the CPU is completely busy. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows. Switch on: sets SystemResponsiveness to 10. Switch off: puts Windows'' default of 20 back.' `
     -Parts @(
         pReg $mm 'SystemResponsiveness' 10 20
     )
 
 Add-Tweak -Id 'gamesched' -Cat $cNothing -Unproven -Name 'Set game scheduling priority to High (multimedia scheduler "Games" task)' `
-    -Desc 'Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games. Switch on: sets Scheduling Category and SFIO Priority to High, Priority to 6 and GPU Priority to 8. Switch off: puts your previous values back (Windows ships Medium, Normal, 2 and 8).' `
+    -Desc 'Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games. Switch on: sets Scheduling Category and SFIO Priority to High, Priority to 6 and GPU Priority to 8. Switch off: puts Windows'' defaults back (Medium, Normal, 2 and 8).' `
     -Parts @(
         pReg "$mm\Tasks\Games" 'GPU Priority' 8 8
         pReg "$mm\Tasks\Games" 'Priority' 6 2
@@ -4150,7 +4132,7 @@ Add-Tweak -Id 'gamesched' -Cat $cNothing -Unproven -Name 'Set game scheduling pr
     )
 
 Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Reboot -Unproven -Name 'Set TCP to acknowledge at once (no-delay) on every network connection' `
-    -Desc 'Only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Switch on: sets TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 on every network interface, so Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this switched on again. Switch off: puts your previous values back, or deletes them if there were none (how Windows ships).' `
+    -Desc 'Only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Switch on: sets TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 on every network interface, so Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this switched on again. Switch off: deletes the three values (how Windows ships).' `
     -Parts @(
         pRegDyn -Info 'Every network interface under HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces: TcpAckFrequency = 1, TCPNoDelay = 1, TcpDelAckTicks = 0    (undo: values deleted)' -Gen {
             foreach ($k in @(Reg-SubKeys 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces')) {
@@ -4162,13 +4144,13 @@ Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Reboot -Unproven -Name 'Set TCP to a
     )
 
 Add-Tweak -Id 'svc-sysmain' -Cat $cNothing -Unproven -Name 'Set SysMain (Superfetch) to disabled' `
-    -Desc 'Little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. SysMain pre-loads frequently used apps into memory, which mainly helps hard drives. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it. Switch on: sets the SysMain service to Disabled. Switch off: puts your previous setting back (Windows'' default is Automatic).' `
+    -Desc 'Little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. SysMain pre-loads frequently used apps into memory, which mainly helps hard drives. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it. Switch on: sets the SysMain service to Disabled. Switch off: sets the service back to Windows'' default, Automatic.' `
     -Parts @(
         pSvc 'SysMain' 'Disabled' 'Automatic'
     )
 
 Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Unproven -Name 'Set the delay before startup programs and the desktop load to 0' `
-    -Desc 'May do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once. Switch on: sets StartupDelayInMSec and WaitforIdleState to 0. Switch off: puts your previous values back, or deletes them if there were none.' `
+    -Desc 'May do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once. Switch on: sets StartupDelayInMSec and WaitforIdleState to 0. Switch off: deletes them (how Windows ships).' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'WaitforIdleState' 0
@@ -4211,9 +4193,9 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable Memory In
 
 Add-Tweak -Id 'hypervisor' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable hypervisor start with Windows (hypervisorlaunchtype)' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'Stops the Windows hypervisor from loading at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Undo puts the boot setting back as it was.' `
+    -Desc 'Stops the Windows hypervisor from loading at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Undo deletes the boot setting, so Windows decides again (its default).' `
     -Parts @(
-        pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: the value you had, else bcdedit /deletevalue hypervisorlaunchtype)'
+        pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: bcdedit /deletevalue hypervisorlaunchtype)'
     )
 
 Add-Tweak -Id 'bitlocker' -Cat $cSec -OneWay -Risk 'security' -Name 'Disable BitLocker drive encryption (decrypts your drives)' `
@@ -4331,7 +4313,7 @@ Add-Tweak -Id 'defender-core' -Cat $cPriv -Preset -Risk 'note' -Name 'Disable De
 
 # ------------------------------------------------------- Storage and clean-up ---
 Add-Tweak -Id 'storage-sense' -Cat $cStore -Name 'Disable Storage Sense' `
-    -Desc 'Turns off Storage Sense, the Windows feature that deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and that can be set up to clear your Downloads folder as well. With it off Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This only changes that one switch; undo puts it back the way it was.' `
+    -Desc 'Turns off Storage Sense, the Windows feature that deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and that can be set up to clear your Downloads folder as well. With it off Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This only changes that one switch; undo removes the value, which is the Windows default.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
     )
@@ -4392,7 +4374,7 @@ Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Preset -Explorer -Name 'Disable Wid
     )
 
 Add-Tweak -Id 'taskbar-search' -Cat $cLook -Preset -Explorer -Name 'Disable taskbar search button' `
-    -Desc 'Hides the search box or search icon from the taskbar. Search still opens with Win+S, and typing in the Start menu still searches. Turning this off puts back the search button the way you had it before.' `
+    -Desc 'Hides the search box or search icon from the taskbar. Search still opens with Win+S, and typing in the Start menu still searches. Turning this off puts back the search button the way Windows ships it.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
     )
@@ -4426,7 +4408,7 @@ Add-Tweak -Id 'start-recommended' -Cat $cLook -Preset -Explorer -Risk 'note' -Na
     )
 
 Add-Tweak -Id 'blackdesk' -Cat $cLook -Preset -Name 'Solid black desktop' `
-    -Desc 'No wallpaper, plain black background. Turning this off restores the wallpaper you had when you switched it on.' `
+    -Desc 'No wallpaper, plain black background. Turning this off puts back the default Windows wallpaper and background colour.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Colors' 'Background' '0 0 0' '0 0 0' 'String'
         pReg 'HKCU:\Control Panel\Desktop' 'WallPaper' '' "$env:SystemRoot\web\wallpaper\Windows\img0.jpg" 'String'
@@ -4435,7 +4417,7 @@ Add-Tweak -Id 'blackdesk' -Cat $cLook -Preset -Name 'Solid black desktop' `
     )
 
 Add-Tweak -Id 'animations' -Cat $cLook -Preset -Explorer -Name 'Disable visual effects (only smooth font edges stays on)' `
-    -Desc 'Sets Performance Options > Visual Effects to Custom with only "Smooth edges of screen fonts" left on (ClearType, so text stays sharp). Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Undo hands back the settings you had before.' `
+    -Desc 'Sets Performance Options > Visual Effects to Custom with only "Smooth edges of screen fonts" left on (ClearType, so text stays sharp). Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Undo puts back the Windows default for all of these.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 3 0
         pReg 'HKCU:\Control Panel\Desktop\WindowMetrics' 'MinAnimate' '0' '1' 'String'
@@ -6897,14 +6879,14 @@ function Get-DetailParts {
     [void]$p.Add(@{ S = 'title'; C = ''; T = $t.Name + $nl })
     [void]$p.Add(@{ S = 'sub'; C = ''; T = $t.Cat + $nl + $nl })
     [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
-    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it, so there is nothing of its own to put back.' + $nl }) }
-    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Applied by this app: the values from before are saved, so turning it off puts them back.' + $nl }) }
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it. Turning it off still puts the Windows default back.' + $nl }) }
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Applied by this app: turning it off puts the Windows default back.' + $nl }) }
     $a = Get-Action $row
     if ($t.Choices -and $a) {
-        [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be set to "' + (Get-ChoiceLabel $t ([string]$row.Pick)) + '" when you press the button' + $(if ($a -eq 'Undo') { ' (your previous values are put back)' } else { '' }) + $nl) })
+        [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be set to "' + (Get-ChoiceLabel $t ([string]$row.Pick)) + '" when you press the button' + $(if ($a -eq 'Undo') { ' (the Windows default is put back)' } else { '' }) + $nl) })
     } elseif ($a -eq 'Apply' -and $t.Once) { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will run once when you press the button' + $nl }) }
     elseif ($a -eq 'Apply') { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned ON when you press the button' + $nl }) }
-    elseif ($a -eq 'Undo')  { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned OFF (your previous values are put back) when you press the button' + $nl }) }
+    elseif ($a -eq 'Undo')  { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned OFF (the Windows default is put back) when you press the button' + $nl }) }
     if ($row.NoteDetail) { [void]$p.Add(@{ S = 'last'; C = ''; T = 'Last result: ' + [string]$row.Note + ' - ' + [string]$row.NoteDetail + $nl }) }
     if ([string]$row.Read) {
         [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Read from your PC (the last check):' + $nl })
@@ -6996,7 +6978,7 @@ function Get-ConfirmText {
     if ($one.Count) { $s += ('These cannot be undone from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
     if ($rb.Count)  { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl + $nl }
     if (@($Plan | Where-Object { -not $script:ById[$_.Id].Once }).Count -gt 0) {
-        $s += 'A restore point is created first, and your current values are saved so that switching a setting off later puts them back.'
+        $s += 'A restore point is created first. Switching a setting off later puts the Windows default back.'
     } else {
         $s += 'Nothing here can be undone, so no restore point is made.'
     }
@@ -10738,7 +10720,7 @@ function Ui-Build {
     $detCard.Width = $M.Details
     $detCard.Padding = New-Object System.Windows.Forms.Padding((Px 22), (Px 20), (Px 12), (Px 16))
     $detail = New-Rich $Th.Card $Th.Text 'body'
-    $forceBtn = New-Btn 'Put this one fully back (undo)' 200 'secondary' 'Turn this setting fully off and put your earlier values back.' 38
+    $forceBtn = New-Btn 'Put this one fully back (undo)' 200 'secondary' 'Turn this setting fully off and put the Windows default back.' 38
     $forceBtn.Dock = [System.Windows.Forms.DockStyle]::Bottom
     $forceBtn.Visible = $false
     $detCard.Controls.Add($detail)
@@ -12598,7 +12580,7 @@ function Get-PresetViewParts {
         if ($ac) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $ac + $nl }) }
         Add-PresetChangeList $p $sp
         if ($sp.Change.Count -gt 0) {
-            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'A restore point is created first. Switching a setting off later puts the Windows default back.' + $nl })
         }
     } else {
         [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings are already enabled on this PC' -f $sp.On.Count, $avail) + $nl })
@@ -12672,7 +12654,7 @@ function Get-PresetWinParts {
         [void]$p.Add(@{ S = 'last'; C = ''; T = $nl + ('A restart is needed afterwards for {0} of these: {1}{2}' -f $rb.Count, (($rb | Select-Object -First 6) -join ', '), $more) + $nl })
     }
     if ($chg.Count -gt 0) {
-        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first. Switching a setting off later puts the Windows default back.' + $nl })
     }
     return $p
 }
@@ -12706,7 +12688,7 @@ function Get-CustomWinParts {
             [void]$p.Add(@{ S = 'note'; C = ''; T = 'Open "Will be changed" or "Already enabled" above to see which settings they are.' + $nl })
         }
         if ($sp.Change.Count -gt 0) {
-            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first, and your current values are saved so that switching a setting off later puts them back.' + $nl })
+            [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab. A restore point is created first. Switching a setting off later puts the Windows default back.' + $nl })
         }
     }
     $rows = @()
