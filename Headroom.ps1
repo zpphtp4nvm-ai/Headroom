@@ -19,8 +19,8 @@
       Advanced Debloat      for PCs used mainly for gaming; it may remove services that other uses need
       Custom Preset         your own saved configuration, which can be applied again after a clean install of Windows
 
-    Preview only lists what would happen and changes nothing. Latency tests measures how responsive the PC is and changes
-    nothing. Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines ask first.
+    Preview only lists what would happen and changes nothing. Settings that can stop FACEIT or Riot Vanguard, printing, or
+    virtual machines ask first.
 
     Where things are kept:
       undo record   %ProgramData%\Win11GamingDebloat\undo-record.xml
@@ -1385,7 +1385,10 @@ function Get-TweakState {
         return @{ State = 'NA'; Read = $rd; Detail = $d }
     }
     if ($gated.Count) {
-        $note += (' ({0} value{1} left out on {2}: {3})' -f $gated.Count, $(if ($gated.Count -gt 1) { 's' } else { '' }), (Ed-ClassName (Get-WinEdition).Class), (Ed-Reason $gated[0].Ed))
+        # one reason when every left-out value has the same one; otherwise the details window gives each value its own
+        $gWhy = @($gated | ForEach-Object { Ed-Reason $_.Ed } | Select-Object -Unique)
+        $gWhyText = 'the details give the reason for each'; if ($gWhy.Count -eq 1) { $gWhyText = [string]$gWhy[0] }
+        $note += (' ({0} value{1} left out on {2}: {3})' -f $gated.Count, $(if ($gated.Count -gt 1) { 's' } else { '' }), (Ed-ClassName (Get-WinEdition).Class), $gWhyText)
     }
     if ($off -eq 0)  { return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note } }
     if ($onI -eq 0)  { return @{ State = 'Off'; Read = $rd; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note } }
@@ -1428,6 +1431,33 @@ function Take-Snapshot {
         }
     }
     return $snap
+}
+
+# A record made by an older version of this app lacks the values the setting has gained since. Before they are set, what is there now
+# is added to the record, so that switching the setting off puts those back as well (the values already in the record are left as
+# they were saved: they are the originals). Only registry values and services: their record can tell "already set before" apart.
+# Returns $true when something was added.
+function Add-MissingSnapshot {
+    param($t, $snap)
+    $added = $false
+    foreach ($p in (Expand-Parts $t)) {
+        if ($p.T -eq 'reg' -and $snap.Reg -is [hashtable]) {
+            $k = "$($p.Path)|$($p.Name)"
+            if ($snap.Reg.ContainsKey($k)) { continue }
+            $c = Reg-Read $p.Path $p.Name
+            $already = ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type))
+            $snap.Reg[$k] = @{ Exists = $c.Exists; Value = $c.Value; Kind = $c.Kind; Unknown = $already }
+            $added = $true
+        } elseif ($p.T -eq 'svc' -and $snap.Svc -is [hashtable]) {
+            if ($snap.Svc.ContainsKey($p.Name)) { continue }
+            $c = Svc-Read $p.Name
+            if ($null -ne $c) {
+                $snap.Svc[$p.Name] = @{ Start = $c.Start; Delayed = $c.Delayed; Unknown = (Svc-IsApplied $c $p) }
+                $added = $true
+            }
+        }
+    }
+    return $added
 }
 
 # --------------------------------------------------------------- apply -------
@@ -1514,6 +1544,7 @@ function Invoke-TweakApply {
     $store = Get-Store
     $snap = $store[$t.Id]
     if (-not $snap) { $snap = Take-Snapshot $t; $store[$t.Id] = $snap; Save-Store $store }
+    elseif (Add-MissingSnapshot $t $snap) { $store[$t.Id] = $snap; Save-Store $store }
     if ($c) {
         # this option's values are set; the values that only another option sets go back to what they were before (the saved record)
         $mine = @{}
@@ -3594,7 +3625,7 @@ $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
 Add-Tweak -Id 'telemetry' -Cat $cPriv -Preset -Name 'Disable Windows telemetry and error reporting' `
-    -Desc 'Sets diagnostic data to the minimum Windows allows, and turns off the Customer Experience program, Windows Error Reporting, app inventory collection and remote diagnostic-config downloads. The minimum is "Off" (0) on Enterprise and Education; Home and Pro treat 0 as 1, so there the app sets 1, "Required" only, which also stops the optional diagnostic data from being switched on in Settings.' `
+    -Desc 'Sets diagnostic data to the minimum Windows allows, and turns off the Customer Experience program, Windows Error Reporting (the current policy, the older error-reporting policy, and sending extra data with a report), app inventory collection and remote diagnostic-config downloads. The minimum is "Off" (0) on Enterprise and Education; Home and Pro treat 0 as 1, so there the app sets 1, "Required" only, which also stops the optional diagnostic data from being switched on in Settings.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\DataCollection" 'AllowTelemetry' 0)
         pEd 'Home,Pro' (pReg "$pol\DataCollection" 'AllowTelemetry' 1)
@@ -3609,6 +3640,8 @@ Add-Tweak -Id 'telemetry' -Cat $cPriv -Preset -Name 'Disable Windows telemetry a
         pReg "$pol\AppCompat" 'DisableInventory' 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
         pReg "$pol\Windows Error Reporting" 'Disabled' 1
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting' 'DoReport' 0
+        pReg 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1
     )
 
 Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Preset -Name 'Disable telemetry services' `
@@ -3667,7 +3700,7 @@ Add-Tweak -Id 'feedback' -Cat $cPriv -Preset -Name 'Disable feedback pop-ups' `
     )
 
 Add-Tweak -Id 'inking' -Cat $cPriv -Preset -Name 'Disable inking, typing, handwriting and speech data collection' `
-    -Desc 'Stops Windows from collecting what you type and write to personalise suggestions, and from sending handwriting data. Online speech recognition consent is withdrawn.' `
+    -Desc 'Stops Windows from collecting what you type and write to personalise suggestions, and from sending handwriting data. Online speech recognition consent is withdrawn, and Typing insights (the statistics Windows keeps about your typing) are turned off.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
@@ -3677,6 +3710,7 @@ Add-Tweak -Id 'inking' -Cat $cPriv -Preset -Name 'Disable inking, typing, handwr
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
         pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
         pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
+        pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0
     )
 
 Add-Tweak -Id 'location' -Cat $cPriv -Name 'Disable location services' `
@@ -3951,7 +3985,7 @@ try { Add-StartupTweaks } catch { }
 
 # ---------------------------------------------------------------- Gaming ------
 Add-Tweak -Id 'gamedvr' -Cat $cGame -Preset -Name 'Disable Game Bar (Game Mode stays on)' `
-    -Desc 'Turns Xbox Game Bar off in settings: it stops recording clips in the background (which can cost frames), the Xbox button on a controller no longer opens it and its start-up tip is hidden. Windows Game Mode stays on. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely.' `
+    -Desc 'Turns Xbox Game Bar off in settings: it stops recording clips in the background (which can cost frames), the Xbox button on a controller no longer opens it and its start-up tip is hidden. Windows Game Mode stays on. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. It also tries to turn off Game Bar''s presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies.' `
     -Parts @(
         pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
@@ -3959,6 +3993,7 @@ Add-Tweak -Id 'gamedvr' -Cat $cGame -Preset -Name 'Disable Game Bar (Game Mode s
         pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1 1
+        pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
     )
 
 Add-Tweak -Id 'mouse' -Cat $cGame -Preset -Name 'Disable mouse acceleration' `
@@ -3972,11 +4007,31 @@ Add-Tweak -Id 'mouse' -Cat $cGame -Preset -Name 'Disable mouse acceleration' `
     )
 
 Add-Tweak -Id 'wu-drivers' -Cat $cGame -Risk 'note' -Name 'Windows Update does not replace drivers' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
-    -Desc 'Keeps Windows Update from swapping the graphics and other drivers you installed yourself. You then update drivers manually (GPU maker''s installer or your motherboard''s site).' `
+    -Desc 'Keeps Windows Update from swapping the graphics and other drivers you installed yourself, and from searching Windows Update for a driver when you plug in new hardware. You then update drivers manually (GPU maker''s installer or your motherboard''s site). The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting and Windows Update''s own settings key.' `
     -Parts @(
         pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1
+        pReg "$pol\DriverSearching" 'SearchOrderConfig' 0
+        pReg "$pol\DriverSearching" 'DontSearchWindowsUpdate' 1
+        pReg 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'ExcludeWUDriversInQualityUpdate' 1
+    )
+
+# One setting, three options. Windows Update itself is never switched off here; the strongest option only stops it from installing
+# updates without being asked. Not in any preset and left out of "Apply all" (see $script:ApplyAllSkip).
+$wuStore = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'
+$wuMrt   = 'HKLM:\SOFTWARE\Policies\Microsoft\MRT'
+$wuAU    = "$pol\WindowsUpdate\AU"
+Add-Tweak -Id 'wu-auto' -Cat $cGame -Risk 'security' -Name 'Stop Store app and Malicious Software Removal Tool updates (option: automatic Windows updates too)' `
+    -Desc ('Windows Update itself stays on whichever option you choose: security updates, drivers and feature updates can still be installed. ' +
+           'Choose one of three options on the card. Automatic (Windows default): nothing is set. Store and MRT off: the Microsoft Store stops downloading and installing app updates by itself (AutoDownload = 2), and Windows Update stops offering the monthly Malicious Software Removal Tool, MRT (DontOfferThroughWUAU = 1); Windows Security is not affected. ' +
+           'No auto-updates: the same two values and NoAutoUpdate = 1 (the "Configure Automatic Updates" policy set to Disabled). Windows then no longer downloads and installs updates by itself: open Settings > Windows Update and press Check for updates when you want them, and do it at least once a month, or the PC goes without security fixes. ' +
+           'Limits: a manual check in the Store or in Windows Update still installs updates. It is not confirmed that Windows Home obeys the NoAutoUpdate policy, so on Home that option may change nothing; look at Settings > Windows Update after a restart. Nothing says which editions obey the MRT value. ' +
+           'Changing the option or choosing Automatic again puts back the values you had before; a value that was not there before is removed.') `
+    -Choices @(
+        @{ Key = 'default'; Label = 'Automatic (Windows default)'; Short = 'Automatic (default)'; Parts = @() }
+        @{ Key = 'apps'; Label = 'Store app and MRT updates off'; Short = 'Store and MRT off'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1) ) }
+        @{ Key = 'all'; Label = 'Also stop automatic Windows updates'; Short = 'No auto-updates'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1), (pReg $wuAU 'NoAutoUpdate' 1) ) }
     )
 
 Add-Tweak -Id 'wpbt' -Cat $cGame -Reboot -Risk 'note' -Name 'Disable WPBT (firmware cannot install programs at startup)' `
@@ -4440,11 +4495,12 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Preset -Explorer -Name 'Gallery rem
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Add-Tweak -Id 'suggestions' -Cat $cLook -Preset -Name 'Disable ads, suggestions and auto-installed apps' `
-    -Desc 'No promoted apps in Start, no tips and suggestions on the lock screen or in Settings, no silently installed sponsored apps, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, so on Home and Pro the app sets only the per-user switches, which work on every edition.' `
+    -Desc 'No promoted apps in Start, no tips and suggestions on the lock screen or in Settings, no silently installed sponsored apps, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsSpotlightFeatures' 1)
+        pEd 'Pro,Ent' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0)
         pReg $cdm 'ContentDeliveryAllowed' 0 1
         pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
         pReg $cdm 'PreInstalledAppsEnabled' 0 1
@@ -4869,586 +4925,6 @@ Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Name 'Disable scheduled task: Power 
         pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
     )
 }   # ---- end of $engine ----
-# =============================================================================
-# LATENCY TESTS (measuring side). Nothing here changes a setting: it only measures and rates.
-#
-# What it can measure from software alone:
-#   PC latency   timer wake-up jitter, CPU stalls (interrupts, drivers, firmware), interrupt / DPC load,
-#                and how steadily Windows refreshes the screen.
-# What it cannot measure: the monitor's own processing and pixel response. That needs a high-speed camera or a hardware tester
-# (for example the latency analyzer built into some NVIDIA Reflex monitors).
-#
-# Ratings are rules of thumb tied to the frame time of YOUR monitor (1000 / refresh rate): a delay of half a frame or more
-# can cost a frame, a stall longer than a frame does. Each result shows its rule.
-#
-# Everything lives in $latEngine so the same text can run on the window's thread and in a background worker.
-# C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
-# =============================================================================
-$LatQ = $null    # the queue the background worker reports through (its host sets it; the code below only reads it)
-$latEngine = {
-
-$script:LatSrcProbe = @'
-using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Runtime.InteropServices;
-using System.Threading;
-
-public static class LatProbe
-{
-    [DllImport("ntdll.dll")]
-    static extern int NtQueryTimerResolution(out uint minimum, out uint maximum, out uint current);
-    [DllImport("winmm.dll")]
-    static extern uint timeBeginPeriod(uint period);
-    [DllImport("winmm.dll")]
-    static extern uint timeEndPeriod(uint period);
-    [DllImport("dwmapi.dll")]
-    static extern int DwmFlush();
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    static extern IntPtr CreateWaitableTimerEx(IntPtr attributes, string name, uint flags, uint access);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    static extern bool SetWaitableTimer(IntPtr timer, ref long dueTime, int period, IntPtr completion, IntPtr argument, bool resume);
-    [DllImport("kernel32.dll")]
-    static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-    [DllImport("kernel32.dll")]
-    static extern bool CloseHandle(IntPtr handle);
-
-    public static string WaitMode = "";
-    public static long StallLoops = 0;
-
-    // minimum, maximum (finest) and current system timer resolution, in 100 ns units
-    public static uint[] TimerResolution()
-    {
-        uint mn; uint mx; uint cur;
-        int rc = NtQueryTimerResolution(out mn, out mx, out cur);
-        if (rc != 0) { throw new InvalidOperationException("NtQueryTimerResolution returned " + rc); }
-        return new uint[] { mn, mx, cur };
-    }
-
-    // How late each 1 ms wait ends, in milliseconds. Uses a high-resolution waitable timer when Windows has one.
-    public static double[] WaitJitter(int count)
-    {
-        double[] r = new double[count];
-        double toMs = 1000.0 / Stopwatch.Frequency;
-        IntPtr h = IntPtr.Zero;
-        try { h = CreateWaitableTimerEx(IntPtr.Zero, null, 0x2, 0x1F0003); }
-        catch (Exception) { h = IntPtr.Zero; }
-        bool hi = (h != IntPtr.Zero);
-        WaitMode = hi ? "high-resolution timer" : "Sleep(1)";
-        ThreadPriority old = Thread.CurrentThread.Priority;
-        bool began = false;
-        try
-        {
-            Thread.CurrentThread.Priority = ThreadPriority.Highest;
-            if (!hi) { began = (timeBeginPeriod(1) == 0); }
-            for (int i = 0; i < count; i++)
-            {
-                long t0 = Stopwatch.GetTimestamp();
-                if (hi)
-                {
-                    long due = -10000;   // 1 ms, relative (negative, in 100 ns units)
-                    // if Windows refuses to arm the timer, stop here: waiting on it would take a full second per step
-                    if (!SetWaitableTimer(h, ref due, 0, IntPtr.Zero, IntPtr.Zero, false)) { throw new InvalidOperationException("SetWaitableTimer failed (" + Marshal.GetLastWin32Error() + ")"); }
-                    WaitForSingleObject(h, 1000);
-                }
-                else
-                {
-                    Thread.Sleep(1);
-                }
-                long t1 = Stopwatch.GetTimestamp();
-                double late = (t1 - t0) * toMs - 1.0;
-                r[i] = late < 0 ? 0 : late;
-            }
-        }
-        finally
-        {
-            if (began) { timeEndPeriod(1); }
-            if (h != IntPtr.Zero) { CloseHandle(h); }
-            Thread.CurrentThread.Priority = old;
-        }
-        return r;
-    }
-
-    // Spin on the clock and note every gap longer than thresholdUs: the thread was stopped by something (an interrupt,
-    // a driver routine, firmware, another thread). Returns the gaps in microseconds.
-    public static double[] Stalls(int durationMs, double thresholdUs)
-    {
-        List<double> gaps = new List<double>();
-        long freq = Stopwatch.Frequency;
-        long minTicks = (long)(thresholdUs * freq / 1000000.0);
-        long span = (long)(durationMs * (double)freq / 1000.0);
-        long loops = 0;
-        ThreadPriority old = Thread.CurrentThread.Priority;
-        try
-        {
-            Thread.CurrentThread.Priority = ThreadPriority.Highest;
-            long start = Stopwatch.GetTimestamp();
-            long end = start + span;
-            long prev = start;
-            while (true)
-            {
-                long now = Stopwatch.GetTimestamp();
-                loops++;
-                long d = now - prev;
-                if (d >= minTicks) { gaps.Add(d * 1000000.0 / freq); }
-                prev = now;
-                if (now >= end) { break; }
-            }
-        }
-        finally { Thread.CurrentThread.Priority = old; }
-        StallLoops = loops;
-        return gaps.ToArray();
-    }
-
-    // The time between the desktop compositor's refreshes, in milliseconds
-    public static double[] DwmIntervals(int count)
-    {
-        double[] r = new double[count];
-        double toMs = 1000.0 / Stopwatch.Frequency;
-        ThreadPriority old = Thread.CurrentThread.Priority;
-        try
-        {
-            Thread.CurrentThread.Priority = ThreadPriority.Highest;
-            int rc = DwmFlush();
-            if (rc != 0) { throw new InvalidOperationException("DwmFlush returned 0x" + rc.ToString("X")); }
-            long prev = Stopwatch.GetTimestamp();
-            for (int i = 0; i < count; i++)
-            {
-                DwmFlush();
-                long now = Stopwatch.GetTimestamp();
-                r[i] = (now - prev) * toMs;
-                prev = now;
-            }
-        }
-        finally { Thread.CurrentThread.Priority = old; }
-        return r;
-    }
-}
-'@
-
-# ------------------------------------------------------------------ compiling the helpers ----
-# Returns '' when the helper is ready, otherwise the reason it could not be built.
-function Lat-EnsureProbe {
-    if ('LatProbe' -as [type]) { return '' }
-    try {
-        Add-Type -TypeDefinition $script:LatSrcProbe -Language CSharp -ErrorAction Stop
-        return ''
-    } catch {
-        return [string]$_.Exception.Message
-    }
-}
-# ------------------------------------------------------------------ the probes (thin, so tests can replace them) ----
-function Lat-ProbeTimerRes {
-    $r = [LatProbe]::TimerResolution()
-    return @{ Min = [double]$r[0]; Max = [double]$r[1]; Cur = [double]$r[2] }
-}
-function Lat-ProbeWait {
-    param([int]$Count)
-    [void][LatProbe]::WaitJitter(20)             # warm-up, so compiling the loop is not measured
-    $v = [LatProbe]::WaitJitter($Count)
-    return @{ Values = [double[]]$v; Mode = [string][LatProbe]::WaitMode }
-}
-function Lat-ProbeStalls {
-    param([int]$Ms, [double]$MinUs)
-    [void][LatProbe]::Stalls(60, $MinUs)         # warm-up
-    $g = [LatProbe]::Stalls($Ms, $MinUs)
-    return @{ Gaps = [double[]]$g; Loops = [long][LatProbe]::StallLoops; Ms = $Ms }
-}
-function Lat-ProbeDwm {
-    param([int]$Count)
-    return (, [double[]][LatProbe]::DwmIntervals($Count))
-}
-# Interrupt and DPC time per logical processor, averaged over a few one-second samples (the first is dropped).
-# The CIM class names are the same on every Windows language.
-function Lat-ProbeIrq {
-    param([int]$Seconds = 5)
-    $sum = @{}
-    $cnt = 0
-    $total = @{ Dpc = 0.0; Isr = 0.0 }
-    for ($i = 0; $i -lt $Seconds; $i++) {
-        Start-Sleep -Milliseconds 1000
-        $rows = @(Get-CimInstance -ClassName Win32_PerfFormattedData_Counters_ProcessorInformation -ErrorAction Stop)
-        if ($i -eq 0) { continue }
-        $cnt++
-        foreach ($r in $rows) {
-            $n = [string]$r.Name
-            if ($n -eq '_Total') { $total.Dpc += [double]$r.PercentDPCTime; $total.Isr += [double]$r.PercentInterruptTime; continue }
-            if ($n -like '*_Total') { continue }
-            if (-not $sum.ContainsKey($n)) { $sum[$n] = @{ Dpc = 0.0; Isr = 0.0 } }
-            $sum[$n].Dpc += [double]$r.PercentDPCTime
-            $sum[$n].Isr += [double]$r.PercentInterruptTime
-        }
-    }
-    if ($cnt -lt 1) { throw 'The processor counters gave no samples.' }
-    $cores = @()
-    foreach ($k in @($sum.Keys)) { $cores += , @{ Name = $k; Dpc = ($sum[$k].Dpc / $cnt); Isr = ($sum[$k].Isr / $cnt) } }
-    return @{ Cores = $cores; Total = @{ Dpc = ($total.Dpc / $cnt); Isr = ($total.Isr / $cnt) }; Samples = $cnt }
-}
-
-# ------------------------------------------------------------------ this PC ----
-$script:LatPlans = @{
-    '381b4222-f694-41f0-9685-ff5bb260df2e' = 'Balanced'
-    '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c' = 'High performance'
-    'a1841308-3541-4fab-bc81-f71556f20b4a' = 'Power saver'
-    'e9a42b02-d5df-448d-aa00-03f14749eb61' = 'Ultimate Performance'
-}
-# The hardware that the ratings are tied to. Every field is optional: what cannot be read stays empty / 0.
-function Get-LatSpecs {
-    $s = @{ Cpu = ''; Cores = 0; Threads = 0; RamGB = 0.0; RamSpeed = 0; RamRated = 0; RamType = ''; RamModules = 0; Gpu = ''; RefreshHz = 0; ResW = 0; ResH = 0; Plan = ''; Os = '' }
-    try {
-        $c = @(Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop)[0]
-        $s.Cpu = ([string]$c.Name).Trim()
-        $s.Cores = [int]$c.NumberOfCores
-        $s.Threads = [int]$c.NumberOfLogicalProcessors
-    } catch { }
-    try {
-        $m = @(Get-CimInstance -ClassName Win32_PhysicalMemory -ErrorAction Stop)
-        $s.RamModules = $m.Count
-        $bytes = 0.0; foreach ($x in $m) { $bytes += [double]$x.Capacity }
-        $s.RamGB = [Math]::Round($bytes / 1GB, 0)
-        $s.RamRated = [int](($m | ForEach-Object { [int]$_.Speed } | Measure-Object -Maximum).Maximum)
-        $s.RamSpeed = [int](($m | ForEach-Object { [int]$_.ConfiguredClockSpeed } | Measure-Object -Maximum).Maximum)
-        $t = [int]$m[0].SMBIOSMemoryType
-        if ($t -eq 34) { $s.RamType = 'DDR5' } elseif ($t -eq 26) { $s.RamType = 'DDR4' } elseif ($t -eq 24) { $s.RamType = 'DDR3' }
-    } catch { }
-    try {
-        $v = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
-        $names = @($v | ForEach-Object { ([string]$_.Name).Trim() } | Where-Object { $_ })
-        $s.Gpu = ($names -join ' + ')
-        $best = $null
-        foreach ($x in $v) { if ([int]$x.CurrentRefreshRate -gt 0 -and (-not $best -or [int]$x.CurrentRefreshRate -gt [int]$best.CurrentRefreshRate)) { $best = $x } }
-        if ($best) { $s.RefreshHz = [int]$best.CurrentRefreshRate; $s.ResW = [int]$best.CurrentHorizontalResolution; $s.ResH = [int]$best.CurrentVerticalResolution }
-    } catch { }
-    try {
-        $o = & powercfg /getactivescheme 2>$null
-        $g = [regex]::Match(([string]($o -join ' ')), '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}')
-        if ($g.Success) {
-            $k = $g.Value.ToLower()
-            if ($script:LatPlans.ContainsKey($k)) { $s.Plan = $script:LatPlans[$k] } else { $s.Plan = 'a custom plan' }
-        }
-    } catch { }
-    try { $s.Os = [string][Environment]::OSVersion.Version } catch { }
-    return $s
-}
-
-# One frame of the monitor, in milliseconds. A monitor that Windows did not report counts as 60 Hz (and is flagged).
-function Get-LatFrame {
-    param($Specs)
-    $hz = 0.0
-    if ($Specs -and [double]$Specs.RefreshHz -ge 24) { $hz = [double]$Specs.RefreshHz }
-    $assumed = $false
-    if ($hz -lt 24) { $hz = 60.0; $assumed = $true }
-    return @{ Hz = $hz; Ms = (1000.0 / $hz); Assumed = $assumed }
-}
-
-# ------------------------------------------------------------------ numbers ----
-function Lat-Arr {
-    param($v)
-    if ($null -eq $v) { return (, [double[]]@()) }
-    return (, [double[]]@($v))
-}
-function Lat-Sorted {
-    param($v)
-    $a = ([double[]](Lat-Arr $v)).Clone()
-    [Array]::Sort($a)
-    return (, $a)
-}
-# nearest-rank percentile of a sorted array
-function Lat-Pct {
-    param($Sorted, [double]$P)
-    $a = [double[]]$Sorted
-    $n = $a.Length
-    if ($n -eq 0) { return 0.0 }
-    $i = [int][Math]::Ceiling($P / 100.0 * $n) - 1
-    if ($i -lt 0) { $i = 0 }
-    if ($i -ge $n) { $i = $n - 1 }
-    return [double]$a[$i]
-}
-function Lat-RateLow {
-    param([double]$v, [double]$good, [double]$ok)
-    if ($v -le $good) { return 'Good' }
-    if ($v -le $ok) { return 'OK' }
-    return 'Poor'
-}
-# the worst of several ratings ('None' is ignored; 'None' if there is nothing to judge)
-function Lat-Worst {
-    param($Ratings)
-    $rank = @{ 'Good' = 1; 'OK' = 2; 'Poor' = 3 }
-    $w = 0
-    foreach ($r in @($Ratings)) { if ($rank.ContainsKey([string]$r) -and $rank[[string]$r] -gt $w) { $w = $rank[[string]$r] } }
-    switch ($w) { 1 { return 'Good' } 2 { return 'OK' } 3 { return 'Poor' } }
-    return 'None'
-}
-function New-LatResult {
-    param([string]$Id, [string]$Title, [string]$Value, [string]$Rating, [string]$Rule, [string]$Detail, [string]$Advice = '')
-    return @{ Id = $Id; Title = $Title; Value = $Value; Rating = $Rating; Rule = $Rule; Detail = $Detail; Advice = $Advice }
-}
-function Lat-NotMeasured {
-    param([string]$Id, [string]$Title, [string]$Why)
-    return (New-LatResult $Id $Title 'Not measured' 'None' '' $Why)
-}
-function Lat-FrameNote {
-    param($F)
-    if ($F.Assumed) { return ('{0:0} Hz is assumed because Windows did not report your refresh rate.' -f $F.Hz) }
-    return ('{0:0} Hz is your monitor''s current refresh rate.' -f $F.Hz)
-}
-
-# What to look at when a result is not Good
-$script:LatAdvice = @{
-    wait  = 'Something delays the Windows scheduler for about as long as part of a frame. Close background programs (overlays, launchers, browsers, RGB and monitoring tools) and run the test again; if it stays like this, a driver or power-saving feature is the likely cause.'
-    stall = 'Something stops the CPU for a noticeable time: usually a driver (network, audio, GPU, USB), a power-saving state, or firmware (SMI). A tool such as LatencyMon can name the driver. Updating chipset, network and GPU drivers and switching off adapter power saving are the usual first steps.'
-    irq   = 'One processor core spends a large share of its time answering a device. That is usually the network adapter, GPU, USB controller or audio device. Updating its driver, or switching off its power saving, is the usual first step.'
-    dwm   = 'Windows is not refreshing the desktop at your monitor''s rate, or skips refreshes. Check Settings > System > Display > Advanced display for the refresh rate, unplug or lower the refresh rate of other monitors to test, and close overlays.'
-}
-
-# ------------------------------------------------------------------ PC latency: turning numbers into results ----
-function Get-LatTimerResult {
-    param($Res)
-    $title = 'Windows timer tick'
-    if (-not $Res) { return (Lat-NotMeasured 'timer' $title 'Could not be read.') }
-    $cur = [double]$Res.Cur / 10000.0
-    $fine = [double]$Res.Max / 10000.0
-    $detail = 'This is how often Windows wakes up to schedule timers right now. At rest it is usually 15.6 ms; games and audio programs raise it to 1 ms or 0.5 ms while they run. The finest tick this PC allows is {0:0.0##} ms. It is shown for information and is not rated.' -f $fine
-    return (New-LatResult 'timer' $title ('{0:0.0##} ms now' -f $cur) 'None' '' $detail)
-}
-
-function Get-LatWaitResult {
-    param($Values, [string]$Mode, $F)
-    $title = 'Timer wake-up jitter'
-    $v = Lat-Sorted $Values
-    if ($v.Length -lt 50) { return (Lat-NotMeasured 'wait' $title 'Too few samples were collected.') }
-    $med = Lat-Pct $v 50
-    $p99 = Lat-Pct $v 99
-    $max = [double]$v[$v.Length - 1]
-    $spread = [Math]::Max(0.0, $p99 - $med)
-    $good = 0.20 * $F.Ms
-    $ok = 0.50 * $F.Ms
-    $rating = Lat-RateLow $spread $good $ok
-    $rule = 'Good: under {0:0.00} ms (20% of one frame). OK: under {1:0.00} ms (50%). {2}' -f $good, $ok, (Lat-FrameNote $F)
-    $detail = '{0} waits of 1 ms using a {1}. A wait normally ends {2:0.00} ms late; 99 in 100 ended within {3:0.00} ms of that, the worst {4:0.00} ms late.' -f $v.Length, $Mode, $med, $spread, $max
-    if ($Mode -eq 'Sleep(1)') { $detail += ' This Windows has no high-resolution timer, so the result is less precise.' }
-    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.wait }
-    return (New-LatResult 'wait' $title ('{0:0.00} ms jitter' -f $spread) $rating $rule $detail $adv)
-}
-
-function Get-LatStallResult {
-    param($Gaps, [long]$Loops, [int]$Ms, $F)
-    $title = 'Longest CPU stall'
-    if ($Loops -lt 1000 -or $Ms -lt 500) { return (Lat-NotMeasured 'stall' $title 'The test did not run long enough.') }
-    $g = [double[]](Lat-Arr $Gaps)
-    $maxUs = 0.0; $sumUs = 0.0; $n100 = 0; $n500 = 0; $n1000 = 0
-    foreach ($x in $g) {
-        if ($x -gt $maxUs) { $maxUs = $x }
-        $sumUs += $x
-        if ($x -ge 100) { $n100++ }
-        if ($x -ge 500) { $n500++ }
-        if ($x -ge 1000) { $n1000++ }
-    }
-    $maxMs = $maxUs / 1000.0
-    $good = 0.25 * $F.Ms
-    $ok = 1.00 * $F.Ms
-    $rating = Lat-RateLow $maxMs $good $ok
-    $rule = 'Good: no stall over {0:0.00} ms (a quarter of one frame). OK: none over {1:0.00} ms (one frame). {2}' -f $good, $ok, (Lat-FrameNote $F)
-    $lost = $sumUs / ($Ms * 1000.0) * 100.0
-    $val = 'no stall over 0.05 ms'
-    if ($g.Length -gt 0) { $val = '{0:0.00} ms' -f $maxMs }
-    $detail = 'A thread running at high priority for {0:0.0} s was stopped {1} time(s) for 0.1 ms or more, {2} time(s) for 0.5 ms or more and {3} time(s) for 1 ms or more; {4:0.00}% of the time was lost to stops longer than 0.05 ms.' -f ($Ms / 1000.0), $n100, $n500, $n1000, $lost
-    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.stall }
-    return (New-LatResult 'stall' $title $val $rating $rule $detail $adv)
-}
-
-function Get-LatIrqResult {
-    param($Data)
-    $title = 'Interrupt and driver load'
-    if (-not $Data -or @($Data.Cores).Count -eq 0) { return (Lat-NotMeasured 'irq' $title 'The processor counters could not be read.') }
-    $best = $null; $bestV = -1.0; $sumAll = 0.0
-    foreach ($c in @($Data.Cores)) {
-        $t = [double]$c.Dpc + [double]$c.Isr
-        $sumAll += $t
-        if ($t -gt $bestV) { $bestV = $t; $best = $c }
-    }
-    $avg = $sumAll / @($Data.Cores).Count
-    $rating = Lat-RateLow $bestV 3.0 8.0
-    $rule = 'Good: the busiest core spends under 3% of its time on interrupts and driver routines (DPCs). OK: under 8%.'
-    $detail = 'Averaged over {0} one-second samples. Busiest core: {1} ({2:0.00}% in driver routines, {3:0.00}% in interrupts). Average over all {4} cores: {5:0.00}%.' -f $Data.Samples, $best.Name, [double]$best.Dpc, [double]$best.Isr, @($Data.Cores).Count, $avg
-    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.irq }
-    return (New-LatResult 'irq' $title ('{0:0.0}% of the busiest core' -f $bestV) $rating $rule $detail $adv)
-}
-
-function Get-LatDwmResult {
-    param($Intervals, [double]$ReportedHz)
-    $title = 'Screen refresh steadiness'
-    $v = Lat-Sorted $Intervals
-    if ($v.Length -lt 60) { return (Lat-NotMeasured 'dwm' $title 'Too few refreshes were collected.') }
-    $med = Lat-Pct $v 50
-    if ($med -le 0) { return (Lat-NotMeasured 'dwm' $title 'The refresh timing could not be read.') }
-    $hz = 1000.0 / $med
-    $late = 0
-    foreach ($x in $v) { if ($x -gt (1.5 * $med)) { $late++ } }
-    $latePct = $late * 100.0 / $v.Length
-    $max = [double]$v[$v.Length - 1]
-    $ratio = 1.0
-    if ($ReportedHz -ge 24) { $ratio = $hz / $ReportedHz }
-    if ($ratio -ge 0.97 -and $latePct -le 0.5) { $rating = 'Good' }
-    elseif ($ratio -ge 0.90 -and $latePct -le 2.0) { $rating = 'OK' }
-    else { $rating = 'Poor' }
-    $rule = 'Good: Windows refreshes the desktop at 97% or more of your monitor''s rate and under 0.5% of refreshes are late. OK: 90% or more and under 2%.'
-    $rep = 'Windows did not report a refresh rate for your monitor'
-    if ($ReportedHz -ge 24) { $rep = 'Windows reports {0:0} Hz for your monitor' -f $ReportedHz }
-    $detail = '{0} refreshes timed. {1}. {2} of them ({3:0.0}%) came late (more than 1.5 times the usual {4:0.00} ms); the slowest took {5:0.00} ms.' -f $v.Length, $rep, $late, $latePct, $med, $max
-    $adv = ''; if ($rating -ne 'Good') { $adv = $script:LatAdvice.dwm }
-    return (New-LatResult 'dwm' $title ('{0:0.0} Hz' -f $hz) $rating $rule $detail $adv)
-}
-
-# ------------------------------------------------------------------ the PC latency test (runs in the worker) ----
-# $Progress: a scriptblock taking (percent, text). Every step has its own try, so one failing probe does not stop the rest.
-function Invoke-LatPcTest {
-    param($Specs, $Progress)
-    $say = { param($p, $t) if ($Progress) { try { & $Progress $p $t } catch { } } }
-    $F = Get-LatFrame $Specs
-    $out = New-Object System.Collections.ArrayList
-    & $say 2 'Preparing the measuring code...'
-    $why = Lat-EnsureProbe
-    if ($why) {
-        foreach ($d in @(@('timer', 'Windows timer tick'), @('wait', 'Timer wake-up jitter'), @('stall', 'Longest CPU stall'), @('dwm', 'Screen refresh steadiness'))) {
-            [void]$out.Add((Lat-NotMeasured $d[0] $d[1] ('The measuring code could not be built on this PC: ' + $why)))
-        }
-    } else {
-        & $say 8 'Reading the timer tick...'
-        try { [void]$out.Add((Get-LatTimerResult (Lat-ProbeTimerRes))) } catch { [void]$out.Add((Lat-NotMeasured 'timer' 'Windows timer tick' $_.Exception.Message)) }
-        & $say 14 'Timer wake-up test (about 2 seconds)...'
-        try { $w = Lat-ProbeWait 1500; [void]$out.Add((Get-LatWaitResult $w.Values $w.Mode $F)) } catch { [void]$out.Add((Lat-NotMeasured 'wait' 'Timer wake-up jitter' $_.Exception.Message)) }
-        & $say 30 'CPU stall test (3 seconds)...'
-        try { $s = Lat-ProbeStalls 3000 50; [void]$out.Add((Get-LatStallResult $s.Gaps $s.Loops $s.Ms $F)) } catch { [void]$out.Add((Lat-NotMeasured 'stall' 'Longest CPU stall' $_.Exception.Message)) }
-        & $say 46 'Interrupt and driver load (5 seconds)...'
-        try { [void]$out.Add((Get-LatIrqResult (Lat-ProbeIrq 5))) } catch { [void]$out.Add((Lat-NotMeasured 'irq' 'Interrupt and driver load' $_.Exception.Message)) }
-        & $say 78 'Screen refresh test (about 2 seconds)...'
-        try {
-            $cnt = [int][Math]::Min(1200, [Math]::Max(120, [Math]::Round($F.Hz * 2)))
-            $iv = Lat-ProbeDwm $cnt
-            $rep = 0.0; if ($Specs -and [double]$Specs.RefreshHz -ge 24) { $rep = [double]$Specs.RefreshHz }
-            [void]$out.Add((Get-LatDwmResult $iv $rep))
-        } catch { [void]$out.Add((Lat-NotMeasured 'dwm' 'Screen refresh steadiness' $_.Exception.Message)) }
-    }
-    & $say 100 'Done.'
-    return @($out)
-}
-
-# Worker entry points: results go into the queue $LatQ as hashtables with T = specs | progress | done | error
-# Reading the hardware (a second or two of WMI queries) - done in the background when the window opens
-function Invoke-LatSpecsJob {
-    try {
-        $LatQ.Enqueue(@{ T = 'specs'; Specs = (Get-LatSpecs) })
-    } catch {
-        $LatQ.Enqueue(@{ T = 'error'; Text = [string]$_.Exception.Message })
-    }
-}
-function Invoke-LatPcTestJob {
-    try {
-        $sp = Get-LatSpecs
-        $LatQ.Enqueue(@{ T = 'specs'; Specs = $sp })
-        $res = Invoke-LatPcTest -Specs $sp -Progress { param($pct, $text) $LatQ.Enqueue(@{ T = 'progress'; Pct = $pct; Text = $text }) }
-        $LatQ.Enqueue(@{ T = 'done'; Specs = $sp; Results = $res })
-    } catch {
-        $LatQ.Enqueue(@{ T = 'error'; Text = [string]$_.Exception.Message })
-    }
-}
-
-function Get-LatOverall {
-    param($Results)
-    $w = Lat-Worst @(@($Results) | ForEach-Object { $_.Rating })
-    switch ($w) {
-        'Good' { return @{ Rating = 'Good'; Text = 'Good: nothing measured here is likely to cost you frames or response.' } }
-        'OK'   { return @{ Rating = 'OK'; Text = 'OK: mostly fine, with something worth a look.' } }
-        'Poor' { return @{ Rating = 'Poor'; Text = 'Needs attention: something below is likely to be felt in games.' } }
-    }
-    return @{ Rating = 'None'; Text = 'Nothing could be measured.' }
-}
-
-# ------------------------------------------------------------------ the report ----
-function Get-LatSpecLines {
-    param($Specs, $F)
-    $l = New-Object System.Collections.ArrayList
-    if ($Specs) {
-        if ($Specs.Cpu) { $t = [string]$Specs.Cpu; if ($Specs.Cores -gt 0) { $t += ' ({0} cores, {1} threads)' -f $Specs.Cores, $Specs.Threads }; [void]$l.Add('CPU: ' + $t) }
-        if ($Specs.RamGB -gt 0) {
-            $t = '{0:0} GB' -f $Specs.RamGB
-            if ($Specs.RamType) { $t += ' ' + $Specs.RamType }
-            if ($Specs.RamSpeed -gt 0) { $t += ' at {0} MT/s' -f $Specs.RamSpeed }
-            if ($Specs.RamModules -gt 0) { $t += ' ({0} module(s))' -f $Specs.RamModules }
-            [void]$l.Add('Memory: ' + $t)
-        }
-        if ($Specs.Gpu) { [void]$l.Add('Graphics: ' + $Specs.Gpu) }
-        if ($Specs.RefreshHz -ge 24) {
-            $t = '{0} Hz' -f $Specs.RefreshHz
-            if ($Specs.ResW -gt 0) { $t = '{0} x {1}, {2}' -f $Specs.ResW, $Specs.ResH, $t }
-            [void]$l.Add(('Monitor: {0} (one frame is {1:0.00} ms)' -f $t, $F.Ms))
-        } else {
-            [void]$l.Add(('Monitor: refresh rate not reported, 60 Hz assumed (one frame is {0:0.00} ms)' -f $F.Ms))
-        }
-        if ($Specs.Plan) { [void]$l.Add('Power plan: ' + $Specs.Plan) }
-    }
-    return @($l)
-}
-
-# Findings about the setup itself (not from a test)
-function Get-LatSetupNotes {
-    param($Specs)
-    $n = New-Object System.Collections.ArrayList
-    if ($Specs -and $Specs.RamRated -gt 0 -and $Specs.RamSpeed -gt 0 -and $Specs.RamSpeed -lt (0.9 * $Specs.RamRated)) {
-        [void]$n.Add(('Your memory runs at {0} MT/s but its modules are rated {1} MT/s. The memory profile (EXPO or XMP) may be switched off in the BIOS.' -f $Specs.RamSpeed, $Specs.RamRated))
-    }
-    return @($n)
-}
-
-# The whole report as styled pieces (same shape as the settings' details text: S = style, T = text)
-function Get-LatParts {
-    param($Specs, $Pc, [string]$When = '')
-    $nl = "`r`n"
-    $p = New-Object System.Collections.ArrayList
-    $F = Get-LatFrame $Specs
-    [void]$p.Add(@{ S = 'title'; C = ''; T = 'Latency results' + $nl })
-    if ($When) { [void]$p.Add(@{ S = 'sub'; C = ''; T = $When + $nl }) }
-    $lines = @(Get-LatSpecLines $Specs $F)
-    if ($lines.Count) {
-        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Your PC' + $nl })
-        foreach ($x in $lines) { [void]$p.Add(@{ S = 'body'; C = ''; T = $x + $nl }) }
-    }
-    foreach ($x in @(Get-LatSetupNotes $Specs)) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $x + $nl }) }
-    if (@($Pc).Count -eq 0) {
-        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What the test does' + $nl })
-        [void]$p.Add(@{ S = 'metric'; C = ''; T = $nl + 'PC latency test (about 12 seconds)' + $nl })
-        [void]$p.Add(@{ S = 'body'; C = ''; T = 'Measures how late Windows wakes up a timer, how long the CPU gets stopped by drivers or firmware, how much of a core is spent answering devices, and how steadily Windows refreshes the screen. Keep the mouse still and close other programs while it runs.' + $nl })
-        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Each result is rated against your monitor''s refresh rate, and the rule used is shown with it.' + $nl })
-    }
-    $res = @($Pc)
-    if ($res.Count -gt 0) {
-        $ov = Get-LatOverall $res
-        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'PC latency' + $nl })
-        [void]$p.Add(@{ S = [string]$ov.Rating.ToLower(); C = ''; T = $ov.Text + $nl })
-        foreach ($r in $res) {
-            [void]$p.Add(@{ S = 'metric'; C = ''; T = $nl + $r.Title + $nl })
-            $rt = [string]$r.Rating
-            if ($rt -eq 'None') { [void]$p.Add(@{ S = 'none'; C = ''; T = $r.Value + $nl }) }
-            else { [void]$p.Add(@{ S = $rt.ToLower(); C = ''; T = ('{0}: {1}' -f $rt, $r.Value) + $nl }) }
-            if ($r.Detail) { [void]$p.Add(@{ S = 'body'; C = ''; T = $r.Detail + $nl }) }
-            if ($r.Rule)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Rating rule: ' + $r.Rule + $nl }) }
-            if ($r.Advice) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'What to try: ' + $r.Advice + $nl }) }
-        }
-    }
-    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What this test cannot see' + $nl })
-    [void]$p.Add(@{ S = 'note'; C = ''; T = 'Software cannot measure the monitor''s own processing and its pixel response. A high-speed camera, or the latency analyzer built into some NVIDIA Reflex monitors, measures that. The ratings are rules of thumb tied to your monitor''s frame time, not an official standard.' + $nl })
-    return $p
-}
-function Get-LatText {
-    param($Specs, $Pc, [string]$When = '')
-    $s = ''
-    foreach ($x in @(Get-LatParts $Specs $Pc $When)) { $s += [string]$x.T }
-    return $s
-}
-
-}   # ---- end of $latEngine ----
-. $latEngine
 
 # =============================================================================
 # SYSTEM INFORMATION (read only): what the Home page and the Display page show.
@@ -7046,7 +6522,8 @@ function Get-PersonalInfo {
 # Left out of "Apply all" on purpose (the reason is shown in the question that is asked first).
 $script:ApplyAllSkip = @{ 'uac-lua' = 'it can stop Settings, Calculator and other apps from opening'
                          'bitlocker' = 'it decrypts your drives, which is a decision of its own'
-                         'mpo' = 'it is a fix for flicker and stutter, not a speed-up, so you choose it yourself' }
+                         'mpo' = 'it is a fix for flicker and stutter, not a speed-up, so you choose it yourself'
+                         'wu-auto' = 'its last option stops Windows from installing updates by itself, so you choose it yourself' }
 
 # '' when "Apply all" takes this setting, otherwise why it does not. $cat is the page ('' = All settings).
 # The Startup apps and the Testing settings are left out of "All settings" only: which programs start with Windows is your own
@@ -7596,6 +7073,45 @@ function Get-PresetNote {
     return $s
 }
 
+# ------------------------------------------------ settings that are only partly applied ----
+# After a check, a setting that reads "partly applied" (some of its values are set, the others are not) is offered for applying again.
+# That happens when a newer version of this app adds values to a setting an older version applied, and when Windows or another
+# program changes one value back. Nothing is written to disk for this: the check only reads, and the question is made from what
+# the check found. The settings asked about stay in memory, so the question is not repeated for them until the window is opened again.
+# Left out: run-once actions, and settings with options (T.Choices), because there is no telling which option was meant.
+$script:ReapplyAsked = @{}
+$script:ReapplyPending = $false      # a check has finished and the offer has not been made yet (the timer makes it when the window is free)
+
+# The ids (in list order) of the partly applied settings that have not been asked about since the window was opened
+function Get-ReapplyOffer {
+    $out = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        $row = $script:Rows[$id]
+        if ([string]$row.State -ne 'Partial' -or $row.T.Once -or $row.T.Choices) { continue }
+        if ($script:ReapplyAsked.ContainsKey([string]$id)) { continue }
+        $out += [string]$id
+    }
+    return $out
+}
+
+# These settings were asked about (whatever the answer): do not ask about them again until the window is opened again
+function Set-ReapplyAsked {
+    param($ids)
+    foreach ($id in @($ids)) { $script:ReapplyAsked[[string]$id] = $true }
+}
+
+# The heads-up at the top of the question, above the usual list of changes
+function Get-ReapplyNote {
+    param($Plan)
+    $nl = "`r`n"
+    $apply = @(@($Plan) | Where-Object { $_.Action -eq 'Apply' })
+    $s = ('{0} setting(s) are only partly applied on this PC: some of their values are set and the others are not.' -f $apply.Count) + $nl
+    $s += 'That happens when a newer version of Headroom adds values to a setting, or when Windows or another program changes one back.' + $nl
+    $s += 'Yes sets the values that are missing. No leaves everything as it is.' + $nl + $nl
+    $s += Get-NoteSections $apply
+    return $s
+}
+
 # ------------------------------------------------------------ the questions ----
 # Some settings ask a question before they are turned on (anti-cheat, printing). These work out what to ask for a plan.
 # One entry per question: Group, Title, Ask (the text), Ids and Names of the settings it covers (in plan order).
@@ -7684,6 +7200,7 @@ function Handle-Event {
                 if ($r.State -eq 'Checking') { $r.State = 'Unknown'; $r.Detail = 'Not checked - press "Check again"' }
             }
             Ui-ScanFinished
+            $script:ReapplyPending = $true      # partly applied settings are offered for applying again (Ui-OfferReapply)
         }
         'finished' {
             $script:Applying = $false
@@ -9755,7 +9272,7 @@ function Ui-Buttons {
     $busy = ($script:Scanning -or $script:Applying -or ($c.Checking -gt 0))
     Ui-SetEnabled $script:UI.apply ((-not $busy) -and (($c.Apply + $c.Undo) -gt 0))
     Ui-SetEnabled $script:UI.stop ([bool]$script:Applying)
-    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll', 'latency') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
+    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
 }
 
 function Ui-Counts {
@@ -9792,13 +9309,8 @@ function Ui-PartStyle {
         'note'  { return @{ F = 'ui'; C = $Th.Dim } }
         'head'  { return @{ F = 'uib'; C = $Th.Sub } }
         'mono'  { return @{ F = 'monoS'; C = $Th.Mute } }
-        # the latency results: a rating is green / orange / red, a measurement's name is bold
         'good'   { return @{ F = 'uib'; C = $Th.Good } }
         'goodl'  { return @{ F = 'ui'; C = $Th.Good } }
-        'ok'     { return @{ F = 'uib'; C = $Th.Warn } }
-        'poor'   { return @{ F = 'uib'; C = $Th.Bad } }
-        'none'   { return @{ F = 'ui'; C = $Th.Sub } }
-        'metric' { return @{ F = 'uib'; C = $Th.Text } }
     }
     return @{ F = 'ui'; C = $Th.Text }
 }
@@ -10095,6 +9607,43 @@ function Ui-DoApplyAll {
     }
 }
 
+# True when the main window is the one in front: the app is the active program and no other window of it (a details window, the
+# preset window, a question) is open on top
+function Test-MainWindowActive {
+    try { $af = [System.Windows.Forms.Form]::ActiveForm } catch { return $true }
+    return [bool]($af -and $script:UI.form -and [object]::ReferenceEquals($af, $script:UI.form))
+}
+
+# After a check: the settings that are only partly applied are offered for applying again (Get-ReapplyOffer says which). One question
+# lists them all. Yes ticks them and goes through the usual Apply (the questions some settings ask, the restore point, the undo
+# record); No leaves them as they are. A setting is asked about once each time the window is opened, whatever the answer was.
+function Ui-OfferReapply {
+    if (Get-BusyReason) { return }
+    if ($script:UI.dry -and [bool]$script:UI.dry.Checked) { return }     # "Preview only" is on: a preview of this would only confuse
+    if (@(Get-Pending).Count -gt 0) { return }                           # the user has changes lined up already; do not mix these in
+    $ids = @(Get-ReapplyOffer)
+    if ($ids.Count -eq 0) { return }
+    [void](Set-ReapplyAsked $ids)
+    foreach ($id in $ids) { [void](Try-SetWant ([string]$id) $true) }
+    $plan = @(Get-Pending)
+    if ($plan.Count -eq 0) { Reset-Ticks; return }
+    # the timer is stopped while the question is open, so that it cannot run the screen update inside the question
+    $tm = $script:UI.timer
+    if ($tm) { try { $tm.Stop() } catch { } }
+    try {
+        if (Ui-Ask (Get-ConfirmText $plan (Get-ReapplyNote $plan)) 'Finish applying these settings?' $false) {
+            Ui-DoApply '' 'Finish applying these settings?' $false $true
+        } else {
+            Reset-Ticks
+            Ui-RefreshAll
+            Ui-Status ('Nothing was changed.  ' + (Get-SummaryText))
+            Ui-Flush
+        }
+    } finally {
+        if ($tm) { try { $tm.Start() } catch { } }
+    }
+}
+
 function Ui-DoDiscard {
     $b = Get-BusyReason
     if ($b) { Ui-Status $b; return }
@@ -10360,6 +9909,11 @@ function Ui-Tick {
     if ($script:Job -and $script:Job.Async.IsCompleted -and $script:Q.IsEmpty) {
         try { Finish-Job } catch { Ui-Fail $_ }
     }
+    # a check has finished: offer to apply the partly applied settings again, once the welcome screen is gone and nothing else is open
+    if ($script:ReapplyPending -and -not $script:Job -and -not $script:Scanning -and -not $script:Applying -and -not (Test-WelcomeShowing) -and (Test-MainWindowActive)) {
+        $script:ReapplyPending = $false
+        try { Ui-OfferReapply } catch { Ui-Fail $_ }
+    }
     try { Ui-SysTick } catch { Ui-Fail $_ }
     try { Ui-WelcomeTick } catch { Ui-Fail $_ }
     Ui-Flush
@@ -10390,7 +9944,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '70'             # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '72'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11070,13 +10624,11 @@ function Ui-Build {
     Ui-WireBtn $dry 'switch'
     $script:UI.tip.SetToolTip($dry, 'When on, the Apply button only lists what would happen and changes nothing.')
     $btnRescan = New-Btn 'Check again' 100 'ghost' 'Look at the PC again and show what is applied now.' 38
+    $btnRescan.Size = New-Object System.Drawing.Size(($M.Side - (Px 24)), (Px 38))
     $btnRescan.Location = New-Object System.Drawing.Point((Px 12), (Px 98))
-    $btnLatency = New-Btn 'Latency tests' 100 'ghost' 'Measure how responsive your PC is, rated for your monitor. Nothing is changed.' 38
-    $btnLatency.Location = New-Object System.Drawing.Point((Px 120), (Px 98))
     $sideBottom.Controls.Add($btnPresets)
     $sideBottom.Controls.Add($dry)
     $sideBottom.Controls.Add($btnRescan)
-    $sideBottom.Controls.Add($btnLatency)
     $side.Controls.Add($nav)
     $side.Controls.Add($sideBottom)
     $script:UI.sideBottom = $sideBottom
@@ -11085,7 +10637,6 @@ function Ui-Build {
     $script:UI.dry = $dry
     $script:UI.presetBtn = $btnPresets            # Select Optimization Preset (opens the window with the three presets)
     $script:UI.rescan = $btnRescan
-    $script:UI.latency = $btnLatency
 
     # --- header: page title, search, the filter buttons
     $header = New-Pnl 'Top' $M.HeaderH $Th.Bg
@@ -11299,7 +10850,6 @@ function Ui-Build {
     $btnPage.Add_Click({ try { Ui-DoPageButton } catch { Ui-Fail $_ } })
     $btnDiscard.Add_Click({ try { Ui-DoDiscard } catch { Ui-Fail $_ } })
     $btnRescan.Add_Click({ try { Ui-DoRescan } catch { Ui-Fail $_ } })
-    $btnLatency.Add_Click({ try { Ui-ShowLatency } catch { Ui-Fail $_ } })
     $btnOpenLog.Add_Click({ try { Ui-DoOpenLog } catch { Ui-Fail $_ } })
     $btnRestart.Add_Click({ try { Ui-DoRestart } catch { Ui-Fail $_ } })
     $btnLog.Add_Click({ try { Ui-ToggleLog } catch { Ui-Fail $_ } })
@@ -11354,326 +10904,6 @@ function Show-Window {
         }
         try { $script:UI.form.Dispose() } catch { }
         foreach ($d in (@($script:Brushes.Values) + @($script:Pens.Values) + @($script:Fonts.Values))) { try { $d.Dispose() } catch { } }
-    }
-}
-
-# =============================================================================
-# THE WINDOW, part 6: the "Latency tests" window (opened from the side menu).
-# It is a window of its own, like "View description". The measuring code is in e4-latency.ps1; this file only runs it and shows it:
-#   - the PC latency test runs in a background worker (a runspace, like the settings check) and reports through a queue
-# Names used here start with Lat / Ui-Lat. $script:LatWin holds the controls of the open window ($null when it is closed).
-# =============================================================================
-$script:LatWin = $null
-$script:LatEvents = $null        # the queue the worker reports through
-$script:LatJob = $null           # the running worker: PS, RS, Async
-$script:LatSpecs = $null         # this PC's hardware
-$script:LatPc = @()              # results of the PC latency test
-$script:LatWhen = ''
-$script:LatMode = 'idle'         # idle | specs | pc
-
-# the clipboard (kept apart so a test can stand in for it)
-function Ui-SetClipboard {
-    param([string]$text)
-    try { [System.Windows.Forms.Clipboard]::SetText($text); return $true } catch { return $false }
-}
-
-function Ui-LatNowText {
-    return (Get-Date).ToString('yyyy-MM-dd HH:mm')
-}
-
-# ----------------------------------------------------------- what is on screen ----
-function Ui-LatRender {
-    $w = $script:LatWin
-    if (-not $w) { return }
-    Ui-FillRich $w.Rich (Get-LatParts $script:LatSpecs $script:LatPc $script:LatWhen)
-}
-
-# the line under the buttons and the thin bar below it ($pct below 0 leaves the bar as it is)
-function Ui-LatStatus {
-    param([string]$text, [double]$pct = -1)
-    $w = $script:LatWin
-    if (-not $w) { return }
-    $w.Status.Text = $text
-    if ($pct -ge 0) {
-        $tw = [int]$w.Track.Width
-        $w.Fill.Width = [int][Math]::Round($tw * [Math]::Min(100.0, $pct) / 100.0)
-    }
-}
-
-function Ui-LatButtons {
-    $w = $script:LatWin
-    if (-not $w) { return }
-    $m = $script:LatMode
-    $idle = ($m -eq 'idle')
-    Ui-SetEnabled $w.BtnPc $idle
-    Ui-SetEnabled $w.BtnCopy ($idle -and @($script:LatPc).Count -gt 0)
-    # how often the window looks at what is happening: rarely while measuring, so that it does not disturb the measurement
-    $iv = 200
-    if ($m -eq 'pc') { $iv = 250 }
-    if ($w.Timer -and [int]$w.Timer.Interval -ne $iv) { $w.Timer.Interval = $iv }
-}
-
-# ----------------------------------------------------------- the background worker ----
-function Start-LatJob {
-    param([string]$Call)
-    if ($script:LatJob) { Finish-LatJob }
-    $rs = Open-WorkerRunspace
-    $rs.SessionStateProxy.SetVariable('LatQ', $script:LatEvents)
-    $ps = [System.Management.Automation.PowerShell]::Create()
-    $ps.Runspace = $rs
-    [void]$ps.AddScript($latEngine.ToString() + "`r`n" + $Call)
-    $async = $ps.BeginInvoke()
-    $script:LatJob = @{ PS = $ps; RS = $rs; Async = $async }
-}
-
-# The worker is done (or died): collect it. If it never said it was done, say so.
-function Finish-LatJob {
-    $j = $script:LatJob
-    $script:LatJob = $null
-    if (-not $j) { return }
-    $err = ''
-    try { [void]$j.PS.EndInvoke($j.Async) } catch {
-        $err = $_.Exception.Message
-        if ($_.Exception.InnerException) { $err = $_.Exception.InnerException.Message }
-    }
-    try { $j.PS.Dispose() } catch { }
-    try { $j.RS.Close(); $j.RS.Dispose() } catch { }
-    if ($script:LatMode -eq 'pc') {
-        $script:LatMode = 'idle'
-        $t = 'The test stopped early.'
-        if ($err) { $t = 'The test stopped early: ' + $err }
-        Ui-LatStatus $t 0
-    } elseif ($script:LatMode -eq 'specs') {
-        $script:LatMode = 'idle'
-        Ui-LatStatus 'Ready. Pick a test.' 0
-    }
-    Ui-LatButtons
-}
-
-# Stop a worker that is still running because the window is closing; it is not waited for
-function Stop-LatJob {
-    $j = $script:LatJob
-    $script:LatJob = $null
-    if (-not $j) { return }
-    try { [void]$j.PS.BeginStop($null, $null) } catch { }
-}
-
-function Handle-LatEvent {
-    param($ev)
-    switch ([string]$ev.T) {
-        'specs' {
-            $script:LatSpecs = $ev.Specs
-            Ui-LatRender
-        }
-        'progress' {
-            Ui-LatStatus ([string]$ev.Text) ([double]$ev.Pct)
-        }
-        'done' {
-            $script:LatSpecs = $ev.Specs
-            $script:LatPc = @($ev.Results)
-            $script:LatWhen = Ui-LatNowText
-            $script:LatMode = 'idle'
-            Ui-LatStatus 'PC latency test finished. Scroll down for the results of each check.' 100
-            Ui-LatRender
-            Ui-LatButtons
-        }
-        'error' {
-            if ($script:LatMode -eq 'pc') { $script:LatMode = 'idle' }
-            Ui-LatStatus ('Could not finish: ' + [string]$ev.Text) 0
-            Ui-LatButtons
-        }
-    }
-}
-
-function Ui-LatTick {
-    if (-not $script:LatWin -or -not $script:LatEvents) { return }
-    $n = 0
-    $ev = $null
-    while ($n -lt 100 -and $script:LatEvents.TryDequeue([ref]$ev)) {
-        $n++
-        try { Handle-LatEvent $ev } catch { Ui-Fail $_ }
-    }
-    $j = $script:LatJob
-    if ($j -and $j.Async.IsCompleted -and $script:LatEvents.IsEmpty) {
-        try { Finish-LatJob } catch { Ui-Fail $_ }
-    }
-}
-
-# ----------------------------------------------------------- the tests ----
-function Ui-LatStartSpecs {
-    if ($script:LatMode -ne 'idle') { return }
-    $script:LatMode = 'specs'
-    Ui-LatStatus 'Reading your PC''s hardware...' 0
-    Ui-LatButtons
-    try {
-        Start-LatJob 'Invoke-LatSpecsJob'
-    } catch {
-        $script:LatMode = 'idle'
-        Ui-LatStatus ('Could not read the hardware: ' + $_.Exception.Message) 0
-        Ui-LatButtons
-    }
-}
-
-function Ui-LatStartPc {
-    if ($script:LatMode -ne 'idle') { return }
-    $script:LatMode = 'pc'
-    Ui-LatStatus 'Starting the PC latency test. Keep the mouse still and leave other windows alone...' 0
-    Ui-LatButtons
-    try {
-        Start-LatJob 'Invoke-LatPcTestJob'
-    } catch {
-        $script:LatMode = 'idle'
-        Ui-LatStatus ('Could not start the test: ' + $_.Exception.Message) 0
-        Ui-LatButtons
-    }
-}
-
-function Ui-LatCopy {
-    $t = Get-LatText $script:LatSpecs $script:LatPc $script:LatWhen
-    if (Ui-SetClipboard $t) { Ui-LatStatus 'The results are copied. Paste them anywhere.' } else { Ui-LatStatus 'Could not copy to the clipboard.' }
-}
-
-# the window is closing: stop whatever is still running
-function Ui-LatCleanup {
-    Stop-LatJob
-    $script:LatMode = 'idle'
-    $w = $script:LatWin
-    $script:LatWin = $null
-    if ($w -and $w.Timer) { try { $w.Timer.Stop(); $w.Timer.Dispose() } catch { } }
-}
-
-# ----------------------------------------------------------- the window ----
-# Builds the window and its controls (not shown yet): $script:LatWin holds them, and its Form is the window.
-function Ui-LatBuild {
-    $Th = $script:Th
-    $script:LatEvents = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
-    $script:LatMode = 'idle'
-    $f = New-Object System.Windows.Forms.Form
-    try {
-        $f.Text = 'Latency tests'
-        $f.Font = (Ui-Font 'ui')
-        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
-        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
-        $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
-        $f.MaximizeBox = $true
-        $f.MinimizeBox = $false
-        $f.ShowInTaskbar = $false
-        $f.BackColor = $Th.Panel
-        $wa = Ui-WorkArea
-        $w = [Math]::Min((Px 900), ([int]$wa.Width - (Px 40)))
-        $h = [Math]::Min((Px 780), ([int]$wa.Height - (Px 40)))
-        $f.ClientSize = New-Object System.Drawing.Size($w, $h)
-        $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 620), $w), [Math]::Min((Px 520), $h))
-
-        $strip = New-Object System.Windows.Forms.Panel
-        $strip.Dock = [System.Windows.Forms.DockStyle]::Top
-        $strip.Height = (Px 3)
-        $strip.BackColor = $Th.Accent
-
-        # title
-        $head = New-Object System.Windows.Forms.Panel
-        $head.Dock = [System.Windows.Forms.DockStyle]::Top
-        $head.Height = (Px 70)
-        $head.BackColor = $Th.Panel
-        $head.Controls.Add((New-Lbl 'Latency tests' 'detTitle' $Th.Text $Th.Panel (Px 24) (Px 12)))
-        $head.Controls.Add((New-Lbl 'Measures your PC and rates the results for your monitor. It does not change any setting.' 'small' $Th.Sub $Th.Panel (Px 26) (Px 44)))
-
-        # the test button
-        $actions = New-Object System.Windows.Forms.Panel
-        $actions.Dock = [System.Windows.Forms.DockStyle]::Top
-        $actions.Height = (Px 58)
-        $actions.BackColor = $Th.Panel
-        $btnPc = New-Btn 'Run PC latency test' 200 'primary' 'Timer jitter, CPU stalls, interrupt load and screen refresh steadiness (about 12 seconds). Keep the mouse still.' 38
-        $btnPc.Location = New-Object System.Drawing.Point((Px 24), (Px 8))
-        $actions.Controls.Add($btnPc)
-
-        # status line and progress bar
-        $stat = New-Object System.Windows.Forms.Panel
-        $stat.Dock = [System.Windows.Forms.DockStyle]::Top
-        $stat.Height = (Px 52)
-        $stat.BackColor = $Th.Panel
-        $stat.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 2), (Px 24), (Px 8))
-        $track = New-Object System.Windows.Forms.Panel
-        $track.Dock = [System.Windows.Forms.DockStyle]::Bottom
-        $track.Height = (Px 6)
-        $track.BackColor = $Th.Raised
-        $fill = New-Object System.Windows.Forms.Panel
-        $fill.Dock = [System.Windows.Forms.DockStyle]::Left
-        $fill.Width = 0
-        $fill.BackColor = $Th.Accent
-        $track.Controls.Add($fill)
-        $status = New-Object System.Windows.Forms.Label
-        $status.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $status.AutoSize = $false
-        $status.Font = (Ui-Font 'ui')
-        $status.ForeColor = $Th.Sub
-        $status.BackColor = $Th.Panel
-        $status.Text = ''
-        $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-        $stat.Controls.Add($status)
-        $stat.Controls.Add($track)
-
-        # bottom bar
-        $bar = New-Object System.Windows.Forms.Panel
-        $bar.Dock = [System.Windows.Forms.DockStyle]::Bottom
-        $bar.Height = (Px 64)
-        $bar.BackColor = $Th.Bg
-        $bar.Padding = New-Object System.Windows.Forms.Padding((Px 20), (Px 14), (Px 20), (Px 14))
-        $close = New-Btn 'Close' 96 'primary' '' 36
-        $close.DialogResult = [System.Windows.Forms.DialogResult]::OK
-        $close.Dock = [System.Windows.Forms.DockStyle]::Right
-        $btnCopy = New-Btn 'Copy results' 130 'secondary' 'Copy everything in the results box as text.' 36
-        $btnCopy.Dock = [System.Windows.Forms.DockStyle]::Left
-        $bar.Controls.Add($close)
-        $bar.Controls.Add($btnCopy)
-
-        # the results
-        $body = New-Object System.Windows.Forms.Panel
-        $body.Dock = [System.Windows.Forms.DockStyle]::Fill
-        $body.BackColor = $Th.Panel
-        $body.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 8), (Px 12), (Px 8))
-        $rb = New-Rich $Th.Panel $Th.Text 'body'
-        $body.Controls.Add($rb)
-
-        # the one added first fills what is left; each one added later is laid out before it
-        $f.Controls.Add($body)
-        $f.Controls.Add($bar)
-        $f.Controls.Add($stat)
-        $f.Controls.Add($actions)
-        $f.Controls.Add($head)
-        $f.Controls.Add($strip)
-        $f.AcceptButton = $close
-        $f.CancelButton = $close
-        $f.ActiveControl = $close
-
-        $timer = New-Object System.Windows.Forms.Timer
-        $timer.Interval = 200
-        $script:LatWin = @{ Form = $f; Rich = $rb; Status = $status; Track = $track; Fill = $fill
-                            BtnPc = $btnPc; BtnCopy = $btnCopy; BtnClose = $close; Timer = $timer }
-        $btnPc.Add_Click({ try { Ui-LatStartPc } catch { Ui-Fail $_ } })
-        $btnCopy.Add_Click({ try { Ui-LatCopy } catch { Ui-Fail $_ } })
-        $timer.Add_Tick({ try { Ui-LatTick } catch { Ui-Fail $_ } })
-        $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
-        # the text goes in once the window exists (formatting a rich text box needs its handle), before it is shown
-        $f.Add_Load({ try { Ui-LatRender; Ui-LatButtons; $script:LatWin.Timer.Start() } catch { Ui-Fail $_ } })
-        $f.Add_Shown({ try { Ui-LatStartSpecs } catch { Ui-Fail $_ } })
-        $f.Add_FormClosing({ try { Ui-LatCleanup } catch { } })
-    } catch {
-        try { $f.Dispose() } catch { }
-        throw
-    }
-}
-
-function Ui-ShowLatency {
-    $f = $null
-    try {
-        Ui-LatBuild | Out-Null
-        $f = $script:LatWin.Form
-        $owner = $script:UI.form
-        if ($owner) { [void]$f.ShowDialog($owner) } else { [void]$f.ShowDialog() }
-    } finally {
-        try { Ui-LatCleanup } catch { }
-        if ($f) { try { $f.Dispose() } catch { } }
     }
 }
 
