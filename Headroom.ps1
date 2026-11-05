@@ -1096,10 +1096,12 @@ function Add-Tweak {
     # the setting is left alone. -AskTitle is its heading; settings with the same -AskGroup are asked about together.
     # -Unproven: the setting is harmless as far as is known, but it may not change anything on a PC (the description says why);
     # the card carries a "May do nothing" tag (on the "Placebo Tweaks - Not Recommended" page the page name says it, so the tag is not repeated).
+    # -Untested: an idea taken from other debloat scripts that has not been checked for gaming. The card carries an "Untested" tag, and
+    # "Apply all" and "Turn all on" leave it out wherever it is listed (you switch it on yourself).
     # -NotRec: a short reason why this script does not recommend switching the setting on. The card then shows "Not recommended" next
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
-          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
+          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
           [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '')
     # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
     # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
@@ -1114,9 +1116,10 @@ function Add-Tweak {
     # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
-            OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Risk = $Risk
+            OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Untested = [bool]$Untested; Risk = $Risk
             Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
+    if ($Untested -and ($Preset -or $Once)) { throw "setting ${Id}: an untested setting is never part of the Recommended preset and is not a run-once action" }
     if ($NotRec -and $Unproven) { throw "setting ${Id}: an unproven setting already counts as not recommended, so it takes no reason of its own" }
     if ($Inv -and ($Once -or $Choices.Count -gt 0)) { throw "setting ${Id}: -Inv is for a plain on/off switch (not a run-once action or a setting with options)" }
     if ($Once -and $Def) { throw "setting ${Id}: a run-once action has no Windows default" }
@@ -3595,7 +3598,7 @@ $script:DisplayCat = 'Display'          # the window puts its live display cards
 $cDisplay = $script:DisplayCat
 $cNothing = 'Placebo Tweaks - Not Recommended (may do nothing, no proven benefit - each one says why)'
 $cSec    = 'Security prompts (turning these off lowers protection)'
-$cSvc    = 'Other Windows services'
+$cSvc    = 'Services'
 $cLook   = 'Look and feel'
 $cExplorer = 'File Explorer'
 $cAi     = 'AI features'
@@ -3632,15 +3635,6 @@ Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diag
         pReg 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1
     )
 
-Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry services (DiagTrack and related)' `
-    -Desc 'On: the four telemetry and error-reporting services are enabled, with the start types Windows gives them. They are the Connected User Experiences and Telemetry service (DiagTrack), WAP push message routing, the diagnostics hub collector and the Windows Error Reporting service. Off: all four are stopped and disabled.' `
-    -Parts @(
-        pSvc 'DiagTrack' 'Disabled' 'Automatic'
-        pSvc 'dmwappushservice' 'Disabled' 'Manual'
-        pSvc 'diagnosticshub.standardcollector.service' 'Disabled' 'Manual'
-        pSvc 'WerSvc' 'Disabled' 'Manual'
-    )
-
 Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry scheduled tasks' `
     -Desc 'On: the compatibility appraiser, customer-experience, disk-diagnostic data and error-reporting tasks are enabled and run in the background, as Windows has them. Off: those tasks are disabled.' `
     -Parts @(
@@ -3655,13 +3649,6 @@ Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Teleme
         pTask '\Microsoft\Windows\Feedback\Siuf\DmClientOnScenarioDownload'
         pTask '\Microsoft\Windows\Windows Error Reporting\QueueReporting'
         pTask '\Microsoft\Windows\Autochk\Proxy'
-    )
-
-Add-Tweak -Id 'svc-telemetry2' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Compatibility and usage reporting services' `
-    -Desc 'On: the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights are enabled (they start when Windows asks for them). Off: both are disabled. They collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
-    -Parts @(
-        pSvc 'InventorySvc' 'Disabled' 'Manual'
-        pSvc 'wuqisvc' 'Disabled' 'Manual'
     )
 
 Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and tailored experiences' `
@@ -3765,22 +3752,6 @@ Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing an
         pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
     )
 
-Add-Tweak -Id 'syncsvc' -Cat $cCloud -Inv -Def 'On' -Risk 'note' -Name 'Contacts, mail and calendar sync services' `
-    -Desc 'On: the per-user background services behind the Mail, Calendar and People apps and Phone Link are enabled. Off: they are disabled. Leave this on if you use those apps.' `
-    -Parts @(
-        pSvc 'OneSyncSvc' 'Disabled' 'AutomaticDelayed'
-        pSvc 'CDPUserSvc' 'Disabled' 'Automatic'
-        pSvc 'UnistoreSvc' 'Disabled' 'Manual'
-        pSvc 'UserDataSvc' 'Disabled' 'Manual'
-        pSvc 'PimIndexMaintenanceSvc' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'offlinefiles' -Cat $cCloud -Inv -Def 'On' -Name 'Offline Files service' `
-    -Desc 'On: the Offline Files service is enabled (Windows starts it when needed) and can keep copies of network folders for use without a connection. Off: the service is disabled.' `
-    -Parts @(
-        pSvc 'CscService' 'Disabled' 'Manual'
-    )
-
 Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
     -Desc 'On: OneDrive can sync, and it shows in the File Explorer side bar. Off: a policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. Fully reversible.' `
     -Parts @(
@@ -3854,15 +3825,6 @@ Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Inv -Def 'On' -Name 'Other remote man
     )
 
 # ---------------------------------------------------------------- VPN ---------
-Add-Tweak -Id 'vpn' -Cat $cVpn -Inv -Def 'On' -Risk 'note' -Name 'Windows'' built-in VPN services' `
-    -Desc 'On: the services behind Windows'' own VPN client (IKEv2, SSTP, L2TP) and dial-up (Remote Access Connection Manager) are enabled. Off: they are disabled. VPN apps that bring their own driver, such as WireGuard, usually keep working, but some VPN clients need these services. Off also breaks PPPoE broadband dial-ups.' `
-    -Parts @(
-        pSvc 'SstpSvc' 'Disabled' 'Manual'
-        pSvc 'IKEEXT' 'Disabled' 'Manual'
-        pSvc 'RasMan' 'Disabled' 'Manual'
-        pSvc 'RasAuto' 'Disabled' 'Manual'
-    )
-
 # ------------------------------------------------------------- Sharing --------
 Add-Tweak -Id 'fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -Name 'File and printer sharing' `
     -Desc 'On: file and printer sharing is left as Windows has it. That covers the Server service, the default C$ and ADMIN$ shares, the File and Printer Sharing firewall rules and the adapter binding. Off: file and printer sharing is switched off, so other PCs cannot reach files or printers on this PC. The Server service is disabled, the default shares are off, the firewall rules are switched off and File and Printer Sharing is unbound from your network adapters. You can still open shares on a NAS or other PCs (Client for Microsoft Networks stays on).' `
@@ -3898,24 +3860,10 @@ Add-Tweak -Id 'legacy-names' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -N
         }
     )
 
-Add-Tweak -Id 'svc-netbios' -Cat $cShare -Inv -Def 'On' -Preset -Name 'NetBIOS name helper (TCP/IP NetBIOS Helper)' `
-    -Desc 'On: the TCP/IP NetBIOS Helper service is enabled; it looks up other computers by their old-style NetBIOS name. Off: the service is disabled. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
-    -Parts @(
-        pSvc 'lmhosts' 'Disabled' 'Manual'
-    )
-
 Add-Tweak -Id 'smb1' -Cat $cShare -Inv -Def 'Off' -Preset -Reboot -Name 'SMB1 protocol' `
     -Desc 'On: the SMB1 Windows feature is installed (SMB1 is an obsolete, insecure file-sharing protocol that modern Windows no longer needs). Off: it is removed. A clean Windows 11 does not have it installed, so on most PCs this already reads Off. Only switch it on for very old devices.' `
     -Parts @(
         pFeat 'SMB1Protocol'
-    )
-
-Add-Tweak -Id 'ics' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Connection sharing (ICS, hotspot, media streaming)' `
-    -Desc 'On: Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing are enabled, with the start types Windows gives them. Off: all three are disabled. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
-    -Parts @(
-        pSvc 'SharedAccess' 'Disabled' 'Manual' 'Test-UsesVirtualization' 'WSL2 / Hyper-V / Sandbox is on, so Internet Connection Sharing is left alone'
-        pSvc 'icssvc' 'Disabled' 'Manual'
-        pSvc 'WMPNetworkSvc' 'Disabled' 'Manual'
     )
 
 # ----------------------------------------------------- Adapters and USB -------
@@ -4149,12 +4097,6 @@ Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Def 'Off' -Reboot -Unproven -Name 'T
         }
     )
 
-Add-Tweak -Id 'svc-sysmain' -Cat $cNothing -Inv -Def 'On' -Unproven -Name 'SysMain (Superfetch) service' `
-    -Desc 'On: the SysMain service is enabled (Automatic, as Windows has it) and pre-loads frequently used apps into memory, which mainly helps hard drives. Off: the service is disabled. There is little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it.' `
-    -Parts @(
-        pSvc 'SysMain' 'Disabled' 'Automatic'
-    )
-
 Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Def 'Off' -Unproven -Name 'Startup programs and desktop load without delay' `
     -Desc 'On: StartupDelayInMSec and WaitforIdleState are set to 0. Off: both are deleted (how Windows ships). It may do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once.' `
     -Parts @(
@@ -4310,6 +4252,131 @@ Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Inv -Def 'On' -Preset -Reboot -Risk 'n
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control' 'SvcHostSplitThresholdInKB' 268435456 3670016
     )
 
+# Every setting that only changes services is on this page, so they are all in one place. The last eight are untested ideas from
+# other debloat scripts (-Untested): "Apply all" and "Turn all on" leave them out, and each one is its own card so it can be switched alone.
+Add-Tweak -Id 'telemetry-svc' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Telemetry services (DiagTrack and related)' `
+    -Desc 'On: the four telemetry and error-reporting services are enabled, with the start types Windows gives them. They are the Connected User Experiences and Telemetry service (DiagTrack), WAP push message routing, the diagnostics hub collector and the Windows Error Reporting service. Off: all four are stopped and disabled.' `
+    -Parts @(
+        pSvc 'DiagTrack' 'Disabled' 'Automatic'
+        pSvc 'dmwappushservice' 'Disabled' 'Manual'
+        pSvc 'diagnosticshub.standardcollector.service' 'Disabled' 'Manual'
+        pSvc 'WerSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-telemetry2' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Compatibility and usage reporting services' `
+    -Desc 'On: the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights are enabled (they start when Windows asks for them). Off: both are disabled. They collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
+    -Parts @(
+        pSvc 'InventorySvc' 'Disabled' 'Manual'
+        pSvc 'wuqisvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'syncsvc' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Contacts, mail and calendar sync services' `
+    -Desc 'On: the per-user background services behind the Mail, Calendar and People apps and Phone Link are enabled. Off: they are disabled. Leave this on if you use those apps.' `
+    -Parts @(
+        pSvc 'OneSyncSvc' 'Disabled' 'AutomaticDelayed'
+        pSvc 'CDPUserSvc' 'Disabled' 'Automatic'
+        pSvc 'UnistoreSvc' 'Disabled' 'Manual'
+        pSvc 'UserDataSvc' 'Disabled' 'Manual'
+        pSvc 'PimIndexMaintenanceSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'offlinefiles' -Cat $cSvc -Inv -Def 'On' -Name 'Offline Files service' `
+    -Desc 'On: the Offline Files service is enabled (Windows starts it when needed) and can keep copies of network folders for use without a connection. Off: the service is disabled.' `
+    -Parts @(
+        pSvc 'CscService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-netbios' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'NetBIOS name helper (TCP/IP NetBIOS Helper)' `
+    -Desc 'On: the TCP/IP NetBIOS Helper service is enabled; it looks up other computers by their old-style NetBIOS name. Off: the service is disabled. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
+    -Parts @(
+        pSvc 'lmhosts' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'ics' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Connection sharing (ICS, hotspot, media streaming)' `
+    -Desc 'On: Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing are enabled, with the start types Windows gives them. Off: all three are disabled. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
+    -Parts @(
+        pSvc 'SharedAccess' 'Disabled' 'Manual' 'Test-UsesVirtualization' 'WSL2 / Hyper-V / Sandbox is on, so Internet Connection Sharing is left alone'
+        pSvc 'icssvc' 'Disabled' 'Manual'
+        pSvc 'WMPNetworkSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'vpn' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Windows'' built-in VPN services' `
+    -Desc 'On: the services behind Windows'' own VPN client (IKEv2, SSTP, L2TP) and dial-up (Remote Access Connection Manager) are enabled. Off: they are disabled. VPN apps that bring their own driver, such as WireGuard, usually keep working, but some VPN clients need these services. Off also breaks PPPoE broadband dial-ups.' `
+    -Parts @(
+        pSvc 'SstpSvc' 'Disabled' 'Manual'
+        pSvc 'IKEEXT' 'Disabled' 'Manual'
+        pSvc 'RasMan' 'Disabled' 'Manual'
+        pSvc 'RasAuto' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'edge-upd' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Edge update services start with Windows' `
+    -Desc 'On: the Edge update and elevation services start with Windows, the way Windows ships them. Off: they are set to Manual, so they start on demand. Edge still updates itself through its scheduled update tasks, so the "Microsoft Edge Update" process still shows up in the background list; "Edge background update tasks" stops those tasks too.' `
+    -Parts @(
+        pSvc 'edgeupdate' 'Manual' 'AutomaticDelayed'
+        pSvc 'edgeupdatem' 'Manual' 'Manual'
+        pSvc 'MicrosoftEdgeElevationService' 'Manual' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-storage' -Cat $cSvc -Inv -Def 'On' -Name 'Storage Service starts with Windows' `
+    -Desc 'On: Storage Service (storage settings and external-drive handling) starts with Windows (Automatic, as Windows has it). Off: it is set to Manual, so it starts when Windows needs it. One background process fewer while it is idle.' `
+    -Parts @(
+        pSvc 'StorSvc' 'Manual' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-sysmain' -Cat $cSvc -Inv -Def 'On' -Unproven -Name 'SysMain (Superfetch) service' `
+    -Desc 'On: the SysMain service is enabled (Automatic, as Windows has it) and pre-loads frequently used apps into memory, which mainly helps hard drives. Off: the service is disabled. There is little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it.' `
+    -Parts @(
+        pSvc 'SysMain' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-smsrouter' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'SMS Router service (SmsRouter)' `
+    -Desc 'On: the service that sends text messages (SMS) to the right app is enabled (Manual, as Windows has it). Off: it is set to Disabled. It is only used with a mobile-broadband modem or a phone link that carries texts; a desktop PC does not use it.' `
+    -Parts @(
+        pSvc 'SmsRouter' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-wallet' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Wallet service (WalletService)' `
+    -Desc 'On: the Wallet service, used for payment cards, tickets and passes, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop gaming PC does not use it.' `
+    -Parts @(
+        pSvc 'WalletService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-scpolicy' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Smart Card Removal Policy service (SCPolicySvc)' `
+    -Desc 'On: the service that locks the PC or signs you out when a smart card is pulled out of its reader is enabled (Manual, as Windows has it). Off: it is set to Disabled. It only matters if you sign in with a smart card. The other two smart-card services are in "Smart card services" on the Services page; this one is separate so it can be switched on its own.' `
+    -Parts @(
+        pSvc 'SCPolicySvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-spotverifier' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Spot Verifier service (svsvc)' `
+    -Desc 'On: the service that checks a drive for damage after Windows notices a problem is enabled (Manual, the default). Off: it is set to Disabled, so that automatic check does not run. You can still run a check yourself (chkdsk).' `
+    -Parts @(
+        pSvc 'svsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-biometric' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Windows Biometric Service (WbioSrvc)' `
+    -Desc 'On: the service behind fingerprint and face sign-in (Windows Hello) is enabled (Manual, as Windows has it). Off: it is set to Disabled. A PIN or a password does not use it. Leave this on if you sign in with a fingerprint reader or a face camera.' `
+    -Parts @(
+        pSvc 'WbioSrvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-sensormon' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Sensor Monitoring service (SensrSvc)' `
+    -Desc 'On: the service that watches sensors such as ambient light and screen orientation, for automatic brightness and rotation, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
+    -Parts @(
+        pSvc 'SensrSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-sensordata' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Sensor Data service (SensorDataService)' `
+    -Desc 'On: the service that passes sensor readings on to apps is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
+    -Parts @(
+        pSvc 'SensorDataService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-mixedreality' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
+    -Desc 'On: the service used by Windows Mixed Reality headsets is enabled (Manual, as Windows has it). Off: it is set to Disabled. Other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available.' `
+    -Parts @(
+        pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
+    )
+
 Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Defender Core Service telemetry and experiments' `
     -Desc 'On: the Defender Core Service sends telemetry and uses Microsoft''s experimentation service to deliver fixes. Off: both are turned off. Fixes still arrive through the normal Defender updates, and Windows Security keeps scanning as normal. Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
     -Parts @(
@@ -4322,12 +4389,6 @@ Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Depends on the PC' -Name '
     -Desc 'On: Storage Sense is left as Windows has it. It deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and can be set up to clear your Downloads folder as well. Windows turns it on by itself when disk space runs low, and on many PCs it is off until you switch it on. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. Only that one switch is written; switching it back on removes the value, which is the Windows default.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
-    )
-
-Add-Tweak -Id 'svc-storage' -Cat $cStore -Inv -Def 'On' -Name 'Storage Service starts with Windows' `
-    -Desc 'On: Storage Service (storage settings and external-drive handling) starts with Windows (Automatic, as Windows has it). Off: it is set to Manual, so it starts when Windows needs it. One background process fewer while it is idle.' `
-    -Parts @(
-        pSvc 'StorSvc' 'Manual' 'Automatic'
     )
 
 Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Risk 'note' -Name 'Disk Cleanup (run once)' `
@@ -4655,14 +4716,6 @@ Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: fir
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0
     )
 
-Add-Tweak -Id 'edge-upd' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge update services start with Windows' `
-    -Desc 'On: the Edge update and elevation services start with Windows, the way Windows ships them. Off: they are set to Manual, so they start on demand. Edge still updates itself through its scheduled update tasks, so the "Microsoft Edge Update" process still shows up in the background list; "Edge background update tasks" stops those tasks too.' `
-    -Parts @(
-        pSvc 'edgeupdate' 'Manual' 'AutomaticDelayed'
-        pSvc 'edgeupdatem' 'Manual' 'Manual'
-        pSvc 'MicrosoftEdgeElevationService' 'Manual' 'Manual'
-    )
-
 Add-Tweak -Id 'edge-tasks' -Cat $cEdge -Inv -Def 'On' -Preset -Risk 'note' -Name 'Edge background update tasks' `
     -Desc 'On: Edge Update starts at sign-in and every hour (its two scheduled tasks are enabled). Off: both tasks are disabled, which keeps the "Microsoft Edge Update" process out of your background list. Edge, and the WebView2 component that many apps use, then stop getting background updates, so only switch this off if you do not use Edge.' `
     -Parts @(
@@ -4807,7 +4860,8 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Internet Expl
 # --------------------------------------------------------------- Testing -------
 # Settings taken from other debloat scripts that have not been proven to matter for gaming. They live on their own page, are not part
 # of the Recommended preset and are left out of "Apply all" and "Turn all on" on "All settings" (the Testing page's own buttons take them).
-# Every service and every scheduled task is its own card, so any one of them can be turned back on without touching the others.
+# Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
+# Services page (marked -Untested).
 Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut (Left Alt + Left Shift + Num Lock)' `
     -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
@@ -4839,54 +4893,6 @@ Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Def 'Off' -Explorer -Risk 'note' -Na
     -Parts @(
         pKey "$clsidCmdA\InprocServer32" $clsidCmdA
         pKey "$clsidCmdB\InprocServer32" $clsidCmdB
-    )
-
-Add-Tweak -Id 'svc-smsrouter' -Cat $cTest -Inv -Def 'On' -Name 'SMS Router service (SmsRouter)' `
-    -Desc 'On: the service that sends text messages (SMS) to the right app is enabled (Manual, as Windows has it). Off: it is set to Disabled. It is only used with a mobile-broadband modem or a phone link that carries texts; a desktop PC does not use it.' `
-    -Parts @(
-        pSvc 'SmsRouter' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-wallet' -Cat $cTest -Inv -Def 'On' -Name 'Wallet service (WalletService)' `
-    -Desc 'On: the Wallet service, used for payment cards, tickets and passes, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop gaming PC does not use it.' `
-    -Parts @(
-        pSvc 'WalletService' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-scpolicy' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Smart Card Removal Policy service (SCPolicySvc)' `
-    -Desc 'On: the service that locks the PC or signs you out when a smart card is pulled out of its reader is enabled (Manual, as Windows has it). Off: it is set to Disabled. It only matters if you sign in with a smart card. The other two smart-card services are in "Smart card services" on the "Other Windows services" page; this one is separate so it can be switched on its own.' `
-    -Parts @(
-        pSvc 'SCPolicySvc' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-spotverifier' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Spot Verifier service (svsvc)' `
-    -Desc 'On: the service that checks a drive for damage after Windows notices a problem is enabled (Manual, the default). Off: it is set to Disabled, so that automatic check does not run. You can still run a check yourself (chkdsk).' `
-    -Parts @(
-        pSvc 'svsvc' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-biometric' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Windows Biometric Service (WbioSrvc)' `
-    -Desc 'On: the service behind fingerprint and face sign-in (Windows Hello) is enabled (Manual, as Windows has it). Off: it is set to Disabled. A PIN or a password does not use it. Leave this on if you sign in with a fingerprint reader or a face camera.' `
-    -Parts @(
-        pSvc 'WbioSrvc' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-sensormon' -Cat $cTest -Inv -Def 'On' -Name 'Sensor Monitoring service (SensrSvc)' `
-    -Desc 'On: the service that watches sensors such as ambient light and screen orientation, for automatic brightness and rotation, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
-    -Parts @(
-        pSvc 'SensrSvc' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-sensordata' -Cat $cTest -Inv -Def 'On' -Name 'Sensor Data service (SensorDataService)' `
-    -Desc 'On: the service that passes sensor readings on to apps is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
-    -Parts @(
-        pSvc 'SensorDataService' 'Disabled' 'Manual'
-    )
-
-Add-Tweak -Id 'svc-mixedreality' -Cat $cTest -Inv -Def 'On' -Name 'Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
-    -Desc 'On: the service used by Windows Mixed Reality headsets is enabled (Manual, as Windows has it). Off: it is set to Disabled. Other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available.' `
-    -Parts @(
-        pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
     )
 
 Add-Tweak -Id 'task-sqm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics (PI\Sqm-Tasks)' `
@@ -6306,7 +6312,7 @@ $script:AdvancedExtra = @(
     'wu-drivers',
     # Security prompts (all but BitLocker and automatic device encryption)
     'uac', 'uac-lua', 'vbs', 'hypervisor',
-    # Other Windows services (all; Recommended has the other six)
+    # Services (all that are in the Advanced preset; Recommended has the other six)
     'svc-search', 'svc-smartcard', 'printing', 'xbox-svc',
     # File Explorer opens to This PC
     'launchto',
@@ -6528,10 +6534,12 @@ $script:ApplyAllSkip = @{ 'uac-lua' = 'it can stop Settings, Calculator and othe
 # '' when "Apply all" takes this setting, otherwise why it does not. $cat is the page ('' = All settings).
 # The Startup apps and the Testing settings are left out of "All settings" only: which programs start with Windows is your own
 # choice and the Testing page holds untested ideas, so they are switched on in bulk only when you press Apply all on their own page.
+# The untested services (-Untested) are on the Services page next to the others, so they are left out wherever they are listed.
 function Get-ApplyAllSkip {
     param($row, [string]$cat = '')
     if (-not $cat -and [string]$row.T.Cat -like 'Startup apps*') { return 'which programs start with Windows is your own choice' }
     if (-not $cat -and [string]$row.T.Cat -eq $script:TestingCat) { return 'they are untested ideas from other debloat scripts, so you pick them yourself on the Testing page' }
+    if ($row.T.Untested) { return 'they are untested ideas from other debloat scripts, so you pick them yourself' }
     $why = $script:ApplyAllSkip[[string]$row.T.Id]
     if ($why) { return [string]$why }
     return ''
@@ -6553,6 +6561,7 @@ function Select-ApplyAll {
     $left = @()
     $startN = 0; $startWhy = ''
     $testN = 0; $testWhy = ''
+    $untN = 0; $untWhy = ''
     $ticked = 0
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
@@ -6563,6 +6572,7 @@ function Select-ApplyAll {
         if ($why) {
             if ($row.State -ne 'On') {
                 if ([string]$row.T.Cat -like 'Startup apps*') { $startN++; $startWhy = $why }
+                elseif ($row.T.Untested) { $untN++; $untWhy = $why }
                 elseif ([string]$row.T.Cat -eq $script:TestingCat) { $testN++; $testWhy = $why }
                 else { $left += ,@{ Name = [string]$row.T.Name; Why = $why } }
             }
@@ -6574,6 +6584,7 @@ function Select-ApplyAll {
     }
     if ($startN -gt 0) { $left += ,@{ Name = ('Startup apps ({0})' -f $startN); Why = $startWhy } }
     if ($testN -gt 0) { $left += ,@{ Name = ('Testing ({0})' -f $testN); Why = $testWhy } }
+    if ($untN -gt 0) { $left += ,@{ Name = ('Untested settings ({0})' -f $untN); Why = $untWhy } }
     return @{ Ticked = $ticked; Left = $left }
 }
 
@@ -6776,7 +6787,6 @@ function Get-NavTitle {
         'Power plan and startup' { return 'Power and startup' }
         'Remote access and VPN' { return 'Remote and VPN' }
         'Gaming and performance' { return 'Gaming' }
-        'Other Windows services' { return 'Other services' }
         'Legacy Windows features' { return 'Legacy features' }
         'Placebo Tweaks - Not Recommended' { return 'Placebo Tweaks' }
     }
@@ -6842,6 +6852,7 @@ function Get-CardTags {
     if ($t.OneWay) { $tags += 'One-way' }
     if ($t.Once) { $tags += 'Runs once' }
     if ($t.Ask) { $tags += 'Asks first' }
+    if ($t.Untested) { $tags += 'Untested' }
     # on the "Placebo Tweaks - Not Recommended" page the first tag already says it
     if ($t.Unproven -and (Get-NavTitle ([string]$t.Cat)) -ne 'Placebo Tweaks') { $tags += 'May do nothing' }
     if ($t.Preset) { $tags += 'Recommended preset' }
@@ -6986,6 +6997,8 @@ function Test-RowVisible {
     if ($text) {
         $hay = $row.T.Name + ' ' + $row.T.Desc + ' ' + $row.T.Id + ' ' + $row.T.Cat
         if (Get-NotRecReason $row.T) { $hay += ' ' + $script:NotRecText }        # a search for "not recommended" finds the marked ones
+        if ($row.T.Unproven) { $hay += ' May do nothing' }                       # ... and "may do nothing" and "untested" find the cards that carry those tags
+        if ($row.T.Untested) { $hay += ' Untested' }
         if ($hay.IndexOf($text, [StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
     }
     switch ($mode) {
@@ -7518,7 +7531,7 @@ $script:RiskNames = @('Any risk', 'Low risk', 'Medium risk', 'Risky')
 $script:BtnHot = $null            # the button under the mouse
 $script:BtnDown = $null           # the button being pressed
 $script:ChipCount = @{}           # filter name -> the number shown on its button ('' = none yet)
-$script:TabAccent = @{}           # tab name -> the colour of its bar and number when it is not the accent one (the preset window's tabs)
+$script:TabAccent = @{}           # tab name -> the colour of its box and number when it is not the accent one (the preset window's tabs)
 $script:StartupSynced = $false    # the startup list was just read, no need to read it again for the first check
 
 # a size in pixels, scaled for the screen
@@ -8087,10 +8100,21 @@ function Ui-PaintBtn {
     $back = $b.BackColor
     if ($down) { $back = $fa.MouseDownBackColor } elseif ($hot) { $back = $fa.MouseOverBackColor }
     elseif ($kind -eq 'ghost' -or $kind -eq 'chip') { $back = $behind }
-    if ($isTab) { $back = $behind }                      # a tab has no box, only its text and (when it is the open one) a bar below
+    if ($isTab) { $back = $behind }                      # a tab that is not open has no box, only its text
     $r = [Math]::Min($M.BtnR, [int]($h / 2))
     Ui-Fill $g $behind 0 0 $w $h
-    Ui-FillRound $g $back 0 0 $w $h $r
+    if ($kind -eq 'tabon') {
+        # the open tab is a filled box (no line under it): the soft purple, or a tint of the tab's own colour (the preset window's tabs)
+        $boxFill = $Th.AccentSoft
+        if ($script:TabAccent.ContainsKey([string]$b.Name)) {
+            $ta = $script:TabAccent[[string]$b.Name]
+            $boxFill = Rgb ([int]($behind.R + ($ta.R - $behind.R) * 0.18)) ([int]($behind.G + ($ta.G - $behind.G) * 0.18)) ([int]($behind.B + ($ta.B - $behind.B) * 0.18))
+        }
+        $iy = Px 2
+        Ui-FillRound $g $boxFill 0 $iy $w ($h - 2 * $iy) $r
+    } else {
+        Ui-FillRound $g $back 0 0 $w $h $r
+    }
     if ([int]$fa.BorderSize -gt 0) { Ui-StrokeRound $g $fa.BorderColor 1 0 0 $w $h $r }
     $fore = $b.ForeColor
     if (($kind -eq 'chip' -or $kind -eq 'tab') -and $hot) { $fore = $Th.Text }
@@ -8108,18 +8132,12 @@ function Ui-PaintBtn {
         $x0 = [int](($w - ($lw + $gap + $cw)) / 2)
         $cc = $Th.Dim
         if ($kind -eq 'chipon') { $cc = $Th.Accent }
-        if ($kind -eq 'tabon') { $cc = $Th.Mute }
+        if ($kind -eq 'tabon') { $cc = $Th.Accent }
         if ($isTab -and $script:TabAccent.ContainsKey([string]$b.Name)) { $cc = $script:TabAccent[[string]$b.Name] }
         Ui-Text $g $label $font $fore $x0 0 ($lw + (Px 6)) $h $TF.L
         Ui-Text $g $cnt $sf $cc ($x0 + $lw + $gap) 0 ($cw + (Px 6)) $h $TF.L
     } else {
         Ui-Text $g $label $font $fore 0 0 $w $h $TF.C
-    }
-    if ($kind -eq 'tabon') {
-        $uw = Px 28
-        $bc = $Th.Accent
-        if ($script:TabAccent.ContainsKey([string]$b.Name)) { $bc = $script:TabAccent[[string]$b.Name] }
-        Ui-FillRound $g $bc ([int](($w - $uw) / 2)) ($h - (Px 5)) $uw (Px 3) (Px 1)
     }
     if ($on -and ($b.Focused -eq $true)) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h $r }
 }
@@ -10012,7 +10030,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '75'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '76'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10201,7 +10219,7 @@ $script:NavIcons = @{
     'Display'             = @(@('r', 3, 4, 18, 12, 2), @('p', 12, 16, 12, 20), @('p', 8, 20, 16, 20))
     'Placebo Tweaks'      = @(@('c', 9, 3, 9, 9, 4.5, 18, 5.2, 20, 18.8, 20, 19.5, 18, 15, 9, 15, 3), @('p', 8, 3, 16, 3), @('p', 7.5, 14, 16.5, 14))
     'Security prompts'    = @(@('r', 5, 11, 14, 10, 2.5), @('a', 12, 11, 4, 180, 180), @('d', 12, 16, 1.2))
-    'Other services'      = @(@('o', 6, 6, 12, 12), @('o', 9.5, 9.5, 5, 5), @('k', 12, 12, 6, 9, 8, 22.5))
+    'Services'            = @(@('o', 6, 6, 12, 12), @('o', 9.5, 9.5, 5, 5), @('k', 12, 12, 6, 9, 8, 22.5))
     'Storage and clean-up' = @(@('p', 4, 6, 20, 6), @('p', 9, 6, 9, 4, 15, 4, 15, 6), @('p', 6, 6, 7, 20, 17, 20, 18, 6), @('p', 10, 10, 10, 16), @('p', 14, 10, 14, 16))
     'Look and feel'       = @(@('o', 3, 3, 18, 18), @('d', 8, 10, 1.3), @('d', 12, 7.5, 1.3), @('d', 16, 10, 1.3), @('d', 9, 15, 1.3))
     'File Explorer'       = @(, @('c', 3, 6, 9.5, 6, 11.5, 8.5, 21, 8.5, 21, 19, 3, 19))
@@ -10736,7 +10754,7 @@ function Ui-Build {
     $script:UI.find = $find
     $script:UI.searchBox = $searchBox
 
-    # the filter tabs are plain text with the number next to it; the open one is white with a purple bar under it.
+    # the filter tabs are plain text with the number next to it; the open one is a filled box.
     # Two rows: the state of the setting (top) and its risk (below); one tab is open in each row and they work together.
     $chipClick = { param($s, $e) try { Ui-SetMode ([string]$s.Name) } catch { Ui-Fail $_ } }
     $chipRows = @(

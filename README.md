@@ -92,6 +92,7 @@ Each card has one switch, and the switch is the setting itself. On means the set
 - A feature that is on in Windows by default (Xbox Game Bar, telemetry, widgets and so on): the switch starts on, and switching it off turns the feature off.
 - A feature that Windows has off by default: the switch starts off, and switching it on turns the feature on.
 - A startup program: on means it starts with Windows, off means it does not.
+- Services: every setting that only changes services is on the Services page, so they are all in one place. Eight of them are untested ideas from other debloat scripts and carry an "Untested" tag; Apply all and Tweak all leave those out, so you switch them yourself.
 
 Reset all puts everything back to the Windows default, which means Game Mode and Optimizations for windowed games go back to on. When the check of the PC finds a setting that is only partly in place, Headroom offers to finish it.
 
