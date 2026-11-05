@@ -105,7 +105,8 @@ try {
 function Say {
     param($msg, [string]$color = 'Gray')
     $text = ([string]$msg).TrimEnd()
-    if ($log) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    # the check of the PC only reads: while it runs nothing is written, not even to the log file (the lines still show on screen)
+    if ($log -and -not $script:ScanMode) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
     if ($null -ne $Q) {
         $Q.Enqueue([pscustomobject]@{ Kind = 'log'; Id = ''; State = ''; Detail = ''; Text = $text; Color = $color; A = 0; B = 0 })
     } else {
@@ -1096,8 +1097,10 @@ function Add-Tweak {
     # -NotRec: a short reason why this script does not recommend switching the setting on. The card then shows "Not recommended" next
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
-          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [string]$Risk = '', [int]$At = -1,
+          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [switch]$DefaultOn, [string]$Risk = '', [int]$At = -1,
           [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '')
+    # -DefaultOn: Windows has this switch on (on some builds at least), so undoing it removes what this app wrote and the setting may still
+    # read On afterwards: that is the Windows default, not a failed undo (see Invoke-Plan).
     # -Once: an action that is run when asked (a clean-up), not a switch. It is never "applied": it reads Off (Ready to run) every time,
     # keeps no undo record, has nothing to undo, and is never part of the Recommended preset, "Apply all" or "Turn all on".
     # Its custom part's Apply says what it did by setting $script:RunResult.
@@ -1106,9 +1109,10 @@ function Add-Tweak {
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
             OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Risk = $Risk
-            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim() }
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim(); DefaultOn = [bool]$DefaultOn }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
     if ($NotRec -and $Unproven) { throw "setting ${Id}: an unproven setting already counts as not recommended, so it takes no reason of its own" }
+    if ($DefaultOn -and ($Once -or $OneWay -or $Choices.Count -gt 0)) { throw "setting ${Id}: -DefaultOn is for a plain on/off switch (not a run-once action, a one-way action or a setting with options)" }
     if ($NotRec -and $Once) { throw "setting ${Id}: a run-once action is not a switch, so it cannot be marked not recommended" }
     if ($Once -and ($Preset -or $OneWay -or $Choices.Count -gt 0)) { throw "setting ${Id}: a run-once action cannot be in the Recommended preset, one-way or have options" }
     if ($Choices.Count -gt 0) {
@@ -1866,7 +1870,7 @@ function Invoke-Plan {
             if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
             $good++
             Emit 'item' $t.Id 'done' $res '' 'Green' $i $total
-        } elseif ($after.State -eq 'NA' -or ($undo -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
+        } elseif ($after.State -eq 'NA' -or ($undo -and $t.DefaultOn -and ($after.State -eq 'On' -or $after.State -eq 'Off')) -or ($undo -and -not $t.DefaultOn -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
             Say '  done' 'Green'; $good++
             if ($undo) { Remove-Snapshot $t.Id }
             if ($t.Reboot) { $reboot += $t.Name }
@@ -2928,7 +2932,7 @@ function Custom-DxGlobal-Snapshot {
     $v = Dx-Get (Dx-ReadText) $key
     $want = Dx-Want $key
     # a switch that already has the wanted value when this app first looks (an entry with it, or for a wanted 1 no entry on a build where
-    # Windows' default is on): what it was before is unknown, undo then puts it back to the other value (or to no entry)
+    # Windows' default is on): what it was before is unknown (undo does not use it: it removes the entry, which is the Windows default)
     return @{ Key = $key; Had = ($null -ne $v); Was = [string]$v; Unknown = ($v -eq $want -or ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn))) }
 }
 function Custom-DxGlobal-Apply {
@@ -2944,11 +2948,10 @@ function Custom-DxGlobal-Revert {
     $key = [string]$p.Data
     if (-not (Dx-Supported $key)) { return }
     if (Vrr-Missing $key) { return }
-    $want = Dx-Want $key
-    $val = $null
-    if ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
-    # otherwise the entry is removed, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
-    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
+    # the entry is removed, which leaves the Windows default (on for the windowed-games switch on Windows 11 24H2 and newer, off on older builds;
+    # for variable refresh rate whatever Windows decides for this PC)
+    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $null))
+    if ($key -eq 'SwapEffectUpgradeEnable' -and (Dx-DefaultOn)) { Say '  this switch is on by default in Windows (11 24H2 and newer): the entry is removed, so it stays on' 'DarkGray' }
 }
 
 # ------------------------------- Game Mode -----
@@ -2984,7 +2987,7 @@ function Custom-GameMode-Snapshot {
     param($p)
     $r = Gm-Read
     $snap = @{ On = [bool](Gm-IsOn $r) }
-    # what each value was: when Game Mode was already on, nothing is known about "before" (undo then turns it off)
+    # what each value was (kept in the record; undo does not use it: it removes the entries, which is the Windows default)
     foreach ($n in $script:GmNames) { $snap[$n] = @{ Had = [bool]$r[$n].Exists; Was = $r[$n].Value; Kind = [string]$r[$n].Kind } }
     return $snap
 }
@@ -2996,8 +2999,10 @@ function Custom-GameMode-Apply {
 }
 function Custom-GameMode-Revert {
     param($p, $mine)
-    # Windows' default is Game Mode on, so removing the entries would leave this setting reading as on: switching it off needs an explicit 0
-    foreach ($n in $script:GmNames) { [void](Reg-Write $script:GmPath $n 0 'DWord') }
+    # Windows' default is Game Mode on and a clean Windows has no entry for it: the entries are removed, so the setting still reads On afterwards
+    # (the setting is marked -DefaultOn, so that is not a failed undo)
+    foreach ($n in $script:GmNames) { [void](Reg-Remove $script:GmPath $n) }
+    Say '  Game Mode is on by default in Windows: the entries are removed, so it stays on' 'DarkGray'
 }
 
 # ------------------------------- Windows AI core package -----
@@ -3629,7 +3634,7 @@ Add-Tweak -Id 'svc-telemetry2' -Cat $cPriv -Preset -Name 'Disable compatibility 
     -Desc 'Turns off the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights. Both collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
     -Parts @(
         pSvc 'InventorySvc' 'Disabled' 'Manual'
-        pSvc 'wuqisvc' 'Disabled' 'Automatic'
+        pSvc 'wuqisvc' 'Disabled' 'Manual'
     )
 
 Add-Tweak -Id 'ads' -Cat $cPriv -Preset -Name 'Disable advertising ID and tailored experiences' `
@@ -4048,10 +4053,10 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys short
 # card on the page says what else keeps a game at the full rate. The two switches below are real: they are the "Optimizations for windowed
 # games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
 # keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
-Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -Name 'Optimizations for windowed games on' `
-    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here writes an explicit 0 on those builds (on older builds the entry is removed, which Windows reads as off).' `
+Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -DefaultOn -Name 'Optimizations for windowed games on' `
+    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here removes the entry, which puts the Windows default back (on for Windows 11 24H2 and newer, so it stays on there; off on older builds).' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
+        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'SwapEffectUpgradeEnable'
     )
 
 Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Disable variable refresh rate for DirectX 11 full-screen games' `
@@ -4060,10 +4065,10 @@ Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Disable variable refresh rate fo
         pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
     )
 
-Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -Name 'Game Mode on' `
-    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off turns Game Mode off. A missing entry is shown as on, because that is what Windows does when nothing has been changed; switching this off writes an explicit 0 (Game Mode off), because removing the entries would leave Windows'' default, which is on. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
+Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -DefaultOn -Name 'Game Mode on' `
+    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off puts the Windows default back: the entries this app wrote are removed, and since the default is on, Game Mode stays on (to turn Game Mode off, use the switch in Settings). A missing entry is shown as on, because that is what Windows does when nothing has been changed. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
     -Parts @(
-        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are set to 0, which is Game Mode off)'
+        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are removed, which is the Windows default: Game Mode on)'
     )
 
 # ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
@@ -6160,6 +6165,10 @@ function Try-SetWant {
     if ((-not $want) -and $row.State -eq 'On' -and $row.T.OneWay) {
         return ('"' + $row.T.Name + '" cannot be undone from here. Its description says how to get it back.')
     }
+    # a switch that Windows has on by default, and this app has not changed: turning it off would put back what is already there
+    if ((-not $want) -and $row.State -eq 'On' -and $row.T.DefaultOn -and [string]$row.Mine -ne 'yes') {
+        return ('"' + $row.T.Name + '" is how Windows has it by default and this app has not changed it, so there is nothing to turn off.')
+    }
     if ($row.T.Choices) {
         # no single switch: "off" means the Windows default; "on" is not guessed, one of the options has to be picked
         if ($want) { return ('"' + $row.T.Name + '" has several options: pick one on its card.') }
@@ -6200,6 +6209,7 @@ function Try-ForceUndo {
     if ($why) { return $why }
     if ($row.T.OneWay) { return ('"' + $row.T.Name + '" cannot be undone from here.') }
     if ($row.State -eq 'Off') { return 'It is not applied, so there is nothing to undo.' }
+    if ($row.State -eq 'On' -and $row.T.DefaultOn -and [string]$row.Mine -ne 'yes') { return ('"' + $row.T.Name + '" is how Windows has it by default and this app has not changed it, so there is nothing to undo.') }
     $row.Want = $false
     if ($row.T.Choices) { $row.Pick = 'default' }
     $row.Force = 'Undo'
@@ -6853,7 +6863,8 @@ function Get-DetailParts {
     [void]$p.Add(@{ S = 'title'; C = ''; T = $t.Name + $nl })
     [void]$p.Add(@{ S = 'sub'; C = ''; T = $t.Cat + $nl + $nl })
     [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
-    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it. Turning it off still puts the Windows default back.' + $nl }) }
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no' -and $row.T.DefaultOn) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already on: this is how Windows has it by default (or you set it yourself). The app has not changed it, so there is nothing to turn off.' + $nl }) }
+    elseif ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it. Turning it off still puts the Windows default back.' + $nl }) }
     if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Applied by this app: turning it off puts the Windows default back.' + $nl }) }
     $a = Get-Action $row
     if ($t.Choices -and $a) {
@@ -7870,8 +7881,8 @@ function Ui-FlushLog {
 
 # A line from the window itself: into the log box and into the log file
 function Ui-Note {
-    param([string]$text, [string]$color = 'Gray')
-    if ($log) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    param([string]$text, [string]$color = 'Gray', [switch]$NoFile)
+    if ($log -and -not $NoFile) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
     Ui-Log $text $color
 }
 
@@ -9782,7 +9793,7 @@ function Ui-StartScan {
     if ($script:StartupSynced) {
         $script:StartupSynced = $false      # the list was read a moment ago when the window was made
     } else {
-        try { Sync-StartupRows } catch { Ui-Note ('Could not read the startup list: ' + $_.Exception.Message) 'Yellow' }
+        try { Sync-StartupRows } catch { Ui-Note ('Could not read the startup list: ' + $_.Exception.Message) 'Yellow' -NoFile }
     }
     foreach ($id in @($script:Rows.Keys)) {
         $r = $script:Rows[$id]
@@ -9798,7 +9809,7 @@ function Ui-StartScan {
     } catch {
         $script:Scanning = $false
         foreach ($id in @($script:Rows.Keys)) { $script:Rows[$id].State = 'Unknown'; $script:Rows[$id].Detail = 'Could not be checked' }
-        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red'
+        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red' -NoFile
         Ui-ScanFinished
     }
     Ui-Flush
@@ -9839,7 +9850,7 @@ function Finish-Job {
             $r = $script:Rows[$id]
             if ($r.State -eq 'Checking') { $r.State = 'Unknown'; $r.Detail = 'Could not be checked' }
         }
-        Ui-Note ('The check of your PC stopped early: ' + $err) 'Yellow'
+        Ui-Note ('The check of your PC stopped early: ' + $err) 'Yellow' -NoFile
         Ui-ScanFinished
     }
     if ($j.Kind -eq 'apply' -and $script:Applying) {
@@ -9900,7 +9911,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '73'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '74'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {

@@ -90,7 +90,7 @@ Switching a setting off puts the Windows default back for everything that settin
 A few settings are handled differently:
 
 - Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
-- Settings whose Windows default is already the on state (Game Mode on, Optimizations for windowed games on) are switched off by writing an explicit 0, because deleting the value would leave them on.
+- Settings whose Windows default is already the on state (Game Mode on, Optimizations for windowed games on) are put back by removing what Headroom wrote. They still read as on afterwards, because that is the Windows default; if Headroom never changed them, the window does not offer to turn them off. To switch them off, use the switch in Windows Settings.
 - Settings that remove apps cannot be undone from Headroom.
 
 ## Where things are kept
@@ -98,7 +98,7 @@ A few settings are handled differently:
 | What | Where |
 | --- | --- |
 | Undo record | `%ProgramData%\Win11GamingDebloat\undo-record.xml` |
-| Log | `debloat-log.txt` on the Desktop (or in `%TEMP%` if there is no Desktop) |
+| Log | `debloat-log.txt` on the Desktop (or in `%TEMP%` if there is no Desktop). Applying and undoing write to it; the check of the PC does not. |
 
 ## Hardware readings
 
