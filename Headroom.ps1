@@ -6303,14 +6303,14 @@ function Get-Action {
     return ''
 }
 
-# A row that is neither "applied" nor "not applied": a setting with options that is marked not recommended (a fix to use only when you have
-# the problem, like Multiplane Overlay) and sits on its Windows default option while nothing asks for another one (nothing lined up, not in
-# the saved configuration). The default is the intended state there, so there is nothing to apply; the row is only counted under All settings.
+# A row that is neither "applied" nor "not applied": a setting with options (a fix to use only when you have the problem, like Multiplane
+# Overlay, or the update options for Store apps) that sits on its Windows default option, or a run-once action (a clean-up) that has not
+# been asked for, while nothing asks for anything else (nothing lined up, not in the saved configuration). The default is the intended
+# state there, so there is nothing to apply; the row is only counted under All settings, and again as soon as something is lined up.
 function Test-NothingToApply {
     param($row)
     if ([string]$row.State -ne 'Off') { return $false }
-    if (-not $row.T.Choices) { return $false }
-    if (-not (Get-NotRecReason $row.T)) { return $false }
+    if (-not $row.T.Choices -and -not $row.T.Once) { return $false }
     if (Get-Action $row) { return $false }
     if ($script:Personal.Picks.ContainsKey([string]$row.T.Id)) { return $false }
     return $true
@@ -6780,13 +6780,13 @@ function Get-Pending {
 }
 
 function Get-Counts {
-    $c = @{ Total = 0; On = 0; Off = 0; Idle = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
+    $c = @{ Total = 0; On = 0; Off = 0; Idle = 0; RunOnce = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
         $c.Total++
         switch ([string]$row.State) {
             'On'       { $c.On++ }
-            'Off'      { if (Test-NothingToApply $row) { $c.Idle++ } else { $c.Off++ } }
+            'Off'      { if (Test-NothingToApply $row) { if ($row.T.Once) { $c.RunOnce++ } else { $c.Idle++ } } else { $c.Off++ } }
             'Partial'  { $c.Partial++ }
             'NA'       { $c.NA++ }
             'Checking' { $c.Checking++ }
@@ -6857,6 +6857,7 @@ function Get-SummaryText {
     $n = $c.Apply + $c.Undo
     $s = ('{0} settings: {1} applied, {2} not applied' -f ($c.Total - $c.NA), $c.On, ($c.Off + $c.Partial + $c.Unknown))
     if ($c.Idle -gt 0) { $s += (', {0} left on the Windows default' -f $c.Idle) }
+    if ($c.RunOnce -gt 0) { $s += (', {0} run-once action{1} not run' -f $c.RunOnce, $(if ($c.RunOnce -eq 1) { '' } else { 's' })) }
     if ($c.NA -gt 0) { $s += (', {0} not on this PC' -f $c.NA) }
     if ($n -gt 0) {
         $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.GoOn, $c.GoOff)
@@ -7750,17 +7751,25 @@ function Ui-InitTheme {
         BadFill   = (Rgb 74 40 54)    # the dark red tint behind the Risky badge
         GoodFill  = (Rgb 28 54 46)
         WarnFill  = (Rgb 70 48 40)
+        Shade     = (Rgb 5 5 10)         # the shadow right under a raised card
+        ShadeFar  = (Rgb 11 11 19)       # the softer edge of that shadow
+        Shine     = (Rgb 50 50 76)       # the faint light line along the top inside edge of a raised card
+        BevelLight = (Rgb 108 108 152)   # the lit top and left outline of a raised card
+        BevelLightHot = (Rgb 136 136 182)
+        BevelDark = (Rgb 6 6 12)         # the shaded bottom and right outline
+        BevelLight2 = (Rgb 56 56 84)     # the second, inner line of the bevel: softer
+        BevelDark2 = (Rgb 14 14 24)
     }
 }
 
 function Ui-InitMetrics {
     $script:M = @{
-        Row = (Px 184); Gap = (Px 12); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); TogZone = (Px 68); ViewW = (Px 118); ViewGap = (Px 8); BandH = (Px 44); ChoiceY = (Px 96); ChoiceH = (Px 28)
+        Row = (Px 84); Gap = (Px 8); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); InfoD = (Px 28); RiskDot = (Px 10); ChoiceY = (Px 72); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
         Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 10); BtnR = (Px 8)
         ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
-        CardMin = (Px 380); ColGap = (Px 14); Wheel = (Px 110)
+        CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 14); Wheel = (Px 168)
         Side = (Px 244); Gutter = (Px 28); Details = (Px 340); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
-        NavTop = (Px 84); NavRow = (Px 40); NavLabel = (Px 44); NavSb = (Px 12); NavWheel = (Px 80)
+        NavTop = (Px 132); SearchY = (Px 80); SearchH = (Px 40); NavRow = (Px 40); NavLabel = (Px 44); NavSb = (Px 12); NavWheel = (Px 80)
     }
 }
 
@@ -7934,6 +7943,55 @@ function Ui-StrokeRound {
     $o = $width / 2.0
     $gp = Ui-RoundPath ($x + $o) ($y + $o) ($w - $width) ($h - $width) ([Math]::Max(0.0, ($r - $o)))
     try { $g.DrawPath((Ui-Pen $c $width), $gp) } finally { $gp.Dispose() }
+}
+# The points of a rounded outline between two angles (degrees, 0 = right, 90 = down), so that the lit part and the shaded part of a bevel
+# can be drawn as two lines. (cx, cy) is the middle of the corner, $r its radius.
+function Ui-ArcPts {
+    param([double]$cx, [double]$cy, [double]$r, [int]$from, [int]$to)
+    $pts = @()
+    for ($a = $from; $a -le $to; $a += 15) {
+        $rad = $a * [Math]::PI / 180.0
+        $pts += , @(($cx + $r * [Math]::Cos($rad)), ($cy + $r * [Math]::Sin($rad)))
+    }
+    return $pts
+}
+# The 3D edge of a card: the outline is lit along the top and the left and shaded along the bottom and the right, as if the light came
+# from the top left. It is drawn over the quiet outline (the same rounded rectangle Ui-StrokeRound makes).
+function Ui-PaintBevel {
+    param($g, $light, $dark, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
+    $l = $x + 0.5; $t = $y + 0.5; $rt = $x + $w - 0.5; $b = $y + $h - 0.5
+    $q = [Math]::Max(1.0, [double]$r - 0.5)
+    $lp = @()
+    $lp += Ui-ArcPts ($l + $q) ($b - $q) $q 135 180
+    $lp += Ui-ArcPts ($l + $q) ($t + $q) $q 180 270
+    $lp += Ui-ArcPts ($rt - $q) ($t + $q) $q 270 315
+    $dp = @()
+    $dp += Ui-ArcPts ($rt - $q) ($t + $q) $q 315 360
+    $dp += Ui-ArcPts ($rt - $q) ($b - $q) $q 0 90
+    $dp += Ui-ArcPts ($l + $q) ($b - $q) $q 90 135
+    Ui-StrokePoly $g $dark 1 $dp
+    if ($null -ne $light) { Ui-StrokePoly $g $light 1 $lp }
+}
+# A card that stands out of the page: a soft shadow under it, the card, its outline, a faint shine along its top inside edge, and the
+# bevel over the outline: two lines, lit along the top and left, shaded along the bottom and right. $bevel: 1 = the whole bevel, 2 = only
+# the shaded lines (a card with a change waiting keeps its coloured outline along the top and left), 0 = none (the selected card keeps
+# its purple outline whole). The shadow and the shine are there for every card.
+function Ui-PaintRaised {
+    param($g, $fill, $edge, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r, [int]$bevel, [bool]$hot)
+    $Th = $script:Th
+    Ui-FillRound $g $Th.ShadeFar ($x - 1) ($y + (Px 5)) ($w + 2) $h ($r + 1)
+    Ui-FillRound $g $Th.Shade $x ($y + (Px 3)) $w $h $r
+    Ui-FillRound $g $fill $x $y $w $h $r
+    Ui-StrokeRound $g $edge 1 $x $y $w $h $r
+    Ui-Line $g $Th.Shine 1 ($x + $r) ($y + 2) ($x + $w - $r) ($y + 2)
+    if ($bevel -gt 0) {
+        $lc = $Th.BevelLight
+        $l2 = $Th.BevelLight2
+        if ($hot) { $lc = $Th.BevelLightHot }
+        if ($bevel -eq 2) { $lc = $null; $l2 = $null }
+        Ui-PaintBevel $g $lc $Th.BevelDark $x $y $w $h $r
+        Ui-PaintBevel $g $l2 $Th.BevelDark2 ($x + 1) ($y + 1) ($w - 2) ($h - 2) ([Math]::Max(1, $r - 1))
+    }
 }
 # the width of a text in pixels (for putting one thing right after another)
 function Ui-Measure {
@@ -8529,7 +8587,7 @@ function Ui-ListSize {
     # one column of cards, or two when each card can still be wide enough
     $cols = 1
     if ($right -ge (2 * $M.CardMin + $M.ColGap)) { $cols = 2 }
-    $cw = [int](($right - ($cols - 1) * $M.ColGap) / $cols)
+    $cw = [int][Math]::Floor(($right - ($cols - 1) * $M.ColGap) / $cols)        # rounded down: two cards and the gap never run past the list
     $oldCols = [int]$script:Col.Cols
     $oldCw = [int]$script:Col.CardW
     $script:Col = @{ Right = $right; Cols = $cols; CardW = $cw }
@@ -8686,6 +8744,9 @@ function Ui-Layout {
     $cw = [int]$script:Col.CardW
     if ($cw -le 0) { $cw = [Math]::Max((Px 100), $script:ListW - $M.Sb) }
     $full = $cw * $cols + $M.ColGap * ($cols - 1)
+    # the read-out cards use the grid as soon as two of them fit; a settings row needs more room for its text, so while the columns are
+    # narrower than RowMin the rows keep to one per line, the whole width
+    $rowWide = [bool]($cols -gt 1 -and $cw -lt $M.RowMin)
     foreach ($g in $script:Groups) {
         $open = ($single -or $script:Filtering -or -not [bool]$script:Collapsed[[string]$g.Cat])
         $h = $g.Head
@@ -8717,7 +8778,7 @@ function Ui-Layout {
                 continue
             }
             # a line ends when the next entry is a read-out that wants the whole width, or the first settings card after read-outs
-            $wide = ($r.Kind -eq 'info' -and ($cols -le 1 -or [int]$r.Span -ge 2))
+            $wide = (($r.Kind -eq 'info' -and ($cols -le 1 -or [int]$r.Span -ge 2)) -or ($r.Kind -ne 'info' -and $rowWide))
             if (($wide -or ($prev -eq 'info' -and $r.Kind -ne 'info')) -and $c -gt 0) {
                 foreach ($e in $line) { $e.H = $lineH }
                 $y += $lineH
@@ -8729,7 +8790,9 @@ function Ui-Layout {
                 Info-Prepare $r $iw
             } else {
                 $r.W = $cw
+                if ($rowWide) { $r.W = $full }
                 $r.H = $M.Row
+                if ($r.Choices) { $r.H = $M.Row + $M.ChoiceExtra }
             }
             if ($wide) {
                 $r.X = 0
@@ -8927,28 +8990,108 @@ function Ui-SoftKey {
     return 'Raised'
 }
 
-# Where the "Not recommended" label sits on a card: on the bottom line right after the risk badge, when it fits before the buttons
-# on the right. On a narrow card (a small window) it goes to the top right corner instead, above the title, where nothing is drawn;
-# if even that has no room it is left out (the details and the tooltip still say it). Top = $true says which of the two it is.
-# Returns $null when the setting is not marked or there is no room. $riskW is the width of the risk badge when the painter has
-# just measured it.
-function Ui-NotRecRect {
-    param($e, [int]$riskW = -1)
-    if (-not $e -or -not $e.NotRec) { return $null }
+# ---- the compact settings row --------------------------------------------------------------------------------------
+# One row is: an icon tile, the title (with small marks after it), a one-line description, and at the right a status chip, the risk
+# pill, the info button and the switch. A row with options has the option pill on a second line under the text instead of the switch.
+# Ui-RowGeom works out where each part goes (offsets from the row's top-left corner); the painter, the hit test and the tooltip all
+# use it, so they cannot disagree.
+
+# The tags that become small marks after the title: not the Windows default or the preset (the details say them) and not the category (the page says it)
+function Ui-RowTags {
+    param($e)
+    $own = ''
+    try { $own = [string](Get-NavTitle ([string]$e.Cat)) } catch { }
+    $list = @()
+    foreach ($tg in @($e.Tags)) {
+        $s = [string]$tg
+        if (-not $s -or $s.StartsWith('Windows default') -or $s -eq $own -or $s -eq 'Recommended preset') { continue }
+        $list += $s
+    }
+    return $list
+}
+
+function Ui-RowGeom {
+    param($e)
     $M = $script:M
-    $font = Ui-Font 'smallb'
-    if ($riskW -lt 0) { $riskW = (Ui-TextWidth ([string]$e.Risk) $font) + (Px 22) }
-    $nw = (Ui-TextWidth ([string]$script:NotRecText) $font) + (Px 22)
-    $nx = [int]$e.X + $M.Pad + $riskW + (Px 6)
-    $right = [int]$e.X + [int]$e.W
-    $viewX = $right - $M.Pad - $M.TogW - $M.ViewGap - $M.ViewW
-    if ($e.Choices) { $viewX = $right - $M.Pad - $M.ViewW }
-    if (($nx + $nw) -le ($viewX - (Px 8))) { return @{ X = $nx; W = $nw; Top = $false } }
-    # the top right corner, clear of the id text at the left
-    $tx = $right - $M.Pad - $nw
-    $idEnd = [int]$e.X + $M.Pad + (Ui-TextWidth ([string]$e.Id) (Ui-Font 'cardId')) + (Px 10)
-    if ($tx -ge $idEnd) { return @{ X = $tx; W = $nw; Top = $true } }
-    return $null
+    $f = Ui-Font 'smallb'
+    $w = [int]$e.W
+    $o = @{}
+    $o.TopH = $M.Row - $M.Gap
+    $o.CardH = [int]$e.H - $M.Gap
+    $o.TextX = $M.Pad                                   # no icon tile: the title starts at the left padding
+    # from the right edge inwards: the switch (not on a row with options), the info button, the risk pill, the status chip
+    $x = $w - $M.Pad
+    $o.TogX = -1
+    $o.TogY = [int](($o.TopH - $M.TogH) / 2)
+    if (-not $e.Choices) { $x -= $M.TogW; $o.TogX = $x; $x -= (Px 12) }
+    $x -= $M.InfoD
+    $o.InfoX = $x
+    $o.InfoY = [int](($o.TopH - $M.InfoD) / 2)
+    $x -= (Px 12)
+    $rw = (Ui-TextWidth 'Medium risk' $f) + (Px 20)                    # one width for all three, so the pills line up in a column
+    $o.RiskDot = $false
+    $o.RiskH = Px 22
+    if (($x - $rw - $o.TextX) -lt (Px 200)) { $o.RiskDot = $true; $rw = $M.RiskDot; $o.RiskH = $M.RiskDot }       # a narrow row: the risk is a coloured dot
+    $o.RiskW = $rw
+    $o.RiskX = $x - $rw
+    $o.RiskY = [int](($o.TopH - $o.RiskH) / 2)
+    $x = $o.RiskX - (Px 10)
+    $o.ChipX = -1
+    $o.ChipW = 0
+    $o.ChipH = Px 22
+    $o.ChipY = [int](($o.TopH - $o.ChipH) / 2)
+    if ($e.ChipText) {
+        $cw = (Ui-TextWidth ([string]$e.ChipText) $f) + (Px 22)
+        $need = Px 280
+        # the "Not recommended" mark matters more than a status chip: the chip only takes room the title and the mark can spare (except "Not on this PC": a setting that is not there cannot be switched, so its reason comes first)
+        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
+        if ($e.Failed -or (($x - $cw - $o.TextX) -ge $need)) { $o.ChipW = $cw; $o.ChipX = $x - $cw; $x = $o.ChipX - (Px 10) }
+    }
+    $o.TextEnd = $x
+    $o.TextW = [Math]::Max(0, $x - $o.TextX)
+    $o.TitleY = Px 14
+    $o.TitleH = Px 24
+    $o.DescY = Px 40
+    $o.DescH = Px 20
+    # the title, and the small marks after it (the "Not recommended" mark first), as many as fit
+    $tw = Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')
+    $o.TitleCut = [bool]($tw -gt $o.TextW)
+    $o.TitleW = [Math]::Min($o.TextW, ($tw + (Px 4)))
+    $o.DescCut = [bool]((Ui-TextWidth ([string]$e.Desc) (Ui-Font 'cardDesc')) -gt $o.TextW)
+    $px = $o.TextX + $o.TitleW + (Px 8)
+    $ph = Px 20
+    $py = $o.TitleY + [int](($o.TitleH - $ph) / 2)
+    $o.Pills = @()
+    $o.Hidden = 0
+    $o.NotRec = $null
+    $items = @()
+    if ($e.NotRec) { $items += , @('notrec', [string]$script:NotRecText) }
+    foreach ($t in @(Ui-RowTags $e)) { $items += , @('tag', [string]$t) }
+    $room = $true
+    foreach ($it in $items) {
+        $pw = (Ui-TextWidth ([string]$it[1]) $f) + (Px 16)
+        if ($room -and -not $o.TitleCut -and (($px + $pw) -le $o.TextEnd)) {
+            $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $px; Y = $py; W = $pw; H = $ph }
+            $o.Pills += , $p
+            if ($p.Kind -eq 'notrec') { $o.NotRec = $p }
+            $px += $pw + (Px 6)
+        } else {
+            $room = $false
+            $o.Hidden++
+        }
+    }
+    return $o
+}
+
+# Where the "Not recommended" mark sits on a row (right after the title), or $null when the row has no mark or no room for it
+# (the details and the tooltip still say it). X is in the list's own coordinates; Y is the offset from the row's top.
+function Ui-NotRecRect {
+    param($e)
+    if (-not $e -or -not $e.NotRec) { return $null }
+    $o = Ui-RowGeom $e
+    $p = $o.NotRec
+    if (-not $p) { return $null }
+    return @{ X = ([int]$e.X + [int]$p.X); W = [int]$p.W; Y = [int]$p.Y; H = [int]$p.H; Top = $false }
 }
 
 function Ui-PaintRow {
@@ -8960,7 +9103,8 @@ function Ui-PaintRow {
     $hot = ($script:HotEntry -and $script:HotEntry.Key -eq $e.Key)
     $x = [int]$e.X
     $cw = [int]$e.W
-    $ch = $e.H - $M.Gap                                   # the card is a little shorter than its line: that is the gap
+    $o = Ui-RowGeom $e
+    $ch = $o.CardH                                        # the card is a little shorter than its line: that is the gap
     $fill = $Th.Card
     $edge = $Th.Edge
     if ($e.Tint) {
@@ -8974,82 +9118,68 @@ function Ui-PaintRow {
         $fill = $Th.CardHot
         $edge = $Th.EdgeHot
     }
-    Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
-    Ui-StrokeRound $g $edge 1 $x $y $cw $ch $M.Radius
+    $bevel = 1
+    if ($sel) { $bevel = 0 } elseif ($e.Tint) { $bevel = 2 }
+    Ui-PaintRaised $g $fill $edge $x $y $cw $ch $M.Radius $bevel ([bool]$hot)
     if ($e.Tint) {
-        # a change waiting to be made: a short bar at the left edge (purple: the switch will go on, orange: it will go off) instead of a loud outline
+        # a change waiting to be made: a short bar at the left edge (purple: the switch will go on, orange: it will go off)
         $bar = $Th.Accent
         if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
-        Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 18)) (Px 3) ($ch - (Px 36)) (Px 1)
+        Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 14)) (Px 3) ($o.TopH - (Px 28)) (Px 1)
     }
-    $ix = $x + $M.Pad
-    $iw = $cw - 2 * $M.Pad
+    $on = [bool]$e.Enabled
     $nameCol = $Th.Text
-    $descCol = $Th.Sub
-    $idCol = $Th.Dim
-    if (-not $e.Enabled) { $nameCol = $Th.Dim; $descCol = $Th.Dim }
-    # the id (what -Apply and -Undo call it), the title, the tags
-    Ui-Text $g $e.Id (Ui-Font 'cardId') $idCol $ix ($y + (Px 14)) $iw (Px 14) $TF.L
-    Ui-Text $g $e.Name (Ui-Font 'cardName') $nameCol $ix ($y + (Px 30)) $iw (Px 26) $TF.L
-    $tx = $ix
-    $ty = $y + (Px 62)
-    $tagH = Px 22
+    $descCol = $Th.Mute
+    if (-not $on) { $nameCol = $Th.Dim; $descCol = $Th.Dim }
+    # the title, then the marks after it
+    $textX = $x + $o.TextX
+    Ui-Text $g $e.Name (Ui-Font 'cardName') $nameCol $textX ($y + $o.TitleY) $o.TitleW $o.TitleH $TF.L
     $tagFont = Ui-Font 'smallb'
-    foreach ($tg in @($e.Tags)) {
-        $tw = (Ui-Measure $g ([string]$tg) $tagFont) + (Px 18)
-        if (($tx + $tw) -gt ($ix + $iw)) { break }
-        Ui-FillRound $g $Th.Tag $tx $ty $tw $tagH (Px 6)
-        Ui-Text $g ([string]$tg) $tagFont $Th.TagText $tx $ty $tw $tagH $TF.C
-        $tx += $tw + (Px 6)
-    }
-    # the description, wrapped to two lines (the details panel shows all of it). A card with options has its option buttons
-    # there instead (the description is one click away on "View description").
-    if ($e.Choices) { Ui-DrawChoices $g $e $ix ($y + $M.ChoiceY) $iw $M.ChoiceH }
-    elseif ($e.Desc) { Ui-Text $g $e.Desc (Ui-Font 'cardDesc') $descCol $ix ($y + (Px 92)) $iw (Px 40) $TF.W }
-    # the bottom line: risk badge and status chip on the left; on the right "View description", then the switch
-    $by = $y + $ch - (Px 12) - (Px 24)
-    $bx = $ix
-    $bh = Px 24
-    $bw = (Ui-Measure $g ([string]$e.Risk) $tagFont) + (Px 22)
-    $fk = $e.RiskKey + 'Fill'
-    $tk = $e.RiskKey + 'Text'
-    if (-not $e.Enabled) { $fk = 'Raised'; $tk = 'Dim' }
-    Ui-FillRound $g $Th[$fk] $bx $by $bw $bh (Px 6)
-    Ui-Text $g ([string]$e.Risk) $tagFont $Th[$tk] $bx $by $bw $bh $TF.C
-    # "Not recommended": an outlined label next to the risk badge (outlined, so it cannot be mistaken for the solid risk colours)
-    $nextX = $bx + $bw
-    $nrr = Ui-NotRecRect $e $bw
-    if ($nrr) {
-        $nc = $Th.Bad
-        if (-not $e.Enabled) { $nc = $Th.Dim }
-        $ny = $by
-        $nh = $bh
-        if ($nrr.Top) { $ny = $y + (Px 8); $nh = Px 22 }          # a narrow card: the top right corner
-        Ui-StrokeRound $g $nc 1 $nrr.X $ny $nrr.W $nh (Px 6)
-        Ui-Text $g ([string]$script:NotRecText) $tagFont $nc $nrr.X $ny $nrr.W $nh $TF.C
-        if (-not $nrr.Top) { $nextX = $nrr.X + $nrr.W }
-    }
-    $togX = $x + $cw - $M.Pad - $M.TogW
-    $viewX = $togX - $M.ViewGap - $M.ViewW
-    if ($e.Choices) { $viewX = $x + $cw - $M.Pad - $M.ViewW }          # no switch on this card: the button goes to the right end
-    if ($e.ChipText) {
-        $cx = $nextX + (Px 10)
-        $cwid = (Ui-Measure $g ([string]$e.ChipText) $tagFont) + (Px 22)
-        if (($cx + $cwid) -le ($viewX - (Px 8))) {
-            Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] $cx $by $cwid $bh (Px 6)
-            Ui-Text $g ([string]$e.ChipText) $tagFont $Th[$e.ChipKey] $cx $by $cwid $bh $TF.C
+    foreach ($p in @($o.Pills)) {
+        if ($p.Kind -eq 'notrec') {
+            $nc = $Th.Bad
+            if (-not $on) { $nc = $Th.Dim }
+            Ui-StrokeRound $g $nc 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
+            Ui-Text $g $p.Text $tagFont $nc ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
+        } else {
+            Ui-FillRound $g $Th.Tag ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
+            Ui-Text $g $p.Text $tagFont $Th.TagText ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
         }
     }
-    # "View description": an outlined button (it fills in when the pointer is over it)
+    # the one-line description (the details panel shows all of it)
+    if ($e.Desc) { Ui-Text $g $e.Desc (Ui-Font 'cardDesc') $descCol $textX ($y + $o.DescY) $o.TextW $o.DescH $TF.L }
+    # a row with options has its option pill on a second line, under the text
+    if ($e.Choices) { Ui-DrawChoices $g $e $textX ($y + $M.ChoiceY) ($cw - $M.Pad - $o.TextX) $M.ChoiceH }
+    # the right side: status chip, risk pill (or dot), info button, switch
+    if ($o.ChipX -ge 0) {
+        Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH (Px 6)
+        Ui-Text $g ([string]$e.ChipText) $tagFont $Th[$e.ChipKey] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH $TF.C
+    }
+    $fk = $e.RiskKey + 'Fill'
+    $tk = $e.RiskKey + 'Text'
+    if (-not $on) { $fk = 'Raised'; $tk = 'Dim' }
+    if ($o.RiskDot) {
+        Ui-FillOval $g $Th[$tk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH
+    } else {
+        Ui-FillRound $g $Th[$fk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH (Px 6)
+        Ui-Text $g ([string]$e.Risk) $tagFont $Th[$tk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH $TF.C
+    }
+    # the info button (opens the full description); it fills in when the pointer is over it
     $vhot = ($hot -and $script:HotZone -eq 'view')
-    $vcol = $Th.Sub
-    if ($vhot) { Ui-FillRound $g $Th.Raised $viewX $by $M.ViewW $bh (Px 6); $vcol = $Th.Text }
-    Ui-StrokeRound $g $Th.Border 1 $viewX $by $M.ViewW $bh (Px 6)
-    Ui-Text $g 'View description' $tagFont $vcol $viewX $by $M.ViewW $bh $TF.C
-    if (-not $e.Choices) { Ui-DrawToggle $g $togX ($by + [int](($bh - $M.TogH) / 2)) ([bool]$e.Checked) ([bool]$e.Enabled) }
+    $ix = $x + $o.InfoX
+    $iy = $y + $o.InfoY
+    $icol = $Th.Mute
+    if ($vhot) { Ui-FillOval $g $Th.Raised $ix $iy $M.InfoD $M.InfoD; $icol = $Th.Text }
+    Ui-StrokeOval $g $Th.Border 1.2 ($ix + 0.5) ($iy + 0.5) ($M.InfoD - 1) ($M.InfoD - 1)
+    $cx = $ix + [int]($M.InfoD / 2)
+    $cy = $iy + [int]($M.InfoD / 2)
+    $dd = [Math]::Max(3, (Px 3))
+    Ui-FillOval $g $icol ($cx - [int]($dd / 2)) ($cy - (Px 6)) $dd $dd
+    Ui-Line $g $icol 1.8 $cx ($cy - (Px 1)) $cx ($cy + (Px 6))
+    if (-not $e.Choices) { Ui-DrawToggle $g ($x + $o.TogX) ($y + $o.TogY) ([bool]$e.Checked) $on }
 }
 
-# The option buttons of a card with options: one pill split in equal parts. The picked part is filled, the option that is in force
+# The option buttons of a row with options: one pill split in equal parts. The picked part is filled, the option that is in force
 # (when it is not the picked one) has a green outline, the part under the pointer lights up.
 function Ui-DrawChoices {
     param($g, $e, [int]$x, [int]$y, [int]$w, [int]$h)
@@ -9154,35 +9284,30 @@ function Ui-Zone {
     $e = $script:View[$i]
     if ($e.Kind -eq 'info') { return @{ Zone = ''; Entry = $null } }          # a read-out: nothing to click
     if ($e.Kind -eq 'row') {
-        # the "Not recommended" label in the top right corner (only on a card too narrow for it on the bottom line)
-        $nrr = Ui-NotRecRect $e
-        if ($nrr -and $nrr.Top -and $ly -ge ($e.Y + (Px 8)) -and $ly -lt ($e.Y + (Px 30)) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
-        # the bottom line of the card: the switch at the right end (a little more than the switch itself) turns it on or off,
-        # and the "View description" button just left of it opens the full text
-        $cardBottom = $e.Y + $e.H - $M.Gap
+        $o = Ui-RowGeom $e
+        $rx = $x - [int]$e.X
+        $ry = $ly - [int]$e.Y
+        if ($ry -ge $o.CardH) { return @{ Zone = 'row'; Entry = $e } }
         if ($e.Choices) {
             # the option buttons: seg0, seg1, ... from the left
-            $cl = $e.X + $M.Pad
-            $cwid = $e.W - 2 * $M.Pad
-            $ctop = $e.Y + $M.ChoiceY
-            if ($ly -ge $ctop -and $ly -lt ($ctop + $M.ChoiceH) -and $x -ge $cl -and $x -lt ($cl + $cwid)) {
+            $cl = [int]$e.X + $o.TextX
+            $cwid = [int]$e.W - $M.Pad - $o.TextX
+            $ctop = $M.ChoiceY
+            if ($ry -ge $ctop -and $ry -lt ($ctop + $M.ChoiceH) -and $x -ge $cl -and $x -lt ($cl + $cwid)) {
                 $cn = @($e.Choices).Count
-                $k = [int][Math]::Floor(($x - $cl) * $cn / [double]$cwid)
+                $segw = [Math]::Max(1, [int][Math]::Floor($cwid / $cn))          # the same split as Ui-DrawChoices: equal parts, the last takes the remainder
+                $k = [int][Math]::Floor(($x - $cl) / $segw)
                 if ($k -ge $cn) { $k = $cn - 1 }
                 return @{ Zone = ('seg' + $k); Entry = $e }
             }
         }
-        if ($ly -ge ($cardBottom - $M.BandH) -and $ly -lt $cardBottom) {
-            $right = $e.X + $e.W
-            if ($nrr -and -not $nrr.Top -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
-            if ($e.Choices) {
-                if ($x -ge ($right - $M.Pad - $M.ViewW - (Px 4)) -and $x -lt $right) { return @{ Zone = 'view'; Entry = $e } }
-                return @{ Zone = 'row'; Entry = $e }
-            }
-            if ($x -ge ($right - $M.TogZone) -and $x -lt $right) { return @{ Zone = 'toggle'; Entry = $e } }
-            $viewLeft = $right - $M.Pad - $M.TogW - $M.ViewGap - $M.ViewW
-            if ($x -ge ($viewLeft - (Px 4)) -and $x -lt ($right - $M.TogZone)) { return @{ Zone = 'view'; Entry = $e } }
-        }
+        # the "Not recommended" mark after the title
+        $nrr = Ui-NotRecRect $e
+        if ($nrr -and $ry -ge $nrr.Y -and $ry -lt ($nrr.Y + $nrr.H) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
+        # the info button opens the full text; the switch (a little more than the switch itself) turns the setting on or off
+        if ($ry -lt $o.TopH -and $rx -ge ($o.InfoX - (Px 6)) -and $rx -lt ($o.InfoX + $M.InfoD + (Px 6))) { return @{ Zone = 'view'; Entry = $e } }
+        if (-not $e.Choices -and $rx -ge ($o.TogX - (Px 6)) -and $rx -lt [int]$e.W) { return @{ Zone = 'toggle'; Entry = $e } }
+        if ($o.RiskDot -and $ry -lt $o.TopH -and $rx -ge ($o.RiskX - (Px 4)) -and $rx -lt ($o.RiskX + $o.RiskW + (Px 4))) { return @{ Zone = 'risk'; Entry = $e } }
         return @{ Zone = 'row'; Entry = $e }
     }
     return @{ Zone = 'head'; Entry = $e }
@@ -9223,13 +9348,18 @@ function Ui-SetTip {
     if ($e -and $e.Kind -eq 'row') {
         if ($zone -eq 'view') { $t = 'Read the full description and see exactly what this setting changes.' }
         elseif ($zone -eq 'notrec') { $t = Format-TipLines ([string]$script:NotRecText + ': ' + [string]$e.NotRecWhy) 64 }
+        elseif ($zone -eq 'risk') { $t = [string]$e.Risk }
         elseif ($zone -like 'seg*' -and $e.Choices) {
             $k = [int]$zone.Substring(3)
             $cs = @($e.Choices)
             if ($k -ge 0 -and $k -lt $cs.Count) { $t = [string]$cs[$k].Label }
         } else {
-            $room = [int]$e.W - 2 * [int]$script:M.Pad
-            if ($room -gt 0 -and (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) -gt $room) { $t = [string]$e.Name }
+            # over the text: the full title when the row cuts it off, else the full description when it is cut, plus the
+            # "Not recommended" reason when its mark did not fit
+            $o = Ui-RowGeom $e
+            if ($o.TitleCut) { $t = [string]$e.Name }
+            elseif ($o.DescCut) { $t = Format-TipLines ([string]$e.Desc) 64 }
+            if ($e.NotRec -and -not $o.NotRec -and $t) { $t = $t + "`r`n" + (Format-TipLines ([string]$script:NotRecText + ': ' + [string]$e.NotRecWhy) 64) }
         }
     }
     if ($t -eq $script:TipText) { return }
@@ -9518,7 +9648,7 @@ function Ui-Counts {
 }
 
 # ----------------------------------------------------------- details panel -----------
-$script:DetailHint = "Click a setting to read what it does and exactly what it changes. Press 'View description' on a setting to read the same text in a window of its own.`r`n`r`nUse the switch on the right of a setting to turn the feature on or off: on means the feature is on, off means it is off (or the service is disabled). Every card says what Windows has by default. Nothing is changed until you press the Apply button at the bottom."
+$script:DetailHint = "Click a setting to read what it does and exactly what it changes. Press the i button at the right of a setting to read the same text in a window of its own.`r`n`r`nUse the switch on the right of a setting to turn the feature on or off: on means the feature is on, off means it is off (or the service is disabled). Every card says what Windows has by default. Nothing is changed until you press the Apply button at the bottom."
 
 # which font and colour a piece of the details text gets
 function Ui-PartStyle {
@@ -9567,7 +9697,7 @@ function Ui-FillRich {
     }
 }
 
-# "View description" on a card: everything the details panel shows for the setting (what it does, side effects, and the exact
+# the i button ("View description") on a row: everything the details panel shows for the setting (what it does, side effects, and the exact
 # registry values, services and tasks it touches), in a window of its own that can be made bigger
 function Ui-ShowInfo {
     param([string]$id)
@@ -10174,7 +10304,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '79'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '80'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10372,6 +10502,14 @@ $script:NavIcons = @{
     'Remove apps'         = @(@('r', 4, 4, 16, 16, 3), @('p', 9, 9, 15, 15), @('p', 15, 9, 9, 15))
     'Legacy features'     = @(@('o', 3, 3, 18, 18), @('p', 12, 7, 12, 12, 15.5, 14))
     'Testing'             = @(, @('p', 2, 12, 7, 12, 9.5, 5, 14, 19, 16.5, 12, 22, 12))
+    # the Home cards
+    'Windows'             = @(@('r', 3, 4, 8, 7, 1), @('r', 13, 3, 8, 8, 1), @('r', 3, 13, 8, 8, 1), @('r', 13, 14, 8, 7, 1))
+    'Processor'           = @(@('r', 6, 6, 12, 12, 2), @('r', 9.5, 9.5, 5, 5, 1), @('p', 9, 3, 9, 6), @('p', 15, 3, 15, 6), @('p', 9, 18, 9, 21), @('p', 15, 18, 15, 21), @('p', 3, 9, 6, 9), @('p', 3, 15, 6, 15), @('p', 18, 9, 21, 9), @('p', 18, 15, 21, 15))
+    'Graphics card'       = @(@('r', 2, 6, 20, 11, 2), @('o', 9, 8.5, 6, 6), @('d', 12, 11.5, 1), @('p', 5, 17, 5, 20))
+    'Memory'              = @(@('r', 2, 7, 20, 9, 1.5), @('r', 5, 9.5, 3.5, 4, 0.5), @('r', 10.25, 9.5, 3.5, 4, 0.5), @('r', 15.5, 9.5, 3.5, 4, 0.5), @('p', 6, 16, 6, 19), @('p', 10, 16, 10, 19), @('p', 14, 16, 14, 19), @('p', 18, 16, 18, 19))
+    'Storage'             = @(@('r', 3, 5, 18, 14, 3), @('p', 3, 14, 21, 14), @('d', 17.5, 16.5, 1))
+    'Motherboard'         = @(@('r', 3, 3, 18, 18, 2), @('r', 7, 7, 6, 6, 1), @('p', 16, 6, 16, 11), @('p', 7, 16, 17, 16))
+    'Sensors'             = @(@('r', 9.5, 3, 5, 13, 2.5), @('o', 7.5, 13, 9, 9), @('p', 12, 8, 12, 16))
 }
 # the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
 function Get-IconPts {
@@ -10441,6 +10579,7 @@ function Ui-PaintNav {
         $ih = $e.H - (Px 2)
         if ($sel) {
             Ui-FillRound $g $Th.SideSel $ix $e.Y $iw $ih (Px 10)
+            Ui-FillRound $g $Th.Accent ($ix + (Px 1)) ($e.Y + [int](($ih - (Px 20)) / 2)) (Px 3) (Px 20) (Px 1)      # the bar at the left edge of the open page
         } elseif ($hot) {
             Ui-FillRound $g $Th.SideHot $ix $e.Y $iw $ih (Px 10)
         }
@@ -10453,15 +10592,24 @@ function Ui-PaintNav {
         $ixx = $ix + (Px 12)
         Ui-PaintIcon $g ([string]$e.Title) $ixx ($e.Y + [int](($ih - $isz) / 2)) $isz $icol
         $tx2 = $ixx + $isz + (Px 11)
-        $cw = Px 40
-        $right = $w - $ix - (Px 12)
-        $limit = $right - $cw - (Px 6)
-        Ui-Text $g $e.Title $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
+        $right = $w - $ix - (Px 10)
+        $limit = $right
+        $pw = 0
         if ($e.CountText) {
-            $cc = $Th.Dim
-            if ($sel) { $cc = $Th.Sub }
-            Ui-Text $g $e.CountText (Ui-Font 'small') $cc ($right - $cw + (Px 4)) $e.Y $cw $ih $TF.R
+            # the count sits in a small pill at the right edge (lit for the open page)
+            $cf = Ui-Font 'smallb'
+            $pw = (Ui-Measure $g ([string]$e.CountText) $cf) + (Px 16)
+            $ph = Px 20
+            $pxx = $right - $pw
+            $pyy = $e.Y + [int](($ih - $ph) / 2)
+            $pfill = $Th.Tag
+            $pcol = $Th.Mute
+            if ($sel) { $pfill = $Th.AccentSoft; $pcol = $Th.Accent }
+            Ui-FillRound $g $pfill $pxx $pyy $pw $ph ([int]($ph / 2))
+            Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.C
+            $limit = $pxx - (Px 6)
         }
+        Ui-Text $g $e.Title $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
     }
     # the app name stays put: it is drawn over the pages that have scrolled under it
     Ui-Fill $g $Th.Side 0 0 $w $M.NavTop
@@ -10746,7 +10894,6 @@ function Ui-PlaceBars {
     $g = $M.Gutter
     $wv = $ui.welcome
     if ($wv -and [bool]$wv.Visible) { $wv.Size = $ui.form.ClientSize }
-    $ui.searchBox.Left = $mw - $g - $ui.searchBox.Width
     $ui.allOff.Left = $mw - $g - $ui.allOff.Width
     $ui.allOn.Left = $ui.allOff.Left - (Px 4) - $ui.allOn.Width
     $ui.applyAll.Left = $ui.allOn.Left - (Px 8) - $ui.applyAll.Width         # the three page buttons are one group on the tab row
@@ -10763,23 +10910,22 @@ function Ui-PlaceBars {
     Ui-ApplyBar
 }
 
-# The button that belongs to the page sits left of the search box, level with it; the title and the line under it stop before them
+# The button that belongs to the page sits at the right end of the title row; the title stops before it
 function Ui-PlacePageBtn {
     $ui = $script:UI
     $M = $script:M
-    $sb = $ui.searchBox
-    if (-not $sb -or -not $ui.form -or -not $ui.title) { return }
+    if (-not $ui.form -or -not $ui.title) { return }
     $fw = [int]$ui.form.ClientSize.Width
     if ($fw -lt (Px 300)) { return }
-    $limit = $sb.Left
+    $edge = ($fw - $M.Side) - $M.Gutter
+    $limit = $edge
     $pb = $ui.pageBtn
     if ($pb) {
-        $pb.Left = $sb.Left - (Px 10) - $pb.Width
-        $pb.Top = $sb.Top + [int](($sb.Height - $pb.Height) / 2)
+        $pb.Left = $edge - $pb.Width
         if ([bool]$pb.Visible) { $limit = $pb.Left }
     }
     $ui.title.Width = [Math]::Max((Px 100), ($limit - $M.Gutter - (Px 16)))
-    $ui.sub.Width = [Math]::Max((Px 100), ($sb.Left - $M.Gutter - (Px 16)))
+    $ui.sub.Width = [Math]::Max((Px 100), ($edge - $M.Gutter - (Px 16)))
     Ui-FitTitle
 }
 
@@ -10868,7 +11014,7 @@ function Ui-Build {
     $script:UI.presetBtn = $btnPresets            # Select Optimization Preset (opens the window with the three presets)
     $script:UI.rescan = $btnRescan
 
-    # --- header: page title, search, the filter buttons
+    # --- header: page title, the filter buttons
     $header = New-Pnl 'Top' $M.HeaderH $Th.Bg
     $title = New-Lbl 'All settings' 'title' $Th.Text $Th.Bg $M.Gutter (Px 20)
     $title.AutoSize = $false
@@ -10884,19 +11030,22 @@ function Ui-Build {
     $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), or open Windows display settings (Display).' 32
     $btnPage.Top = (Px 24)
     $btnPage.Visible = $false
+    # the search box lives in the side menu, under the app name
     $searchBox = Ui-NewCard $Th.Card $Th.Edge $M.Radius 'search'
-    $searchBox.Size = New-Object System.Drawing.Size((Px 250), (Px 40))
-    $searchBox.Top = (Px 20)
+    $searchBox.BackColor = $Th.Side
+    $searchBox.Size = New-Object System.Drawing.Size(($M.Side - (Px 24)), $M.SearchH)
+    $searchBox.Location = New-Object System.Drawing.Point((Px 12), $M.SearchY)
     $find = New-Object System.Windows.Forms.TextBox
     $find.BorderStyle = [System.Windows.Forms.BorderStyle]::None
     $find.BackColor = $Th.Card
     $find.ForeColor = $Th.Text
     $find.Font = (Ui-Font 'row')
     $find.Location = New-Object System.Drawing.Point((Px 40), (Px 11))
-    $find.Width = (Px 250) - (Px 40) - (Px 12)
+    $find.Width = ($M.Side - (Px 24)) - (Px 40) - (Px 12)
     $searchBox.Controls.Add($find)
     $script:UI.find = $find
     $script:UI.searchBox = $searchBox
+    $nav.Controls.Add($searchBox)
 
     # the filter tabs are plain text with the number next to it; the open one is a filled box.
     # Two rows: the state of the setting (top) and its risk (below); one tab is open in each row and they work together.
@@ -10945,7 +11094,7 @@ function Ui-Build {
     $btnAllOff.Top = (Px 141)
     $btnAllOn.Visible = $false
     $btnAllOff.Visible = $false
-    foreach ($hc in $title, $sub, $searchBox, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
+    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
     $script:UI.header = $header
     $script:UI.title = $title
     $script:UI.sub = $sub
@@ -11070,7 +11219,7 @@ function Ui-Build {
     $find.Add_KeyDown({ param($s, $e) try { if ([string]$e.KeyCode -eq 'Escape') { $s.Text = ''; $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
     $find.Add_Enter({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Accent; $script:UI.searchBox.Invalidate() } catch { } })
     $find.Add_Leave({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Edge; $script:UI.searchBox.Invalidate() } catch { } })
-    $find.Add_HandleCreated({ param($s, $e) try { Ui-Cue $s 'Search settings' } catch { } })
+    $find.Add_HandleCreated({ param($s, $e) try { Ui-Cue $s 'Find a setting' } catch { } })
     $dry.Add_CheckedChanged({ try { Ui-StyleDry; Ui-Counts } catch { Ui-Fail $_ } })
     $forceBtn.Add_Click({ try { Ui-ForceUndo } catch { Ui-Fail $_ } })
     $btnApply.Add_Click({ try { Ui-DoApply } catch { Ui-Fail $_ } })
@@ -11679,8 +11828,7 @@ function Info-Prepare {
     param($e, [int]$w)
     $M = $script:M
     $iw = $w - 2 * $M.Pad
-    $top = Px 40
-    if ($e.Sub) { $top = Px 64 }
+    $top = Px 66                                          # the icon tile and the name beside it, then the lines
     $h = $top
     foreach ($l in @($e.Lines)) { if ($null -ne $l.Bar) { $h += Px 32 } else { $h += Px 22 } }
     $e.NoteLines = @()
@@ -11694,6 +11842,21 @@ function Info-Prepare {
     $e.H = $h + $M.Gap
 }
 
+# The icon on a Home card: by what the card shows
+function Info-IconKey {
+    param($e)
+    $k = [string]$e.Key
+    if ($k -eq 'info:os') { return 'Windows' }
+    if ($k -eq 'info:cpu') { return 'Processor' }
+    if ($k -eq 'info:gpu') { return 'Graphics card' }
+    if ($k -eq 'info:ram') { return 'Memory' }
+    if ($k -eq 'info:storage') { return 'Storage' }
+    if ($k -eq 'info:board') { return 'Motherboard' }
+    if ($k -eq 'info:sensors') { return 'Sensors' }
+    if ($k.StartsWith('info:disp') -or $k -eq 'info:ratenote') { return 'Display' }
+    return '_'
+}
+
 function Ui-PaintInfo {
     param($g, $e, [int]$y)
     $Th = $script:Th
@@ -11702,8 +11865,7 @@ function Ui-PaintInfo {
     $x = [int]$e.X
     $cw = [int]$e.W
     $ch = $e.H - $M.Gap
-    Ui-FillRound $g $Th.Card $x $y $cw $ch $M.Radius
-    Ui-StrokeRound $g $Th.Edge 1 $x $y $cw $ch $M.Radius
+    Ui-PaintRaised $g $Th.Card $Th.Edge $x $y $cw $ch $M.Radius 1 $false
     $ix = $x + $M.Pad
     $iw = $cw - 2 * $M.Pad
     $chipW = 0
@@ -11715,10 +11877,19 @@ function Ui-PaintInfo {
         Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx ($y + (Px 10)) $chipW (Px 22) (Px 6)
         Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx ($y + (Px 10)) $chipW (Px 22) $TF.C
     }
-    $tw = $iw
-    if ($chipW -gt 0) { $tw = $iw - $chipW - (Px 8) }
-    Ui-Text $g ([string]$e.Title).ToUpperInvariant() (Ui-Font 'cap') $Th.Dim $ix ($y + (Px 14)) $tw (Px 14) $TF.L
-    if ($e.Sub) { Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $ix ($y + (Px 30)) $iw (Px 26) $TF.L }
+    # the icon tile, and the name beside it
+    $tx0 = $ix + $M.IconD + $M.IconGap
+    $tw = $iw - $M.IconD - $M.IconGap
+    if ($chipW -gt 0) { $tw = $tw - $chipW - (Px 8) }
+    Ui-FillRound $g $Th.AccentSoft $ix ($y + (Px 12)) $M.IconD $M.IconD (Px 12)
+    $isz = Px 22
+    Ui-PaintIcon $g (Info-IconKey $e) ($ix + [int](($M.IconD - $isz) / 2)) ($y + (Px 12) + [int](($M.IconD - $isz) / 2)) $isz $Th.Accent
+    if ($e.Sub) {
+        Ui-Text $g ([string]$e.Title).ToUpperInvariant() (Ui-Font 'cap') $Th.Dim $tx0 ($y + (Px 15)) $tw (Px 14) $TF.L
+        Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 31)) ($cw - 2 * $M.Pad - $M.IconD - $M.IconGap) (Px 26) $TF.L
+    } else {
+        Ui-Text $g ([string]$e.Title) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 12)) $tw $M.IconD $TF.L
+    }
     $ly = $y + [int]$e.Top
     $lw = [Math]::Min((Px 150), [int]($iw * 0.42))
     foreach ($l in @($e.Lines)) {

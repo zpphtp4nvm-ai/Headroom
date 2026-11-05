@@ -94,6 +94,7 @@ Each card has one switch, and the switch is the setting itself. On means the set
 - A startup program: on means it starts with Windows, off means it does not.
 - Browser settings (Edge and Chrome) are policies. Edge and Chrome show "Managed by your organization" while any of their policies is set; switching the setting off removes the policy values again. Chrome has no group of its own, so its AI setting is on the AI features page next to the Windows ones.
 - Services: every setting that only changes services is on the Services page, so they are all in one place. Eight of them are untested ideas from other debloat scripts and carry an "Untested" tag; Apply all and Tweak all leave those out, so you switch them yourself.
+- Settings with options and one-time clean-ups: a setting with options that is sitting on its Windows default (Multiplane Overlay, automatic updates for Store apps) and the run-once clean-ups (Disk Cleanup, Temporary files) are listed under All settings but not counted as "Not applied", because there is nothing to apply until you pick an option or line the clean-up up. They count again as soon as you do.
 
 Reset all puts everything back to the Windows default, which means Game Mode and Optimizations for windowed games go back to on. When the check of the PC finds a setting that is only partly in place, Headroom offers to finish it.
 
