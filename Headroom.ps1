@@ -6303,6 +6303,19 @@ function Get-Action {
     return ''
 }
 
+# A row that is neither "applied" nor "not applied": a setting with options that is marked not recommended (a fix to use only when you have
+# the problem, like Multiplane Overlay) and sits on its Windows default option while nothing asks for another one (nothing lined up, not in
+# the saved configuration). The default is the intended state there, so there is nothing to apply; the row is only counted under All settings.
+function Test-NothingToApply {
+    param($row)
+    if ([string]$row.State -ne 'Off') { return $false }
+    if (-not $row.T.Choices) { return $false }
+    if (-not (Get-NotRecReason $row.T)) { return $false }
+    if (Get-Action $row) { return $false }
+    if ($script:Personal.Picks.ContainsKey([string]$row.T.Id)) { return $false }
+    return $true
+}
+
 function Get-BusyReason {
     if ($script:Scanning) { return 'Please wait - still checking your PC.' }
     if ($script:Applying) { return 'Please wait - changes are being made.' }
@@ -6767,13 +6780,13 @@ function Get-Pending {
 }
 
 function Get-Counts {
-    $c = @{ Total = 0; On = 0; Off = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
+    $c = @{ Total = 0; On = 0; Off = 0; Idle = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
         $c.Total++
         switch ([string]$row.State) {
             'On'       { $c.On++ }
-            'Off'      { $c.Off++ }
+            'Off'      { if (Test-NothingToApply $row) { $c.Idle++ } else { $c.Off++ } }
             'Partial'  { $c.Partial++ }
             'NA'       { $c.NA++ }
             'Checking' { $c.Checking++ }
@@ -6843,6 +6856,7 @@ function Get-SummaryText {
     if ($c.Checking -gt 0) { return 'Checking your PC...' }
     $n = $c.Apply + $c.Undo
     $s = ('{0} settings: {1} applied, {2} not applied' -f ($c.Total - $c.NA), $c.On, ($c.Off + $c.Partial + $c.Unknown))
+    if ($c.Idle -gt 0) { $s += (', {0} left on the Windows default' -f $c.Idle) }
     if ($c.NA -gt 0) { $s += (', {0} not on this PC' -f $c.NA) }
     if ($n -gt 0) {
         $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.GoOn, $c.GoOff)
@@ -7012,7 +7026,7 @@ function Get-ModeCounts {
         if ($risk -ne 'Any risk' -and $level -ne $risk) { continue }
         $c['All settings']++
         if ($row.State -eq 'On') { $c['Applied']++ }
-        elseif ($row.State -eq 'Off' -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') { $c['Not applied']++ }
+        elseif (($row.State -eq 'Off' -and -not (Test-NothingToApply $row)) -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') { $c['Not applied']++ }
         if (Get-Action $row) { $c['Waiting to change']++ }
         if ($row.T.Preset) { $c['Recommended']++ }
         if ($script:Personal.Picks.ContainsKey([string]$row.T.Id)) { $c['Personal']++ }
@@ -7133,7 +7147,7 @@ function Test-RowVisible {
     }
     switch ($mode) {
         'Applied'              { return ($row.State -eq 'On') }
-        'Not applied'          { return ($row.State -eq 'Off' -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') }
+        'Not applied'          { return (($row.State -eq 'Off' -and -not (Test-NothingToApply $row)) -or $row.State -eq 'Partial' -or $row.State -eq 'Unknown') }
         'Waiting to change'    { return [bool](Get-Action $row) }
         'Recommended'          { return [bool]$row.T.Preset }
         'Personal'             { return [bool]$script:Personal.Picks.ContainsKey([string]$row.T.Id) }
@@ -10160,7 +10174,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '78'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '79'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -12930,7 +12944,7 @@ function Get-CustomWinParts {
     $rows = @()
     foreach ($id in @($script:Rows.Keys)) { if (-not $script:Rows[$id].T.Once) { $rows += $script:Rows[$id] } }
     $applied = @($rows | Where-Object { $_.State -eq 'On' })
-    $not = @($rows | Where-Object { $_.State -eq 'Off' -or $_.State -eq 'Partial' -or $_.State -eq 'Unknown' })
+    $not = @($rows | Where-Object { ($_.State -eq 'Off' -and -not (Test-NothingToApply $_)) -or $_.State -eq 'Partial' -or $_.State -eq 'Unknown' })
     $na = @($rows | Where-Object { $_.State -eq 'NA' }).Count
     $lined = @(Get-Pending).Count
     if ($script:Scanning) {
