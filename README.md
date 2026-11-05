@@ -1,6 +1,6 @@
 # Headroom
 
-Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 160 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
+Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 170 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
 
 There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
 
@@ -92,6 +92,7 @@ Each card has one switch, and the switch is the setting itself. On means the set
 - A feature that is on in Windows by default (Xbox Game Bar, telemetry, widgets and so on): the switch starts on, and switching it off turns the feature off.
 - A feature that Windows has off by default: the switch starts off, and switching it on turns the feature on.
 - A startup program: on means it starts with Windows, off means it does not.
+- Browser settings (Edge and Chrome) are policies. Edge and Chrome show "Managed by your organization" while any of their policies is set; switching the setting off removes the policy values again. Chrome has no group of its own, so its AI setting is on the AI features page next to the Windows ones.
 - Services: every setting that only changes services is on the Services page, so they are all in one place. Eight of them are untested ideas from other debloat scripts and carry an "Untested" tag; Apply all and Tweak all leave those out, so you switch them yourself.
 
 Reset all puts everything back to the Windows default, which means Game Mode and Optimizations for windowed games go back to on. When the check of the PC finds a setting that is only partly in place, Headroom offers to finish it.
@@ -103,6 +104,7 @@ A few settings are handled differently:
 - Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
 - Some defaults depend on the PC (for example hardware GPU scheduling, Memory Integrity, BitLocker and Storage Sense). Those cards say "Depends on the PC" instead of On or Off.
 - Settings that remove apps cannot be undone from Headroom.
+- Some Windows-owned values are only tried: if Windows protects or rewrites one (the driver exclusion copy in Windows Update's policy state, the Delivery Optimization switch of the service account), a refusal is noted and the setting still counts as applied. The setting for the "ms-gamebar" pop-up writes two link entries; if another program already handles one of those links, Headroom leaves that one alone.
 
 ## Where things are kept
 

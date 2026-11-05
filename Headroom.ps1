@@ -251,6 +251,15 @@ function Reg-Write {
         if ([long]::TryParse([string]$Value, [ref]$wide) -and $wide -gt 2147483647L -and $wide -le 4294967295L) { $data = [int]($wide - 4294967296L) }
     }
     try {
+        if ($Name -eq '') {
+            # the key's own (Default) value: New-ItemProperty cannot take an empty name, so it is written through .NET (HKLM:\ and HKCU:\ only)
+            $root = $null; if ($Path.Length -gt 6 -and $Path[4] -eq ':' -and $Path[5] -eq '\') { $root = $script:RegRoot[$Path.Substring(0, 4).ToUpperInvariant()] }
+            if (-not $root) { throw 'the (Default) value can only be written under HKLM:\ or HKCU:\' }
+            $dk = $root.CreateSubKey($Path.Substring(6))
+            try { $dk.SetValue('', [string]$data, [Microsoft.Win32.RegistryValueKind]::String) } finally { $dk.Close() }
+            if (-not $Quiet) { Say "  set $Path\(Default) = $Value" 'DarkGray' }
+            return $true
+        }
         if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force -ErrorAction Stop | Out-Null }
         New-ItemProperty -LiteralPath $Path -Name $Name -Value $data -PropertyType $Kind -Force -ErrorAction Stop | Out-Null
         if (-not $Quiet) { Say "  set $Path\$Name = $Value" 'DarkGray' }
@@ -3159,6 +3168,58 @@ function Custom-SettingsHide-Revert {
     else { [void](Reg-Write $script:ShPath $script:ShName ('hide:' + ($left -join ';')) 'String') }
 }
 
+# ------------------------------------------------------------ Game Bar link handlers ---
+# Without Game Bar, Windows answers an ms-gamebar:// link with "You'll need a new app to open this ms-gamebar link". Registering a handler
+# that does nothing (systray.exe) for the two link types stops that. Both keys are ours only while their command is exactly the one below:
+# a link handler that another program registered is never touched.
+$script:GbSchemes = @('ms-gamebar', 'ms-gamebarservices')
+$script:GbCmd = '%SystemRoot%/System32/systray.exe'
+function Gb-Root { param([string]$scheme) return ('HKLM:\SOFTWARE\Classes\' + $scheme) }
+# 'ours' | 'none' | 'other' for one link type
+function Gb-Handler {
+    param([string]$scheme)
+    $c = Reg-Read ((Gb-Root $scheme) + '\shell\open\command') ''
+    if (-not $c.Exists) { return 'none' }
+    if ([string]$c.Value -ieq $script:GbCmd) { return 'ours' }
+    return 'other'
+}
+function Custom-GameBarLinks-Detect {
+    param($p)
+    $h = @{}; $parts = @()
+    foreach ($s in $script:GbSchemes) {
+        $h[$s] = Gb-Handler $s
+        $word = @{ ours = 'does nothing (set by this app)'; none = 'not set, Windows handles it'; other = 'another program handles it' }[$h[$s]]
+        $parts += ('{0}: {1}' -f $s, $word)
+    }
+    $script:Now = (($parts -join '; ') + ', wanted a do-nothing handler')
+    # a link another program handles is left alone, so it counts neither for nor against the setting
+    $n = @($script:GbSchemes | Where-Object { $h[$_] -eq 'ours' }).Count
+    $z = @($script:GbSchemes | Where-Object { $h[$_] -eq 'none' }).Count
+    if ($n -eq 0 -and $z -eq 0) { $script:Why = 'another program has registered the ms-gamebar links here, so they are left alone'; return 'NA' }
+    if ($z -eq 0) { return 'On' }
+    if ($n -gt 0) { return 'Partial' }
+    return 'Off'
+}
+function Custom-GameBarLinks-Snapshot { param($p) return $null }
+function Custom-GameBarLinks-Apply {
+    param($p, $mine)
+    foreach ($s in $script:GbSchemes) {
+        if ((Gb-Handler $s) -eq 'other') { Say "  note: another program handles $s links; it was left as it is" 'DarkGray'; continue }
+        $root = Gb-Root $s
+        [void](Reg-Write $root '' ('URL:' + $s) 'String')
+        [void](Reg-Write $root 'URL Protocol' '' 'String')
+        [void](Reg-Write $root 'NoOpenWith' '' 'String')
+        [void](Reg-Write ($root + '\shell\open\command') '' $script:GbCmd 'String')
+    }
+}
+function Custom-GameBarLinks-Revert {
+    param($p, $mine)
+    foreach ($s in $script:GbSchemes) {
+        if ((Gb-Handler $s) -ne 'ours') { continue }
+        [void](Reg-KeyRemove (Gb-Root $s))
+    }
+}
+
 # ------------------------------------------------------------ startup apps -----
 # Task Manager > Startup apps lists the Run keys and the two Startup folders. Whether an entry runs is a
 # small binary value under ...\Explorer\StartupApproved (first byte 02 = on, 03 = off, then the time it was
@@ -3675,7 +3736,7 @@ Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-
     )
 
 Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing, handwriting and speech data collection' `
-    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well.' `
+    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
@@ -3686,6 +3747,7 @@ Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing,
         pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
         pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
         pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0
+        pReg 'HKCU:\Software\Microsoft\Input\TIPC' 'Enabled' 0 1
     )
 
 Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
@@ -3696,6 +3758,18 @@ Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
         pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
         pSvc 'lfsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name 'Find my device' `
+    -Desc 'On: Find my device is left to Windows. If you switched it on in Settings > Privacy and security > Find my device, this PC and its location are registered with your Microsoft account so you can locate it from account.microsoft.com/devices. Off: it is turned off by policy, the PC is not registered and Find my device stops working. Location services are a separate setting. Microsoft lists this policy for Windows Pro, Enterprise and Education and does not list Home, so Windows Home may ignore it; if the switch in Settings still works there, turn it off by hand.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0
+    )
+
+Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps downloaded from the internet' `
+    -Desc 'On: when you plug in a device, Windows can ask Microsoft for its details (name, picture and the maker''s device app) and download them. Off: Windows does not download device information from the internet, and the policy overrides the "Device Installation Settings" choice. Drivers are not affected, they still come from Windows Update or your own installer. A new device may show with a generic icon and name. "Driver updates through Windows Update" sets that dialog''s own switch too; this one adds the policy.' `
+    -Parts @(
+        pReg "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
     )
 
 Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app-launch tracking' `
@@ -3766,9 +3840,10 @@ Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note'
     )
 
 Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update peer-to-peer sharing' `
-    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: it downloads updates only from Microsoft and never uploads them to other PCs.' `
+    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: it downloads updates only from Microsoft and never uploads them to other PCs. The "Allow downloads from other PCs" switch in Settings is set to off too (that value belongs to the Delivery Optimization service account; Windows protects it on some builds, and where it does it is left as it is).' `
     -Parts @(
         pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0
+        pRegSoft 'Registry::HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' 'DownloadMode' 0
         pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
     )
 
@@ -3932,6 +4007,12 @@ Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar 
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
     )
 
+Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-gamebar" pop-up when Game Bar is gone' `
+    -Desc 'On: ms-gamebar and ms-gamebarservices links are sent to a program that does nothing (systray.exe), so Windows never shows "You''ll need a new app to open this ms-gamebar link". Off: Windows handles those links as shipped. Game Bar opens them, and if Game Bar has been removed the pop-up appears. Switch this on only if you removed Game Bar (Remove apps) or never use it: while it is on, anything that opens an ms-gamebar link, such as the Game Bar button on a controller, does nothing. Switching it off deletes the two link entries again. If another program has registered one of the links, that one is left alone.' `
+    -Parts @(
+        pCustom 'GameBarLinks' 'makes HKLM\SOFTWARE\Classes\ms-gamebar and ms-gamebarservices open systray.exe, a program that does nothing    (undo: deletes both keys)'
+    )
+
 Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse acceleration (Enhance pointer precision)' `
     -Desc 'On: Windows speeds the pointer up when you move the mouse faster ("Enhance pointer precision"). Off: the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
     -Parts @(
@@ -3943,7 +4024,7 @@ Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse accelerati
     )
 
 Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver updates through Windows Update' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
-    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting and Windows Update''s own settings key.' `
+    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting, Windows Update''s own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted.' `
     -Parts @(
         pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
@@ -3951,6 +4032,7 @@ Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver
         pReg "$pol\DriverSearching" 'SearchOrderConfig' 0
         pReg "$pol\DriverSearching" 'DontSearchWindowsUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'ExcludeWUDriversInQualityUpdate' 1
+        pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UpdatePolicy\PolicyState' 'ExcludeWUDrivers' 1
     )
 
 # One setting, three options. Windows Update itself is never switched off here; the strongest option only stops it from installing
@@ -3968,6 +4050,12 @@ Add-Tweak -Id 'wu-auto' -Cat $cGame -Def 'Automatic' -Risk 'security' -Name 'Aut
         @{ Key = 'default'; Label = 'Automatic (Windows default)'; Short = 'Automatic (default)'; Parts = @() }
         @{ Key = 'apps'; Label = 'Store app and MRT updates off'; Short = 'Store and MRT off'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1) ) }
         @{ Key = 'all'; Label = 'Also stop automatic Windows updates'; Short = 'No auto-updates'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1), (pReg $wuAU 'NoAutoUpdate' 1) ) }
+    )
+
+Add-Tweak -Id 'wu-noreboot' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No automatic restart for updates while you are signed in' `
+    -Desc 'On: after an update that Windows installs on its schedule, it does not restart the PC by itself while someone is signed in. It shows a notice and waits for you to restart. Off: Windows can restart the PC by itself after installing updates, about five minutes after a scheduled install (the Windows default). That is how it stops a restart in the middle of a game. The update stays unfinished until you restart yourself, so do that now and then. The policy only covers scheduled installs; your active hours in Settings > Windows Update are not changed.' `
+    -Parts @(
+        pReg $wuAU 'NoAutoRebootWithLoggedOnUsers' 1
     )
 
 Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT (firmware installing programs at startup)' `
@@ -4544,7 +4632,7 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Na
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, suggestions and auto-installed apps' `
-    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. Off: none of that, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
+    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. That includes account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders. Off: none of that, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
@@ -4570,6 +4658,11 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, sugge
         pReg $adv 'Start_IrisRecommendations' 0 1
         pReg $adv 'ShowSyncProviderNotifications' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' 'ScoobeSystemSettingEnabled' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SystemSettings\AccountNotifications' 'EnableAccountNotifications' 0 1
+        pReg $adv 'Start_AccountNotifications' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Mobility' 'OptedIn' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested' 'Enabled' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.BackupReminder' 'Enabled' 0 1
     )
 
 Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and Microsoft account cards in Settings' `
@@ -4607,11 +4700,12 @@ Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilo
     )
 
 Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, Click to Do and Settings AI search' `
-    -Desc 'On: Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings are left to Windows. Off: all of them are turned off by policy. On Copilot+ PCs the Recall optional feature is also removed and the Windows AI Fabric service is switched off. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
+    -Desc 'On: Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings are left to Windows. Off: all of them are turned off by policy. A second snapshot value, TurnOffSavingSnapshots, is set as well; Microsoft does not list it, so Windows may ignore it; it does no harm. On Copilot+ PCs the Recall optional feature is also removed and the Windows AI Fabric service is switched off. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
     -Parts @(
         pReg "$pol\WindowsAI" 'DisableAIDataAnalysis' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
         pReg "$pol\WindowsAI" 'AllowRecallEnablement' 0
+        pReg "$pol\WindowsAI" 'TurnOffSavingSnapshots' 1
         pReg "$pol\WindowsAI" 'DisableClickToDo' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableClickToDo' 1
         pEd 'Ent' (pReg "$pol\WindowsAI" 'DisableSettingsAgent' 1)
@@ -4621,12 +4715,14 @@ Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, C
 
 $paintPol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'
 Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI features in Notepad and Paint' `
-    -Desc 'On: Notepad''s AI features (Rewrite, Summarize, Write) and Paint''s Image Creator, Cocreator and Generative Fill are available. Off: they are turned off by policy. Paint''s "Generative erase" and "Remove background" cannot be turned off this way. A few Windows builds have refused to start Paint while Image Creator is blocked; if that happens, switch this back on and restart.' `
+    -Desc 'On: Notepad''s AI features (Rewrite, Summarize, Write) and Paint''s Image Creator, Cocreator, Generative Fill, Generative erase and Remove background are available. Off: they are turned off by policy. Microsoft documents the policies for the first three but not for Generative erase and Remove background, so Paint may ignore those two and still show them. A few Windows builds have refused to start Paint while Image Creator is blocked; if that happens, switch this back on and restart.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\WindowsNotepad' 'DisableAIFeatures' 1
         pReg $paintPol 'DisableImageCreator' 1
         pReg $paintPol 'DisableCocreator' 1
         pReg $paintPol 'DisableGenerativeFill' 1
+        pReg $paintPol 'DisableGenerativeErase' 1
+        pReg $paintPol 'DisableRemoveBackground' 1
     )
 
 Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Text and image generation for apps (Windows AI)' `
@@ -4656,6 +4752,28 @@ Add-Tweak -Id 'ai-page' -Cat $cAi -Inv -Def 'On' -Preset -Name 'AI components pa
         pCustom 'SettingsHide' 'adds aicomponents to the hide: list in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\SettingsPageVisibility and leaves every other page in that list as it is    (undo: takes only aicomponents out again)' 'aicomponents'
     )
 
+$chrome = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
+Add-Tweak -Id 'chrome-ai' -Cat $cAi -Inv -Def 'On' -Name 'Chrome: Gemini and other AI features' `
+    -Desc 'On: Chrome''s AI features are left to Chrome. Off: sixteen Chrome policies turn them off. Among them are Gemini in Chrome, AI Mode, "Help me write", AI themes, AI history search, tab compare, the AI helper in DevTools, third-party AI chat, voice typing and the local AI model (Chrome then stops downloading it). Chrome shows "Managed by your organization" while any policy is set. Chrome only reads the policies for features it has, so an older Chrome ignores some of them. Switching it back on removes the policies.' `
+    -Parts @(
+        pReg $chrome 'AIModeSettings' 1
+        pReg $chrome 'AutofillPredictionSettings' 2
+        pReg $chrome 'ChromeSuggestionsSettings' 1
+        pReg $chrome 'CreateThemesSettings' 2
+        pReg $chrome 'DevToolsGenAiSettings' 2
+        pReg $chrome 'FindAndFillWithGeminiSettings' 2
+        pReg $chrome 'GeminiSettings' 1
+        pReg $chrome 'GeminiSparkSettings' 1
+        pReg $chrome 'GenAILocalFoundationalModelSettings' 1
+        pReg $chrome 'HelpMeWriteSettings' 2
+        pReg $chrome 'HistorySearchSettings' 2
+        pReg $chrome 'SearchContentSharingSettings' 1
+        pReg $chrome 'SmartTabSharingSettings' 1
+        pReg $chrome 'TabCompareSettings' 2
+        pReg $chrome 'ThirdPartyAiChatSettings' 1
+        pReg $chrome 'VoiceTypingSettings' 2
+    )
+
 # ----------------------------------------------------------------- Edge --------
 Add-Tweak -Id 'edge-ai' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: Copilot sidebar and recommendations' `
     -Desc 'On: Edge''s sidebar, Copilot page context, Microsoft 365 Copilot icon, shopping assistant and recommendations are available. Off: all of them are turned off by policy.' `
@@ -4668,7 +4786,7 @@ Add-Tweak -Id 'edge-ai' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: Copilot 
     )
 
 Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: AI writing help, history search and local AI model' `
-    -Desc 'On: Edge''s extra AI features are available. These are Rewrite, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search and the built-in AI interfaces for websites. Off: all of those AI features are turned off. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
+    -Desc 'On: Edge''s extra AI features are available. These are Rewrite, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search, Copilot access to page content for work accounts, tab group name suggestions (they need Edge to send your tab data to an online service) and the built-in AI interfaces for websites. Off: all of those AI features are turned off. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
     -Parts @(
         pReg $edge 'ComposeInlineEnabled' 0
         pReg $edge 'EdgeHistoryAISearchEnabled' 0
@@ -4677,6 +4795,8 @@ Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: AI 
         pReg $edge 'CopilotNewTabPageEnabled' 0
         pReg $edge 'AllowBrowsingWithCopilot' 0
         pReg $edge 'EdgeEntraCopilotPageContext' 0
+        pReg $edge 'CopilotCDPPageContext' 0
+        pReg $edge 'TabServicesEnabled' 0
         pReg $edge 'ShareBrowsingHistoryWithCopilotSearchAllowed' 0
         pReg $edge 'BuiltInAIAPIsEnabled' 0
         pReg $edge 'GenAILocalFoundationalModelSettings' 1
@@ -4701,7 +4821,7 @@ Add-Tweak -Id 'edge-tele' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: teleme
     )
 
 Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: first-run page, rewards, shortcuts and other nags' `
-    -Desc 'On: Edge shows its first-run page, promotions and other extras, as it does by default. That is the first-run welcome page, a desktop shortcut made when it updates, suggestions on error pages, Collections, Insider promotion, Microsoft Rewards, the web widget, Microsoft content pushed to Edge, the donation prompt in Wallet and "make Edge your default browser" campaigns. Off: Edge policies turn all of those off and Do Not Track is set on (sites may ignore it). Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
+    -Desc 'On: Edge shows its first-run page, promotions and other extras, as it does by default. That is the first-run welcome page, a desktop shortcut made when it updates, suggestions on error pages, Collections, Insider promotion, Microsoft Rewards, the web widget, Microsoft content pushed to Edge, the donation prompt in Wallet, "make Edge your default browser" campaigns and the check that asks whether Edge is your default browser. Spotlight tips and recommendations for Microsoft services and the Adobe Acrobat subscription button in Edge''s PDF viewer go too. Off: Edge policies turn all of those off and Do Not Track is set on (sites may ignore it). Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
     -Parts @(
         pReg $edge 'HideFirstRunExperience' 1
         pReg $edge 'ConfigureDoNotTrack' 1
@@ -4713,7 +4833,17 @@ Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: fir
         pReg $edge 'EdgeAssetDeliveryServiceEnabled' 0
         pReg $edge 'WalletDonationEnabled' 0
         pReg $edge 'DefaultBrowserSettingsCampaignEnabled' 0
+        pReg $edge 'DefaultBrowserSettingEnabled' 0
+        pReg $edge 'SpotlightExperiencesAndRecommendationsEnabled' 0
+        pReg $edge 'ShowAcrobatSubscriptionButton' 0
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0
+    )
+
+Add-Tweak -Id 'edge-newtab' -Cat $cEdge -Inv -Def 'On' -Name 'Edge: news feed and default shortcuts on the new tab page' `
+    -Desc 'On: the new tab page in Edge shows Microsoft''s news and content feed and the shortcut tiles Microsoft fills in for you. Off: the content feed is turned off ("Content off") and the pre-filled shortcut tiles are hidden. Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
+    -Parts @(
+        pReg $edge 'NewTabPageContentEnabled' 0
+        pReg $edge 'NewTabPageHideDefaultTopSites' 1
     )
 
 Add-Tweak -Id 'edge-tasks' -Cat $cEdge -Inv -Def 'On' -Preset -Risk 'note' -Name 'Edge background update tasks' `
@@ -10030,7 +10160,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '76'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '77'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
