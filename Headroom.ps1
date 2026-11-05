@@ -4322,7 +4322,7 @@ Add-Tweak -Id 'svc-diag' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Troubleshootin
 Add-Tweak -Id 'svc-pca' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Program Compatibility Assistant' `
     -Desc 'On: the service behind the "this program might not have installed correctly" pop-ups and the automatic compatibility fixes for old programs is enabled. Off: it is disabled. Compatibility settings you choose yourself in a program''s Properties still apply. Leave this on if you play old games and like those prompts.' `
     -Parts @(
-        pSvc 'PcaSvc' 'Disabled' 'Automatic'
+        pSvc 'PcaSvc' 'Disabled' 'AutomaticDelayed'
     )
 
 Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Data usage meter service' `
@@ -4406,9 +4406,9 @@ Add-Tweak -Id 'edge-upd' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Edge update se
     )
 
 Add-Tweak -Id 'svc-storage' -Cat $cSvc -Inv -Def 'On' -Name 'Storage Service starts with Windows' `
-    -Desc 'On: Storage Service (storage settings and external-drive handling) starts with Windows (Automatic, as Windows has it). Off: it is set to Manual, so it starts when Windows needs it. One background process fewer while it is idle.' `
+    -Desc 'On: Storage Service (storage settings and external-drive handling) starts with Windows (Automatic with a delayed start, as Windows has it). Off: it is set to Manual, so it starts when Windows needs it. One background process fewer while it is idle.' `
     -Parts @(
-        pSvc 'StorSvc' 'Manual' 'Automatic'
+        pSvc 'StorSvc' 'Manual' 'AutomaticDelayed'
     )
 
 Add-Tweak -Id 'svc-sysmain' -Cat $cSvc -Inv -Def 'On' -Unproven -Name 'SysMain (Superfetch) service' `
@@ -10160,7 +10160,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '77'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '78'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {

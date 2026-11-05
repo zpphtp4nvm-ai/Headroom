@@ -1,6 +1,6 @@
 @echo off
 rem Opens Headroom (the Windows 11 gaming settings window) as administrator.
-rem Keep this file in the same folder as Headroom.ps1.
+rem Keep this file in the same folder as Headroom_78.ps1.
 rem (For the command-line options, open an administrator PowerShell and run the .ps1 with -NoGui instead.)
 cd /d "%~dp0"
 rem Is this window running as administrator? PowerShell is asked, because the usual "net session" test fails
@@ -17,9 +17,9 @@ if %errorlevel% neq 0 (
     powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'elevated' -Verb RunAs"
     exit /b
 )
-if not exist "%~dp0Headroom.ps1" (
-    echo Cannot find Headroom.ps1 next to this file.
+if not exist "%~dp0Headroom_78.ps1" (
+    echo Cannot find Headroom_78.ps1 next to this file.
     pause
     exit /b 1
 )
-start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0Headroom.ps1"
+start "" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0Headroom_78.ps1"
