@@ -5,10 +5,12 @@
 
 .DESCRIPTION
     Opens a window with about 160 settings in 20 groups. Each setting shows what it does and exactly which registry values,
-    services, tasks, features or apps it touches, and reads its current state from this PC. Nothing changes until you switch
-    a setting on and apply it. Before the first change a restore point is created. Switching a setting off puts the Windows
-    default back for everything that setting changed (not the values the PC had before Headroom). Settings that remove apps
-    cannot be undone from here.
+    services, tasks, features or apps it touches, and reads its current state from this PC. The switch on a card shows the
+    feature itself: on means the feature is on (or the service is enabled), off means it is off (or the service is disabled),
+    and every card says what Windows has by default. Nothing changes until you move a switch and apply it. Before the first
+    change a restore point is created. Putting a setting back restores the Windows default for everything that setting
+    changed (not the values the PC had before Headroom); Game Mode and the windowed-games optimizations are the exception:
+    switching those off really turns them off. Settings that remove apps cannot be switched back on from here.
 
     The window opens on a welcome screen and then on Home, which shows the PC as it is right now: Windows, processor, graphics
     card, memory, motherboard, displays and drives. Windows does not report CPU temperature, CPU power or memory timings, so
@@ -37,18 +39,18 @@
     Window: starts with Preview only switched on. Console: shows what would happen and changes nothing.
 
 .PARAMETER List
-    Console: print every setting with its id and whether it is applied.
+    Console: print every setting with its id, the state of its switch (on / off), the Windows default and which way -Apply turns it.
 
 .PARAMETER Preset
-    Console: turn on the Recommended preset. A setting that asks a question first asks it when the console is interactive,
+    Console: apply the Recommended preset. A setting that asks a question first asks it when the console is interactive,
     and is skipped with a warning when it is not.
 
 .PARAMETER Apply
-    Console: turn on these setting ids (see -List). Naming an id is your answer to its question. A setting with options takes
+    Console: apply these setting ids (see -List: each one says whether -Apply turns its switch on or off). Naming an id is your answer to its question. A setting with options takes
     one as id=option (for example mpo=full); without an option the first one is used. id=default is the same as -Undo id.
 
 .PARAMETER Undo
-    Console: turn these setting ids back off. Every value the setting changed goes back to the Windows default (a setting with
+    Console: put these setting ids back. Every value the setting changed goes back to the Windows default (a setting with
     options goes back to its Windows default option).
 
 .EXAMPLE
@@ -1097,10 +1099,14 @@ function Add-Tweak {
     # -NotRec: a short reason why this script does not recommend switching the setting on. The card then shows "Not recommended" next
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
-          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [switch]$DefaultOn, [string]$Risk = '', [int]$At = -1,
+          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Once, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
           [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '')
-    # -DefaultOn: Windows has this switch on (on some builds at least), so undoing it removes what this app wrote and the setting may still
-    # read On afterwards: that is the Windows default, not a failed undo (see Invoke-Plan).
+    # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
+    # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
+    #   Undo puts the Windows default back, so the switch is the opposite of "applied".  Without -Inv, Apply turns the feature on (Dark mode,
+    #   Ultimate Performance power plan) and the switch follows "applied".
+    # -Def: what the Windows default looks like on the switch: 'On' or 'Off' (without -Def: On for an -Inv setting, Off for the others),
+    #   or a short text such as 'Depends on the PC' where it differs from PC to PC.  The card shows it as "Windows default: ...".
     # -Once: an action that is run when asked (a clean-up), not a switch. It is never "applied": it reads Off (Ready to run) every time,
     # keeps no undo record, has nothing to undo, and is never part of the Recommended preset, "Apply all" or "Turn all on".
     # Its custom part's Apply says what it did by setting $script:RunResult.
@@ -1109,10 +1115,12 @@ function Add-Tweak {
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
             OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Risk = $Risk
-            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim(); DefaultOn = [bool]$DefaultOn }
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
     if ($NotRec -and $Unproven) { throw "setting ${Id}: an unproven setting already counts as not recommended, so it takes no reason of its own" }
-    if ($DefaultOn -and ($Once -or $OneWay -or $Choices.Count -gt 0)) { throw "setting ${Id}: -DefaultOn is for a plain on/off switch (not a run-once action, a one-way action or a setting with options)" }
+    if ($Inv -and ($Once -or $Choices.Count -gt 0)) { throw "setting ${Id}: -Inv is for a plain on/off switch (not a run-once action or a setting with options)" }
+    if ($Once -and $Def) { throw "setting ${Id}: a run-once action has no Windows default" }
+    if ($OneWay -and -not $Inv) { throw "setting ${Id}: a one-way setting takes something away, so its switch is -Inv" }
     if ($NotRec -and $Once) { throw "setting ${Id}: a run-once action is not a switch, so it cannot be marked not recommended" }
     if ($Once -and ($Preset -or $OneWay -or $Choices.Count -gt 0)) { throw "setting ${Id}: a run-once action cannot be in the Recommended preset, one-way or have options" }
     if ($Choices.Count -gt 0) {
@@ -1151,6 +1159,12 @@ function Add-Tweak {
             if ($overlap -and -not $t.Choices) { throw "setting ${Id}: $vid is set twice for the same edition" }
         } else { $byVal[$vid] = $p }
     }
+    # the Windows default as the card shows it
+    if ($Once) { $t.Def = '' }
+    elseif ($Def) { $t.Def = $Def.Trim() }
+    elseif ($t.Choices) { $t.Def = (([string]$Choices[0].Short) -replace '\s*\(default\)\s*$', '').Trim() }
+    elseif ($Inv) { $t.Def = 'On' }
+    else { $t.Def = 'Off' }
     if ($script:ById.ContainsKey($Id)) { throw "duplicate setting id: $Id" }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
@@ -1800,6 +1814,18 @@ function Invoke-Scan {
     Emit 'scandone' '' '' '' '' 'Gray' $n $n
 }
 
+# ---------------------------------------------------------------- the switch -------
+# A setting is "applied" (State On) when this app's change is in place. The switch on the card shows the FEATURE: for an -Inv setting
+# (Apply turns the feature off) the switch is on while the setting is NOT applied; for the others it is on while the setting is applied.
+function Get-SwitchOn {
+    param($t, [bool]$applied)
+    return ($applied -ne [bool]$t.Inv)
+}
+# Does the switch go on when this action is done? ($undo = the action is Undo)
+function Get-SwitchGoesOn {
+    param($t, [bool]$undo)
+    return ((-not $undo) -ne [bool]$t.Inv)
+}
 # ---------------------------------------------------------------- plan -------
 # $Plan = array of @{ Id = '...'; Action = 'Apply' | 'Undo' }
 function Invoke-Plan {
@@ -1820,7 +1846,9 @@ function Invoke-Plan {
         $t = $script:ById[[string]$item.Id]
         if (-not $t) { Say "  unknown setting '$($item.Id)'" 'Red'; $bad++; continue }
         $undo = ($item.Action -eq 'Undo')
-        $verb = 'Turning on'; if ($undo) { $verb = 'Turning off' }
+        # the verb says what the SWITCH does: an -Inv setting that is applied turns its feature off, and undone turns it back on
+        $verb = 'Turning on'; if (-not (Get-SwitchGoesOn $t $undo)) { $verb = 'Turning off' }
+        if ($t.Once) { $verb = 'Running' }
         $failed = $null
         # a setting with options: the one to set (the plan item names it; none named = the first that changes something)
         $choiceKey = ''
@@ -1870,7 +1898,7 @@ function Invoke-Plan {
             if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
             $good++
             Emit 'item' $t.Id 'done' $res '' 'Green' $i $total
-        } elseif ($after.State -eq 'NA' -or ($undo -and $t.DefaultOn -and ($after.State -eq 'On' -or $after.State -eq 'Off')) -or ($undo -and -not $t.DefaultOn -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
+        } elseif ($after.State -eq 'NA' -or ($undo -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
             Say '  done' 'Green'; $good++
             if ($undo) { Remove-Snapshot $t.Id }
             if ($t.Reboot) { $reboot += $t.Name }
@@ -2932,7 +2960,7 @@ function Custom-DxGlobal-Snapshot {
     $v = Dx-Get (Dx-ReadText) $key
     $want = Dx-Want $key
     # a switch that already has the wanted value when this app first looks (an entry with it, or for a wanted 1 no entry on a build where
-    # Windows' default is on): what it was before is unknown (undo does not use it: it removes the entry, which is the Windows default)
+    # Windows' default is on): what it was before is unknown, undo then puts it back to the other value (or to no entry)
     return @{ Key = $key; Had = ($null -ne $v); Was = [string]$v; Unknown = ($v -eq $want -or ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn))) }
 }
 function Custom-DxGlobal-Apply {
@@ -2948,10 +2976,11 @@ function Custom-DxGlobal-Revert {
     $key = [string]$p.Data
     if (-not (Dx-Supported $key)) { return }
     if (Vrr-Missing $key) { return }
-    # the entry is removed, which leaves the Windows default (on for the windowed-games switch on Windows 11 24H2 and newer, off on older builds;
-    # for variable refresh rate whatever Windows decides for this PC)
-    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $null))
-    if ($key -eq 'SwapEffectUpgradeEnable' -and (Dx-DefaultOn)) { Say '  this switch is on by default in Windows (11 24H2 and newer): the entry is removed, so it stays on' 'DarkGray' }
+    $want = Dx-Want $key
+    $val = $null
+    if ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
+    # otherwise the entry is removed, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
+    [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
 }
 
 # ------------------------------- Game Mode -----
@@ -2987,7 +3016,7 @@ function Custom-GameMode-Snapshot {
     param($p)
     $r = Gm-Read
     $snap = @{ On = [bool](Gm-IsOn $r) }
-    # what each value was (kept in the record; undo does not use it: it removes the entries, which is the Windows default)
+    # what each value was: when Game Mode was already on, nothing is known about "before" (undo then turns it off)
     foreach ($n in $script:GmNames) { $snap[$n] = @{ Had = [bool]$r[$n].Exists; Was = $r[$n].Value; Kind = [string]$r[$n].Kind } }
     return $snap
 }
@@ -2999,10 +3028,8 @@ function Custom-GameMode-Apply {
 }
 function Custom-GameMode-Revert {
     param($p, $mine)
-    # Windows' default is Game Mode on and a clean Windows has no entry for it: the entries are removed, so the setting still reads On afterwards
-    # (the setting is marked -DefaultOn, so that is not a failed undo)
-    foreach ($n in $script:GmNames) { [void](Reg-Remove $script:GmPath $n) }
-    Say '  Game Mode is on by default in Windows: the entries are removed, so it stays on' 'DarkGray'
+    # Windows' default is Game Mode on, so removing the entries would leave this setting reading as on: switching it off needs an explicit 0
+    foreach ($n in $script:GmNames) { [void](Reg-Write $script:GmPath $n 0 'DWord') }
 }
 
 # ------------------------------- Windows AI core package -----
@@ -3280,13 +3307,13 @@ function Add-StartupTweaks {
         $seen[$id] = 1
         $shown = $e.Show; if ($shown.Length -gt 48) { $shown = $shown.Substring(0, 45) + '...' }
         $nl = "`r`n"
-        $desc = 'Stops ' + $shown + ' from starting by itself when you sign in to Windows. The program stays installed and you can still open it yourself; switching it off puts it back on the startup list.' + $nl + $nl +
+        $desc = 'On: ' + $shown + ' starts by itself when you sign in to Windows (the Windows default). Off: it does not start by itself. The program stays installed and you can still open it yourself; switching it back on puts it on the startup list again.' + $nl + $nl +
                 'It starts from: ' + $e.From + $nl +
                 'What it runs: ' + $e.Cmd + $nl + $nl +
                 'If this belongs to a driver or hardware tool (audio, mouse or keyboard software, RGB lighting, a printer, antivirus), its tray icon, shortcuts and profiles will not work until you open it yourself. ' +
                 'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.'
         $info = 'Startup apps switch for "' + $e.Show + '": HKCU\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: the entry is removed, so it starts with Windows again)'
-        Add-Tweak -Id $id -Cat $script:StartupCat -Name ($shown + ' does not start with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
+        Add-Tweak -Id $id -Cat $script:StartupCat -Inv -Def 'On' -Name ($shown + ' starts with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
         $at++
     }
 }
@@ -3578,15 +3605,15 @@ $cLegacy = 'Legacy Windows features'
 $cStore  = 'Storage and clean-up'
 $script:TestingCat = 'Testing'          # always the last page in the menu; "Apply all" on "All settings" leaves it out
 $cTest   = $script:TestingCat
-$script:StartupCat ='Startup apps (switch on = do not start with Windows)'
+$script:StartupCat ='Startup apps (switch off = does not start with Windows)'
 
 $edge = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge'
 $pol  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
 $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
-Add-Tweak -Id 'telemetry' -Cat $cPriv -Preset -Name 'Disable Windows telemetry and error reporting' `
-    -Desc 'Sets diagnostic data to the minimum Windows allows, and turns off the Customer Experience program, Windows Error Reporting (the current policy, the older error-reporting policy, and sending extra data with a report), app inventory collection and remote diagnostic-config downloads. The minimum is "Off" (0) on Enterprise and Education; Home and Pro treat 0 as 1, so there the app sets 1, "Required" only, which also stops the optional diagnostic data from being switched on in Settings.' `
+Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diagnostic data and error reporting' `
+    -Desc 'On: Windows sends diagnostic data to Microsoft and reports errors, as it does by default. Off: diagnostic data is set to the minimum Windows allows and error reporting is turned off. That covers the current error-reporting policy, the older error-reporting policy and sending extra data with a report. The Customer Experience program, app inventory collection and remote diagnostic-config downloads are turned off too. The minimum is "Off" (0) on Enterprise and Education; Windows Home and Pro treat 0 as 1 ("Required" only), so there the app sets 1, which also stops the optional diagnostic data from being switched on in Settings.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\DataCollection" 'AllowTelemetry' 0)
         pEd 'Home,Pro' (pReg "$pol\DataCollection" 'AllowTelemetry' 1)
@@ -3605,8 +3632,8 @@ Add-Tweak -Id 'telemetry' -Cat $cPriv -Preset -Name 'Disable Windows telemetry a
         pReg 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1
     )
 
-Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Preset -Name 'Disable telemetry services' `
-    -Desc 'Stops and disables Connected User Experiences and Telemetry (DiagTrack), WAP push message routing, the diagnostics hub collector and the Windows Error Reporting service.' `
+Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry services (DiagTrack and related)' `
+    -Desc 'On: the four telemetry and error-reporting services are enabled, with the start types Windows gives them. They are the Connected User Experiences and Telemetry service (DiagTrack), WAP push message routing, the diagnostics hub collector and the Windows Error Reporting service. Off: all four are stopped and disabled.' `
     -Parts @(
         pSvc 'DiagTrack' 'Disabled' 'Automatic'
         pSvc 'dmwappushservice' 'Disabled' 'Manual'
@@ -3614,8 +3641,8 @@ Add-Tweak -Id 'telemetry-svc' -Cat $cPriv -Preset -Name 'Disable telemetry servi
         pSvc 'WerSvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Preset -Name 'Disable telemetry scheduled tasks' `
-    -Desc 'Disables the compatibility appraiser, customer-experience, disk-diagnostic data and error-reporting tasks that run in the background.' `
+Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry scheduled tasks' `
+    -Desc 'On: the compatibility appraiser, customer-experience, disk-diagnostic data and error-reporting tasks are enabled and run in the background, as Windows has them. Off: those tasks are disabled.' `
     -Parts @(
         pTask '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser'
         pTask '\Microsoft\Windows\Application Experience\ProgramDataUpdater'
@@ -3630,15 +3657,15 @@ Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Preset -Name 'Disable telemetry sch
         pTask '\Microsoft\Windows\Autochk\Proxy'
     )
 
-Add-Tweak -Id 'svc-telemetry2' -Cat $cPriv -Preset -Name 'Disable compatibility and usage reporting services' `
-    -Desc 'Turns off the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights. Both collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
+Add-Tweak -Id 'svc-telemetry2' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Compatibility and usage reporting services' `
+    -Desc 'On: the Inventory and Compatibility Appraisal service and Microsoft Usage and Quality Insights are enabled (they start when Windows asks for them). Off: both are disabled. They collect information about your apps and how Windows is used, for Microsoft. Windows and your games run the same without them.' `
     -Parts @(
         pSvc 'InventorySvc' 'Disabled' 'Manual'
         pSvc 'wuqisvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'ads' -Cat $cPriv -Preset -Name 'Disable advertising ID and tailored experiences' `
-    -Desc 'Apps can no longer use your advertising ID, and Microsoft does not use your diagnostic data to tailor tips and ads.' `
+Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and tailored experiences' `
+    -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads.' `
     -Parts @(
         pReg "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
@@ -3646,22 +3673,22 @@ Add-Tweak -Id 'ads' -Cat $cPriv -Preset -Name 'Disable advertising ID and tailor
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
     )
 
-Add-Tweak -Id 'activity' -Cat $cPriv -Preset -Name 'Disable activity history' `
-    -Desc 'Windows stops recording and uploading what you open and do (the old Timeline).' `
+Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity history' `
+    -Desc 'On: Windows records what you open and do (the old Timeline) and can upload it. Off: Windows stops recording and uploading it.' `
     -Parts @(
         pReg "$pol\System" 'PublishUserActivities' 0
         pReg "$pol\System" 'EnableActivityFeed' 0
         pReg "$pol\System" 'UploadUserActivities' 0
     )
 
-Add-Tweak -Id 'feedback' -Cat $cPriv -Preset -Name 'Disable feedback pop-ups' `
-    -Desc 'Windows no longer asks you for feedback.' `
+Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-ups' `
+    -Desc 'On: Windows asks you for feedback now and then. Off: Windows no longer asks you for feedback.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
     )
 
-Add-Tweak -Id 'inking' -Cat $cPriv -Preset -Name 'Disable inking, typing, handwriting and speech data collection' `
-    -Desc 'Stops Windows from collecting what you type and write to personalise suggestions, and from sending handwriting data. Online speech recognition consent is withdrawn, and Typing insights (the statistics Windows keeps about your typing) are turned off.' `
+Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing, handwriting and speech data collection' `
+    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
@@ -3674,8 +3701,8 @@ Add-Tweak -Id 'inking' -Cat $cPriv -Preset -Name 'Disable inking, typing, handwr
         pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0
     )
 
-Add-Tweak -Id 'location' -Cat $cPriv -Name 'Disable location services' `
-    -Desc 'Turns off Windows location for the whole PC, and the Geolocation service. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
+Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
+    -Desc 'On: Windows can tell apps where you are (the Location switch in Settings still decides per app). Off: location is turned off for the whole PC, and so is the Geolocation service. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
     -Parts @(
         pReg "$pol\LocationAndSensors" 'DisableLocation' 1
         pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1
@@ -3684,36 +3711,36 @@ Add-Tweak -Id 'location' -Cat $cPriv -Name 'Disable location services' `
         pSvc 'lfsvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'tracking' -Cat $cPriv -Preset -Name 'Disable language list and app-launch tracking' `
-    -Desc 'Websites cannot read your language list, and Start no longer tracks which apps you launch to rank them.' `
+Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app-launch tracking' `
+    -Desc 'On: websites can read your language list, and Start tracks which apps you launch to rank them. Off: websites cannot read your language list and Start no longer tracks which apps you launch.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\International\User Profile' 'HttpAcceptLanguageOptOut' 1
         pReg $adv 'Start_TrackProgs' 0 1
     )
 
-Add-Tweak -Id 'bgapps' -Cat $cPriv -Preset -Risk 'note' -Name 'Store apps cannot run in the background' -NotRec 'Reported to stop programs from showing up in Start search.' `
-    -Desc 'Microsoft Store (UWP) apps stop running and fetching data while you are not using them. Normal desktop programs such as Steam, Discord and browsers are not affected.' `
+Add-Tweak -Id 'bgapps' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Store apps running in the background' -NotRec 'Reported to stop programs from showing up in Start search.' `
+    -Desc 'On: Microsoft Store (UWP) apps can run and fetch data while you are not using them. Off: they stop running and fetching data in the background. Normal desktop programs such as Steam, Discord and browsers are not affected.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\BackgroundAccessApplications' 'GlobalUserDisabled' 1 0
         pReg "$pol\AppPrivacy" 'LetAppsRunInBackground' 2
     )
 
-Add-Tweak -Id 'defender-samples' -Cat $cPriv -Preset -Name 'Defender never sends samples to Microsoft automatically' `
-    -Desc 'Windows Defender keeps scanning as normal; it just never uploads suspicious files by itself.' `
+Add-Tweak -Id 'defender-samples' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Defender automatic sample submission' `
+    -Desc 'On: Windows Defender may upload suspicious files to Microsoft by itself. Off: Defender keeps scanning as normal; it just never uploads suspicious files by itself.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' 'SubmitSamplesConsent' 2
     )
 
-Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Preset -Name 'Disable clipboard history (Win+V)' `
-    -Desc 'Windows stops keeping a list of the things you copied, so Win+V shows no history and the switch in Settings > System > Clipboard is greyed out. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. This is separate from "Disable cloud clipboard", which only stops the list being shared with your other devices.' `
+Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Allow clipboard history (Win+V)' `
+    -Desc 'On: clipboard history is allowed. Windows keeps it off until you turn it on in Settings > System > Clipboard, and Win+V then shows your list. Off: Windows stops keeping a list of the things you copied, so Win+V shows no history and the switch in Settings is greyed out. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. This is separate from "Allow cloud clipboard", which only controls sharing the list with your other devices.' `
     -Parts @(
         pReg "$pol\System" 'AllowClipboardHistory' 0
         pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0
     )
 
 # -------------------------------------------------------------- Cloud ---------
-Add-Tweak -Id 'settingsync' -Cat $cCloud -Name 'Disable settings sync' `
-    -Desc 'Your theme, passwords-for-Wi-Fi and other Windows settings are not synced with your Microsoft account.' `
+Add-Tweak -Id 'settingsync' -Cat $cCloud -Inv -Def 'On' -Name 'Settings sync with your Microsoft account' `
+    -Desc 'On: your theme, Wi-Fi passwords and other Windows settings can sync with your Microsoft account. Off: settings sync is blocked and its two background tasks are disabled.' `
     -Parts @(
         pReg "$pol\SettingSync" 'DisableSettingSync' 2
         pReg "$pol\SettingSync" 'DisableSettingSyncUserOverride' 1
@@ -3721,15 +3748,15 @@ Add-Tweak -Id 'settingsync' -Cat $cCloud -Name 'Disable settings sync' `
         pTask '\Microsoft\Windows\SettingSync\NetworkStateChangeTask'
     )
 
-Add-Tweak -Id 'clipboard' -Cat $cCloud -Name 'Disable cloud clipboard' `
-    -Desc 'Clipboard history (Win+V) still works on this PC; it just is not uploaded or shared with your other devices.' `
+Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'On' -Name 'Allow cloud clipboard' `
+    -Desc 'On: you can share your clipboard history with your other devices. Windows keeps this off until you turn it on in Settings. Off: clipboard history (Win+V) still works, but it is not uploaded or shared with other devices.' `
     -Parts @(
         pReg "$pol\System" 'AllowCrossDeviceClipboard' 0
         pReg 'HKCU:\Software\Microsoft\Clipboard' 'CloudClipboardAutomaticUpload' 0
     )
 
-Add-Tweak -Id 'crossdevice' -Cat $cCloud -Name 'Disable nearby sharing and Share across devices' `
-    -Desc 'Turns off Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them.' `
+Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing and Share across devices' `
+    -Desc 'On: Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them are available. Off: all three are turned off.' `
     -Parts @(
         pReg "$pol\System" 'EnableCdp' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
@@ -3738,8 +3765,8 @@ Add-Tweak -Id 'crossdevice' -Cat $cCloud -Name 'Disable nearby sharing and Share
         pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
     )
 
-Add-Tweak -Id 'syncsvc' -Cat $cCloud -Risk 'note' -Name 'Disable contacts, mail and calendar sync services' `
-    -Desc 'Disables the per-user background services behind the Mail, Calendar and People apps and Phone Link. Leave this off if you use those apps.' `
+Add-Tweak -Id 'syncsvc' -Cat $cCloud -Inv -Def 'On' -Risk 'note' -Name 'Contacts, mail and calendar sync services' `
+    -Desc 'On: the per-user background services behind the Mail, Calendar and People apps and Phone Link are enabled. Off: they are disabled. Leave this on if you use those apps.' `
     -Parts @(
         pSvc 'OneSyncSvc' 'Disabled' 'AutomaticDelayed'
         pSvc 'CDPUserSvc' 'Disabled' 'Automatic'
@@ -3748,35 +3775,35 @@ Add-Tweak -Id 'syncsvc' -Cat $cCloud -Risk 'note' -Name 'Disable contacts, mail 
         pSvc 'PimIndexMaintenanceSvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'offlinefiles' -Cat $cCloud -Name 'Disable Offline Files' `
-    -Desc 'Turns off the Offline Files service that keeps copies of network folders for use without a connection.' `
+Add-Tweak -Id 'offlinefiles' -Cat $cCloud -Inv -Def 'On' -Name 'Offline Files service' `
+    -Desc 'On: the Offline Files service is enabled (Windows starts it when needed) and can keep copies of network folders for use without a connection. Off: the service is disabled.' `
     -Parts @(
         pSvc 'CscService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Name 'Block OneDrive sync and hide it in File Explorer' `
-    -Desc 'A policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. Fully reversible.' `
+Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
+    -Desc 'On: OneDrive can sync, and it shows in the File Explorer side bar. Off: a policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. Fully reversible.' `
     -Parts @(
         pReg "$pol\OneDrive" 'DisableFileSyncNGSC' 1
         pReg 'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' 'System.IsPinnedToNameSpaceTree' 0 1
     )
 
-Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -OneWay -Risk 'note' -Name 'Uninstall OneDrive' `
-    -Desc 'Runs the OneDrive uninstaller and removes leftovers (a OneDrive folder that still has files in it is left alone). Cannot be undone from here; reinstall later with  winget install Microsoft.OneDrive.' `
+Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note' -Name 'OneDrive app' `
+    -Desc 'On: OneDrive is installed. Off: runs the OneDrive uninstaller and removes leftovers (a OneDrive folder that still has files in it is left alone). It cannot be switched back on from here; reinstall it later with  winget install Microsoft.OneDrive.' `
     -Parts @(
         pCustom 'OneDrive' 'OneDrive is stopped and uninstalled, leftover folders and its startup entry are removed'
     )
 
-Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Name 'Disable Windows Update peer-to-peer sharing' `
-    -Desc 'Delivery Optimization downloads updates only from Microsoft, and never uploads them to other PCs on your network or the internet.' `
+Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update peer-to-peer sharing' `
+    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: it downloads updates only from Microsoft and never uploads them to other PCs.' `
     -Parts @(
         pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0
         pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
     )
 
 # -------------------------------------------------------------- Remote --------
-Add-Tweak -Id 'rdp' -Cat $cRemote -Name 'Disable Remote Desktop' `
-    -Desc 'Nobody can connect to this PC with Remote Desktop. The Remote Desktop services are disabled and its firewall rules switched off. (Windows already ships with this off.)' `
+Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Desktop services' `
+    -Desc 'On: the Remote Desktop services and firewall rules are left as Windows has them. Windows blocks Remote Desktop connections until you allow them in Settings, so nobody can connect unless you have done that. Off: Remote Desktop is blocked: the services are disabled and the firewall rules are switched off. A setting also blocks connections, so nobody can connect to this PC with Remote Desktop.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
@@ -3786,8 +3813,8 @@ Add-Tweak -Id 'rdp' -Cat $cRemote -Name 'Disable Remote Desktop' `
         pFw 'Remote Desktop'
     )
 
-Add-Tweak -Id 'remote-assist' -Cat $cRemote -Name 'Disable Remote Assistance' `
-    -Desc 'Turns off "Allow Remote Assistance connections to this computer" and its firewall rules.' `
+Add-Tweak -Id 'remote-assist' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Assistance' `
+    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: it is turned off and its firewall rules are switched off.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowToGetHelp' 0 1
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowFullControl' 0 1
@@ -3797,23 +3824,23 @@ Add-Tweak -Id 'remote-assist' -Cat $cRemote -Name 'Disable Remote Assistance' `
         pFw 'Remote Assistance'
     )
 
-Add-Tweak -Id 'quickassist' -Cat $cRemote -OneWay -Name 'Remove Quick Assist' `
-    -Desc 'Removes the Quick Assist remote-help app (and the older Quick Assist Windows capability). Cannot be undone from here; reinstall it from the Microsoft Store if you ever need it.' `
+Add-Tweak -Id 'quickassist' -Cat $cRemote -Inv -Def 'On' -OneWay -Name 'Quick Assist app' `
+    -Desc 'On: the Quick Assist remote-help app is installed. Off: the app (and the older Quick Assist Windows capability) is removed. It cannot be switched back on from here; reinstall it from the Microsoft Store if you ever need it.' `
     -Parts @(
         pCap 'App.Support.QuickAssist*'
         pAppx 'MicrosoftCorporationII.QuickAssist'
     )
 
-Add-Tweak -Id 'winrm' -Cat $cRemote -Name 'Disable PowerShell remoting (WinRM)' `
-    -Desc 'Disables the Windows Remote Management service and its firewall rules, so this PC cannot be managed over the network with PowerShell remoting.' `
+Add-Tweak -Id 'winrm' -Cat $cRemote -Inv -Def 'On' -Name 'PowerShell remoting (WinRM)' `
+    -Desc 'On: the Windows Remote Management service and its firewall rules are left as Windows has them. Off: the service is disabled and its firewall rules are switched off. This PC then cannot be managed over the network with PowerShell remoting.' `
     -Parts @(
         pSvc 'WinRM' 'Disabled' 'Manual'
         pFw 'Windows Remote Management'
         pFw 'Windows Remote Management (Compatibility)'
     )
 
-Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Name 'Disable other remote management' `
-    -Desc 'Disables Remote Registry, Routing and Remote Access, the legacy RPC locator and the OpenSSH server (if installed), and switches off the remote event log, scheduled task, service, volume and WMI firewall rules.' `
+Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Inv -Def 'On' -Name 'Other remote management services' `
+    -Desc 'On: the remote-management services and firewall rules are left as Windows has them. These are Remote Registry, Routing and Remote Access, the legacy RPC locator and the OpenSSH server (if installed), and the remote event log, scheduled task, service, volume and WMI firewall rules. Off: those services are disabled and those firewall rules are switched off.' `
     -Parts @(
         pSvc 'RemoteRegistry' 'Disabled' 'Disabled'
         pSvc 'RpcLocator' 'Disabled' 'Manual'
@@ -3827,8 +3854,8 @@ Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Name 'Disable other remote management
     )
 
 # ---------------------------------------------------------------- VPN ---------
-Add-Tweak -Id 'vpn' -Cat $cVpn -Risk 'note' -Name 'Disable Windows'' built-in VPN services' `
-    -Desc 'Disables the services behind Windows'' own VPN client (IKEv2, SSTP, L2TP) and dial-up (Remote Access Connection Manager). VPN apps that bring their own driver, such as WireGuard, usually keep working, but some VPN clients need these services. It also breaks PPPoE broadband dial-ups.' `
+Add-Tweak -Id 'vpn' -Cat $cVpn -Inv -Def 'On' -Risk 'note' -Name 'Windows'' built-in VPN services' `
+    -Desc 'On: the services behind Windows'' own VPN client (IKEv2, SSTP, L2TP) and dial-up (Remote Access Connection Manager) are enabled. Off: they are disabled. VPN apps that bring their own driver, such as WireGuard, usually keep working, but some VPN clients need these services. Off also breaks PPPoE broadband dial-ups.' `
     -Parts @(
         pSvc 'SstpSvc' 'Disabled' 'Manual'
         pSvc 'IKEEXT' 'Disabled' 'Manual'
@@ -3837,8 +3864,8 @@ Add-Tweak -Id 'vpn' -Cat $cVpn -Risk 'note' -Name 'Disable Windows'' built-in VP
     )
 
 # ------------------------------------------------------------- Sharing --------
-Add-Tweak -Id 'fileshare' -Cat $cShare -Preset -Risk 'note' -Name 'Disable file and printer sharing' `
-    -Desc 'Other PCs cannot reach files or printers on this PC: the Server service is disabled, the default C$ and ADMIN$ shares are off, and File and Printer Sharing is unbound from your network adapters. You can still open shares on a NAS or other PCs (Client for Microsoft Networks stays on).' `
+Add-Tweak -Id 'fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -Name 'File and printer sharing' `
+    -Desc 'On: file and printer sharing is left as Windows has it. That covers the Server service, the default C$ and ADMIN$ shares, the File and Printer Sharing firewall rules and the adapter binding. Off: file and printer sharing is switched off, so other PCs cannot reach files or printers on this PC. The Server service is disabled, the default shares are off, the firewall rules are switched off and File and Printer Sharing is unbound from your network adapters. You can still open shares on a NAS or other PCs (Client for Microsoft Networks stays on).' `
     -Parts @(
         pSvc 'LanmanServer' 'Disabled' 'Automatic'
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
@@ -3846,8 +3873,8 @@ Add-Tweak -Id 'fileshare' -Cat $cShare -Preset -Risk 'note' -Name 'Disable file 
         pBind 'ms_server'
     )
 
-Add-Tweak -Id 'discovery' -Cat $cShare -Preset -Name 'Disable network discovery and UPnP hosting' `
-    -Desc 'This PC stops announcing itself on the network and stops looking for devices: the Function Discovery, Link-Layer Topology Discovery, UPnP Device Host and Network Connected Devices services are disabled and Network Discovery''s firewall rules and adapter bindings are removed. SSDP Discovery is deliberately left alone, so games that use UPnP port mapping keep working. Side effect: Windows may stop finding new network printers and other devices by itself; adding a printer by its IP address still works.' `
+Add-Tweak -Id 'discovery' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Network discovery and UPnP hosting' `
+    -Desc 'On: network discovery is left as Windows has it. Off: this PC stops announcing itself and stops looking for devices on the network. The Function Discovery, Link-Layer Topology Discovery, UPnP Device Host and Network Connected Devices services are disabled, and Network Discovery''s firewall rules and adapter bindings are removed. SSDP Discovery is deliberately left alone, so games that use UPnP port mapping keep working. Side effect: Windows may stop finding new network printers and other devices by itself; adding a printer by its IP address still works.' `
     -Parts @(
         pSvc 'FDResPub' 'Disabled' 'Manual'
         pSvc 'fdPHost' 'Disabled' 'Manual'
@@ -3859,8 +3886,8 @@ Add-Tweak -Id 'discovery' -Cat $cShare -Preset -Name 'Disable network discovery 
         pBind 'ms_rspndr'
     )
 
-Add-Tweak -Id 'legacy-names' -Cat $cShare -Preset -Risk 'note' -Name 'Disable old name lookups (LLMNR, mDNS, NetBIOS)' `
-    -Desc 'Turns off three legacy ways of finding devices by name. Names that DNS can resolve keep working; a few old NAS boxes or printers that are only found by NetBIOS name may no longer show up by name.' `
+Add-Tweak -Id 'legacy-names' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -Name 'Old name lookups (LLMNR, mDNS, NetBIOS)' `
+    -Desc 'On: the three legacy ways of finding devices by name (LLMNR, mDNS and NetBIOS over TCP/IP) work as Windows has them. Off: all three are turned off. Names that DNS can resolve keep working; a few old NAS boxes or printers that are only found by NetBIOS name may no longer show up by name.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' 'EnableMulticast' 0
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\Dnscache\Parameters' 'EnableMDNS' 0
@@ -3871,20 +3898,20 @@ Add-Tweak -Id 'legacy-names' -Cat $cShare -Preset -Risk 'note' -Name 'Disable ol
         }
     )
 
-Add-Tweak -Id 'svc-netbios' -Cat $cShare -Preset -Name 'Disable NetBIOS name helper' `
-    -Desc 'Stops the TCP/IP NetBIOS Helper, which looks up other computers by their old-style NetBIOS name. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
+Add-Tweak -Id 'svc-netbios' -Cat $cShare -Inv -Def 'On' -Preset -Name 'NetBIOS name helper (TCP/IP NetBIOS Helper)' `
+    -Desc 'On: the TCP/IP NetBIOS Helper service is enabled; it looks up other computers by their old-style NetBIOS name. Off: the service is disabled. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
     -Parts @(
         pSvc 'lmhosts' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'smb1' -Cat $cShare -Preset -Reboot -Name 'SMB1 protocol removed' `
-    -Desc 'SMB1 is an obsolete, insecure file-sharing protocol that modern Windows no longer needs. Only add it back for very old devices.' `
+Add-Tweak -Id 'smb1' -Cat $cShare -Inv -Def 'Off' -Preset -Reboot -Name 'SMB1 protocol' `
+    -Desc 'On: the SMB1 Windows feature is installed (SMB1 is an obsolete, insecure file-sharing protocol that modern Windows no longer needs). Off: it is removed. A clean Windows 11 does not have it installed, so on most PCs this already reads Off. Only switch it on for very old devices.' `
     -Parts @(
         pFeat 'SMB1Protocol'
     )
 
-Add-Tweak -Id 'ics' -Cat $cShare -Preset -Name 'Disable connection sharing (ICS, hotspot, media streaming)' `
-    -Desc 'Disables Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
+Add-Tweak -Id 'ics' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Connection sharing (ICS, hotspot, media streaming)' `
+    -Desc 'On: Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing are enabled, with the start types Windows gives them. Off: all three are disabled. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
     -Parts @(
         pSvc 'SharedAccess' 'Disabled' 'Manual' 'Test-UsesVirtualization' 'WSL2 / Hyper-V / Sandbox is on, so Internet Connection Sharing is left alone'
         pSvc 'icssvc' 'Disabled' 'Manual'
@@ -3892,45 +3919,45 @@ Add-Tweak -Id 'ics' -Cat $cShare -Preset -Name 'Disable connection sharing (ICS,
     )
 
 # ----------------------------------------------------- Adapters and USB -------
-Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Reboot -Name 'Disable Windows powering down network adapters to save power' `
-    -Desc 'Unticks "Allow the computer to turn off this device to save power" on every physical network adapter (Wake-on-LAN settings you chose are kept).' `
+Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Inv -Def 'On' -Reboot -Name 'Windows turning off network adapters to save power' `
+    -Desc 'On: Windows may turn off a network adapter to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked. Off: the "turn off this device to save power" box is unticked on every physical network adapter. Wake-on-LAN settings you chose are kept.' `
     -Parts @(
         pCustom 'NicTurnOff' 'Device Manager > network adapter > Power Management > "Allow the computer to turn off this device": off, on every physical adapter'
     )
 
-Add-Tweak -Id 'nic-eee' -Cat $cNic -Preset -Reboot -Name 'Disable Energy-Efficient Ethernet, Green Ethernet and Wi-Fi power save' `
-    -Desc 'Switches off the driver''s own power-saving options (EEE, Green Ethernet, Power Saving Mode, Ultra Low Power and similar) on your adapters, which can cause latency spikes and brief disconnects. Only options your adapter actually has are touched.' `
+Add-Tweak -Id 'nic-eee' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter power saving (Energy-Efficient Ethernet, Green Ethernet, Wi-Fi power save)' `
+    -Desc 'On: the driver''s own power-saving options (EEE, Green Ethernet and similar) stay as the driver has them. That includes Power Saving Mode and Ultra Low Power. Off: those options are switched off on your adapters. They can cause latency spikes and brief disconnects. Only options your adapter actually has are touched.' `
     -Parts @(
         pCustom 'NicEee' 'Adapter driver "Advanced" tab: Energy-Efficient Ethernet, Green Ethernet, power-saving mode options -> off (where present)'
     )
 
-Add-Tweak -Id 'nic-suspend' -Cat $cNic -Preset -Reboot -Name 'Disable adapter selective suspend and sleep-on-disconnect' `
-    -Desc 'Stops Windows suspending USB network adapters and putting adapters to sleep when the cable is unplugged. Not shown as available on PCs whose adapters do not offer these options.' `
+Add-Tweak -Id 'nic-suspend' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter selective suspend and sleep-on-disconnect' `
+    -Desc 'On: Windows may suspend USB network adapters and put adapters to sleep when the cable is unplugged, as it does by default. Off: Windows does neither. Not shown as available on PCs whose adapters do not offer these options.' `
     -Parts @(
         pCustom 'NicSuspend' 'Adapter power management: Selective Suspend and Device Sleep on Disconnect -> off (where present)'
     )
 
-Add-Tweak -Id 'usb-power' -Cat $cNic -Preset -Name 'Disable USB power saving for all USB devices' `
-    -Desc 'Unticks "Allow the computer to turn off this device to save power" for every USB device and disables USB selective suspend per device. Devices plugged in later start with Windows'' defaults, so switch this on again after adding new ones.' `
+Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power saving' `
+    -Desc 'On: Windows may turn off USB devices to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked and selective suspend is on. Off: the "turn off this device" box is unticked for every USB device and selective suspend is off. Devices plugged in later start with Windows'' defaults, so press Apply again after adding new ones.' `
     -Parts @(
         pCustom 'UsbPower' 'Every USB device: "Allow the computer to turn off this device" off, and selective suspend off in its driver settings'
     )
 
 # --------------------------------------------------------------- Power --------
-Add-Tweak -Id 'ultimate' -Cat $cPower -Preset -Name 'Use the Ultimate Performance power plan' `
-    -Desc 'Creates the Ultimate Performance plan (High Performance if your PC hides it), makes it the active plan, and inside it turns off USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving. Turning this off goes back to the plan you used before and deletes the plan this app made.' `
+Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Performance power plan' `
+    -Desc 'On: the Ultimate Performance plan is created and made the active plan. High Performance is used if your PC hides it, and inside the plan USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving are turned off. Off: your PC goes back to the plan you used before, and the plan this app made is deleted. Windows normally uses the Balanced plan.' `
     -Parts @(
         pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
     )
 
-Add-Tweak -Id 'plans-delete' -Cat $cPower -Risk 'note' -Name 'Delete all other power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
-    -Desc 'Leaves only the active power plan, so Windows cannot switch to Balanced or Power Saver. Turning this off recreates Balanced, High Performance and Power Saver. Not offered on laptops (a battery was detected) so you keep Balanced for when you unplug.' `
+Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans (Balanced, High Performance, Power Saver)' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
+    -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Switching it back on recreates the three standard plans. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
     -Parts @(
         pCustom 'PlansDelete' 'powercfg /delete for every plan except the active one'
     )
 
-Add-Tweak -Id 'hibernate' -Cat $cPower -Risk 'note' -Name 'Disable Fast Startup and hibernation' `
-    -Desc 'Shut down becomes a real shutdown (no half-hibernated kernel state, which helps with driver and update glitches) and hiberfil.sys, several GB, is deleted. Hibernate is no longer available; Sleep still works.' `
+Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast Startup and hibernation' `
+    -Desc 'On: Fast Startup and hibernation work (hiberfil.sys, several GB, is kept on the drive). Off: Shut down becomes a real shutdown and hiberfil.sys is deleted. That means no half-hibernated kernel state, which helps with driver and update glitches. Hibernate is no longer available; Sleep still works.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 0 1
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled' 0 1
@@ -3945,8 +3972,8 @@ Add-Tweak -Id 'hibernate' -Cat $cPower -Risk 'note' -Name 'Disable Fast Startup 
 try { Add-StartupTweaks } catch { }
 
 # ---------------------------------------------------------------- Gaming ------
-Add-Tweak -Id 'gamedvr' -Cat $cGame -Preset -Name 'Disable Game Bar (Game Mode stays on)' `
-    -Desc 'Turns Xbox Game Bar off in settings: it stops recording clips in the background (which can cost frames), the Xbox button on a controller no longer opens it and its start-up tip is hidden. Windows Game Mode stays on. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. It also tries to turn off Game Bar''s presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies.' `
+Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar and background recording' `
+    -Desc 'On: Xbox Game Bar can record clips in the background and the Xbox button on a controller opens it. Its start-up tip shows. Off: it stops recording clips in the background, which can cost frames. The controller button no longer opens it and the start-up tip is hidden. Windows Game Mode is not affected. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. Off also tries to turn off Game Bar''s presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies.' `
     -Parts @(
         pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
@@ -3957,8 +3984,8 @@ Add-Tweak -Id 'gamedvr' -Cat $cGame -Preset -Name 'Disable Game Bar (Game Mode s
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
     )
 
-Add-Tweak -Id 'mouse' -Cat $cGame -Preset -Name 'Disable mouse acceleration' `
-    -Desc 'Turns off "Enhance pointer precision" so the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
+Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse acceleration (Enhance pointer precision)' `
+    -Desc 'On: Windows speeds the pointer up when you move the mouse faster ("Enhance pointer precision"). Off: the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Mouse' 'MouseSpeed' '0' '1' 'String'
         pReg 'HKCU:\Control Panel\Mouse' 'MouseThreshold1' '0' '6' 'String'
@@ -3967,8 +3994,8 @@ Add-Tweak -Id 'mouse' -Cat $cGame -Preset -Name 'Disable mouse acceleration' `
         pCustom 'MouseLive' 'also applied to the running session'
     )
 
-Add-Tweak -Id 'wu-drivers' -Cat $cGame -Risk 'note' -Name 'Windows Update does not replace drivers' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
-    -Desc 'Keeps Windows Update from swapping the graphics and other drivers you installed yourself, and from searching Windows Update for a driver when you plug in new hardware. You then update drivers manually (GPU maker''s installer or your motherboard''s site). The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting and Windows Update''s own settings key.' `
+Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver updates through Windows Update' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
+    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting and Windows Update''s own settings key.' `
     -Parts @(
         pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
@@ -3983,7 +4010,7 @@ Add-Tweak -Id 'wu-drivers' -Cat $cGame -Risk 'note' -Name 'Windows Update does n
 $wuStore = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'
 $wuMrt   = 'HKLM:\SOFTWARE\Policies\Microsoft\MRT'
 $wuAU    = "$pol\WindowsUpdate\AU"
-Add-Tweak -Id 'wu-auto' -Cat $cGame -Risk 'security' -Name 'Stop Store app and Malicious Software Removal Tool updates (option: automatic Windows updates too)' `
+Add-Tweak -Id 'wu-auto' -Cat $cGame -Def 'Automatic' -Risk 'security' -Name 'Automatic updates for Store apps and the Malicious Software Removal Tool' `
     -Desc ('Windows Update itself stays on whichever option you choose: security updates, drivers and feature updates can still be installed. ' +
            'Choose one of three options on the card. Automatic (Windows default): nothing is set. Store and MRT off: the Microsoft Store stops downloading and installing app updates by itself (AutoDownload = 2), and Windows Update stops offering the monthly Malicious Software Removal Tool, MRT (DontOfferThroughWUAU = 1); Windows Security is not affected. ' +
            'No auto-updates: the same two values and NoAutoUpdate = 1 (the "Configure Automatic Updates" policy set to Disabled). Windows then no longer downloads and installs updates by itself: open Settings > Windows Update and press Check for updates when you want them, and do it at least once a month, or the PC goes without security fixes. ' +
@@ -3995,21 +4022,21 @@ Add-Tweak -Id 'wu-auto' -Cat $cGame -Risk 'security' -Name 'Stop Store app and M
         @{ Key = 'all'; Label = 'Also stop automatic Windows updates'; Short = 'No auto-updates'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1), (pReg $wuAU 'NoAutoUpdate' 1) ) }
     )
 
-Add-Tweak -Id 'wpbt' -Cat $cGame -Reboot -Risk 'note' -Name 'Disable WPBT (firmware cannot install programs at startup)' `
-    -Desc 'Stops motherboard firmware from copying a program into Windows and running it at every boot (the Windows Platform Binary Table, WPBT). Some boards use it to deliver their own software: Gigabyte firmware has been reported installing an updater this way, and ASUS boards have a BIOS option, on by default, that downloads Armoury Crate. Side effects: tools that PC makers deliver this way, including some anti-theft software, are no longer installed, and a program the firmware already installed stays until you remove it. Your board''s BIOS setting for its own software is the other place to turn this off. Needs a restart.' `
+Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT (firmware installing programs at startup)' `
+    -Desc 'On: motherboard firmware can copy a program into Windows and run it at every boot (the Windows Platform Binary Table, WPBT). Some boards use it to deliver their own software: Gigabyte firmware has been reported installing an updater this way, and ASUS boards have a BIOS option, on by default, that downloads Armoury Crate. Off: Windows does not run such programs. Side effects: tools that PC makers deliver this way, including some anti-theft software, are no longer installed, and a program the firmware already installed stays until you remove it. Your board''s BIOS setting for its own software is the other place to turn this off. Needs a restart.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
     )
 
-Add-Tweak -Id 'hags' -Cat $cDisplay -Preset -Reboot -Name 'Hardware-accelerated GPU scheduling on (HAGS)' `
-    -Desc 'Lets the graphics card manage its own memory scheduling, which can lower latency and CPU load in some games. It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch this off if yours do.' `
+Add-Tweak -Id 'hags' -Cat $cDisplay -Def 'Depends on the graphics card' -Preset -Reboot -Name 'Hardware-accelerated GPU scheduling (HAGS)' `
+    -Desc 'On: the graphics card manages its own memory scheduling, which can lower latency and CPU load in some games. Off: Windows and the driver decide (the Windows default). It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch it off if yours do.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2
     )
 
 $mpoDwm = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'
 $mpoGfx = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers'
-Add-Tweak -Id 'mpo' -Cat $cDisplay -Reboot -Name 'Multiplane Overlay (MPO)' -NotRec 'A fix for flicker, not a speed-up: leave it on Enabled unless you see flicker.' `
+Add-Tweak -Id 'mpo' -Cat $cDisplay -Def 'Enabled' -Reboot -Name 'Multiplane Overlay (MPO)' -NotRec 'A fix for flicker, not a speed-up: leave it on Enabled unless you see flicker.' `
     -Desc ('Fix for screen flicker and stutter; not a speed-up. Multiplane Overlay lets the graphics hardware combine the game, the desktop and overlays itself, instead of Windows blending them into one picture. On some graphics card, driver and monitor combinations, switching between those layers is reported to cause flicker, black flashes or stutter, and turning MPO off makes Windows blend everything itself again. ' +
            'That comes from user reports, not measurements, and it is not a speed-up: leave it on Enabled unless you see those problems. ' +
            'Choose one of three options on the card. Enabled (Windows default): nothing is set. Disabled: OverlayTestMode = 5, the usual fix. Fully disabled: OverlayTestMode = 5 and DisableOverlays = 1 (the second value is what the Fully Disabled option of Chris Titus Tech''s WinUtil sets). ' +
@@ -4020,28 +4047,28 @@ Add-Tweak -Id 'mpo' -Cat $cDisplay -Reboot -Name 'Multiplane Overlay (MPO)' -Not
         @{ Key = 'full'; Label = 'Fully disabled'; Short = 'Fully disabled'; Parts = @( (pReg $mpoDwm 'OverlayTestMode' 5), (pReg $mpoGfx 'DisableOverlays' 1) ) }
     )
 
-Add-Tweak -Id 'defender-idle' -Cat $cGame -Preset -Name 'Windows Security scans only when the PC is idle (low priority, low CPU)' `
-    -Desc 'Windows Security keeps protecting you in real time exactly as before. Only its scheduled scans change: they run only while the PC is idle, at low priority, and use at most 20% of the CPU. Scans take longer to finish. Shown as not available on PCs where Windows Security is turned off or replaced by another antivirus.' `
+Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact Windows Security scans' `
+    -Desc 'On: Windows Security scans run only while the PC is idle, at low priority, using at most 20% of the CPU. Real-time protection keeps working exactly as before. Scans take longer to finish. Off: Windows'' own scan settings come back (idle only, normal priority, up to 50% CPU). Shown as not available on PCs where Windows Security is turned off or replaced by another antivirus.' `
     -Parts @(
         pCustom 'DefenderIdle' 'Set-MpPreference: ScanOnlyIfIdleEnabled = on, EnableLowCpuPriority = on, ScanAvgCPULoadFactor = 20    (undo: the Windows defaults: on / off / 50)'
     )
 
-Add-Tweak -Id 'sticky-keys' -Cat $cGame -Preset -Name 'Disable Sticky Keys shortcut (Shift pressed 5 times)' `
-    -Desc 'Stops the "Do you want to turn on Sticky Keys?" window that appears when Shift is pressed five times in a row, which can interrupt a game. Only the shortcut is turned off; Sticky Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut (Shift pressed 5 times)' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off. Only the shortcut is affected; Sticky Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '506' '510' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
     )
 
-Add-Tweak -Id 'filter-keys' -Cat $cGame -Preset -Name 'Disable Filter Keys shortcut (Right Shift held for 8 seconds)' `
-    -Desc 'Stops the "Do you want to turn on Filter Keys?" window and its beeps that appear when the right Shift key is held down for eight seconds. Only the shortcut is turned off; Filter Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut (Right Shift held for 8 seconds)' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off. Only the shortcut is affected; Filter Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '122' '126' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Filter'
     )
 
-Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys shortcut (Num Lock held for 5 seconds)' `
-    -Desc 'Stops the beeps and the "Do you want to turn on Toggle Keys?" window that appear when Num Lock is held down for five seconds (Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed). Only the shortcut is turned off; Toggle Keys itself is still there under Settings > Accessibility > Keyboard.' `
+Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut (Num Lock held for 5 seconds)' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, so the beeps and the window do not appear. Only the shortcut is affected; Toggle Keys itself is still there under Settings > Accessibility > Keyboard.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '58' '62' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Toggle'
@@ -4053,22 +4080,22 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Preset -Name 'Disable Toggle Keys short
 # card on the page says what else keeps a game at the full rate. The two switches below are real: they are the "Optimizations for windowed
 # games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
 # keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
-Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Preset -DefaultOn -Name 'Optimizations for windowed games on' `
-    -Desc 'Windows 11 22H2 and newer. For DirectX 10 and 11 games that run in a window or in borderless windowed mode, Windows presents the picture in its newer way (the flip model), which lowers latency and lets those games use Auto HDR and variable refresh rate. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings; this app only sets it, so you can still change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Turning it off here removes the entry, which puts the Windows default back (on for Windows 11 24H2 and newer, so it stays on there; off on older builds).' `
+Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Def 'On' -Preset -Name 'Optimizations for windowed games' `
+    -Desc 'On: Windows presents DirectX 10 and 11 games in a window or borderless mode in its newer way (the flip model). That lowers latency and lets those games use Auto HDR and variable refresh rate. Off: the optimization is off, so those games are not presented the newer way. Windows 11 22H2 and newer. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings, so you can also change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Switching it off writes an explicit 0 on those builds (on older builds the entry is removed, which Windows reads as off).' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'SwapEffectUpgradeEnable'
+        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
     )
 
-Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Disable variable refresh rate for DirectX 11 full-screen games' `
-    -Desc 'Windows 10 version 2004 and newer. Turns off the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Microsoft describes that switch as adding variable refresh rate (G-SYNC, FreeSync, Adaptive-Sync) to DirectX 11 games in full screen that were not written for it; with it off those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games", the setting above. Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (greyed out, nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information that each screen reports about itself (its EDID, which Windows keeps) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as not turned off yet, and turning this on writes an explicit 0 (off). An entry of 0 is shown as on here and an entry of 1 as off. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Undo removes the entry again, which leaves the Windows default.' `
+Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Inv -Def 'On' -Name 'Variable refresh rate for DirectX 11 full-screen games' `
+    -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as on (not turned off yet); switching it off writes an explicit 0. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Switching it back on removes the entry, which leaves the Windows default.' `
     -Parts @(
         pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
     )
 
-Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -DefaultOn -Name 'Game Mode on' `
-    -Desc 'Windows Game Mode, the switch under Settings > Gaming > Game Mode. Windows has it on by default; this card shows whether it still is on this PC and turns it back on if something switched it off. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. It is a setting of your Windows account (it is stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. Switching this off puts the Windows default back: the entries this app wrote are removed, and since the default is on, Game Mode stays on (to turn Game Mode off, use the switch in Settings). A missing entry is shown as on, because that is what Windows does when nothing has been changed. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
+Add-Tweak -Id 'game-mode' -Cat $cDisplay -Def 'On' -Preset -Name 'Game Mode' `
+    -Desc 'On: Windows Game Mode (Settings > Gaming > Game Mode) is on, as Windows has it by default. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. Off: Game Mode is turned off (an explicit 0 is written). It is a setting of your Windows account (stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. A missing entry is shown as on, because that is what Windows does when nothing has been changed. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
     -Parts @(
-        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are removed, which is the Windows default: Game Mode on)'
+        pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are set to 0, which is Game Mode off)'
     )
 
 # ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
@@ -4082,27 +4109,27 @@ Add-Tweak -Id 'game-mode' -Cat $cDisplay -Preset -DefaultOn -Name 'Game Mode on'
 #   tcp-nodelay    : Microsoft KB 328890 and KB 935458 (TcpAckFrequency); no Microsoft page was found for TCPNoDelay / TcpDelAckTicks
 #   svc-sysmain    : forum reports (no benchmark was found)
 #   desktop-delay  : Microsoft Q&A answers from community members and forum reports (no Microsoft documentation was found)
-Add-Tweak -Id 'power-throttle' -Cat $cNothing -Reboot -Unproven -Name 'Disable power throttling' `
-    -Desc 'Little to turn off on a plugged-in desktop: Microsoft said power throttling does not apply on AC power. That comes from its announcement of the feature in Windows 10 (2017), which also says the program you are using and anything playing audio are left alone and that, at the time, it needed an Intel CPU with Speed Shift. Windows 11 adds Efficiency mode (EcoQoS), which programs and Windows ask for themselves; Microsoft''s documentation does not say this setting switches that off, and the reports that it does are unverified (some readers say the value does not survive a restart). It matters most on laptops running on battery. It needs a restart and can raise power use and heat a little. Switch on: sets PowerThrottlingOff = 1 (power throttling off). Switch off: removes that value, which is how Windows ships.' `
+Add-Tweak -Id 'power-throttle' -Cat $cNothing -Inv -Def 'On' -Reboot -Unproven -Name 'Power throttling' `
+    -Desc 'On: Windows can slow background programs down to save power, as it does by default. Off: PowerThrottlingOff = 1 is written (power throttling off). Little to turn off on a plugged-in desktop: Microsoft said power throttling does not apply on AC power. That comes from its announcement of the feature in Windows 10 (2017), which also says the program you are using and anything playing audio are left alone and that, at the time, it needed an Intel CPU with Speed Shift. Windows 11 adds Efficiency mode (EcoQoS), which programs and Windows ask for themselves; Microsoft''s documentation does not say this setting switches that off, and the reports that it does are unverified (some readers say the value does not survive a restart). It matters most on laptops running on battery. It needs a restart and can raise power use and heat a little. Switching it back on removes the value, which is how Windows ships.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerThrottling' 'PowerThrottlingOff' 1
     )
 
 $mm = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
-Add-Tweak -Id 'netthrottle' -Cat $cNothing -Unproven -Name 'Disable network throttling' `
-    -Desc 'Should not change your ping: it only limits incoming traffic while media plays, and a game receives far fewer packets than the limit. Windows applies the limit only while a media-playback program is being boosted, and then caps received traffic at 10 packets per millisecond (about 15 MB/s, roughly 120 Mbps), so turning it off only matters for fast downloads while media plays. The one published measurement found (a Windows latency trace, build not stated) showed slightly higher network-driver latency with it off, and no measured ping gain was found. Microsoft''s current multimedia scheduler documentation does not mention this value, and it is not confirmed that Windows 11 still enforces it. Switch on: sets NetworkThrottlingIndex to 0xFFFFFFFF (throttling off). Switch off: puts Windows'' default of 10 back.' `
+Add-Tweak -Id 'netthrottle' -Cat $cNothing -Inv -Def 'On' -Unproven -Name 'Network throttling (multimedia scheduler)' `
+    -Desc 'On: Windows limits incoming traffic while media plays, as it does by default. Off: NetworkThrottlingIndex is set to 0xFFFFFFFF (throttling off). It should not change your ping: the limit only applies while media plays, and a game receives far fewer packets than the limit. Windows applies it only while a media-playback program is being boosted, and then caps received traffic at 10 packets per millisecond (about 15 MB/s, roughly 120 Mbps), so turning it off only matters for fast downloads while media plays. The one published measurement found (a Windows latency trace, build not stated) showed slightly higher network-driver latency with it off, and no measured ping gain was found. Microsoft''s current multimedia scheduler documentation does not mention this value, and it is not confirmed that Windows 11 still enforces it. Switching it back on puts Windows'' default of 10 back.' `
     -Parts @(
         pReg $mm 'NetworkThrottlingIndex' ([uint32]4294967295) 10
     )
 
-Add-Tweak -Id 'sysresp' -Cat $cNothing -Unproven -Name 'Set system responsiveness to 10% (multimedia scheduler)' `
-    -Desc 'May change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the Windows multimedia scheduler. It lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use it (a game''s audio threads, say) can take more when the CPU is completely busy. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows. Switch on: sets SystemResponsiveness to 10. Switch off: puts Windows'' default of 20 back.' `
+Add-Tweak -Id 'sysresp' -Cat $cNothing -Def 'Off' -Unproven -Name 'System responsiveness set to 10% (multimedia scheduler)' `
+    -Desc 'On: SystemResponsiveness is set to 10 (the Windows default is 20). That lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use the Windows multimedia scheduler (a game''s audio threads, say) can take more when the CPU is completely busy. Off: Windows'' default of 20 is used. It may change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the multimedia scheduler. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows.' `
     -Parts @(
         pReg $mm 'SystemResponsiveness' 10 20
     )
 
-Add-Tweak -Id 'gamesched' -Cat $cNothing -Unproven -Name 'Set game scheduling priority to High (multimedia scheduler "Games" task)' `
-    -Desc 'Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games. Switch on: sets Scheduling Category and SFIO Priority to High, Priority to 6 and GPU Priority to 8. Switch off: puts Windows'' defaults back (Medium, Normal, 2 and 8).' `
+Add-Tweak -Id 'gamesched' -Cat $cNothing -Def 'Off' -Unproven -Name 'Game scheduling priority set to High (multimedia scheduler "Games" task)' `
+    -Desc 'On: Scheduling Category and SFIO Priority of the "Games" task are set to High, Priority to 6 and GPU Priority to 8. Off: Windows'' defaults (Medium, Normal, 2 and 8) are used. Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games.' `
     -Parts @(
         pReg "$mm\Tasks\Games" 'GPU Priority' 8 8
         pReg "$mm\Tasks\Games" 'Priority' 6 2
@@ -4110,8 +4137,8 @@ Add-Tweak -Id 'gamesched' -Cat $cNothing -Unproven -Name 'Set game scheduling pr
         pReg "$mm\Tasks\Games" 'SFIO Priority' 'High' 'Normal' 'String'
     )
 
-Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Reboot -Unproven -Name 'Set TCP to acknowledge at once (no-delay) on every network connection' `
-    -Desc 'Only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Switch on: sets TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 on every network interface, so Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this switched on again. Switch off: deletes the three values (how Windows ships).' `
+Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Def 'Off' -Reboot -Unproven -Name 'TCP acknowledges at once (no-delay) on every network connection' `
+    -Desc 'On: Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 are set on every network interface. Off: the three values are deleted (how Windows ships). It only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this applied again.' `
     -Parts @(
         pRegDyn -Info 'Every network interface under HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces: TcpAckFrequency = 1, TCPNoDelay = 1, TcpDelAckTicks = 0    (undo: values deleted)' -Gen {
             foreach ($k in @(Reg-SubKeys 'HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces')) {
@@ -4122,14 +4149,14 @@ Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Reboot -Unproven -Name 'Set TCP to a
         }
     )
 
-Add-Tweak -Id 'svc-sysmain' -Cat $cNothing -Unproven -Name 'Set SysMain (Superfetch) to disabled' `
-    -Desc 'Little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. SysMain pre-loads frequently used apps into memory, which mainly helps hard drives. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it. Switch on: sets the SysMain service to Disabled. Switch off: sets the service back to Windows'' default, Automatic.' `
+Add-Tweak -Id 'svc-sysmain' -Cat $cNothing -Inv -Def 'On' -Unproven -Name 'SysMain (Superfetch) service' `
+    -Desc 'On: the SysMain service is enabled (Automatic, as Windows has it) and pre-loads frequently used apps into memory, which mainly helps hard drives. Off: the service is disabled. There is little or nothing to gain on an SSD or NVMe drive: people report no measurable difference, and no benchmark showing a gain was found. The only certain effect is one background service fewer; one forum post quotes Intel''s SSD guidance as saying not to disable it.' `
     -Parts @(
         pSvc 'SysMain' 'Disabled' 'Automatic'
     )
 
-Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Unproven -Name 'Set the delay before startup programs and the desktop load to 0' `
-    -Desc 'May do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once. Switch on: sets StartupDelayInMSec and WaitforIdleState to 0. Switch off: deletes them (how Windows ships).' `
+Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Def 'Off' -Unproven -Name 'Startup programs and desktop load without delay' `
+    -Desc 'On: StartupDelayInMSec and WaitforIdleState are set to 0. Off: both are deleted (how Windows ships). It may do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'WaitforIdleState' 0
@@ -4137,15 +4164,15 @@ Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Unproven -Name 'Set the delay befo
 
 # ------------------------------------------------------------- Security -------
 $sys ='HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
-Add-Tweak -Id 'uac' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable UAC prompts ("Never notify")' -NotRec 'It gives no speed-up; it only removes a protection.' `
-    -Desc 'Sets the same values the Windows UAC slider writes at "Never notify": programs can start with administrator rights without asking you first. Malware benefits from this too.' `
+Add-Tweak -Id 'uac' -Cat $cSec -Inv -Def 'On' -Reboot -Risk 'security' -Name 'UAC prompts' -NotRec 'It gives no speed-up; it only removes a protection.' `
+    -Desc 'On: Windows asks you before programs start with administrator rights (the Windows default). Off: programs can start with administrator rights without asking you first. The same values the Windows UAC slider writes at "Never notify" are set. Malware benefits from this too.' `
     -Parts @(
         pReg $sys 'ConsentPromptBehaviorAdmin' 0 5
         pReg $sys 'PromptOnSecureDesktop' 0 1
     )
 
-Add-Tweak -Id 'uac-lua' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable UAC engine fully (not recommended)' -NotRec 'It gives no speed-up, and modern apps can refuse to start.' `
-    -Desc 'EnableLUA = 0 switches User Account Control off completely, beyond the slider. Modern apps (Settings, Calculator, Photos, Terminal) can refuse to launch. Not part of the Recommended preset.' `
+Add-Tweak -Id 'uac-lua' -Cat $cSec -Inv -Def 'On' -Reboot -Risk 'security' -Name 'User Account Control (UAC engine)' -NotRec 'It gives no speed-up, and modern apps can refuse to start.' `
+    -Desc 'On: User Account Control works (the Windows default). Off: EnableLUA = 0 switches User Account Control off completely, beyond the slider. Modern apps (Settings, Calculator, Photos, Terminal) can refuse to launch. Not part of the Recommended preset.' `
     -Parts @(
         pReg $sys 'EnableLUA' 0 1
     )
@@ -4160,9 +4187,9 @@ $acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
     '  - Riot Vanguard (Valorant and other Riot games): can ask you to turn on Memory Integrity before it lets you launch the game.' + "`r`n" + `
     'Applying this setting turns those features off.' + "`r`n" + "`r`n" + `
     'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
-Add-Tweak -Id 'vbs' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable Memory Integrity (HVCI) and Virtualization-Based Security' `
+Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity (HVCI) and Virtualization-Based Security' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'Can give a few percent more FPS in some games, but removes protection against kernel-level malware. Also turns off Credential Guard. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this off if you play on those - you are asked about it before it is applied. Undo leaves the values unset, so Windows decides again.' `
+    -Desc 'On: Memory Integrity and Virtualization-Based Security are left to Windows (new Windows 11 installs on capable hardware usually have them on). Off: both are turned off, and Credential Guard with them. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this on if you play on those - you are asked about it before it is applied. Switching it back on leaves the values unset, so Windows decides again.' `
     -Parts @(
         pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
         pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
@@ -4170,14 +4197,14 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable Memory In
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
     )
 
-Add-Tweak -Id 'hypervisor' -Cat $cSec -Reboot -Risk 'security' -Name 'Disable hypervisor start with Windows (hypervisorlaunchtype)' `
+Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup (hypervisorlaunchtype)' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'Stops the Windows hypervisor from loading at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Undo deletes the boot setting, so Windows decides again (its default).' `
+    -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on deletes the boot setting, so Windows decides again.' `
     -Parts @(
         pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: bcdedit /deletevalue hypervisorlaunchtype)'
     )
 
-Add-Tweak -Id 'bitlocker' -Cat $cSec -OneWay -Risk 'security' -Name 'Disable BitLocker drive encryption (decrypts your drives)' `
+Add-Tweak -Id 'bitlocker' -Cat $cSec -Inv -Def 'Depends on the PC' -OneWay -Risk 'security' -Name 'BitLocker drive encryption' `
     -Ask ('BitLocker (and the Windows 11 "Device encryption" that uses it) protects your files if this PC or its drive is lost or stolen.' + "`r`n" + "`r`n" +
           'Applying this setting starts decrypting every drive that is encrypted and unlocked:' + "`r`n" +
           '  - anyone who gets this PC, or just its drive, can then read your files' + "`r`n" +
@@ -4185,26 +4212,26 @@ Add-Tweak -Id 'bitlocker' -Cat $cSec -OneWay -Risk 'security' -Name 'Disable Bit
           '  - it cannot be undone from this window: to encrypt again use Settings > Privacy & security > Device encryption, or Control Panel > BitLocker Drive Encryption (that makes a new recovery key, which you must save)' + "`r`n" + "`r`n" +
           'If you are not sure, answer No: nothing is changed. You can apply it later from the window.') `
     -AskTitle 'Turn off BitLocker?' `
-    -Desc 'Starts decrypting every unlocked drive that BitLocker or Device encryption protects. Why: software encryption makes the drive do extra work on every read and write. One published test (Tom''s Hardware, reported by TechSpot; Samsung 990 Pro, Windows 11 22H2, software BitLocker) measured about 11% slower file copies, about 20% lower PCMark 10 storage scores and 45% slower random writes; the effect depends on the drive and the CPU. Windows 11 version 24H2 and newer can turn Device encryption on by default, which is why a new PC may be encrypted without you having set it up. Cost: if the PC or the drive is lost or stolen, anyone can read your files. Decryption carries on in the background and can take hours. This cannot be undone from here (switching it off only prints a note): to encrypt again use Windows'' own Device encryption or BitLocker settings, which make a new recovery key for you to save. Works on Windows Home too: if Windows has no BitLocker commands there, the drives are read and decrypted through the manage-bde tool of Windows (English Windows only). Shown as not available when neither can be asked, and as applied when no drive is encrypted. Not part of the Recommended preset, and left out of Apply all.' `
+    -Desc 'On: your drives stay as they are; drives that BitLocker or Device encryption protects stay encrypted. Off: starts decrypting every unlocked drive that BitLocker or Device encryption protects. Why: software encryption makes the drive do extra work on every read and write. One published test (Tom''s Hardware, reported by TechSpot; Samsung 990 Pro, Windows 11 22H2, software BitLocker) measured about 11% slower file copies, about 20% lower PCMark 10 storage scores and 45% slower random writes; the effect depends on the drive and the CPU. Windows 11 version 24H2 and newer can turn Device encryption on by default, which is why a new PC may be encrypted without you having set it up. Cost: if the PC or the drive is lost or stolen, anyone can read your files. Decryption carries on in the background and can take hours. This cannot be undone from here (switching it back on only prints a note): to encrypt again use Windows'' own Device encryption or BitLocker settings, which make a new recovery key for you to save. Works on Windows Home too: if Windows has no BitLocker commands there, the drives are read and decrypted through the manage-bde tool of Windows (English Windows only). Shown as not available when neither can be asked, and as off when no drive is encrypted. Not part of the Recommended preset, and left out of Apply all.' `
     -Parts @(
         pCustom 'BitLocker' 'Drive encryption: Disable-BitLocker on every drive that is encrypted and unlocked (other drives first, the Windows drive last)    (undo: not possible from here)'
     )
 
-Add-Tweak -Id 'device-encryption-block' -Cat $cSec -Risk 'security' -Name 'Disable automatic Device encryption (Windows will not encrypt this PC by itself)' `
-    -Desc 'Stops Windows from turning on Device encryption (the simple form of BitLocker) by itself. Windows 11 can do that on a new install, or when you sign in with a Microsoft account on a PC that qualifies, which is how a PC ends up encrypted without you having set it up. This only blocks the automatic start: it does not decrypt anything and does not touch a drive that is already encrypted (the setting above does that), and you can still turn BitLocker on yourself whenever you like. Cost: if the PC or its drive is lost or stolen, an unencrypted drive can be read by whoever has it. Turning this off removes the value, which is the Windows default.' `
+Add-Tweak -Id 'device-encryption-block' -Cat $cSec -Inv -Def 'On' -Risk 'security' -Name 'Automatic Device encryption' `
+    -Desc 'On: Windows may turn on Device encryption (the simple form of BitLocker) by itself. Windows 11 can do that on a new install, or when you sign in with a Microsoft account on a PC that qualifies, which is how a PC ends up encrypted without you having set it up. Off: Windows is stopped from doing that. It only blocks the automatic start: it does not decrypt anything and does not touch a drive that is already encrypted (the BitLocker setting does that), and you can still turn BitLocker on yourself whenever you like. Cost: if the PC or its drive is lost or stolen, an unencrypted drive can be read by whoever has it. Switching it back on removes the value, which is the Windows default.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\BitLocker' 'PreventDeviceEncryption' 1
     )
 
 # ------------------------------------------------------------- Services -------
-Add-Tweak -Id 'svc-search' -Cat $cSvc -Risk 'note' -Name 'Search indexer runs only on demand (file and program search can stop working)' -NotRec 'File and program search can stop finding things.' `
-    -Desc 'Windows Search (the file indexer) is set to Manual, so it no longer starts with Windows. Start-menu results for installed apps keep working, but results that come from the index can stop appearing: files, and programs that are not installed, such as a portable program that runs from its own folder. Benefit: a little less background disk and CPU use while Windows builds the index, which is small on a fast SSD. This is not part of the Recommended preset. If search stops finding something, turn this off: the service goes back to Automatic (Delayed Start) and starts again straight away.' `
+Add-Tweak -Id 'svc-search' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Windows Search indexer starts with Windows' -NotRec 'File and program search can stop finding things.' `
+    -Desc 'On: the Windows Search service (the file indexer) starts with Windows (Automatic, delayed start, as Windows has it). Off: it is set to Manual, so it no longer starts with Windows. Start-menu results for installed apps keep working, but results that come from the index can stop appearing: files, and programs that are not installed, such as a portable program that runs from its own folder. Benefit of off: a little less background disk and CPU use while Windows builds the index, which is small on a fast SSD. This is not part of the Recommended preset. If search stops finding something, switch this back on: the service goes back to Automatic (Delayed Start) and starts again straight away.' `
     -Parts @(
         pSvc 'WSearch' 'Manual' 'AutomaticDelayed'
     )
 
-Add-Tweak -Id 'svc-misc' -Cat $cSvc -Preset -Name 'Disable rarely used services' `
-    -Desc 'Retail Demo, Fax, Parental Controls, NFC / payments, Phone service, Windows Insider service and Downloaded Maps Manager are disabled; Distributed Link Tracking is set to Manual.' `
+Add-Tweak -Id 'svc-misc' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Rarely used services (Retail Demo, Fax, Parental Controls, NFC, Phone, Insider, Maps)' `
+    -Desc 'On: eight rarely used services keep the start types Windows gives them. They are Retail Demo, Fax, Parental Controls, NFC / payments, Phone service, Windows Insider service, Downloaded Maps Manager and Distributed Link Tracking. Off: the first seven are disabled and Distributed Link Tracking is set to Manual.' `
     -Parts @(
         pSvc 'RetailDemo' 'Disabled' 'Manual'
         pSvc 'Fax' 'Disabled' 'Manual'
@@ -4216,14 +4243,14 @@ Add-Tweak -Id 'svc-misc' -Cat $cSvc -Preset -Name 'Disable rarely used services'
         pSvc 'TrkWks' 'Manual' 'Automatic'
     )
 
-Add-Tweak -Id 'svc-smartcard' -Cat $cSvc -Risk 'note' -Name 'Disable smart card services' `
-    -Desc 'Needed only for smart-card logins and some hardware security keys. Leave this switched off if you use one.' `
+Add-Tweak -Id 'svc-smartcard' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Smart card services' `
+    -Desc 'On: the smart card services are enabled (they start when needed). Off: they are disabled. They are needed only for smart-card logins and some hardware security keys. Leave this on if you use one.' `
     -Parts @(
         pSvc 'SCardSvr' 'Disabled' 'Manual'
         pSvc 'ScDeviceEnum' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'printing' -Cat $cSvc -Risk 'note' -Name 'Disable printing (Print Spooler)' `
+Add-Tweak -Id 'printing' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Printing (Print Spooler)' `
     -Ask ('Do you need printing?' + "`r`n" + "`r`n" + `
           'Applying this setting stops the Print Spooler and its notification service. From then on this PC cannot print at all:' + "`r`n" + `
           '  - no paper printing, to a USB printer or to a network printer' + "`r`n" + `
@@ -4231,14 +4258,14 @@ Add-Tweak -Id 'printing' -Cat $cSvc -Risk 'note' -Name 'Disable printing (Print 
           '  - programs that print or save through the Windows print dialog just fail' + "`r`n" + "`r`n" + `
           'If you ever print, or save things as PDF that way, answer No: the setting stays off and printing keeps working. You can apply it later from the window.') `
     -AskTitle 'Turn off printing?' `
-    -Desc 'Disables the Print Spooler and its notification service. No printing, and no "Microsoft Print to PDF", until you turn this off again. You are asked first whether you need printing.' `
+    -Desc 'On: printing works (the Print Spooler and its notification service are enabled, as Windows has them). Off: both services are disabled, so this PC cannot print at all. There is also no "Microsoft Print to PDF" or "Microsoft XPS Document Writer". Switch it back on to print again. You are asked first whether you need printing.' `
     -Parts @(
         pSvc 'Spooler' 'Disabled' 'Automatic'
         pSvc 'PrintNotify' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Risk 'note' -Name 'Disable Xbox services' `
-    -Desc 'Disables Xbox sign-in, cloud saves, accessory and network services. Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG are not affected.' `
+Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Xbox services' `
+    -Desc 'On: Xbox sign-in, cloud saves, accessory and network services are enabled (they start when needed). Off: they are disabled. Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG are not affected.' `
     -Parts @(
         pSvc 'XblAuthManager' 'Disabled' 'Manual'
         pSvc 'XblGameSave' 'Disabled' 'Manual'
@@ -4248,28 +4275,28 @@ Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Risk 'note' -Name 'Disable Xbox services' `
 
 # (The usage-reporting, NetBIOS and Storage Service ones sit on the Privacy, Network sharing and Storage pages, where they belong.)
 # More background services that a gaming PC does not need. Health and Optimized Experiences, diagnostics, Program Compatibility Assistant and the data usage meter are in the Recommended preset; the others are yours to switch on.
-Add-Tweak -Id 'svc-whe' -Cat $cSvc -Preset -Risk 'note' -Name 'Disable Windows Health and Optimized Experiences' `
-    -Desc 'Stops the service that watches CPU, heat and battery and records performance traces on this PC when Windows feels slow. Microsoft says the traces stay on the PC unless you send them in a Feedback Hub report. Little downside on a desktop; on a laptop it may weaken battery optimisation.' `
+Add-Tweak -Id 'svc-whe' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Windows Health and Optimized Experiences service' `
+    -Desc 'On: the service that watches CPU, heat and battery and records performance traces on this PC when Windows feels slow is enabled. Off: it is disabled. Microsoft says the traces stay on the PC unless you send them in a Feedback Hub report. Little downside on a desktop; on a laptop it may weaken battery optimisation.' `
     -Parts @(
         pSvc 'whesvc' 'Disabled' 'Automatic'
     )
 
-Add-Tweak -Id 'svc-diag' -Cat $cSvc -Preset -Name 'Disable troubleshooting and diagnostics services' -NotRec 'Little to gain, and the built-in Troubleshoot wizards stop working.' `
-    -Desc 'Disables the Diagnostic Policy Service, Diagnostic System Host and Diagnostic Service Host. The built-in "Troubleshoot" wizards (network, audio, Windows Update) stop working until you turn this off again.' `
+Add-Tweak -Id 'svc-diag' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Troubleshooting and diagnostics services' -NotRec 'Little to gain, and the built-in Troubleshoot wizards stop working.' `
+    -Desc 'On: the Diagnostic Policy Service, Diagnostic System Host and Diagnostic Service Host are enabled. Off: all three are disabled. The built-in "Troubleshoot" wizards (network, audio, Windows Update) stop working until you switch this back on.' `
     -Parts @(
         pSvc 'DPS' 'Disabled' 'Automatic'
         pSvc 'WdiSystemHost' 'Disabled' 'Manual'
         pSvc 'WdiServiceHost' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-pca' -Cat $cSvc -Preset -Name 'Disable Program Compatibility Assistant' `
-    -Desc 'Stops the service behind the "this program might not have installed correctly" pop-ups and automatic compatibility fixes for old programs. Compatibility settings you choose yourself in a program''s Properties still apply. Leave this off if you play old games and like those prompts.' `
+Add-Tweak -Id 'svc-pca' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Program Compatibility Assistant' `
+    -Desc 'On: the service behind the "this program might not have installed correctly" pop-ups and the automatic compatibility fixes for old programs is enabled. Off: it is disabled. Compatibility settings you choose yourself in a program''s Properties still apply. Leave this on if you play old games and like those prompts.' `
     -Parts @(
         pSvc 'PcaSvc' 'Disabled' 'Automatic'
     )
 
-Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Preset -Name 'Disable data usage meter' `
-    -Desc 'Stops the service that counts how much data each app uses (Settings > Network & internet > Data usage). That page shows nothing afterwards; networking itself is not affected.' `
+Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Data usage meter service' `
+    -Desc 'On: the service that counts how much data each app uses (Settings > Network & internet > Data usage) is enabled. Off: it is disabled, so that page shows nothing; networking itself is not affected.' `
     -Parts @(
         pSvc 'DusmSvc' 'Disabled' 'Automatic'
     )
@@ -4277,74 +4304,74 @@ Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Preset -Name 'Disable data usage meter
 # Windows gives every service its own svchost.exe process once a PC has more than 3.5 GB of RAM. A threshold above the
 # installed memory makes it group them again after a restart. The value is far above any home PC (256 GB in KB); undo removes it,
 # which gives Windows' own default (3.5 GB).
-Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Preset -Reboot -Risk 'note' -Name 'Service Host processes merged (about 50 fewer svchost.exe)' -NotRec 'Saves little memory, and one crashing service can take others down with it.' `
-    -Desc 'Windows runs each background service in its own svchost.exe process. This groups them again after a restart: roughly 50 fewer processes and a little less memory. The costs: one service that crashes can take others in its group with it, and Task Manager can no longer show which service uses the CPU. WinUtil warns that it can interfere with Xbox services.' `
+Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Inv -Def 'On' -Preset -Reboot -Risk 'note' -Name 'Separate svchost.exe process for each service' -NotRec 'Saves little memory, and one crashing service can take others down with it.' `
+    -Desc 'On: each background service runs in its own svchost.exe process (the default with over 3.5 GB of RAM). Off: services are grouped again after a restart (about 50 fewer processes). That uses a little less memory. The costs: one service that crashes can take others in its group with it, and Task Manager can no longer show which service uses the CPU. WinUtil warns that it can interfere with Xbox services.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control' 'SvcHostSplitThresholdInKB' 268435456 3670016
     )
 
-Add-Tweak -Id 'defender-core' -Cat $cPriv -Preset -Risk 'note' -Name 'Disable Defender Core Service telemetry and experiments' `
-    -Desc 'Windows Security keeps scanning as normal. Turns off the telemetry sent by the Defender Core Service and its use of Microsoft''s experimentation service to deliver fixes (fixes still arrive through the normal Defender updates). Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
+Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Defender Core Service telemetry and experiments' `
+    -Desc 'On: the Defender Core Service sends telemetry and uses Microsoft''s experimentation service to deliver fixes. Off: both are turned off. Fixes still arrive through the normal Defender updates, and Windows Security keeps scanning as normal. Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features' 'DisableCoreServiceECSIntegration' 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features' 'DisableCoreService1DSTelemetry' 1
     )
 
 # ------------------------------------------------------- Storage and clean-up ---
-Add-Tweak -Id 'storage-sense' -Cat $cStore -Name 'Disable Storage Sense' `
-    -Desc 'Turns off Storage Sense, the Windows feature that deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and that can be set up to clear your Downloads folder as well. With it off Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This only changes that one switch; undo removes the value, which is the Windows default.' `
+Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Depends on the PC' -Name 'Storage Sense' `
+    -Desc 'On: Storage Sense is left as Windows has it. It deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and can be set up to clear your Downloads folder as well. Windows turns it on by itself when disk space runs low, and on many PCs it is off until you switch it on. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. Only that one switch is written; switching it back on removes the value, which is the Windows default.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
     )
 
-Add-Tweak -Id 'svc-storage' -Cat $cStore -Name 'Storage Service runs only on demand' `
-    -Desc 'Sets Storage Service (storage settings and external-drive handling) to Manual, so it starts when Windows needs it instead of at every start. One background process fewer while it is idle.' `
+Add-Tweak -Id 'svc-storage' -Cat $cStore -Inv -Def 'On' -Name 'Storage Service starts with Windows' `
+    -Desc 'On: Storage Service (storage settings and external-drive handling) starts with Windows (Automatic, as Windows has it). Off: it is set to Manual, so it starts when Windows needs it. One background process fewer while it is idle.' `
     -Parts @(
         pSvc 'StorSvc' 'Manual' 'Automatic'
     )
 
-Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Risk 'note' -Name 'Run Disk Cleanup now (one time)' `
-    -Desc 'Runs the Disk Cleanup program that comes with Windows (cleanmgr) once, on every drive, for these items only: temporary files, temporary setup files, setup and upgrade log files, Active Setup temp folders, thumbnail cache, Windows error reports, downloaded program files, old browser cache files, Delivery Optimization files, old Check Disk files, system error memory dumps and minidumps, and Windows Update Cleanup. It never touches the Recycle Bin, your Downloads folder, the old Windows installation (Windows.old), device driver packages, the DirectX shader cache, language files or file history versions. Windows Update Cleanup removes the files of updates that were replaced by newer ones: updates that are already installed can no longer be uninstalled afterwards. A Disk Cleanup window shows the progress and it can take several minutes. It is an action, not a switch: it runs when you press Apply, files it deletes do not go to the Recycle Bin, and it is never part of Apply all, Turn all on or the Recommended preset.' `
+Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Risk 'note' -Name 'Disk Cleanup (run once)' `
+    -Desc 'A one-time action, not a switch. Runs the Disk Cleanup program that comes with Windows (cleanmgr) once, on every drive, for these items only: temporary files, temporary setup files, setup and upgrade log files, Active Setup temp folders, thumbnail cache, Windows error reports, downloaded program files, old browser cache files, Delivery Optimization files, old Check Disk files, system error memory dumps and minidumps, and Windows Update Cleanup. It never touches the Recycle Bin, your Downloads folder, the old Windows installation (Windows.old), device driver packages, the DirectX shader cache, language files or file history versions. Windows Update Cleanup removes the files of updates that were replaced by newer ones: updates that are already installed can no longer be uninstalled afterwards. A Disk Cleanup window shows the progress and it can take several minutes. It runs when you press Apply, files it deletes do not go to the Recycle Bin, and it is never part of Apply all, Tweak all or the Recommended preset.' `
     -Parts @(
         pCustom 'DiskCleanup' 'cleanmgr /sagerun for 14 items: temporary and setup files, logs, thumbnail and error report caches, Delivery Optimization, old update files, memory dumps (not the Recycle Bin, Downloads, Windows.old, drivers or shader cache)'
     )
 
-Add-Tweak -Id 'temp-files' -Cat $cStore -Once -Risk 'note' -Name 'Remove temporary files now (one time)' `
-    -Desc 'Deletes what is inside your own Temp folder (the TEMP folder of your account) and inside C:\Windows\Temp, once. Anything that was changed in the last hour is left alone, and so is anything a running program is using, because Windows does not allow it to be deleted. Folders that end up empty are removed; the two Temp folders themselves stay. Shortcuts and links inside them are removed but never followed, so nothing outside the Temp folders is touched, and a TEMP folder that is not named Temp is never emptied. When it is done it says how many items were removed and how much space that freed. It is an action, not a switch: it runs when you press Apply, deleted files do not go to the Recycle Bin, and it is never part of Apply all, Turn all on or the Recommended preset.' `
+Add-Tweak -Id 'temp-files' -Cat $cStore -Once -Risk 'note' -Name 'Temporary files (clean up once)' `
+    -Desc 'A one-time action, not a switch. Deletes what is inside your own Temp folder (the TEMP folder of your account) and inside C:\Windows\Temp, once. Anything that was changed in the last hour is left alone, and so is anything a running program is using, because Windows does not allow it to be deleted. Folders that end up empty are removed; the two Temp folders themselves stay. Shortcuts and links inside them are removed but never followed, so nothing outside the Temp folders is touched, and a TEMP folder that is not named Temp is never emptied. When it is done it says how many items were removed and how much space that freed. It runs when you press Apply, deleted files do not go to the Recycle Bin, and it is never part of Apply all, Tweak all or the Recommended preset.' `
     -Parts @(
         pCustom 'TempClean' 'delete the files in %TEMP% and C:\Windows\Temp that are older than an hour and not in use; empty sub-folders are removed'
     )
 
 # ------------------------------------------------------------ Look and feel ---
 $pers = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'
-Add-Tweak -Id 'dark' -Cat $cLook -Preset -Explorer -Name 'Dark mode for apps and Windows' `
-    -Desc 'Dark theme for apps, the taskbar and Start, with no accent colour on the taskbar.' `
+Add-Tweak -Id 'dark' -Cat $cLook -Def 'Off' -Preset -Explorer -Name 'Dark mode for apps and Windows' `
+    -Desc 'On: dark theme for apps, the taskbar and Start, with no accent colour on the taskbar. Off: the light theme (the Windows default).' `
     -Parts @(
         pReg $pers 'AppsUseLightTheme' 0 1
         pReg $pers 'SystemUsesLightTheme' 0 1
         pReg $pers 'ColorPrevalence' 0 0
     )
 
-Add-Tweak -Id 'transparency' -Cat $cLook -Preset -Explorer -Name 'Disable transparency effects' `
-    -Desc 'Windows and menus use solid backgrounds instead of the see-through effect.' `
+Add-Tweak -Id 'transparency' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Transparency effects' `
+    -Desc 'On: windows and menus use the see-through effect (the Windows default). Off: they use solid backgrounds instead.' `
     -Parts @(
         pReg $pers 'EnableTransparency' 0 1
     )
 
-Add-Tweak -Id 'taskbar-left' -Cat $cLook -Preset -Explorer -Name 'Taskbar icons on the left' `
-    -Desc 'Moves the taskbar icons to the left, like Windows 10. (Windows 11 cannot dock the taskbar to the side of the screen.)' `
+Add-Tweak -Id 'taskbar-left' -Cat $cLook -Def 'Off' -Preset -Explorer -Name 'Taskbar icons on the left' `
+    -Desc 'On: the taskbar icons are on the left, like Windows 10. (Windows 11 cannot dock the taskbar to the side of the screen.) Off: the icons are centred (the Windows 11 default).' `
     -Parts @(
         pReg $adv 'TaskbarAl' 0 1
     )
 
-Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Preset -Name 'End task in the taskbar right-click menu' `
-    -Desc 'Adds "End task" to the menu you get when you right-click a program on the taskbar, so a frozen game or app can be closed in one click without opening Task Manager. It is the same switch as Settings > System > For developers > End Task, which needs Windows 11 version 23H2 (build 22631.2715) or newer; on an older build the value does nothing.' `
+Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Def 'Off' -Preset -Name 'End task in the taskbar right-click menu' `
+    -Desc 'On: right-clicking a program on the taskbar shows "End task", so a frozen game or app can be closed in one click without opening Task Manager. Off: the menu has no "End task" (the Windows default). It is the same switch as Settings > System > For developers > End Task, which needs Windows 11 version 23H2 (build 22631.2715) or newer; on an older build the value does nothing.' `
     -Parts @(
         pReg "$adv\TaskbarDeveloperSettings" 'TaskbarEndTask' 1
     )
 
-Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Preset -Explorer -Name 'Disable Widgets and Chat taskbar buttons' `
-    -Desc 'Hides the Widgets and Chat / Teams buttons from the taskbar and turns the Widgets feed off by policy. The Widgets button switch itself is protected on newer Windows 11 builds and may refuse to change; the Widgets policy hides the button anyway, so the setting still counts as applied.' `
+Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Widgets and Chat taskbar buttons' `
+    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both buttons are hidden and the Widgets feed is turned off by policy. The Widgets button switch itself is protected on newer Windows 11 builds and may refuse to change; the Widgets policy hides the button anyway, so the setting still counts as off.' `
     -Parts @(
         pRegSoft $adv 'TaskbarDa' 0 1
         pReg $adv 'TaskbarMn' 0 1
@@ -4352,42 +4379,42 @@ Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Preset -Explorer -Name 'Disable Wid
         pReg "$pol\Windows Chat" 'ChatIcon' 3
     )
 
-Add-Tweak -Id 'taskbar-search' -Cat $cLook -Preset -Explorer -Name 'Disable taskbar search button' `
-    -Desc 'Hides the search box or search icon from the taskbar. Search still opens with Win+S, and typing in the Start menu still searches. Turning this off puts back the search button the way Windows ships it.' `
+Add-Tweak -Id 'taskbar-search' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Taskbar search button' `
+    -Desc 'On: the search box or search icon shows on the taskbar, the way Windows ships it. Off: it is hidden. Search still opens with Win+S, and typing in the Start menu still searches.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'SearchboxTaskbarMode' 0
     )
 
-Add-Tweak -Id 'taskbar-taskview' -Cat $cLook -Preset -Explorer -Name 'Disable taskbar Task View button' `
-    -Desc 'Hides the Task View button (the two overlapping rectangles) from the taskbar. Win+Tab still opens Task View and your virtual desktops keep working.' `
+Add-Tweak -Id 'taskbar-taskview' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Taskbar Task View button' `
+    -Desc 'On: the Task View button (the two overlapping rectangles) shows on the taskbar. Off: it is hidden. Win+Tab still opens Task View and your virtual desktops keep working.' `
     -Parts @(
         pReg $adv 'ShowTaskViewButton' 0 1
     )
 
 # Settings > Personalization > Dynamic Lighting: both switches are per-user values in HKCU\Software\Microsoft\Lighting (1 = on, the default)
 $lighting = 'HKCU:\Software\Microsoft\Lighting'
-Add-Tweak -Id 'dynamic-lighting' -Cat $cLook -Preset -Name 'Disable Dynamic Lighting (RGB devices)' `
-    -Desc 'Turns off "Use Dynamic Lighting on my devices" in Settings > Personalization > Dynamic Lighting. Windows then stops controlling the lights of keyboards, mice and other RGB devices that support it, so the lighting software that came with them (or one you chose yourself) is the only thing that sets them. Nothing is removed and the devices keep their own lighting settings. Turning this off brings Dynamic Lighting back. If the lights do not change at once, sign out of Windows and back in.' `
+Add-Tweak -Id 'dynamic-lighting' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Dynamic Lighting (RGB devices)' `
+    -Desc 'On: Windows can control the lights of keyboards, mice and other RGB devices that support it. "Use Dynamic Lighting on my devices" in Settings > Personalization > Dynamic Lighting is on. Off: Windows stops controlling them, so only the lighting software of your devices sets them. That can be the software that came with the devices or one you chose yourself. Nothing is removed and the devices keep their own lighting settings. If the lights do not change at once, sign out of Windows and back in.' `
     -Parts @(
         pReg $lighting 'AmbientLightingEnabled' 0 1
     )
 
-Add-Tweak -Id 'dynamic-lighting-foreground' -Cat $cLook -Preset -Name 'Disable "Foreground apps always control lighting"' `
-    -Desc 'Turns off "Compatible apps in the foreground always control lighting" in Settings > Personalization > Dynamic Lighting. While that switch is on, the app you are using controls the lights first if it supports Dynamic Lighting; with it off, the order under "Background light control" decides, so apps in the background can control the lights as well. It only matters while Dynamic Lighting itself is on: with "Disable Dynamic Lighting (RGB devices)" applied you will see no difference. Turning this off puts the switch back on.' `
+Add-Tweak -Id 'dynamic-lighting-foreground' -Cat $cLook -Inv -Def 'On' -Preset -Name '"Foreground apps always control lighting"' `
+    -Desc 'On: the app you are using controls the lights first if it supports Dynamic Lighting. "Compatible apps in the foreground always control lighting" is on in Settings > Personalization > Dynamic Lighting. Off: the order under "Background light control" decides, so apps in the background can control the lights as well. It only matters while Dynamic Lighting itself is on: with "Dynamic Lighting (RGB devices)" off you will see no difference.' `
     -Parts @(
         pReg $lighting 'ControlledByForegroundApp' 0 1
     )
 
-Add-Tweak -Id 'start-recommended' -Cat $cLook -Preset -Explorer -Risk 'note' -Name 'Start menu Recommended section hidden' `
-    -Desc 'Hides the Recommended section (recent files and suggested apps) from the Start menu, so only your pinned apps show. It sets the Start policy, the matching group policy and a flag that marks the PC as an education device. Microsoft supports the policy on Education and Enterprise only; the education flag is the workaround people report works on Pro and Home, but Microsoft does not document it, so check the Start menu after Explorer restarts. Side effect: the education flag also turns Windows Spotlight off on the lock screen. The tips setting on the Privacy page and the switches under Settings > Personalization > Start are separate.' `
+Add-Tweak -Id 'start-recommended' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Start menu Recommended section' `
+    -Desc 'On: the Recommended section (recent files and suggested apps) shows in the Start menu. Off: it is hidden, so only your pinned apps show. Off sets the Start policy, the matching group policy and a flag that marks the PC as an education device. Microsoft supports the policy on Education and Enterprise only; the education flag is the workaround people report works on Pro and Home, but Microsoft does not document it, so check the Start menu after Explorer restarts. Side effect: the education flag also turns Windows Spotlight off on the lock screen. The tips setting on the Privacy page and the switches under Settings > Personalization > Start are separate.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Start' 'HideRecommendedSection' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\Education' 'IsEducationEnvironment' 1
         pReg "$pol\Explorer" 'HideRecommendedSection' 1
     )
 
-Add-Tweak -Id 'blackdesk' -Cat $cLook -Preset -Name 'Solid black desktop' `
-    -Desc 'No wallpaper, plain black background. Turning this off puts back the default Windows wallpaper and background colour.' `
+Add-Tweak -Id 'blackdesk' -Cat $cLook -Def 'Off' -Preset -Name 'Solid black desktop' `
+    -Desc 'On: no wallpaper, a plain black background. Off: the default Windows wallpaper and background colour are put back.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Colors' 'Background' '0 0 0' '0 0 0' 'String'
         pReg 'HKCU:\Control Panel\Desktop' 'WallPaper' '' "$env:SystemRoot\web\wallpaper\Windows\img0.jpg" 'String'
@@ -4395,8 +4422,8 @@ Add-Tweak -Id 'blackdesk' -Cat $cLook -Preset -Name 'Solid black desktop' `
         pCustom 'DesktopLive' 'also applied to the running desktop'
     )
 
-Add-Tweak -Id 'animations' -Cat $cLook -Preset -Explorer -Name 'Disable visual effects (only smooth font edges stays on)' `
-    -Desc 'Sets Performance Options > Visual Effects to Custom with only "Smooth edges of screen fonts" left on (ClearType, so text stays sharp). Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Undo puts back the Windows default for all of these.' `
+Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Visual effects (animations, shadows, thumbnails)' `
+    -Desc 'On: Windows visual effects are as Windows has them (the Windows default). Off: Visual Effects is set to Custom with only "Smooth edges of screen fonts" left on. That keeps ClearType, so text stays sharp. The setting is in Performance Options > Visual Effects. Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Switching it back on puts back the Windows default for all of these.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 3 0
         pReg 'HKCU:\Control Panel\Desktop\WindowMetrics' 'MinAnimate' '0' '1' 'String'
@@ -4412,29 +4439,29 @@ Add-Tweak -Id 'animations' -Cat $cLook -Preset -Explorer -Name 'Disable visual e
         pCustom 'AnimLive' 'also applied to the running session'
     )
 
-Add-Tweak -Id 'notifications' -Cat $cLook -Preset -Explorer -Risk 'note' -Name 'Disable notifications (pop-ups and the notification centre)' `
-    -Desc 'No toast pop-ups from apps, games or Windows, and the notification centre is switched off; the calendar flyout goes with it. Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are.' `
+Add-Tweak -Id 'notifications' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Notifications (pop-ups and the notification centre)' `
+    -Desc 'On: apps, games and Windows can show toast pop-ups, and the notification centre works. Off: no toast pop-ups, and the notification centre is switched off; the calendar flyout goes with it. Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are.' `
     -Parts @(
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0 1
     )
 
 # ------------------------------------------------------------ File Explorer ---
-Add-Tweak -Id 'launchto' -Cat $cExplorer -Explorer -Name 'File Explorer opens to This PC' `
-    -Desc 'File Explorer starts at This PC (your drives) instead of Home.' `
+Add-Tweak -Id 'launchto' -Cat $cExplorer -Def 'Off' -Explorer -Name 'File Explorer opens to This PC' `
+    -Desc 'On: File Explorer starts at This PC (your drives). Off: it starts at Home (the Windows default).' `
     -Parts @(
         pReg $adv 'LaunchTo' 1
     )
 
-Add-Tweak -Id 'showext' -Cat $cExplorer -Explorer -Name 'Always show file extensions' `
-    -Desc 'Shows .exe, .txt, .jpg and so on, which makes disguised files easier to spot.' `
+Add-Tweak -Id 'showext' -Cat $cExplorer -Def 'Off' -Explorer -Name 'Always show file extensions' `
+    -Desc 'On: file names show .exe, .txt, .jpg and so on, which makes disguised files easier to spot. Off: Windows hides the extensions of known file types (the Windows default).' `
     -Parts @(
         pReg $adv 'HideFileExt' 0 1
     )
 
 $clsidMenu = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
-Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Preset -Explorer -Name 'Classic right-click menu (no "Show more options")' `
-    -Desc 'Brings back the full right-click menu of Windows 10 in File Explorer and on the desktop, instead of Windows 11''s short menu with "Show more options". File Explorer restarts when this is applied, so open Explorer windows close for a moment. Only does something on Windows 11.' `
+Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Def 'Off' -Preset -Explorer -Name 'Classic right-click menu (no "Show more options")' `
+    -Desc 'On: File Explorer and the desktop show the full right-click menu of Windows 10 instead of Windows 11''s short menu with "Show more options". Off: the short Windows 11 menu (the default). File Explorer restarts when this is changed, so open Explorer windows close for a moment. Only does something on Windows 11.' `
     -Parts @(
         pKey "$clsidMenu\InprocServer32" $clsidMenu
     )
@@ -4442,21 +4469,21 @@ Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Preset -Explorer -Name 'Classic ri
 # The side pane entries are per-user switches (System.IsPinnedToNameSpaceTree = 0 in the entry's own class key); 0 hides, no value = Windows default.
 $clsidHome    = 'HKCU:\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}'
 $clsidGallery = 'HKCU:\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}'
-Add-Tweak -Id 'nav-home' -Cat $cExplorer -Preset -Explorer -Name 'Home removed from the File Explorer side pane' `
-    -Desc 'Hides "Home" (the first entry of the left-hand pane in File Explorer) for your account. File Explorer restarts when this is applied, so open Explorer windows close for a moment. It does not change where File Explorer opens: "File Explorer opens to This PC" does that. If "Show all folders" is switched on in File Explorer''s options, Home can still show. Turning this off brings Home back.' `
+Add-Tweak -Id 'nav-home' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Name 'Home in the File Explorer side pane' `
+    -Desc 'On: "Home" shows as the first entry of the left-hand pane in File Explorer. Off: it is hidden for your account. File Explorer restarts when this is changed, so open Explorer windows close for a moment. It does not change where File Explorer opens: "File Explorer opens to This PC" does that. If "Show all folders" is switched on in File Explorer''s options, Home can still show.' `
     -Parts @(
         pReg $clsidHome 'System.IsPinnedToNameSpaceTree' 0
     )
 
-Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Preset -Explorer -Name 'Gallery removed from the File Explorer side pane' `
-    -Desc 'Hides "Gallery" (the photo view of your Pictures folder, Windows 11 23H2 and newer) from the left-hand pane in File Explorer for your account. File Explorer restarts when this is applied, so open Explorer windows close for a moment. Your pictures are not touched. If "Show all folders" is switched on in File Explorer''s options, Gallery can still show. Turning this off brings Gallery back.' `
+Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Name 'Gallery in the File Explorer side pane' `
+    -Desc 'On: "Gallery" (the photo view of your Pictures folder, Windows 11 23H2 and newer) shows in the left-hand pane in File Explorer. Off: it is hidden for your account. File Explorer restarts when this is changed, so open Explorer windows close for a moment. Your pictures are not touched. If "Show all folders" is switched on in File Explorer''s options, Gallery can still show.' `
     -Parts @(
         pReg $clsidGallery 'System.IsPinnedToNameSpaceTree' 0
     )
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
-Add-Tweak -Id 'suggestions' -Cat $cLook -Preset -Name 'Disable ads, suggestions and auto-installed apps' `
-    -Desc 'No promoted apps in Start, no tips and suggestions on the lock screen or in Settings, no silently installed sponsored apps, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
+Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, suggestions and auto-installed apps' `
+    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. Off: none of that, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
@@ -4484,8 +4511,8 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Preset -Name 'Disable ads, suggestions 
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\UserProfileEngagement' 'ScoobeSystemSettingEnabled' 0 1
     )
 
-Add-Tweak -Id 'settings-promo' -Cat $cLook -Preset -Name 'Disable Copilot and Microsoft account cards in Settings' `
-    -Desc 'Hides the Microsoft account and Copilot subscription cards on the Settings home page and turns off the cloud-optimized suggestions Windows pulls in. Both policies are only obeyed by Enterprise and Education, so on Home and Pro this setting is shown as not available.' `
+Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and Microsoft account cards in Settings' `
+    -Desc 'On: the Microsoft account and Copilot subscription cards show on the Settings home page, and Windows pulls in cloud-optimized suggestions. Off: both are hidden. Both policies are only obeyed by Enterprise and Education, so on Home and Pro this setting is shown as not available.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableConsumerAccountStateContent' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableCloudOptimizedContent' 1)
@@ -4493,8 +4520,8 @@ Add-Tweak -Id 'settings-promo' -Cat $cLook -Preset -Name 'Disable Copilot and Mi
 
 $wsch = "$pol\Windows Search"
 $ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
-Add-Tweak -Id 'search-web' -Cat $cLook -Preset -Name 'Disable web and cloud results in Start search' `
-    -Desc 'Start search only looks on this PC: no Bing results, no cloud account search, no search highlights, no search history on the device.' `
+Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and cloud results in Start search' `
+    -Desc 'On: Start search also shows Bing results, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
@@ -4510,16 +4537,16 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Preset -Name 'Disable web and cloud resu
     )
 
 # ------------------------------------------------------------------ AI ---------
-Add-Tweak -Id 'copilot' -Cat $cAi -Preset -Explorer -Name 'Disable Copilot' `
-    -Desc 'Turns the old Windows Copilot side panel off by policy (Microsoft has marked that policy as deprecated) and hides the Copilot button on the taskbar. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
+Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilot' `
+    -Desc 'On: the old Windows Copilot side panel and the Copilot button on the taskbar are available. Off: the side panel is turned off by policy and the taskbar button is hidden. Microsoft has marked that policy as deprecated. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
     -Parts @(
         pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
         pReg $adv 'ShowCopilotButton' 0 1
     )
 
-Add-Tweak -Id 'recall' -Cat $cAi -Preset -Reboot -Name 'Disable Recall, Click to Do and Settings AI search' `
-    -Desc 'Turns off Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings by policy. On Copilot+ PCs it also removes the Recall optional feature and switches off the Windows AI Fabric service. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
+Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, Click to Do and Settings AI search' `
+    -Desc 'On: Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings are left to Windows. Off: all of them are turned off by policy. On Copilot+ PCs the Recall optional feature is also removed and the Windows AI Fabric service is switched off. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
     -Parts @(
         pReg "$pol\WindowsAI" 'DisableAIDataAnalysis' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
@@ -4532,8 +4559,8 @@ Add-Tweak -Id 'recall' -Cat $cAi -Preset -Reboot -Name 'Disable Recall, Click to
     )
 
 $paintPol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'
-Add-Tweak -Id 'ai-apps' -Cat $cAi -Preset -Risk 'note' -Name 'Disable AI features in Notepad and Paint' `
-    -Desc 'Turns off Notepad''s AI features (Rewrite, Summarize, Write) and Paint''s Image Creator, Cocreator and Generative Fill by policy. Paint''s "Generative erase" and "Remove background" cannot be turned off this way. A few Windows builds have refused to start Paint while Image Creator is blocked; if that happens, switch this off again and restart.' `
+Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI features in Notepad and Paint' `
+    -Desc 'On: Notepad''s AI features (Rewrite, Summarize, Write) and Paint''s Image Creator, Cocreator and Generative Fill are available. Off: they are turned off by policy. Paint''s "Generative erase" and "Remove background" cannot be turned off this way. A few Windows builds have refused to start Paint while Image Creator is blocked; if that happens, switch this back on and restart.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\WindowsNotepad' 'DisableAIFeatures' 1
         pReg $paintPol 'DisableImageCreator' 1
@@ -4541,36 +4568,36 @@ Add-Tweak -Id 'ai-apps' -Cat $cAi -Preset -Risk 'note' -Name 'Disable AI feature
         pReg $paintPol 'DisableGenerativeFill' 1
     )
 
-Add-Tweak -Id 'ai-generative' -Cat $cAi -Preset -Name 'Apps cannot use Windows'' text and image generation' `
-    -Desc 'Sets the "Text and image generation" and "System AI models" privacy settings (Settings > Privacy and security) to Deny for every app, by policy, so an app cannot switch them back on. It only concerns Windows'' own AI features; ordinary apps and games are not touched.' `
+Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Text and image generation for apps (Windows AI)' `
+    -Desc 'On: apps can use Windows'' text and image generation and system AI models. The "Text and image generation" and "System AI models" privacy settings in Settings > Privacy and security are left to you. Off: text and image generation and system AI models are set to Deny for every app, by policy. An app cannot switch them back on. It only concerns Windows'' own AI features; ordinary apps and games are not touched.' `
     -Parts @(
         pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
         pReg "$pol\AppPrivacy" 'LetAppsAccessSystemAIModels' 2
     )
 
-Add-Tweak -Id 'ai-voice' -Cat $cAi -Preset -Name 'Disable voice activation (wake word)' `
-    -Desc 'Apps can no longer be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also not from the lock screen. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it.' `
+Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activation (wake word)' `
+    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it.' `
     -Parts @(
         pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2
         pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
         pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps' 'AgentActivationEnabled' 0 1
     )
 
-Add-Tweak -Id 'ai-core' -Cat $cAi -OneWay -Risk 'note' -Name 'Windows AI core package removed' `
-    -Desc 'Removes MicrosoftWindows.Client.CoreAI, the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Windows treats it as part of the system, so this app first marks it as end of life for your account, which is the way Windows allows such a package to be removed, and then removes it for all users and from the list of apps new accounts get. On a PC that does not have it, the setting reads as done and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
+Add-Tweak -Id 'ai-core' -Cat $cAi -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Windows AI core package' `
+    -Desc 'On: MicrosoftWindows.Client.CoreAI is installed; it is the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Off: the package is removed. Windows treats it as part of the system, so this app first marks it as end of life for your account, which is the way Windows allows such a package to be removed, and then removes it for all users and from the list of apps new accounts get. On a PC that does not have it, the setting reads as off and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
     -Parts @(
         pCustom 'AiCore' 'marks MicrosoftWindows.Client.CoreAI as end of life for your account (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife), removes it for all users and from the apps new accounts get    (cannot be undone from here)'
     )
 
-Add-Tweak -Id 'ai-page' -Cat $cAi -Preset -Name 'Settings: AI components page hidden' `
-    -Desc 'Hides the "AI components" page in Settings (System > AI components, on the Windows versions that have it) by adding it to the list of Settings pages that policy hides. Pages that are already in that list stay in it. The AI features themselves are not changed, the page only stops being shown. Undo takes just that page off the list again. If Settings on this PC is limited to a "showonly" list of pages, this setting reads as not available.' `
+Add-Tweak -Id 'ai-page' -Cat $cAi -Inv -Def 'On' -Preset -Name 'AI components page in Settings' `
+    -Desc 'On: the "AI components" page shows in Settings (System > AI components, on the Windows versions that have it). Off: it is hidden by adding it to the list of Settings pages that policy hides. Pages that are already in that list stay in it. The AI features themselves are not changed, the page only stops being shown. Switching it back on takes just that page off the list again. If Settings on this PC is limited to a "showonly" list of pages, this setting reads as not available.' `
     -Parts @(
         pCustom 'SettingsHide' 'adds aicomponents to the hide: list in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\SettingsPageVisibility and leaves every other page in that list as it is    (undo: takes only aicomponents out again)' 'aicomponents'
     )
 
 # ----------------------------------------------------------------- Edge --------
-Add-Tweak -Id 'edge-ai' -Cat $cEdge -Preset -Name 'Edge: disable Copilot sidebar and recommendations' `
-    -Desc 'Turns off Edge''s sidebar, Copilot page context, Microsoft 365 Copilot icon, shopping assistant and recommendations.' `
+Add-Tweak -Id 'edge-ai' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: Copilot sidebar and recommendations' `
+    -Desc 'On: Edge''s sidebar, Copilot page context, Microsoft 365 Copilot icon, shopping assistant and recommendations are available. Off: all of them are turned off by policy.' `
     -Parts @(
         pReg $edge 'HubsSidebarEnabled' 0
         pReg $edge 'CopilotPageContext' 0
@@ -4579,8 +4606,8 @@ Add-Tweak -Id 'edge-ai' -Cat $cEdge -Preset -Name 'Edge: disable Copilot sidebar
         pReg $edge 'EdgeShoppingAssistantEnabled' 0
     )
 
-Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Preset -Name 'Edge: disable AI writing help, history search and local AI model' `
-    -Desc 'Turns off Edge''s Rewrite writing assistant, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search and the built-in AI interfaces for websites. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
+Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: AI writing help, history search and local AI model' `
+    -Desc 'On: Edge''s extra AI features are available. These are Rewrite, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search and the built-in AI interfaces for websites. Off: all of those AI features are turned off. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
     -Parts @(
         pReg $edge 'ComposeInlineEnabled' 0
         pReg $edge 'EdgeHistoryAISearchEnabled' 0
@@ -4594,15 +4621,15 @@ Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Preset -Name 'Edge: disable AI writing
         pReg $edge 'GenAILocalFoundationalModelSettings' 1
     )
 
-Add-Tweak -Id 'edge-bg' -Cat $cEdge -Preset -Name 'Edge: no startup boost or background running' `
-    -Desc 'Edge does not pre-load at sign-in and does not keep running after you close it.' `
+Add-Tweak -Id 'edge-bg' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: startup boost and background running' `
+    -Desc 'On: Edge pre-loads at sign-in and keeps running after you close it. Off: it does neither.' `
     -Parts @(
         pReg $edge 'StartupBoostEnabled' 0
         pReg $edge 'BackgroundModeEnabled' 0
     )
 
-Add-Tweak -Id 'edge-tele' -Cat $cEdge -Preset -Name 'Edge: disable telemetry and sync' `
-    -Desc 'Turns off Edge usage reporting, personalisation reporting, diagnostic data, feedback, and Edge profile sync.' `
+Add-Tweak -Id 'edge-tele' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: telemetry and sync' `
+    -Desc 'On: Edge sends usage reporting, personalisation reporting, diagnostic data and feedback, and syncs your profile. Off: all of that is turned off.' `
     -Parts @(
         pReg $edge 'MetricsReportingEnabled' 0
         pReg $edge 'PersonalizationReportingEnabled' 0
@@ -4612,8 +4639,8 @@ Add-Tweak -Id 'edge-tele' -Cat $cEdge -Preset -Name 'Edge: disable telemetry and
         pReg $edge 'SendSiteInfoToImproveServices' 0
     )
 
-Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Preset -Name 'Edge: disable first-run page, rewards, shortcuts and other nags' `
-    -Desc 'Sets these Edge policies: no first-run welcome page, no desktop shortcut made when Edge updates, Do Not Track on (sites may ignore it), no suggestions on error pages, Collections off, no Insider promotion, no Microsoft Rewards, no web widget, no asset delivery service (Microsoft content pushed to Edge), no donation prompt in Wallet and no "make Edge your default browser" campaigns. Edge shows "Managed by your organization" while any policy is set. Undo removes the policies.' `
+Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: first-run page, rewards, shortcuts and other nags' `
+    -Desc 'On: Edge shows its first-run page, promotions and other extras, as it does by default. That is the first-run welcome page, a desktop shortcut made when it updates, suggestions on error pages, Collections, Insider promotion, Microsoft Rewards, the web widget, Microsoft content pushed to Edge, the donation prompt in Wallet and "make Edge your default browser" campaigns. Off: Edge policies turn all of those off and Do Not Track is set on (sites may ignore it). Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
     -Parts @(
         pReg $edge 'HideFirstRunExperience' 1
         pReg $edge 'ConfigureDoNotTrack' 1
@@ -4628,59 +4655,59 @@ Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Preset -Name 'Edge: disable first-run 
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0
     )
 
-Add-Tweak -Id 'edge-upd' -Cat $cEdge -Preset -Name 'Edge update services run only on demand' `
-    -Desc 'Sets the Edge update and elevation services to Manual. Edge still updates itself through its scheduled update tasks, so the "Microsoft Edge Update" process still shows up in the background list; the next setting stops those tasks too.' `
+Add-Tweak -Id 'edge-upd' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge update services start with Windows' `
+    -Desc 'On: the Edge update and elevation services start with Windows, the way Windows ships them. Off: they are set to Manual, so they start on demand. Edge still updates itself through its scheduled update tasks, so the "Microsoft Edge Update" process still shows up in the background list; "Edge background update tasks" stops those tasks too.' `
     -Parts @(
         pSvc 'edgeupdate' 'Manual' 'AutomaticDelayed'
         pSvc 'edgeupdatem' 'Manual' 'Manual'
         pSvc 'MicrosoftEdgeElevationService' 'Manual' 'Manual'
     )
 
-Add-Tweak -Id 'edge-tasks' -Cat $cEdge -Preset -Risk 'note' -Name 'Disable Edge background update tasks' `
-    -Desc 'Stops Edge Update from starting at sign-in and every hour (its two scheduled tasks), which keeps the "Microsoft Edge Update" process out of your background list. Edge, and the WebView2 component that many apps use, then stop getting background updates, so only turn this on if you do not use Edge.' `
+Add-Tweak -Id 'edge-tasks' -Cat $cEdge -Inv -Def 'On' -Preset -Risk 'note' -Name 'Edge background update tasks' `
+    -Desc 'On: Edge Update starts at sign-in and every hour (its two scheduled tasks are enabled). Off: both tasks are disabled, which keeps the "Microsoft Edge Update" process out of your background list. Edge, and the WebView2 component that many apps use, then stop getting background updates, so only switch this off if you do not use Edge.' `
     -Parts @(
         pTaskDyn '\' 'MicrosoftEdgeUpdateTask' 'scheduled tasks \MicrosoftEdgeUpdateTask* (Edge Update, at sign-in and hourly): off    (undo: on)'
     )
 
 # ----------------------------------------------------------------- Apps --------
-Add-Tweak -Id 'apps-ai' -Cat $cApps -OneWay -Name 'Copilot and Cortana apps' `
-    -Desc 'Removes the Copilot app and the Cortana app for all users.' `
+Add-Tweak -Id 'apps-ai' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Copilot and Cortana apps' `
+    -Desc 'On: the Copilot app and the Cortana app are installed. Off: both are removed for all users. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.Copilot', 'Microsoft.Windows.Ai.Copilot.Provider', 'Microsoft.549981C3F5F10'
     )
 
-Add-Tweak -Id 'apps-news' -Cat $cApps -OneWay -Name 'News, Weather, Maps and Bing Search apps' `
-    -Desc 'Removes the Bing News, Weather, Search and Windows Maps apps.' `
+Add-Tweak -Id 'apps-news' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'News, Weather, Maps and Bing Search apps' `
+    -Desc 'On: the Bing News, Weather, Search and Windows Maps apps are installed. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.BingNews', 'Microsoft.BingWeather', 'Microsoft.BingSearch', 'Microsoft.WindowsMaps'
     )
 
-Add-Tweak -Id 'apps-mail' -Cat $cApps -OneWay -Name 'Mail, Calendar, Outlook, People and Teams' `
-    -Desc 'Removes the Mail and Calendar app, the new Outlook, People, and the Teams chat apps.' `
+Add-Tweak -Id 'apps-mail' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Mail, Calendar, Outlook, People and Teams' `
+    -Desc 'On: the Mail and Calendar app, the new Outlook, People, and the Teams chat apps are installed. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'microsoft.windowscommunicationsapps', 'Microsoft.OutlookForWindows', 'Microsoft.People', 'MSTeams', 'MicrosoftTeams'
     )
 
-Add-Tweak -Id 'apps-phone' -Cat $cApps -OneWay -Name 'Phone Link and Cross Device' `
-    -Desc 'Removes the Phone Link (Your Phone) and Cross Device apps.' `
+Add-Tweak -Id 'apps-phone' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Phone Link and Cross Device' `
+    -Desc 'On: the Phone Link (Your Phone) and Cross Device apps are installed. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.YourPhone', 'MicrosoftWindows.CrossDevice'
     )
 
-Add-Tweak -Id 'apps-media' -Cat $cApps -OneWay -Risk 'note' -Name 'Media Player and Movies & TV' `
-    -Desc 'Removes the ZuneMusic and ZuneVideo packages. On Windows 11, ZuneMusic IS the Media Player app, so Media Player goes too.' `
+Add-Tweak -Id 'apps-media' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Media Player and Movies & TV' `
+    -Desc 'On: the ZuneMusic and ZuneVideo packages are installed. On Windows 11, ZuneMusic IS the Media Player app. Off: both are removed, so Media Player goes too. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo'
     )
 
-Add-Tweak -Id 'apps-notes' -Cat $cApps -OneWay -Name 'Sticky Notes, To Do, OneNote, Whiteboard and Power Automate' `
-    -Desc 'Removes the Sticky Notes, Microsoft To Do, OneNote, Whiteboard and Power Automate apps.' `
+Add-Tweak -Id 'apps-notes' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sticky Notes, To Do, OneNote, Whiteboard and Power Automate' `
+    -Desc 'On: the Sticky Notes, Microsoft To Do, OneNote, Whiteboard and Power Automate apps are installed. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.MicrosoftStickyNotes', 'Microsoft.Todos', 'Microsoft.Office.OneNote', 'Microsoft.Whiteboard', 'Microsoft.PowerAutomateDesktop'
     )
 
-Add-Tweak -Id 'apps-extras' -Cat $cApps -OneWay -Name 'Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras' `
-    -Desc 'Removes Get Help, Tips, Feedback Hub, Dev Home, the Microsoft 365 hub, Solitaire Collection, Clipchamp, 3D Viewer, Mixed Reality Portal, Print 3D, Paint 3D, Skype, OneConnect and Microsoft Family.' `
+Add-Tweak -Id 'apps-extras' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras' `
+    -Desc 'On: the extra apps that come with Windows are installed. These are Get Help, Tips, Feedback Hub, Dev Home, the Microsoft 365 hub, Solitaire Collection, Clipchamp, 3D Viewer, Mixed Reality Portal, Print 3D, Paint 3D, Skype, OneConnect and Microsoft Family. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.GetHelp', 'Microsoft.Getstarted', 'Microsoft.WindowsFeedbackHub', 'Microsoft.Windows.DevHome',
               'Microsoft.MicrosoftOfficeHub', 'Microsoft.MicrosoftSolitaireCollection', 'Clipchamp.Clipchamp',
@@ -4688,89 +4715,89 @@ Add-Tweak -Id 'apps-extras' -Cat $cApps -OneWay -Name 'Help, Tips, Feedback Hub,
               'Microsoft.SkypeApp', 'Microsoft.OneConnect', 'MicrosoftCorporationII.MicrosoftFamily'
     )
 
-Add-Tweak -Id 'apps-widgets' -Cat $cApps -OneWay -Name 'Widgets (Windows Web Experience Pack)' `
-    -Desc 'Removes the Widgets panel completely. If you only want to hide the button, use "Disable Widgets and Chat taskbar buttons" instead, which can be undone.' `
+Add-Tweak -Id 'apps-widgets' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Widgets (Windows Web Experience Pack)' `
+    -Desc 'On: the Widgets panel is installed. Off: it is removed completely. If you only want to hide the button, use "Widgets and Chat taskbar buttons" instead, which can be switched back on. The panel cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'MicrosoftWindows.Client.WebExperience'
     )
 
-Add-Tweak -Id 'apps-promo' -Cat $cApps -OneWay -Risk 'note' -Name 'Pre-installed promo apps (LinkedIn, Disney+, Spotify, TikTok...)' `
-    -Desc 'Removes LinkedIn, Disney+, Spotify, TikTok, Instagram, Facebook, Twitter, Netflix, Amazon / Prime Video, Hulu, Candy Crush, Duolingo, Flipboard, McAfee and Norton by name. Careful: this also removes the Microsoft Store versions of those apps if you installed them yourself. Games such as Roblox are not touched.' `
+Add-Tweak -Id 'apps-promo' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Pre-installed promo apps (LinkedIn, Disney+, Spotify, TikTok...)' `
+    -Desc 'On: the promo apps that come with Windows stay installed. Off: the promo apps that come with Windows are removed by name. These are LinkedIn, Disney+, Spotify, TikTok, Instagram, Facebook, Twitter, Netflix, Amazon / Prime Video, Hulu, Candy Crush, Duolingo, Flipboard, McAfee and Norton. Careful: this also removes the Microsoft Store versions of those apps if you installed them yourself. Games such as Roblox are not touched. They cannot be switched back on from here.' `
     -Parts @(
         pAppx '*LinkedIn*', '*Disney*', '*Spotify*', '*TikTok*', '*Instagram*', '*Facebook*', '*Twitter*', '*Netflix*', '*Amazon*',
               '*PrimeVideo*', '*Hulu*', '*CandyCrush*', '*Duolingo*', '*Flipboard*', '*McAfee*', '*Norton*'
     )
 
-Add-Tweak -Id 'apps-dolby' -Cat $cApps -OneWay -Risk 'note' -Name 'Dolby Access' `
-    -Desc 'Removes the Dolby Access app only (not the Dolby audio drivers). Without it Dolby Atmos for headphones and home theatre stops working, so leave this off if you use Atmos.' `
+Add-Tweak -Id 'apps-dolby' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Dolby Access' `
+    -Desc 'On: the Dolby Access app is installed. Off: it is removed (the Dolby audio drivers are not). Without it Dolby Atmos for headphones and home theatre stops working, so leave this on if you use Atmos. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'DolbyLaboratories.DolbyAccess'
     )
 
-Add-Tweak -Id 'apps-gamebar' -Cat $cApps -OneWay -Risk 'note' -Name 'Game Bar app' `
-    -Desc 'Removes the Xbox Game Bar overlay (Win+G, the screenshot and recording widgets) and its speech-to-text overlay. The Xbox app and Game Pass are not touched; the next setting takes those out. Removing Game Bar can make an "ms-gamingoverlay" pop-up appear in some games or on controller buttons; "Disable Game Bar" under Gaming and performance is the usual fix. Get it back with winget install 9pfhdd62mxs1.' `
+Add-Tweak -Id 'apps-gamebar' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Game Bar app' `
+    -Desc 'On: the Xbox Game Bar overlay (Win+G, the screenshot and recording widgets) and its speech-to-text overlay are installed. Off: they are removed. The Xbox app and Game Pass are not touched; "Xbox app and Xbox sign-in" takes those out. Removing Game Bar can make an "ms-gamingoverlay" pop-up appear in some games or on controller buttons; switching off "Xbox Game Bar and background recording" under Gaming and performance is the usual fix. It cannot be switched back on from here; get it back with winget install 9pfhdd62mxs1.' `
     -Parts @(
         pAppx 'Microsoft.XboxGamingOverlay', 'Microsoft.XboxGameOverlay', 'Microsoft.XboxSpeechToTextOverlay'
     )
 
-Add-Tweak -Id 'apps-xbox' -Cat $cApps -OneWay -Risk 'note' -Name 'Xbox app and Xbox sign-in' `
-    -Desc 'Removes the Xbox app, Xbox Identity Provider and the Xbox sign-in dialog package. Breaks Game Pass, the Xbox app and Microsoft Store games. Game Bar is a separate setting above this one.' `
+Add-Tweak -Id 'apps-xbox' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Xbox app and Xbox sign-in' `
+    -Desc 'On: the Xbox app, Xbox Identity Provider and the Xbox sign-in dialog package are installed. Off: they are removed, which breaks Game Pass, the Xbox app and Microsoft Store games. Game Bar is a separate setting above this one. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.GamingApp', 'Microsoft.XboxIdentityProvider', 'Microsoft.Xbox.TCUI', 'Microsoft.XboxApp'
     )
 
-Add-Tweak -Id 'apps-store' -Cat $cApps -OneWay -Risk 'note' -Name 'Microsoft Store app' `
-    -Desc 'Removes the Microsoft Store app (this is the setting that works on every edition of Windows) and its purchase / engagement helpers. winget (App Installer) stays. Apps that come from the Store (for example NVIDIA Control Panel and Photos) stop receiving updates. Get it back later with  wsreset -i.' `
+Add-Tweak -Id 'apps-store' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Microsoft Store app' `
+    -Desc 'On: the Microsoft Store app and its purchase / engagement helpers are installed. Off: they are removed (this is the setting that works on every edition of Windows). winget (App Installer) stays. Apps that come from the Store (for example NVIDIA Control Panel and Photos) stop receiving updates. It cannot be switched back on from here; get it back later with  wsreset -i.' `
     -Parts @(
         pAppx 'Microsoft.WindowsStore', 'Microsoft.StorePurchaseApp', 'Microsoft.Services.Store.Engagement'
     )
 
-Add-Tweak -Id 'apps-clock' -Cat $cApps -OneWay -Name 'Clock app (alarms, timers, stopwatch)' `
-    -Desc 'Removes the Clock app (Microsoft.WindowsAlarms) for all users. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store if you want it.' `
+Add-Tweak -Id 'apps-clock' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Clock app (alarms, timers, stopwatch)' `
+    -Desc 'On: the Clock app (Microsoft.WindowsAlarms) is installed. Off: it is removed for all users. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store if you want it.' `
     -Parts @(
         pAppx 'Microsoft.WindowsAlarms'
     )
 
-Add-Tweak -Id 'apps-startexp' -Cat $cApps -OneWay -Name 'Start Experiences App' `
-    -Desc 'Removes the Start Experiences App (Microsoft.StartExperiencesApp) for all users. It is a Microsoft app listed under Installed apps; nothing else was found that depends on it, and a forum report says removing it harms nothing. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here.' `
+Add-Tweak -Id 'apps-startexp' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Start Experiences App' `
+    -Desc 'On: the Start Experiences App (Microsoft.StartExperiencesApp) is installed. Off: it is removed for all users. It is a Microsoft app listed under Installed apps; nothing else was found that depends on it, and a forum report says removing it harms nothing. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here.' `
     -Parts @(
         pAppx 'Microsoft.StartExperiencesApp'
     )
 
-Add-Tweak -Id 'apps-camera' -Cat $cApps -OneWay -Name 'Camera app' `
-    -Desc 'Removes the Camera app (Microsoft.WindowsCamera) for all users. Your webcam keeps working in other programs (browsers, Discord, Teams) and for Windows Hello; only the Camera app itself goes. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+Add-Tweak -Id 'apps-camera' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Camera app' `
+    -Desc 'On: the Camera app (Microsoft.WindowsCamera) is installed. Off: it is removed for all users. Your webcam keeps working in other programs (browsers, Discord, Teams) and for Windows Hello; only the Camera app itself goes. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.WindowsCamera'
     )
 
-Add-Tweak -Id 'apps-paint' -Cat $cApps -OneWay -Name 'Paint app' `
-    -Desc 'Removes the Paint app (Microsoft.Paint) for all users. Paint 3D is a different app and is removed by "Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras". If Paint is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+Add-Tweak -Id 'apps-paint' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Paint app' `
+    -Desc 'On: the Paint app (Microsoft.Paint) is installed. Off: it is removed for all users. Paint 3D is a different app and is removed by "Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras". If Paint is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.Paint'
     )
 
-Add-Tweak -Id 'apps-snip' -Cat $cApps -OneWay -Risk 'note' -Name 'Snipping Tool' `
-    -Desc 'Removes the Snipping Tool app (Microsoft.ScreenSketch) for all users. It is Windows'' own screenshot tool: the editing window that follows Win+Shift+S and what the Print Screen key opens go with it, so keep it if you use them. Screenshots from Steam, the NVIDIA overlay and other programs are not affected. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+Add-Tweak -Id 'apps-snip' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Snipping Tool' `
+    -Desc 'On: the Snipping Tool app (Microsoft.ScreenSketch) is installed. Off: it is removed for all users. It is Windows'' own screenshot tool: the editing window that follows Win+Shift+S and what the Print Screen key opens go with it, so keep it on if you use them. Screenshots from Steam, the NVIDIA overlay and other programs are not affected. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.ScreenSketch'
     )
 
-Add-Tweak -Id 'apps-recorder' -Cat $cApps -OneWay -Name 'Sound Recorder app' `
-    -Desc 'Removes the Sound Recorder app (Microsoft.WindowsSoundRecorder) for all users. Recording in other programs is not affected. If it is not on this PC the setting reads as done and nothing happens. It cannot be put back from here; install it again from the Microsoft Store.' `
+Add-Tweak -Id 'apps-recorder' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sound Recorder app' `
+    -Desc 'On: the Sound Recorder app (Microsoft.WindowsSoundRecorder) is installed. Off: it is removed for all users. Recording in other programs is not affected. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.WindowsSoundRecorder'
     )
 
-Add-Tweak -Id 'store-policy' -Cat $cApps -Name 'Disable Microsoft Store (policy and install service)' `
-    -Desc 'Sets the "Turn off the Store application" policy and disables the Microsoft Store Install Service. Only Enterprise and Education editions honour the policy; on Home and Pro Windows ignores it, but the service part works on every edition and stops Store installs and updates. To make the Store app itself disappear, use "Microsoft Store app" above. Fully reversible.' `
+Add-Tweak -Id 'store-policy' -Cat $cApps -Inv -Def 'On' -Name 'Microsoft Store (policy and install service)' `
+    -Desc 'On: the Microsoft Store and its Install Service work as Windows has them. Off: the "Turn off the Store application" policy is set and the Microsoft Store Install Service is disabled. Only Enterprise and Education editions honour the policy; on Home and Pro Windows ignores it, but the service part works on every edition and stops Store installs and updates. To make the Store app itself disappear, use "Microsoft Store app" above. Fully reversible.' `
     -Parts @(
         pEd 'Ent' (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'RemoveWindowsStore' 1)
         pSvc 'InstallService' 'Disabled' 'Manual'
     )
 
 # --------------------------------------------------------------- Legacy --------
-Add-Tweak -Id 'legacy' -Cat $cLegacy -Reboot -Name 'Internet Explorer mode, Steps Recorder, Work Folders and Fax' `
-    -Desc 'Removes four legacy components. Turning this off adds them back from Windows Update (internet connection needed).' `
+Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Internet Explorer mode, Steps Recorder, Work Folders and Fax' `
+    -Desc 'On: the four legacy components are installed. Off: they are removed. Switching them back on adds them again from Windows Update (internet connection needed).' `
     -Parts @(
         pCap 'Browser.InternetExplorer*'
         pCap 'App.StepsRecorder*'
@@ -4781,107 +4808,107 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Reboot -Name 'Internet Explorer mode, Step
 # Settings taken from other debloat scripts that have not been proven to matter for gaming. They live on their own page, are not part
 # of the Recommended preset and are left out of "Apply all" and "Turn all on" on "All settings" (the Testing page's own buttons take them).
 # Every service and every scheduled task is its own card, so any one of them can be turned back on without touching the others.
-Add-Tweak -Id 'mouse-keys' -Cat $cTest -Preset -Name 'Disable Mouse Keys shortcut (Left Alt + Left Shift + Num Lock)' `
-    -Desc 'Stops the "Do you want to turn on Mouse Keys?" window and its beeps that appear when Left Alt, Left Shift and Num Lock are pressed together, which is easy to hit in a game. Only the shortcut is turned off; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so it works from your next sign-in, not in the session that is open now.' `
+Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut (Left Alt + Left Shift + Num Lock)' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '186' '190' 'String'
     )
 
-Add-Tweak -Id 'contrast-keys' -Cat $cTest -Preset -Name 'Disable High Contrast shortcut (Left Alt + Left Shift + Print Screen)' `
-    -Desc 'Stops the "Do you want to turn on High Contrast?" window that appears when Left Alt, Left Shift and Print Screen are pressed together. Only the shortcut is turned off; High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so it works from your next sign-in, not in the session that is open now.' `
+Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut (Left Alt + Left Shift + Print Screen)' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off. Only the shortcut is affected; High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '122' '126' 'String'
     )
 
-Add-Tweak -Id 'audio-ducking' -Cat $cTest -Name 'Disable Windows volume ducking (Sound > Communications: Do nothing)' `
-    -Desc 'By default Windows turns the volume of other sounds down by 80% when it sees a call or voice chat start. This sets Sound > Communications to "Do nothing", so a game keeps its full volume while you talk. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio. Turning it off puts the Windows default back (reduce by 80%).' `
+Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking (Sound > Communications)' `
+    -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3
     )
 
-Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Risk 'note' -Name 'Disable Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
-    -Desc 'Turns off Windows Automatic Maintenance, the job that wakes up while the PC is idle and starts background tasks such as Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up. With it off those tasks do not start on their own schedule; you can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update, so look again after one.' `
+Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
+    -Desc 'On: Windows Automatic Maintenance runs background tasks while the PC is idle. These are Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up. Off: those tasks do not start on their own schedule. You can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update, so look again after one.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
     )
 
 $clsidCmdA = 'HKCU:\Software\Classes\CLSID\{2aa9162e-c906-4dd9-ad0b-3d24a8eef5a0}'
 $clsidCmdB = 'HKCU:\Software\Classes\CLSID\{6480100b-5a83-4d1e-9f69-8ae5a88e9a33}'
-Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar (instead of the Windows 11 command bar)' `
-    -Desc 'Tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is applied; if it still looks the same, sign out and in. Turning this off removes the two blocks and the Windows 11 command bar comes back. It is on the Testing page for that reason.' `
+Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Def 'Off' -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar (instead of the Windows 11 command bar)' `
+    -Desc 'On: tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Off: the Windows 11 command bar (the default). Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is changed; if it still looks the same, sign out and in. It is on the Testing page for that reason.' `
     -Parts @(
         pKey "$clsidCmdA\InprocServer32" $clsidCmdA
         pKey "$clsidCmdB\InprocServer32" $clsidCmdB
     )
 
-Add-Tweak -Id 'svc-smsrouter' -Cat $cTest -Name 'Disable SMS Router service (SmsRouter)' `
-    -Desc 'Sends text messages (SMS) to the right app. It is only used with a mobile-broadband modem or a phone link that carries texts; a desktop PC does not use it. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-smsrouter' -Cat $cTest -Inv -Def 'On' -Name 'SMS Router service (SmsRouter)' `
+    -Desc 'On: the service that sends text messages (SMS) to the right app is enabled (Manual, as Windows has it). Off: it is set to Disabled. It is only used with a mobile-broadband modem or a phone link that carries texts; a desktop PC does not use it.' `
     -Parts @(
         pSvc 'SmsRouter' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-wallet' -Cat $cTest -Name 'Disable Wallet service (WalletService)' `
-    -Desc 'Used by the Wallet feature for payment cards, tickets and passes. A desktop gaming PC does not use it. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-wallet' -Cat $cTest -Inv -Def 'On' -Name 'Wallet service (WalletService)' `
+    -Desc 'On: the Wallet service, used for payment cards, tickets and passes, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop gaming PC does not use it.' `
     -Parts @(
         pSvc 'WalletService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-scpolicy' -Cat $cTest -Risk 'note' -Name 'Disable Smart Card Removal Policy service (SCPolicySvc)' `
-    -Desc 'Locks the PC or signs you out when a smart card is pulled out of its reader. It only matters if you sign in with a smart card. The other two smart-card services are in "Disable smart card services" on the "Other Windows services" page; this one is separate so it can be switched on its own. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-scpolicy' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Smart Card Removal Policy service (SCPolicySvc)' `
+    -Desc 'On: the service that locks the PC or signs you out when a smart card is pulled out of its reader is enabled (Manual, as Windows has it). Off: it is set to Disabled. It only matters if you sign in with a smart card. The other two smart-card services are in "Smart card services" on the "Other Windows services" page; this one is separate so it can be switched on its own.' `
     -Parts @(
         pSvc 'SCPolicySvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-spotverifier' -Cat $cTest -Risk 'note' -Name 'Disable Spot Verifier service (svsvc)' `
-    -Desc 'Checks a drive for file-system damage in the background when Windows has noticed a problem with it. With it off that automatic follow-up check does not run; you can still run a check yourself (chkdsk). Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-spotverifier' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Spot Verifier service (svsvc)' `
+    -Desc 'On: the service that checks a drive for damage after Windows notices a problem is enabled (Manual, the default). Off: it is set to Disabled, so that automatic check does not run. You can still run a check yourself (chkdsk).' `
     -Parts @(
         pSvc 'svsvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-biometric' -Cat $cTest -Risk 'note' -Name 'Disable Windows Biometric Service (WbioSrvc)' `
-    -Desc 'Needed for fingerprint and face sign-in (Windows Hello). A PIN or a password does not use it. Leave this one on if you sign in with a fingerprint reader or a face camera. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-biometric' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Windows Biometric Service (WbioSrvc)' `
+    -Desc 'On: the service behind fingerprint and face sign-in (Windows Hello) is enabled (Manual, as Windows has it). Off: it is set to Disabled. A PIN or a password does not use it. Leave this on if you sign in with a fingerprint reader or a face camera.' `
     -Parts @(
         pSvc 'WbioSrvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-sensormon' -Cat $cTest -Name 'Disable Sensor Monitoring service (SensrSvc)' `
-    -Desc 'Watches sensors such as ambient light and screen orientation for automatic brightness and rotation. A desktop PC with a normal monitor does not have them. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-sensormon' -Cat $cTest -Inv -Def 'On' -Name 'Sensor Monitoring service (SensrSvc)' `
+    -Desc 'On: the service that watches sensors such as ambient light and screen orientation, for automatic brightness and rotation, is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
     -Parts @(
         pSvc 'SensrSvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-sensordata' -Cat $cTest -Name 'Disable Sensor Data service (SensorDataService)' `
-    -Desc 'Passes the readings of those sensors on to apps. A desktop PC with a normal monitor does not have them. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-sensordata' -Cat $cTest -Inv -Def 'On' -Name 'Sensor Data service (SensorDataService)' `
+    -Desc 'On: the service that passes sensor readings on to apps is enabled (Manual, as Windows has it). Off: it is set to Disabled. A desktop PC with a normal monitor does not have those sensors.' `
     -Parts @(
         pSvc 'SensorDataService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-mixedreality' -Cat $cTest -Name 'Disable Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
-    -Desc 'Only used by Windows Mixed Reality headsets; other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available. Turning it off sets the service to Disabled; turning it back on returns it to Manual.' `
+Add-Tweak -Id 'svc-mixedreality' -Cat $cTest -Inv -Def 'On' -Name 'Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
+    -Desc 'On: the service used by Windows Mixed Reality headsets is enabled (Manual, as Windows has it). Off: it is set to Disabled. Other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available.' `
     -Parts @(
         pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'task-sqm' -Cat $cTest -Name 'Disable scheduled task: Software Quality Metrics (PI\Sqm-Tasks)' `
-    -Desc 'A scheduled task that gathers software-quality and reliability data for Microsoft. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+Add-Tweak -Id 'task-sqm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics (PI\Sqm-Tasks)' `
+    -Desc 'On: the scheduled task that gathers software-quality and reliability data for Microsoft is enabled. Off: the task is disabled. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\PI\Sqm-Tasks'
     )
 
-Add-Tweak -Id 'task-maps' -Cat $cTest -Name 'Disable scheduled task: Maps update (Maps\MapsUpdateTask)' `
-    -Desc 'Downloads updates for offline maps used by the Maps app. It only matters if you use downloaded maps. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+Add-Tweak -Id 'task-maps' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Maps update (Maps\MapsUpdateTask)' `
+    -Desc 'On: the task that downloads updates for offline maps used by the Maps app is enabled. Off: the task is disabled. It only matters if you use downloaded maps. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
     )
 
-Add-Tweak -Id 'task-familysafety' -Cat $cTest -Name 'Disable scheduled task: Family Safety monitor (Shell\FamilySafetyMonitor)' `
-    -Desc 'Part of Microsoft Family Safety (parental controls and screen-time limits). It only matters if this PC is used by a child account in a Microsoft family group. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+Add-Tweak -Id 'task-familysafety' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Family Safety monitor (Shell\FamilySafetyMonitor)' `
+    -Desc 'On: the Microsoft Family Safety task (parental controls and screen-time limits) is enabled. Off: the task is disabled. It only matters if this PC is used by a child account in a Microsoft family group. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Shell\FamilySafetyMonitor'
     )
 
-Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Name 'Disable scheduled task: Power Efficiency Diagnostics (AnalyzeSystem)' `
-    -Desc 'Looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report. Nothing else depends on it. Turning it off disables the task; turning it back on enables it again. If this PC does not have the task the setting reads as not available.' `
+Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Power Efficiency Diagnostics (AnalyzeSystem)' `
+    -Desc 'On: the task that looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report, is enabled. Off: the task is disabled. Nothing else depends on it. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
     )
@@ -6119,7 +6146,8 @@ function Sync-StartupRows {
     $script:Rows = $fresh
 }
 
-# 'Apply' (turn on), 'Undo' (turn off) or '' (nothing to do) for one row
+# 'Apply' (move the setting to this app's position), 'Undo' (put the Windows default back) or '' (nothing to do) for one row.
+# What that does to the SWITCH depends on the setting: see Get-SwitchGoesOn.
 function Get-Action {
     param($row)
     if ($row.State -eq 'Checking' -or $row.State -eq 'NA') { return '' }
@@ -6163,11 +6191,7 @@ function Try-SetWant {
     $why = Test-CanChange $row
     if ($why) { return $why }
     if ((-not $want) -and $row.State -eq 'On' -and $row.T.OneWay) {
-        return ('"' + $row.T.Name + '" cannot be undone from here. Its description says how to get it back.')
-    }
-    # a switch that Windows has on by default, and this app has not changed: turning it off would put back what is already there
-    if ((-not $want) -and $row.State -eq 'On' -and $row.T.DefaultOn -and [string]$row.Mine -ne 'yes') {
-        return ('"' + $row.T.Name + '" is how Windows has it by default and this app has not changed it, so there is nothing to turn off.')
+        return ('"' + $row.T.Name + '" cannot be switched back on from here. Its description says how to get it back.')
     }
     if ($row.T.Choices) {
         # no single switch: "off" means the Windows default; "on" is not guessed, one of the options has to be picked
@@ -6209,13 +6233,19 @@ function Try-ForceUndo {
     if ($why) { return $why }
     if ($row.T.OneWay) { return ('"' + $row.T.Name + '" cannot be undone from here.') }
     if ($row.State -eq 'Off') { return 'It is not applied, so there is nothing to undo.' }
-    if ($row.State -eq 'On' -and $row.T.DefaultOn -and [string]$row.Mine -ne 'yes') { return ('"' + $row.T.Name + '" is how Windows has it by default and this app has not changed it, so there is nothing to undo.') }
     $row.Want = $false
     if ($row.T.Choices) { $row.Pick = 'default' }
     $row.Force = 'Undo'
     $row.Note = ''
     $row.NoteDetail = ''
     return ''
+}
+
+# A setting whose Windows default is the position the app applies (Game Mode on): switching it off turns the feature off for real
+# (an explicit value is written) instead of putting the Windows default back.
+function Test-OffIsExplicit {
+    param($t)
+    return ((-not [bool]$t.Inv) -and [string]$t.Def -eq 'On')
 }
 
 # Tick or untick everything in one group that the filter is showing. Returns how many rows changed.
@@ -6230,8 +6260,12 @@ function Set-GroupWant {
         if (-not $row.Visible) { continue }
         if ($row.T.Once) { continue }
         if ((Get-ApplyAllSkip $row $cat) -and ($want -or -not $cat)) { continue }
+        # "Reset all" puts the Windows default back. For a setting whose Windows default is the position the app applies (Game Mode on),
+        # that means making sure it is on: its off position turns the feature off for real, so it is not the default
+        $w = $want
+        if ((-not $want) -and (Test-OffIsExplicit $row.T)) { $w = $true }
         $before = Get-Action $row
-        if ((Try-SetWant $id $want) -eq '') {
+        if ((Try-SetWant $id $w) -eq '') {
             if ((Get-Action $row) -ne $before) { $changed++ }
         }
     }
@@ -6592,7 +6626,7 @@ function Get-Pending {
 }
 
 function Get-Counts {
-    $c = @{ Total = 0; On = 0; Off = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0 }
+    $c = @{ Total = 0; On = 0; Off = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
         $c.Total++
@@ -6607,27 +6641,39 @@ function Get-Counts {
         $a = Get-Action $row
         if ($a -eq 'Apply') { $c.Apply++ }
         if ($a -eq 'Undo') { $c.Undo++ }
+        if ($a -and -not $row.T.Choices) { if (Get-SwitchGoesOn $row.T ($a -eq 'Undo')) { $c.GoOn++ } else { $c.GoOff++ } }
     }
     return $c
 }
 
 # ---------------------------------------------------------------- the texts ----
 function Get-StateText {
+    # What the setting is now, in the words of the switch: "On" / "Off". 'Already on' / 'Already off' = it was like this before this
+    # app did anything (no undo record), so there is nothing of ours to take back.
     param($row)
+    $t = $row.T
+    $once = ($row.Once -or ($t -and $t.Once))
     switch ([string]$row.State) {
         'Checking' { return 'Checking...' }
         'On'       {
-            # 'Already applied' = it was like this before this app did anything (no undo record), so there is nothing of ours to take back
-            $w = 'Applied'; if ($row.Mine -eq 'no') { $w = 'Already applied' }
-            if ($row.T -and $row.T.Choices) { return ($w + ': ' + (Get-ChoiceLabel $row.T ([string]$row.Choice))) }
-            return $w
+            $already = ($row.Mine -eq 'no')
+            if ($t -and $t.Choices) { return ($(if ($already) { 'Already set: ' } else { 'Set: ' }) + (Get-ChoiceLabel $t ([string]$row.Choice))) }
+            if ($t) {
+                $w = 'Off'; if (Get-SwitchOn $t $true) { $w = 'On' }
+                if ($already) { $w = 'Already ' + $w.ToLower() }
+                return $w
+            }
+            if ($already) { return 'Already applied' }
+            return 'Applied'
         }
         'Off'      {
             # a run-once action is never "applied": it is ready to be run
-            if ($row.Once -or ($row.T -and $row.T.Once)) { return 'Ready to run' }
+            if ($once) { return 'Ready to run' }
+            if ($t -and $t.Choices) { return ('Windows default: ' + ((Get-ChoiceLabel $t 'default') -replace '\s*\(Windows default\)\s*$', '')) }
+            if ($t) { if (Get-SwitchOn $t $false) { return 'On' } else { return 'Off' } }
             return 'Not applied'
         }
-        'Partial'  { return 'Partly applied' }
+        'Partial'  { return 'Partly changed' }
         'NA'       { return 'Not on this PC' }
     }
     return 'Unknown'
@@ -6639,8 +6685,7 @@ function Get-NextText {
     $a = Get-Action $row
     if ($row.T.Choices -and $a) { return ('Set to ' + (Get-ChoiceLabel $row.T ([string]$row.Pick))) }
     if ($a -eq 'Apply' -and $row.T.Once) { return 'Run now' }
-    if ($a -eq 'Apply') { return 'Turn on' }
-    if ($a -eq 'Undo') { return 'Turn off' }
+    if ($a) { if (Get-SwitchGoesOn $row.T ($a -eq 'Undo')) { return 'Turn on' } else { return 'Turn off' } }
     return ''
 }
 
@@ -6659,7 +6704,7 @@ function Get-SummaryText {
     $s = ('{0} settings: {1} applied, {2} not applied' -f ($c.Total - $c.NA), $c.On, ($c.Off + $c.Partial + $c.Unknown))
     if ($c.NA -gt 0) { $s += (', {0} not on this PC' -f $c.NA) }
     if ($n -gt 0) {
-        $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.Apply, $c.Undo)
+        $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.GoOn, $c.GoOff)
     } else {
         $s += '.  Switch settings on or off to choose changes.'
     }
@@ -6714,7 +6759,7 @@ function Split-CatName {
         $short = $cat.Substring(0, $i)
         $hint = $cat.Substring($i + 2, $cat.Length - $i - 3)
     }
-    if ($hint -match '^(tick|switch on) = do not start') { $hint = 'Turn a switch on to stop that program starting with Windows' }
+    if ($hint -match '^switch off = does not start') { $hint = 'Turn a switch off to stop that program starting with Windows' }
     elseif ($hint.Length -gt 1) { $hint = $hint.Substring(0, 1).ToUpper() + $hint.Substring(1) }
     return @{ Short = $short; Hint = $hint }
 }
@@ -6742,10 +6787,19 @@ function Get-NavTitle {
 function Get-ShortDesc {
     param($t)
     $d = ([string]$t.Desc -replace '\s+', ' ').Trim()
-    $i = $d.IndexOf('. ')
-    if ($i -ge 20) { $d = $d.Substring(0, $i) }
-    $d = $d.TrimEnd('.')
-    if ($d.Length -gt 200) { $d = $d.Substring(0, 200) }
+    $m = [regex]::Match($d, '^On: (?<on>.+?) Off: (?<off>.+)$')
+    if ($m.Success) {
+        # a switch: what each position does, the first sentence of each
+        $a = $m.Groups['on'].Value; $b = $m.Groups['off'].Value
+        $i = $a.IndexOf('. '); if ($i -ge 10) { $a = $a.Substring(0, $i) }
+        $i = $b.IndexOf('. '); if ($i -ge 6) { $b = $b.Substring(0, $i) }
+        $d = 'On: ' + $a.TrimEnd('.') + '. Off: ' + $b.TrimEnd('.')
+    } else {
+        $i = $d.IndexOf('. ')
+        if ($i -ge 20) { $d = $d.Substring(0, $i) }
+        $d = $d.TrimEnd('.')
+    }
+    if ($d.Length -gt 200) { $d = $d.Substring(0, 197).TrimEnd() + '...' }
     return $d
 }
 
@@ -6782,12 +6836,14 @@ function Get-NotRecReason {
 function Get-CardTags {
     param($t)
     $tags = @((Get-NavTitle ([string]$t.Cat)))
+    # what the Windows default is, so the card shows whether the switch is on or off out of the box (a run-once action has none)
+    if ([string]$t.Def) { $tags = @(('Windows default: ' + [string]$t.Def)) + $tags }
     if ($t.Reboot) { $tags += 'Needs restart' }
     if ($t.OneWay) { $tags += 'One-way' }
     if ($t.Once) { $tags += 'Runs once' }
     if ($t.Ask) { $tags += 'Asks first' }
     # on the "Placebo Tweaks - Not Recommended" page the first tag already says it
-    if ($t.Unproven -and $tags[0] -ne 'Placebo Tweaks') { $tags += 'May do nothing' }
+    if ($t.Unproven -and (Get-NavTitle ([string]$t.Cat)) -ne 'Placebo Tweaks') { $tags += 'May do nothing' }
     if ($t.Preset) { $tags += 'Recommended preset' }
     return $tags
 }
@@ -6863,15 +6919,38 @@ function Get-DetailParts {
     [void]$p.Add(@{ S = 'title'; C = ''; T = $t.Name + $nl })
     [void]$p.Add(@{ S = 'sub'; C = ''; T = $t.Cat + $nl + $nl })
     [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
-    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no' -and $row.T.DefaultOn) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already on: this is how Windows has it by default (or you set it yourself). The app has not changed it, so there is nothing to turn off.' + $nl }) }
-    elseif ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already applied: Windows was already like this when the app looked, or you set it yourself. The app has not changed it. Turning it off still puts the Windows default back.' + $nl }) }
-    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Applied by this app: turning it off puts the Windows default back.' + $nl }) }
+    # the switch, in words: where it is now and what Windows has out of the box
+    if (-not $t.Once) {
+        if ($t.Choices) {
+            [void]$p.Add(@{ S = 'sub'; C = ''; T = ('Windows default: ' + (Get-ChoiceLabel $t 'default') + $nl) })
+        } elseif ($row.State -eq 'On' -or $row.State -eq 'Off') {
+            $sw = 'off'; if (Get-SwitchOn $t ($row.State -eq 'On')) { $sw = 'on' }
+            [void]$p.Add(@{ S = 'sub'; C = ''; T = ('Switch: ' + $sw + '.   Windows default: ' + [string]$t.Def + $nl) })
+        } else {
+            [void]$p.Add(@{ S = 'sub'; C = ''; T = ('Windows default: ' + [string]$t.Def + $nl) })
+        }
+    }
+    $explicit = (Test-OffIsExplicit $t)
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') {
+        $back = ' Switching it back puts the Windows default back.'
+        if ($explicit) { $back = ' Switching it off turns it off.' }
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Already like this: Windows was already set this way when the app looked, or you set it yourself. The app has not changed it.' + $back + $nl })
+    }
+    if ([string]$row.State -eq 'On' -and $row.Mine -eq 'yes') {
+        $back = 'switching it back puts the Windows default back.'
+        if ($explicit) { $back = 'switching it off turns it off.' }
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Set by this app: ' + $back + $nl })
+    }
     $a = Get-Action $row
     if ($t.Choices -and $a) {
         [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be set to "' + (Get-ChoiceLabel $t ([string]$row.Pick)) + '" when you press the button' + $(if ($a -eq 'Undo') { ' (the Windows default is put back)' } else { '' }) + $nl) })
     } elseif ($a -eq 'Apply' -and $t.Once) { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will run once when you press the button' + $nl }) }
-    elseif ($a -eq 'Apply') { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned ON when you press the button' + $nl }) }
-    elseif ($a -eq 'Undo')  { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will be turned OFF (the Windows default is put back) when you press the button' + $nl }) }
+    elseif ($a) {
+        $dir = 'OFF'; if (Get-SwitchGoesOn $t ($a -eq 'Undo')) { $dir = 'ON' }
+        $tail = ''
+        if ($a -eq 'Undo' -and -not $explicit) { $tail = ' (the Windows default is put back)' }
+        [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be turned ' + $dir + $tail + ' when you press the button' + $nl) })
+    }
     if ($row.NoteDetail) { [void]$p.Add(@{ S = 'last'; C = ''; T = 'Last result: ' + [string]$row.Note + ' - ' + [string]$row.NoteDetail + $nl }) }
     if ([string]$row.Read) {
         [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Read from your PC (the last check):' + $nl })
@@ -6880,14 +6959,14 @@ function Get-DetailParts {
     [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + $t.Desc + $nl + $nl })
     $nr = Get-NotRecReason $t
     if ($nr) { [void]$p.Add(@{ S = 'warn'; C = ''; T = ($script:NotRecText + ': ' + $nr) + $nl }) }
-    if ($t.Risk -eq 'security') { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this lowers a security protection. Read the description above before switching it on.' + $nl }) }
-    if ($t.Risk -eq 'note')     { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this has side effects. Read the description above before switching it on.' + $nl }) }
-    if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: this cannot be turned back on from this window.' + $nl }) }
+    if ($t.Risk -eq 'security') { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this lowers a security protection. Read the description above before you change it.' + $nl }) }
+    if ($t.Risk -eq 'note')     { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'Heads-up: this has side effects. Read the description above before you change it.' + $nl }) }
+    if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: once it is switched off it cannot be switched back on from this window.' + $nl }) }
     if ($t.Unproven) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'May have no effect: read the description above for why.' + $nl }) }
     if ($t.Reboot) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Needs a restart of the PC to take full effect.' + $nl }) }
-    if ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Turn all on or any preset.' + $nl }) }
+    if ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
-    else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (switch it on yourself if you want it).' + $nl }) }
+    else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (change it yourself if you want it).' + $nl }) }
     [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'What it changes:' + $nl })
     foreach ($l in @(Describe-Tweak $t)) { [void]$p.Add(@{ S = 'mono'; C = ''; T = '  ' + [string]$l + $nl }) }
     return $p
@@ -6950,9 +7029,12 @@ function Get-ConfirmText {
     param($Plan, [string]$Extra = '')
     $Plan = @($Plan)
     $nl = "`r`n"
-    $on = @($Plan | Where-Object { $_.Action -eq 'Apply' -and -not $script:ById[$_.Id].Once } | ForEach-Object { Get-PlanName $_ })
+    # "ON" / "OFF" are the positions the SWITCH goes to (a setting that turns its feature off when applied goes OFF when applied);
+    # a setting with options is listed with the option it is set to
+    $goesOn = { param($x) $tt = $script:ById[$x.Id]; if ($tt.Choices) { return ($x.Action -eq 'Apply') }; return [bool](Get-SwitchGoesOn $tt ($x.Action -eq 'Undo')) }
+    $on = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and (& $goesOn $_) } | ForEach-Object { Get-PlanName $_ })
     $run = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once } | ForEach-Object { $script:ById[$_.Id].Name })
-    $off = @($Plan | Where-Object { $_.Action -eq 'Undo' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $off = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and -not (& $goesOn $_) } | ForEach-Object { $script:ById[$_.Id].Name })
     $one = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].OneWay } | ForEach-Object { $script:ById[$_.Id].Name })
     $rb = @($Plan | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
     $s = ('Make {0} change(s) on this PC?' -f $Plan.Count) + $nl + $nl
@@ -6960,10 +7042,10 @@ function Get-ConfirmText {
     if ($on.Count)  { $s += ('Turn ON ({0}):' -f $on.Count) + $nl + (Format-NameList $on) + $nl }
     if ($run.Count) { $s += ('RUN once ({0}); files they delete are gone for good, they do not go to the Recycle Bin:' -f $run.Count) + $nl + (Format-NameList $run) + $nl }
     if ($off.Count) { $s += ('Turn OFF ({0}):' -f $off.Count) + $nl + (Format-NameList $off) + $nl }
-    if ($one.Count) { $s += ('These cannot be undone from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
+    if ($one.Count) { $s += ('These cannot be switched back on from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
     if ($rb.Count)  { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl + $nl }
     if (@($Plan | Where-Object { -not $script:ById[$_.Id].Once }).Count -gt 0) {
-        $s += 'A restore point is created first. Switching a setting off later puts the Windows default back.'
+        $s += 'A restore point is created first. Putting a setting back later restores the Windows default.'
     } else {
         $s += 'Nothing here can be undone, so no restore point is made.'
     }
@@ -6984,7 +7066,7 @@ function Get-NoteSections {
     if ($sec.Count)  { $s += ('These lower protection or turn a feature off ({0}):' -f $sec.Count) + $nl + (Format-NameList $sec 12) + $nl }
     if ($note.Count) { $s += ('These can stop something you use from working ({0}):' -f $note.Count) + $nl + (Format-NameList $note 40) + $nl }
     if ($dud.Count)  { $s += ('These may do nothing on your PC; each description says why ({0}):' -f $dud.Count) + $nl + (Format-NameList $dud 12) + $nl }
-    if ($start.Count) { $s += ('These programs will no longer start with Windows ({0}); switch one back off here or in Task Manager to let it start again:' -f $start.Count) + $nl + (Format-NameList $start 20) + $nl }
+    if ($start.Count) { $s += ('These programs will no longer start with Windows ({0}); switch one back on here or in Task Manager to let it start again:' -f $start.Count) + $nl + (Format-NameList $start 20) + $nl }
     return $s
 }
 
@@ -6994,7 +7076,7 @@ function Get-ApplyAllNote {
     $nl = "`r`n"
     $Plan = @($Plan)
     $apply = @($Plan | Where-Object { $_.Action -eq 'Apply' })
-    $s = ('APPLY ALL: this switches on every setting on "{0}" ({1} of them) in one go.' -f $Where, $apply.Count) + $nl
+    $s = ('APPLY ALL: this applies every setting on "{0}" ({1} of them) in one go. Each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on).' -f $Where, $apply.Count) + $nl
     $s += 'Read the list before you say yes. Each setting''s description says what it changes.' + $nl + $nl
     $s += Get-NoteSections $apply
     $lf = @($Left)
@@ -7021,7 +7103,7 @@ function Get-PresetNote {
     $Plan = @($Plan)
     $apply = @($Plan | Where-Object { $_.Action -eq 'Apply' })
     $name = [string]$script:PresetNames[$Key]
-    $s = ('{0}: this switches on {1} setting(s) in one go.' -f $name.ToUpper(), $apply.Count) + $nl
+    $s = ('{0}: this applies {1} setting(s) in one go. Each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on).' -f $name.ToUpper(), $apply.Count) + $nl
     if ($Key -eq 'advanced') {
         $s += 'Advanced Debloat is only recommended for PCs that are used mainly for gaming: it can remove services other uses need.' + $nl
     } elseif ($Key -eq 'personal') {
@@ -7230,16 +7312,22 @@ function Write-ConsoleList {
             if ($t.Cat -ne $cat) { continue }
             $st = Get-ConsoleState $States $t.Id
             $mine = ''; if ($States.ContainsKey($t.Id)) { $mine = [string]$States[$t.Id].Mine }
-            $text = Get-StateText @{ State = $st; Mine = $mine; Once = [bool]$t.Once }
+            $text = Get-StateText @{ State = $st; Mine = $mine; Once = [bool]$t.Once; T = $t; Choice = $(if ($States.ContainsKey($t.Id)) { [string]$States[$t.Id].Choice } else { '' }) }
             $col = 'Gray'
             if ($st -eq 'On') { $col = 'Green' }
             elseif ($st -eq 'Partial') { $col = 'Yellow' }
             elseif ($st -eq 'NA') { $col = 'DarkGray' }
-            $mark = ''; if ($t.OneWay) { $mark = '  [one-way]' }
+            # the switch: the Windows default, and where -Apply puts it
+            $mark = ''
+            if (-not $t.Once -and -not $t.Choices) {
+                $goes = 'off'; if (Get-SwitchGoesOn $t $false) { $goes = 'on' }
+                $mark = ('  [Windows default: {0}; -Apply turns it {1}]' -f $t.Def, $goes)
+            }
+            if ($t.OneWay) { $mark += '  [one-way]' }
             if ($t.Once) { $mark = '  [runs once when you use -Apply]' }
             if ($t.Choices) {
                 $opts = @($t.Choices | Where-Object { [string]$_.Key -ne 'default' } | ForEach-Object { [string]$_.Key })
-                $mark = '  [options: ' + ($opts -join ', ') + '; Windows default = off]'
+                $mark = '  [options: ' + ($opts -join ', ') + '; Windows default: ' + [string]$t.Def + ']'
                 $now = ''
                 if ($st -eq 'On' -and $States.ContainsKey($t.Id)) { $now = [string]$States[$t.Id].Choice }
                 if ($now) { $mark += '  [now: ' + $now + ']' }
@@ -7251,7 +7339,7 @@ function Write-ConsoleList {
         }
     }
     Write-Host ''
-    Write-Host 'Turn settings on with  -Apply id1,id2   off with  -Undo id1,id2   the Recommended preset with  -Preset' -ForegroundColor DarkGray
+    Write-Host 'The state column is the switch (on / off). Apply settings with  -Apply id1,id2  (each one says which way it turns the switch),  put the Windows default back with  -Undo id1,id2,  the Recommended preset with  -Preset' -ForegroundColor DarkGray
     Write-Host 'A setting that lists options takes one:  -Apply id=option  (without an option the first one is used);  -Undo id  puts the Windows default back' -ForegroundColor DarkGray
 }
 
@@ -7269,7 +7357,7 @@ function Build-ConsolePlan {
             if ($aid -eq [string](Split-IdChoice $u).Id -and $script:ById.ContainsKey($aid)) { $both[$script:ById[$aid].Id] = $true }
         }
     }
-    foreach ($id in @($both.Keys)) { $warn += ("{0}: asked to turn on and off in the same run, skipped" -f $id) }
+    foreach ($id in @($both.Keys)) { $warn += ("{0}: asked to apply and undo in the same run, skipped" -f $id) }
     if ($UsePreset) {
         foreach ($t in $script:Catalog) {
             if (-not $t.Preset) { continue }
@@ -7309,7 +7397,7 @@ function Build-ConsolePlan {
         }
         if ($sp.Choice) { $warn += ("{0}: has no options, so '{1}' is not understood; use -Apply {0}" -f $t.Id, $sp.Choice); $unknown++; continue }
         if ($st -eq 'NA') { $warn += ("{0}: not available on this PC, skipped" -f $t.Id); continue }
-        if ($st -eq 'On') { $warn += ("{0}: already on, skipped" -f $t.Id); continue }
+        if ($st -eq 'On') { $warn += ("{0}: already applied, skipped" -f $t.Id); continue }
         $plan += ,@{ Id = $t.Id; Action = 'Apply' }
         $seen[$t.Id] = 'Apply'
     }
@@ -7319,7 +7407,7 @@ function Build-ConsolePlan {
         if (-not $t) { $warn += ("unknown setting '{0}' (run with -List to see the ids)" -f $sp.Id); $unknown++; continue }
         if ($both.ContainsKey($t.Id)) { continue }
         if ($sp.Choice) { $warn += ("{0}: -Undo takes no option (it puts the Windows default back); use  -Undo {0}" -f $t.Id); $unknown++; continue }
-        if ($seen.ContainsKey($t.Id)) { $warn += ("{0}: turned on by -Preset in the same run, not turned off" -f $t.Id); continue }
+        if ($seen.ContainsKey($t.Id)) { $warn += ("{0}: applied by -Preset in the same run, not undone" -f $t.Id); continue }
         if ($t.OneWay) { $warn += ("{0}: cannot be undone from here, skipped" -f $t.Id); continue }
         if ($t.Once) { $warn += ("{0}: a one-time action, nothing to undo" -f $t.Id); continue }
         $st = Get-ConsoleState $States $t.Id
@@ -8362,7 +8450,10 @@ function Ui-FillEntry {
     $a = Get-Action $row
     $st = [string]$row.State
     $note = [string]$row.Note
-    $e.Checked = [bool]$row.Want
+    # the switch shows the feature: for a setting that turns its feature off when applied, wanting it applied is the switch OFF
+    # (a setting that is not on this PC, or not checked yet, has nothing to switch: its switch is off and greyed)
+    $e.Checked = $false
+    if ($st -ne 'NA' -and $st -ne 'Checking') { $e.Checked = (Get-SwitchOn $row.T ([bool]$row.Want)) }
     if ($row.T.Choices) { $e.Pick = [string]$row.Pick; $e.Now = [string](Get-RealPick $row) }
     $e.State = $st
     $e.Action = $a
@@ -8392,10 +8483,20 @@ function Ui-FillEntry {
     # the chip on the right says something only when there is something to say
     $ct = ''; $ck = 'Sub'
     if ($note) { $ct = $note; $ck = $nk }
-    elseif ($a -eq 'Apply') { $ct = 'Will turn on'; $ck = 'Accent'; if ($row.T.Choices) { $ct = 'Will change' } }
-    elseif ($a -eq 'Undo') { $ct = 'Will turn off'; $ck = 'Warn'; if ($row.T.Choices) { $ct = 'Will reset' } }
-    elseif ($st -eq 'Partial') { $ct = 'Partly applied'; $ck = 'Warn' }
-    elseif ($st -eq 'On' -and $row.Mine -eq 'no') { $ct = 'Already applied'; $ck = 'Good' }
+    elseif ($a) {
+        # the chip says what the SWITCH will do (an -Inv setting that is applied goes off)
+        $goOn = $false
+        if (-not $row.T.Choices) { $goOn = [bool](Get-SwitchGoesOn $row.T ($a -eq 'Undo')) } else { $goOn = ($a -eq 'Apply') }
+        if ($goOn) { $ct = 'Will turn on'; $ck = 'Accent' } else { $ct = 'Will turn off'; $ck = 'Warn' }
+        if ($row.T.Choices) { if ($a -eq 'Apply') { $ct = 'Will change' } else { $ct = 'Will reset' } }
+        if ($row.T.Once) { $ct = 'Will run' }
+    }
+    elseif ($st -eq 'Partial') { $ct = 'Partly changed'; $ck = 'Warn' }
+    elseif ($st -eq 'On' -and $row.Mine -eq 'no') {
+        if ($row.T.Choices) { $ct = 'Already set'; $ck = 'Good' }
+        elseif (Get-SwitchOn $row.T $true) { $ct = 'Already on'; $ck = 'Good' }
+        else { $ct = 'Already off'; $ck = 'Good' }
+    }
     elseif ($st -eq 'Unknown') { $ct = 'Unknown'; $ck = 'Warn' }
     elseif ($st -eq 'NA') { $ct = 'Not on this PC'; $ck = 'Dim' }
     elseif ($st -eq 'Checking') { $ct = 'Checking...'; $ck = 'Dim' }
@@ -8714,7 +8815,7 @@ function Ui-PaintRow {
     Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
     Ui-StrokeRound $g $edge 1 $x $y $cw $ch $M.Radius
     if ($e.Tint) {
-        # a change waiting to be made: a short bar at the left edge (purple to turn on, orange to turn off) instead of a loud outline
+        # a change waiting to be made: a short bar at the left edge (purple: the switch will go on, orange: it will go off) instead of a loud outline
         $bar = $Th.Accent
         if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
         Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 18)) (Px 3) ($ch - (Px 36)) (Px 1)
@@ -9255,7 +9356,7 @@ function Ui-Counts {
 }
 
 # ----------------------------------------------------------- details panel -----------
-$script:DetailHint = "Click a setting to read what it does and exactly what it changes. Press 'View description' on a setting to read the same text in a window of its own.`r`n`r`nUse the switch on the right of a setting to turn it on or off. Nothing is changed until you press the Apply button at the bottom."
+$script:DetailHint = "Click a setting to read what it does and exactly what it changes. Press 'View description' on a setting to read the same text in a window of its own.`r`n`r`nUse the switch on the right of a setting to turn the feature on or off: on means the feature is on, off means it is off (or the service is disabled). Every card says what Windows has by default. Nothing is changed until you press the Apply button at the bottom."
 
 # which font and colour a piece of the details text gets
 function Ui-PartStyle {
@@ -9476,7 +9577,7 @@ function Ui-PickRow {
     Ui-Flush
 }
 
-# "Turn all on" / "Turn all off" (the two buttons at the top right). $cat is the page that is open, '' for "All settings".
+# "Tweak all" / "Reset all" (the two buttons at the top right). $cat is the page that is open, '' for "All settings".
 # They only tick the switches: nothing is changed on the PC until Apply changes is pressed (and confirmed).
 function Ui-GroupTick {
     param([string]$cat, [bool]$want)
@@ -9488,7 +9589,7 @@ function Ui-GroupTick {
     else { Ui-RefreshAll }
     $where = 'All settings'; if ($cat) { $where = (Split-CatName $cat).Short }
     $s = ('{0} setting(s) on "{1}" changed.  ' -f $n, $where)
-    if ($want -and $left.Count -gt 0) { $s += ('{0} left out on purpose (the ones "Apply all" leaves out too: switch them on yourself).  ' -f $left.Count) }
+    if ($want -and $left.Count -gt 0) { $s += ('{0} left out on purpose (the ones "Apply all" leaves out too: change them yourself).  ' -f $left.Count) }
     Ui-Status ($s + (Get-SummaryText))
     Ui-Flush
 }
@@ -9543,13 +9644,13 @@ function Ui-LineUpPreset {
     # other changes had been lined up before (they were not in that window) is the list of changes shown as well
     Ui-DoApply $note ($name + '?') $true ($before -eq 0)
     if ($script:ApplyCancelled) {
-        Ui-Status ('Nothing was changed. {0} setting(s) stay marked "Will turn on" - press Apply changes to go ahead, or Clear changes to remove them.' -f $n)
+        Ui-Status ('Nothing was changed. {0} setting(s) stay lined up - press Apply changes to go ahead, or Clear changes to remove them.' -f $n)
         Ui-Flush
     }
 }
 
 # "Apply all": tick everything on this page (every page when "All settings" is open), then go through the usual Apply,
-# which asks first. If you say no, the settings stay ticked ("Will turn on") and Apply / Discard work as always.
+# which asks first. If you say no, the settings stay lined up and Apply / Discard work as always.
 function Ui-DoApplyAll {
     $b = Get-BusyReason
     if ($b) { Ui-Status $b; return }
@@ -9569,7 +9670,7 @@ function Ui-DoApplyAll {
     $note = { param($p) Get-ApplyAllNote $p $left $where }.GetNewClosure()
     Ui-DoApply $note 'Apply all?' $true
     if ($script:ApplyCancelled) {
-        Ui-Status ('Nothing was changed. {0} setting(s) stay marked "Will turn on" - press Apply changes to go ahead, or Discard to clear them.' -f $r.Ticked)
+        Ui-Status ('Nothing was changed. {0} setting(s) stay lined up - press Apply changes to go ahead, or Discard to clear them.' -f $r.Ticked)
         Ui-Flush
     }
 }
@@ -9911,7 +10012,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '74'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '75'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10615,8 +10716,8 @@ function Ui-Build {
     $sub.AutoSize = $false
     $sub.AutoEllipsis = $true
     $sub.Size = New-Object System.Drawing.Size((Px 400), (Px 22))
-    $btnApplyAll = New-Btn 'Apply all' 128 'accent' 'Switches on every setting on this page and applies them. You are asked to confirm first.' 34
-    $btnApplyAll.Top = (Px 141)            # in the same row as "Turn all on" and "Turn all off": the three page actions sit together
+    $btnApplyAll = New-Btn 'Apply all' 128 'accent' 'Applies every setting on this page: each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on). You are asked to confirm first.' 34
+    $btnApplyAll.Top = (Px 141)            # in the same row as "Tweak all" and "Reset all": the three page actions sit together
     $btnApplyAll.Visible = $false
     $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), or open Windows display settings (Display).' 32
     $btnPage.Top = (Px 24)
@@ -10676,8 +10777,8 @@ function Ui-Build {
     $segBox.Location = New-Object System.Drawing.Point(($M.Gutter - (Px 4)), (Px 98))
     $script:UI.chips = $chips
     $script:UI.segBox = $segBox
-    $btnAllOn = New-Btn 'Turn all on' 100 'secondary' 'Switch on every setting on this page (the ones Apply all leaves out stay as they are). Nothing is changed until you press Apply changes.' 34
-    $btnAllOff = New-Btn 'Turn all off' 104 'secondary' 'Switch off every setting on this page. Nothing is changed until you press Apply changes.' 34
+    $btnAllOn = New-Btn 'Tweak all' 100 'secondary' 'Line up every setting on this page at the position this app sets (the ones Apply all leaves out stay as they are). Nothing is changed until you press Apply changes.' 34
+    $btnAllOff = New-Btn 'Reset all' 104 'secondary' 'Line up every setting on this page at its Windows default (Game Mode and the windowed-games optimizations go back to on). Nothing is changed until you press Apply changes.' 34
     $btnAllOn.Top = (Px 141)               # level with the second row of tabs (the risk tabs), which is short: the first row would run into them in a narrow window
     $btnAllOff.Top = (Px 141)
     $btnAllOn.Visible = $false
@@ -12473,6 +12574,8 @@ function Add-PresetCatLines {
             [void]$parts.Add(@{ S = $style; C = ''; T = '  - ' + [string]$r.T.Name })
             $m = ''
             if ($mark) { $m = [string](& $mark $r) }
+            # where the preset puts the switch: a setting that turns its feature off when applied is listed as "switch off"
+            if (-not $r.T.Choices -and -not $r.T.Once) { $sw = 'switch off'; if (Get-SwitchOn $r.T $true) { $sw = 'switch on' }; if ($m) { $m = $sw + ', ' + $m } else { $m = $sw } }
             if ($m) { [void]$parts.Add(@{ S = $markStyle; C = ''; T = '   (' + $m + ')' }) }
             [void]$parts.Add(@{ S = $style; C = ''; T = $nl })
         }
@@ -12692,7 +12795,7 @@ function Get-CustomWinParts {
     $markOn = {
         param($r)
         $m = @()
-        if ((Get-Action $r) -eq 'Undo') { $m += 'lined up to turn off' }
+        if ((Get-Action $r) -eq 'Undo') { $m += $(if (Get-SwitchGoesOn $r.T $true) { 'lined up to turn on' } else { 'lined up to turn off' }) }
         if ($r.T.Choices -and $saved.ContainsKey([string]$r.T.Id) -and [string]$r.Choice -ne [string]$saved[[string]$r.T.Id]) { $m += 'your saved configuration uses another option' }
         return ($m -join ', ')
     }
@@ -12700,7 +12803,7 @@ function Get-CustomWinParts {
         param($r)
         $m = @()
         $a = Get-Action $r
-        if ($a -eq 'Apply') { $m += 'lined up to turn on' } elseif ($r.State -eq 'Partial') { $m += 'partly applied' }
+        if ($a -eq 'Apply') { $m += $(if (Get-SwitchGoesOn $r.T $false) { 'lined up to turn on' } else { 'lined up to turn off' }) } elseif ($r.State -eq 'Partial') { $m += 'partly changed' }
         if ($saved.ContainsKey([string]$r.T.Id)) { $m += 'in your saved configuration' }
         return ($m -join ', ')
     }

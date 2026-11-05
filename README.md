@@ -1,6 +1,6 @@
 # Headroom
 
-Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 160 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything.
+Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 160 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
 
 There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
 
@@ -67,7 +67,7 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 
 ```powershell
 .\Headroom.ps1                                    # opens the window
-.\Headroom.ps1 -NoGui -List                       # which settings are applied?
+.\Headroom.ps1 -NoGui -List                       # every setting, its switch, and the Windows default
 .\Headroom.ps1 -NoGui -Preset -DryRun             # preview the Recommended preset
 .\Headroom.ps1 -NoGui -Apply mouse,gamedvr        # just those two
 .\Headroom.ps1 -NoGui -Apply mpo=full             # Multiplane Overlay: Fully disabled
@@ -78,19 +78,29 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 | --- | --- |
 | `-NoGui` | Do not open the window; work in the console. Without `-List`, `-Preset`, `-Apply` or `-Undo` it shows the state of every setting. |
 | `-DryRun` | Window: starts with Preview only switched on. Console: shows what would happen and changes nothing. |
-| `-List` | Console: print every setting with its id and whether it is applied. |
+| `-List` | Console: print every setting with its id, whether its switch is on or off, the Windows default, and which way `-Apply` turns the switch. |
 | `-Preset` | Console: turn on the Recommended preset. |
-| `-Apply` | Console: turn on these setting ids (see `-List`). A setting with options takes one as `id=option`. |
-| `-Undo` | Console: turn these setting ids back off. |
+| `-Apply` | Console: apply these setting ids (see `-List`; each one says whether `-Apply` turns its switch on or off). A setting with options takes one as `id=option`. |
+| `-Undo` | Console: put the Windows default back for these setting ids. |
 
-## Switching a setting off
+## What the switches do
 
-Switching a setting off puts the Windows default back for everything that setting changed: registry values (deleted where Windows sets none), service start types, scheduled tasks, firewall rules (as Windows ships them), adapter bindings and driver options (the driver's own default), the power plan (Balanced) and the boot setting for the hypervisor. It does not put back what your PC had before Headroom changed it, so a value that another tool had set earlier also ends up at the Windows default.
+Each card has one switch, and the switch is the setting itself. On means the setting is on, off means it is off (or back at the Windows default, depending on what the setting does). The card's text has an "On:" half and an "Off:" half that say what each position means, and the "Windows default" tag tells you which position Windows ships with.
+
+- Game Mode: on turns Windows Game Mode on, off turns it off. The same goes for Optimizations for windowed games.
+- A service: on lets the service start the way Windows has it, off disables it.
+- A feature that is on in Windows by default (Xbox Game Bar, telemetry, widgets and so on): the switch starts on, and switching it off turns the feature off.
+- A feature that Windows has off by default: the switch starts off, and switching it on turns the feature on.
+- A startup program: on means it starts with Windows, off means it does not.
+
+Reset all puts everything back to the Windows default, which means Game Mode and Optimizations for windowed games go back to on. When the check of the PC finds a setting that is only partly in place, Headroom offers to finish it.
+
+When a setting is put back to the Windows default, that covers everything it changed: registry values (deleted where Windows sets none), service start types, scheduled tasks, firewall rules (as Windows ships them), adapter bindings and driver options (the driver's own default), the power plan (Balanced) and the boot setting for the hypervisor. It does not put back what your PC had before Headroom changed it, so a value that another tool had set earlier also ends up at the Windows default.
 
 A few settings are handled differently:
 
 - Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
-- Settings whose Windows default is already the on state (Game Mode on, Optimizations for windowed games on) are put back by removing what Headroom wrote. They still read as on afterwards, because that is the Windows default; if Headroom never changed them, the window does not offer to turn them off. To switch them off, use the switch in Windows Settings.
+- Some defaults depend on the PC (for example hardware GPU scheduling, Memory Integrity, BitLocker and Storage Sense). Those cards say "Depends on the PC" instead of On or Off.
 - Settings that remove apps cannot be undone from Headroom.
 
 ## Where things are kept
