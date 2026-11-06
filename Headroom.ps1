@@ -3676,7 +3676,7 @@ $pol  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
 $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
-Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diagnostic data and error reporting' `
+Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diagnostic data and error reports' `
     -Desc 'On: Windows sends diagnostic data to Microsoft and reports errors, as it does by default. Off: diagnostic data is set to the minimum Windows allows and error reporting is turned off. That covers the current error-reporting policy, the older error-reporting policy and sending extra data with a report. The Customer Experience program, app inventory collection and remote diagnostic-config downloads are turned off too. The minimum is "Off" (0) on Enterprise and Education; Windows Home and Pro treat 0 as 1 ("Required" only), so there the app sets 1, which also stops the optional diagnostic data from being switched on in Settings.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\DataCollection" 'AllowTelemetry' 0)
@@ -3735,7 +3735,7 @@ Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-
         pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
     )
 
-Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing, handwriting and speech data collection' `
+Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing and speech data collection' `
     -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
@@ -3766,13 +3766,13 @@ Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name '
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0
     )
 
-Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps downloaded from the internet' `
+Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps from the internet' `
     -Desc 'On: when you plug in a device, Windows can ask Microsoft for its details (name, picture and the maker''s device app) and download them. Off: Windows does not download device information from the internet, and the policy overrides the "Device Installation Settings" choice. Drivers are not affected, they still come from Windows Update or your own installer. A new device may show with a generic icon and name. "Driver updates through Windows Update" sets that dialog''s own switch too; this one adds the policy.' `
     -Parts @(
         pReg "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
     )
 
-Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app-launch tracking' `
+Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app tracking' `
     -Desc 'On: websites can read your language list, and Start tracks which apps you launch to rank them. Off: websites cannot read your language list and Start no longer tracks which apps you launch.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\International\User Profile' 'HttpAcceptLanguageOptOut' 1
@@ -3942,19 +3942,19 @@ Add-Tweak -Id 'smb1' -Cat $cShare -Inv -Def 'Off' -Preset -Reboot -Name 'SMB1 pr
     )
 
 # ----------------------------------------------------- Adapters and USB -------
-Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Inv -Def 'On' -Reboot -Name 'Windows turning off network adapters to save power' `
+Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Inv -Def 'On' -Reboot -Name 'Windows turning off network adapters' `
     -Desc 'On: Windows may turn off a network adapter to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked. Off: the "turn off this device to save power" box is unticked on every physical network adapter. Wake-on-LAN settings you chose are kept.' `
     -Parts @(
         pCustom 'NicTurnOff' 'Device Manager > network adapter > Power Management > "Allow the computer to turn off this device": off, on every physical adapter'
     )
 
-Add-Tweak -Id 'nic-eee' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter power saving (Energy-Efficient Ethernet, Green Ethernet, Wi-Fi power save)' `
-    -Desc 'On: the driver''s own power-saving options (EEE, Green Ethernet and similar) stay as the driver has them. That includes Power Saving Mode and Ultra Low Power. Off: those options are switched off on your adapters. They can cause latency spikes and brief disconnects. Only options your adapter actually has are touched.' `
+Add-Tweak -Id 'nic-eee' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter power saving' `
+    -Desc 'On: the driver''s own power-saving options (Energy-Efficient Ethernet, Green Ethernet, Wi-Fi power save and similar) stay as the driver has them. That includes Power Saving Mode and Ultra Low Power. Off: those options are switched off on your adapters. They can cause latency spikes and brief disconnects. Only options your adapter actually has are touched.' `
     -Parts @(
         pCustom 'NicEee' 'Adapter driver "Advanced" tab: Energy-Efficient Ethernet, Green Ethernet, power-saving mode options -> off (where present)'
     )
 
-Add-Tweak -Id 'nic-suspend' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter selective suspend and sleep-on-disconnect' `
+Add-Tweak -Id 'nic-suspend' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Network adapter selective suspend' `
     -Desc 'On: Windows may suspend USB network adapters and put adapters to sleep when the cable is unplugged, as it does by default. Off: Windows does neither. Not shown as available on PCs whose adapters do not offer these options.' `
     -Parts @(
         pCustom 'NicSuspend' 'Adapter power management: Selective Suspend and Device Sleep on Disconnect -> off (where present)'
@@ -3973,7 +3973,7 @@ Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Perform
         pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
     )
 
-Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans (Balanced, High Performance, Power Saver)' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
+Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
     -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Switching it back on recreates the three standard plans. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
     -Parts @(
         pCustom 'PlansDelete' 'powercfg /delete for every plan except the active one'
@@ -4007,13 +4007,13 @@ Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar 
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
     )
 
-Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-gamebar" pop-up when Game Bar is gone' `
+Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-gamebar" pop-up (Game Bar gone)' `
     -Desc 'On: ms-gamebar and ms-gamebarservices links are sent to a program that does nothing (systray.exe), so Windows never shows "You''ll need a new app to open this ms-gamebar link". Off: Windows handles those links as shipped. Game Bar opens them, and if Game Bar has been removed the pop-up appears. Switch this on only if you removed Game Bar (Remove apps) or never use it: while it is on, anything that opens an ms-gamebar link, such as the Game Bar button on a controller, does nothing. Switching it off deletes the two link entries again. If another program has registered one of the links, that one is left alone.' `
     -Parts @(
         pCustom 'GameBarLinks' 'makes HKLM\SOFTWARE\Classes\ms-gamebar and ms-gamebarservices open systray.exe, a program that does nothing    (undo: deletes both keys)'
     )
 
-Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse acceleration (Enhance pointer precision)' `
+Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse acceleration (pointer precision)' `
     -Desc 'On: Windows speeds the pointer up when you move the mouse faster ("Enhance pointer precision"). Off: the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Mouse' 'MouseSpeed' '0' '1' 'String'
@@ -4040,7 +4040,7 @@ Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver
 $wuStore = 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore'
 $wuMrt   = 'HKLM:\SOFTWARE\Policies\Microsoft\MRT'
 $wuAU    = "$pol\WindowsUpdate\AU"
-Add-Tweak -Id 'wu-auto' -Cat $cGame -Def 'Automatic' -Risk 'security' -Name 'Automatic updates for Store apps and the Malicious Software Removal Tool' `
+Add-Tweak -Id 'wu-auto' -Cat $cGame -Def 'Automatic' -Risk 'security' -Name 'Store and Malware Removal Tool updates' `
     -Desc ('Windows Update itself stays on whichever option you choose: security updates, drivers and feature updates can still be installed. ' +
            'Choose one of three options on the card. Automatic (Windows default): nothing is set. Store and MRT off: the Microsoft Store stops downloading and installing app updates by itself (AutoDownload = 2), and Windows Update stops offering the monthly Malicious Software Removal Tool, MRT (DontOfferThroughWUAU = 1); Windows Security is not affected. ' +
            'No auto-updates: the same two values and NoAutoUpdate = 1 (the "Configure Automatic Updates" policy set to Disabled). Windows then no longer downloads and installs updates by itself: open Settings > Windows Update and press Check for updates when you want them, and do it at least once a month, or the PC goes without security fixes. ' +
@@ -4052,13 +4052,13 @@ Add-Tweak -Id 'wu-auto' -Cat $cGame -Def 'Automatic' -Risk 'security' -Name 'Aut
         @{ Key = 'all'; Label = 'Also stop automatic Windows updates'; Short = 'No auto-updates'; Parts = @( (pReg $wuStore 'AutoDownload' 2), (pReg $wuMrt 'DontOfferThroughWUAU' 1), (pReg $wuAU 'NoAutoUpdate' 1) ) }
     )
 
-Add-Tweak -Id 'wu-noreboot' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No automatic restart for updates while you are signed in' `
+Add-Tweak -Id 'wu-noreboot' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No auto-restart while you are signed in' `
     -Desc 'On: after an update that Windows installs on its schedule, it does not restart the PC by itself while someone is signed in. It shows a notice and waits for you to restart. Off: Windows can restart the PC by itself after installing updates, about five minutes after a scheduled install (the Windows default). That is how it stops a restart in the middle of a game. The update stays unfinished until you restart yourself, so do that now and then. The policy only covers scheduled installs; your active hours in Settings > Windows Update are not changed.' `
     -Parts @(
         pReg $wuAU 'NoAutoRebootWithLoggedOnUsers' 1
     )
 
-Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT (firmware installing programs at startup)' `
+Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT (firmware programs at startup)' `
     -Desc 'On: motherboard firmware can copy a program into Windows and run it at every boot (the Windows Platform Binary Table, WPBT). Some boards use it to deliver their own software: Gigabyte firmware has been reported installing an updater this way, and ASUS boards have a BIOS option, on by default, that downloads Armoury Crate. Off: Windows does not run such programs. Side effects: tools that PC makers deliver this way, including some anti-theft software, are no longer installed, and a program the firmware already installed stays until you remove it. Your board''s BIOS setting for its own software is the other place to turn this off. Needs a restart.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' 'DisableWpbtExecution' 1
@@ -4089,21 +4089,21 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
         pCustom 'DefenderIdle' 'Set-MpPreference: ScanOnlyIfIdleEnabled = on, EnableLowCpuPriority = on, ScanAvgCPULoadFactor = 20    (undo: the Windows defaults: on / off / 50)'
     )
 
-Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut (Shift pressed 5 times)' `
+Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
     -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off. Only the shortcut is affected; Sticky Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '506' '510' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
     )
 
-Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut (Right Shift held for 8 seconds)' `
+Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
     -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off. Only the shortcut is affected; Filter Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '122' '126' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Filter'
     )
 
-Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut (Num Lock held for 5 seconds)' `
+Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
     -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, so the beeps and the window do not appear. Only the shortcut is affected; Toggle Keys itself is still there under Settings > Accessibility > Keyboard.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '58' '62' 'String'
@@ -4122,7 +4122,7 @@ Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Def 'On' -Preset -Name 'Optimizatio
         pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
     )
 
-Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Inv -Def 'On' -Name 'Variable refresh rate for DirectX 11 full-screen games' `
+Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Inv -Def 'On' -Name 'Variable refresh rate (DirectX 11 games)' `
     -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as on (not turned off yet); switching it off writes an explicit 0. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Switching it back on removes the entry, which leaves the Windows default.' `
     -Parts @(
         pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
@@ -4158,13 +4158,13 @@ Add-Tweak -Id 'netthrottle' -Cat $cNothing -Inv -Def 'On' -Unproven -Name 'Netwo
         pReg $mm 'NetworkThrottlingIndex' ([uint32]4294967295) 10
     )
 
-Add-Tweak -Id 'sysresp' -Cat $cNothing -Def 'Off' -Unproven -Name 'System responsiveness set to 10% (multimedia scheduler)' `
+Add-Tweak -Id 'sysresp' -Cat $cNothing -Def 'Off' -Unproven -Name 'System responsiveness set to 10%' `
     -Desc 'On: SystemResponsiveness is set to 10 (the Windows default is 20). That lowers the share of CPU kept free for everything else from 20% to 10%, so programs that use the Windows multimedia scheduler (a game''s audio threads, say) can take more when the CPU is completely busy. Off: Windows'' default of 20 is used. It may change nothing in games: it only matters when the CPU is maxed out, and only for programs that use the multimedia scheduler. Microsoft rounds values below 10 up to 20, so 10 is the lowest that does anything. No frame-rate or latency gain from it has been shown on current Windows.' `
     -Parts @(
         pReg $mm 'SystemResponsiveness' 10 20
     )
 
-Add-Tweak -Id 'gamesched' -Cat $cNothing -Def 'Off' -Unproven -Name 'Game scheduling priority set to High (multimedia scheduler "Games" task)' `
+Add-Tweak -Id 'gamesched' -Cat $cNothing -Def 'Off' -Unproven -Name 'Game scheduling priority set to High' `
     -Desc 'On: Scheduling Category and SFIO Priority of the "Games" task are set to High, Priority to 6 and GPU Priority to 8. Off: Windows'' defaults (Medium, Normal, 2 and 8) are used. Three of the four values are ignored by Windows, and the fourth only applies to the "Games" task, which no game is shown to use. Microsoft lists GPU Priority as not yet used and disk (SFIO) Priority as not used, and treats Priority as 2 whenever the category is High, so those three change nothing. Only the High scheduling category is real, and it only affects threads that register under the "Games" task; a published trace of CS:GO, Fortnite and Apex Legends (Windows 10 era) found their threads using the Audio or Pro Audio tasks, none using Games.' `
     -Parts @(
         pReg "$mm\Tasks\Games" 'GPU Priority' 8 8
@@ -4173,7 +4173,7 @@ Add-Tweak -Id 'gamesched' -Cat $cNothing -Def 'Off' -Unproven -Name 'Game schedu
         pReg "$mm\Tasks\Games" 'SFIO Priority' 'High' 'Normal' 'String'
     )
 
-Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Def 'Off' -Reboot -Unproven -Name 'TCP acknowledges at once (no-delay) on every network connection' `
+Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Def 'Off' -Reboot -Unproven -Name 'TCP no-delay on every connection' `
     -Desc 'On: Windows acknowledges each TCP packet at once instead of waiting up to 200 ms to bundle replies. TcpAckFrequency = 1, TCPNoDelay = 1 and TcpDelAckTicks = 0 are set on every network interface. Off: the three values are deleted (how Windows ships). It only affects TCP: games that send their action data over UDP are untouched, and no measured ping gain was found. Microsoft documents TcpAckFrequency for Windows Server and fixed it in Vista SP1; no Microsoft page describing TCPNoDelay or TcpDelAckTicks for Windows 10 or 11 was found. A 2009 TechNet post warns it can slow transfers between local machines. A network adapter or VPN added later needs this applied again.' `
     -Parts @(
         pRegDyn -Info 'Every network interface under HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces: TcpAckFrequency = 1, TCPNoDelay = 1, TcpDelAckTicks = 0    (undo: values deleted)' -Gen {
@@ -4185,7 +4185,7 @@ Add-Tweak -Id 'tcp-nodelay' -Cat $cNothing -Def 'Off' -Reboot -Unproven -Name 'T
         }
     )
 
-Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Def 'Off' -Unproven -Name 'Startup programs and desktop load without delay' `
+Add-Tweak -Id 'desktop-delay' -Cat $cNothing -Def 'Off' -Unproven -Name 'Startup programs load without delay' `
     -Desc 'On: StartupDelayInMSec and WaitforIdleState are set to 0. Off: both are deleted (how Windows ships). It may do nothing: no Microsoft documentation was found for these values, and the reports of an effect disagree. They are not present on a normal Windows install; some people see startup programs open sooner after adding them on Windows 11, others see no change, and one forum user reports that some Windows updates delete them. Where Windows does hold startup programs back, this removes the wait so they load straight away. It applies from your next sign-in. On a slow PC the first seconds after signing in can feel busier because everything starts at once.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize' 'StartupDelayInMSec' 0
@@ -4217,7 +4217,7 @@ $acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
     '  - Riot Vanguard (Valorant and other Riot games): can ask you to turn on Memory Integrity before it lets you launch the game.' + "`r`n" + `
     'Applying this setting turns those features off.' + "`r`n" + "`r`n" + `
     'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
-Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity (HVCI) and Virtualization-Based Security' `
+Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity and VBS (HVCI)' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
     -Desc 'On: Memory Integrity and Virtualization-Based Security are left to Windows (new Windows 11 installs on capable hardware usually have them on). Off: both are turned off, and Credential Guard with them. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this on if you play on those - you are asked about it before it is applied. Switching it back on leaves the values unset, so Windows decides again.' `
     -Parts @(
@@ -4227,7 +4227,7 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'secu
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
     )
 
-Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup (hypervisorlaunchtype)' `
+Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
     -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on deletes the boot setting, so Windows decides again.' `
     -Parts @(
@@ -4260,7 +4260,7 @@ Add-Tweak -Id 'svc-search' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Windows
         pSvc 'WSearch' 'Manual' 'AutomaticDelayed'
     )
 
-Add-Tweak -Id 'svc-misc' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Rarely used services (Retail Demo, Fax, Parental Controls, NFC, Phone, Insider, Maps)' `
+Add-Tweak -Id 'svc-misc' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Rarely used services' `
     -Desc 'On: eight rarely used services keep the start types Windows gives them. They are Retail Demo, Fax, Parental Controls, NFC / payments, Phone service, Windows Insider service, Downloaded Maps Manager and Distributed Link Tracking. Off: the first seven are disabled and Distributed Link Tracking is set to Manual.' `
     -Parts @(
         pSvc 'RetailDemo' 'Disabled' 'Manual'
@@ -4305,7 +4305,7 @@ Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Xbox serv
 
 # (The usage-reporting, NetBIOS and Storage Service ones sit on the Privacy, Network sharing and Storage pages, where they belong.)
 # More background services that a gaming PC does not need. Health and Optimized Experiences, diagnostics, Program Compatibility Assistant and the data usage meter are in the Recommended preset; the others are yours to switch on.
-Add-Tweak -Id 'svc-whe' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Windows Health and Optimized Experiences service' `
+Add-Tweak -Id 'svc-whe' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Health and Optimized Experiences service' `
     -Desc 'On: the service that watches CPU, heat and battery and records performance traces on this PC when Windows feels slow is enabled. Off: it is disabled. Microsoft says the traces stay on the PC unless you send them in a Feedback Hub report. Little downside on a desktop; on a laptop it may weaken battery optimisation.' `
     -Parts @(
         pSvc 'whesvc' 'Disabled' 'Automatic'
@@ -4334,7 +4334,7 @@ Add-Tweak -Id 'svc-datausage' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Data usag
 # Windows gives every service its own svchost.exe process once a PC has more than 3.5 GB of RAM. A threshold above the
 # installed memory makes it group them again after a restart. The value is far above any home PC (256 GB in KB); undo removes it,
 # which gives Windows' own default (3.5 GB).
-Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Inv -Def 'On' -Preset -Reboot -Risk 'note' -Name 'Separate svchost.exe process for each service' -NotRec 'Saves little memory, and one crashing service can take others down with it.' `
+Add-Tweak -Id 'svchost-merge' -Cat $cSvc -Inv -Def 'On' -Preset -Reboot -Risk 'note' -Name 'Separate svchost.exe per service' -NotRec 'Saves little memory, and one crashing service can take others down with it.' `
     -Desc 'On: each background service runs in its own svchost.exe process (the default with over 3.5 GB of RAM). Off: services are grouped again after a restart (about 50 fewer processes). That uses a little less memory. The costs: one service that crashes can take others in its group with it, and Task Manager can no longer show which service uses the CPU. WinUtil warns that it can interfere with Xbox services.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control' 'SvcHostSplitThresholdInKB' 268435456 3670016
@@ -4374,13 +4374,13 @@ Add-Tweak -Id 'offlinefiles' -Cat $cSvc -Inv -Def 'On' -Name 'Offline Files serv
         pSvc 'CscService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-netbios' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'NetBIOS name helper (TCP/IP NetBIOS Helper)' `
+Add-Tweak -Id 'svc-netbios' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'NetBIOS name helper service' `
     -Desc 'On: the TCP/IP NetBIOS Helper service is enabled; it looks up other computers by their old-style NetBIOS name. Off: the service is disabled. The internet and reaching devices by IP address or DNS name are not affected; only an old device that can be found by NetBIOS name alone might stop showing up by name.' `
     -Parts @(
         pSvc 'lmhosts' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'ics' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Connection sharing (ICS, hotspot, media streaming)' `
+Add-Tweak -Id 'ics' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Connection sharing (ICS and hotspot)' `
     -Desc 'On: Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing are enabled, with the start types Windows gives them. Off: all three are disabled. Internet Connection Sharing is left alone automatically when WSL2, Hyper-V or Windows Sandbox is turned on, because their default network uses it.' `
     -Parts @(
         pSvc 'SharedAccess' 'Disabled' 'Manual' 'Test-UsesVirtualization' 'WSL2 / Hyper-V / Sandbox is on, so Internet Connection Sharing is left alone'
@@ -4429,7 +4429,7 @@ Add-Tweak -Id 'svc-wallet' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Wallet ser
         pSvc 'WalletService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-scpolicy' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Smart Card Removal Policy service (SCPolicySvc)' `
+Add-Tweak -Id 'svc-scpolicy' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Smart Card Removal Policy service' `
     -Desc 'On: the service that locks the PC or signs you out when a smart card is pulled out of its reader is enabled (Manual, as Windows has it). Off: it is set to Disabled. It only matters if you sign in with a smart card. The other two smart-card services are in "Smart card services" on the Services page; this one is separate so it can be switched on its own.' `
     -Parts @(
         pSvc 'SCPolicySvc' 'Disabled' 'Manual'
@@ -4459,13 +4459,13 @@ Add-Tweak -Id 'svc-sensordata' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Sensor
         pSvc 'SensorDataService' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'svc-mixedreality' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Windows Mixed Reality OpenXR service (MixedRealityOpenXRSvc)' `
+Add-Tweak -Id 'svc-mixedreality' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Windows Mixed Reality service' `
     -Desc 'On: the service used by Windows Mixed Reality headsets is enabled (Manual, as Windows has it). Off: it is set to Disabled. Other headsets bring their own software. Recent Windows versions may not have this service at all, and then the setting reads as not available.' `
     -Parts @(
         pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
     )
 
-Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Defender Core Service telemetry and experiments' `
+Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Defender Core telemetry and experiments' `
     -Desc 'On: the Defender Core Service sends telemetry and uses Microsoft''s experimentation service to deliver fixes. Off: both are turned off. Fixes still arrive through the normal Defender updates, and Windows Security keeps scanning as normal. Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Features' 'DisableCoreServiceECSIntegration' 1
@@ -4571,7 +4571,7 @@ Add-Tweak -Id 'blackdesk' -Cat $cLook -Def 'Off' -Preset -Name 'Solid black desk
         pCustom 'DesktopLive' 'also applied to the running desktop'
     )
 
-Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Visual effects (animations, shadows, thumbnails)' `
+Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Visual effects (animations, shadows)' `
     -Desc 'On: Windows visual effects are as Windows has them (the Windows default). Off: Visual Effects is set to Custom with only "Smooth edges of screen fonts" left on. That keeps ClearType, so text stays sharp. The setting is in Performance Options > Visual Effects. Everything else is switched off: the window, taskbar, control, menu, tooltip, combo box and list scrolling animations, Aero Peek, the shadows under windows, the mouse pointer and desktop icon labels, the translucent selection rectangle, showing window contents while you drag (a window moves as an outline), keeping taskbar thumbnail previews, and picture and video thumbnails in File Explorer (they show as plain icons). It is applied to the running session at once and Explorer restarts. Switching it back on puts back the Windows default for all of these.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects' 'VisualFXSetting' 3 0
@@ -4588,7 +4588,7 @@ Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'V
         pCustom 'AnimLive' 'also applied to the running session'
     )
 
-Add-Tweak -Id 'notifications' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Notifications (pop-ups and the notification centre)' `
+Add-Tweak -Id 'notifications' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Notifications and notification centre' `
     -Desc 'On: apps, games and Windows can show toast pop-ups, and the notification centre works. Off: no toast pop-ups, and the notification centre is switched off; the calendar flyout goes with it. Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are.' `
     -Parts @(
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
@@ -4609,7 +4609,7 @@ Add-Tweak -Id 'showext' -Cat $cExplorer -Def 'Off' -Explorer -Name 'Always show 
     )
 
 $clsidMenu = 'HKCU:\Software\Classes\CLSID\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}'
-Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Def 'Off' -Preset -Explorer -Name 'Classic right-click menu (no "Show more options")' `
+Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Def 'Off' -Preset -Explorer -Name 'Classic right-click menu' `
     -Desc 'On: File Explorer and the desktop show the full right-click menu of Windows 10 instead of Windows 11''s short menu with "Show more options". Off: the short Windows 11 menu (the default). File Explorer restarts when this is changed, so open Explorer windows close for a moment. Only does something on Windows 11.' `
     -Parts @(
         pKey "$clsidMenu\InprocServer32" $clsidMenu
@@ -4665,7 +4665,7 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, sugge
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.BackupReminder' 'Enabled' 0 1
     )
 
-Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and Microsoft account cards in Settings' `
+Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and account cards in Settings' `
     -Desc 'On: the Microsoft account and Copilot subscription cards show on the Settings home page, and Windows pulls in cloud-optimized suggestions. Off: both are hidden. Both policies are only obeyed by Enterprise and Education, so on Home and Pro this setting is shown as not available.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableConsumerAccountStateContent' 1)
@@ -4725,7 +4725,7 @@ Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI 
         pReg $paintPol 'DisableRemoveBackground' 1
     )
 
-Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Text and image generation for apps (Windows AI)' `
+Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Text and image generation (Windows AI)' `
     -Desc 'On: apps can use Windows'' text and image generation and system AI models. The "Text and image generation" and "System AI models" privacy settings in Settings > Privacy and security are left to you. Off: text and image generation and system AI models are set to Deny for every app, by policy. An app cannot switch them back on. It only concerns Windows'' own AI features; ordinary apps and games are not touched.' `
     -Parts @(
         pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
@@ -4785,7 +4785,7 @@ Add-Tweak -Id 'edge-ai' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: Copilot 
         pReg $edge 'EdgeShoppingAssistantEnabled' 0
     )
 
-Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: AI writing help, history search and local AI model' `
+Add-Tweak -Id 'edge-ai-more' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: AI writing help and local AI model' `
     -Desc 'On: Edge''s extra AI features are available. These are Rewrite, AI-enhanced history search, AI-generated themes, the Bing chat entries and the Copilot page on the new tab page, browsing with Copilot, sharing history with Microsoft 365 Copilot Search, Copilot access to page content for work accounts, tab group name suggestions (they need Edge to send your tab data to an online service) and the built-in AI interfaces for websites. Off: all of those AI features are turned off. Edge also stops downloading its local AI model, and deletes it if it is already there (this frees disk space). Edge ignores several of these policies in a profile that is signed in with a personal Microsoft account; there, switch the same features off in Edge''s own settings.' `
     -Parts @(
         pReg $edge 'ComposeInlineEnabled' 0
@@ -4820,7 +4820,7 @@ Add-Tweak -Id 'edge-tele' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: teleme
         pReg $edge 'SendSiteInfoToImproveServices' 0
     )
 
-Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: first-run page, rewards, shortcuts and other nags' `
+Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: first-run page, rewards and nags' `
     -Desc 'On: Edge shows its first-run page, promotions and other extras, as it does by default. That is the first-run welcome page, a desktop shortcut made when it updates, suggestions on error pages, Collections, Insider promotion, Microsoft Rewards, the web widget, Microsoft content pushed to Edge, the donation prompt in Wallet, "make Edge your default browser" campaigns and the check that asks whether Edge is your default browser. Spotlight tips and recommendations for Microsoft services and the Adobe Acrobat subscription button in Edge''s PDF viewer go too. Off: Edge policies turn all of those off and Do Not Track is set on (sites may ignore it). Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
     -Parts @(
         pReg $edge 'HideFirstRunExperience' 1
@@ -4839,7 +4839,7 @@ Add-Tweak -Id 'edge-debloat' -Cat $cEdge -Inv -Def 'On' -Preset -Name 'Edge: fir
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate' 'CreateDesktopShortcutDefault' 0
     )
 
-Add-Tweak -Id 'edge-newtab' -Cat $cEdge -Inv -Def 'On' -Name 'Edge: news feed and default shortcuts on the new tab page' `
+Add-Tweak -Id 'edge-newtab' -Cat $cEdge -Inv -Def 'On' -Name 'Edge: news feed on the new tab page' `
     -Desc 'On: the new tab page in Edge shows Microsoft''s news and content feed and the shortcut tiles Microsoft fills in for you. Off: the content feed is turned off ("Content off") and the pre-filled shortcut tiles are hidden. Edge shows "Managed by your organization" while any policy is set. Switching it back on removes the policies.' `
     -Parts @(
         pReg $edge 'NewTabPageContentEnabled' 0
@@ -4883,13 +4883,13 @@ Add-Tweak -Id 'apps-media' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name
         pAppx 'Microsoft.ZuneMusic', 'Microsoft.ZuneVideo'
     )
 
-Add-Tweak -Id 'apps-notes' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sticky Notes, To Do, OneNote, Whiteboard and Power Automate' `
+Add-Tweak -Id 'apps-notes' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sticky Notes, To Do, OneNote and more' `
     -Desc 'On: the Sticky Notes, Microsoft To Do, OneNote, Whiteboard and Power Automate apps are installed. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.MicrosoftStickyNotes', 'Microsoft.Todos', 'Microsoft.Office.OneNote', 'Microsoft.Whiteboard', 'Microsoft.PowerAutomateDesktop'
     )
 
-Add-Tweak -Id 'apps-extras' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras' `
+Add-Tweak -Id 'apps-extras' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Extra Microsoft apps (Tips, Clipchamp)' `
     -Desc 'On: the extra apps that come with Windows are installed. These are Get Help, Tips, Feedback Hub, Dev Home, the Microsoft 365 hub, Solitaire Collection, Clipchamp, 3D Viewer, Mixed Reality Portal, Print 3D, Paint 3D, Skype, OneConnect and Microsoft Family. Off: they are removed. They cannot be switched back on from here; install them again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.GetHelp', 'Microsoft.Getstarted', 'Microsoft.WindowsFeedbackHub', 'Microsoft.Windows.DevHome',
@@ -4904,7 +4904,7 @@ Add-Tweak -Id 'apps-widgets' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Widgets (
         pAppx 'MicrosoftWindows.Client.WebExperience'
     )
 
-Add-Tweak -Id 'apps-promo' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Pre-installed promo apps (LinkedIn, Disney+, Spotify, TikTok...)' `
+Add-Tweak -Id 'apps-promo' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Promo apps (LinkedIn, Spotify, TikTok...)' `
     -Desc 'On: the promo apps that come with Windows stay installed. Off: the promo apps that come with Windows are removed by name. These are LinkedIn, Disney+, Spotify, TikTok, Instagram, Facebook, Twitter, Netflix, Amazon / Prime Video, Hulu, Candy Crush, Duolingo, Flipboard, McAfee and Norton. Careful: this also removes the Microsoft Store versions of those apps if you installed them yourself. Games such as Roblox are not touched. They cannot be switched back on from here.' `
     -Parts @(
         pAppx '*LinkedIn*', '*Disney*', '*Spotify*', '*TikTok*', '*Instagram*', '*Facebook*', '*Twitter*', '*Netflix*', '*Amazon*',
@@ -4954,7 +4954,7 @@ Add-Tweak -Id 'apps-camera' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Camera app
     )
 
 Add-Tweak -Id 'apps-paint' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Paint app' `
-    -Desc 'On: the Paint app (Microsoft.Paint) is installed. Off: it is removed for all users. Paint 3D is a different app and is removed by "Help, Tips, Feedback Hub, Clipchamp, Solitaire and other Microsoft extras". If Paint is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
+    -Desc 'On: the Paint app (Microsoft.Paint) is installed. Off: it is removed for all users. Paint 3D is a different app and is removed by "Extra Microsoft apps (Tips, Clipchamp)". If Paint is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store.' `
     -Parts @(
         pAppx 'Microsoft.Paint'
     )
@@ -4971,7 +4971,7 @@ Add-Tweak -Id 'apps-recorder' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sound Re
         pAppx 'Microsoft.WindowsSoundRecorder'
     )
 
-Add-Tweak -Id 'store-policy' -Cat $cApps -Inv -Def 'On' -Name 'Microsoft Store (policy and install service)' `
+Add-Tweak -Id 'store-policy' -Cat $cApps -Inv -Def 'On' -Name 'Store policy and install service' `
     -Desc 'On: the Microsoft Store and its Install Service work as Windows has them. Off: the "Turn off the Store application" policy is set and the Microsoft Store Install Service is disabled. Only Enterprise and Education editions honour the policy; on Home and Pro Windows ignores it, but the service part works on every edition and stops Store installs and updates. To make the Store app itself disappear, use "Microsoft Store app" above. Fully reversible.' `
     -Parts @(
         pEd 'Ent' (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\WindowsStore' 'RemoveWindowsStore' 1)
@@ -4979,8 +4979,8 @@ Add-Tweak -Id 'store-policy' -Cat $cApps -Inv -Def 'On' -Name 'Microsoft Store (
     )
 
 # --------------------------------------------------------------- Legacy --------
-Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Internet Explorer mode, Steps Recorder, Work Folders and Fax' `
-    -Desc 'On: the four legacy components are installed. Off: they are removed. Switching them back on adds them again from Windows Update (internet connection needed).' `
+Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy features (IE mode, Fax and more)' `
+    -Desc 'On: the four legacy components (Internet Explorer mode, Steps Recorder, Work Folders and Fax) are installed. Off: they are removed. Switching them back on adds them again from Windows Update (internet connection needed).' `
     -Parts @(
         pCap 'Browser.InternetExplorer*'
         pCap 'App.StepsRecorder*'
@@ -4992,19 +4992,19 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Internet Expl
 # of the Recommended preset and are left out of "Apply all" and "Turn all on" on "All settings" (the Testing page's own buttons take them).
 # Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
 # Services page (marked -Untested).
-Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut (Left Alt + Left Shift + Num Lock)' `
+Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
     -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '186' '190' 'String'
     )
 
-Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut (Left Alt + Left Shift + Print Screen)' `
+Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
     -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off. Only the shortcut is affected; High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '122' '126' 'String'
     )
 
-Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking (Sound > Communications)' `
+Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
     -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3
@@ -5018,32 +5018,32 @@ Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name '
 
 $clsidCmdA = 'HKCU:\Software\Classes\CLSID\{2aa9162e-c906-4dd9-ad0b-3d24a8eef5a0}'
 $clsidCmdB = 'HKCU:\Software\Classes\CLSID\{6480100b-5a83-4d1e-9f69-8ae5a88e9a33}'
-Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Def 'Off' -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar (instead of the Windows 11 command bar)' `
+Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Def 'Off' -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar' `
     -Desc 'On: tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Off: the Windows 11 command bar (the default). Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is changed; if it still looks the same, sign out and in. It is on the Testing page for that reason.' `
     -Parts @(
         pKey "$clsidCmdA\InprocServer32" $clsidCmdA
         pKey "$clsidCmdB\InprocServer32" $clsidCmdB
     )
 
-Add-Tweak -Id 'task-sqm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics (PI\Sqm-Tasks)' `
+Add-Tweak -Id 'task-sqm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics' `
     -Desc 'On: the scheduled task that gathers software-quality and reliability data for Microsoft is enabled. Off: the task is disabled. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\PI\Sqm-Tasks'
     )
 
-Add-Tweak -Id 'task-maps' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Maps update (Maps\MapsUpdateTask)' `
+Add-Tweak -Id 'task-maps' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Maps update' `
     -Desc 'On: the task that downloads updates for offline maps used by the Maps app is enabled. Off: the task is disabled. It only matters if you use downloaded maps. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
     )
 
-Add-Tweak -Id 'task-familysafety' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Family Safety monitor (Shell\FamilySafetyMonitor)' `
+Add-Tweak -Id 'task-familysafety' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Family Safety monitor' `
     -Desc 'On: the Microsoft Family Safety task (parental controls and screen-time limits) is enabled. Off: the task is disabled. It only matters if this PC is used by a child account in a Microsoft family group. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Shell\FamilySafetyMonitor'
     )
 
-Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Power Efficiency Diagnostics (AnalyzeSystem)' `
+Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Power diagnostics' `
     -Desc 'On: the task that looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report, is enabled. Off: the task is disabled. Nothing else depends on it. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
@@ -6938,26 +6938,6 @@ function Get-NavTitle {
     return $s
 }
 
-# One line of what the setting does: the first sentence of its description
-function Get-ShortDesc {
-    param($t)
-    $d = ([string]$t.Desc -replace '\s+', ' ').Trim()
-    $m = [regex]::Match($d, '^On: (?<on>.+?) Off: (?<off>.+)$')
-    if ($m.Success) {
-        # a switch: what each position does, the first sentence of each
-        $a = $m.Groups['on'].Value; $b = $m.Groups['off'].Value
-        $i = $a.IndexOf('. '); if ($i -ge 10) { $a = $a.Substring(0, $i) }
-        $i = $b.IndexOf('. '); if ($i -ge 6) { $b = $b.Substring(0, $i) }
-        $d = 'On: ' + $a.TrimEnd('.') + '. Off: ' + $b.TrimEnd('.')
-    } else {
-        $i = $d.IndexOf('. ')
-        if ($i -ge 20) { $d = $d.Substring(0, $i) }
-        $d = $d.TrimEnd('.')
-    }
-    if ($d.Length -gt 200) { $d = $d.Substring(0, 197).TrimEnd() + '...' }
-    return $d
-}
-
 # The risk level of a setting: 'Risky' (lowers a protection), 'Medium risk' (has side effects, or cannot be undone from here),
 # else 'Low risk'. "Low risk" is only what this script's own notes say; the description still tells the whole story.
 function Get-RiskLevel {
@@ -7760,7 +7740,7 @@ function Ui-InitTheme {
 
 function Ui-InitMetrics {
     $script:M = @{
-        Row = (Px 84); Gap = (Px 8); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); RiskDot = (Px 10); ChoiceY = (Px 72); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
+        Row = (Px 64); Gap = (Px 8); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); RiskDot = (Px 10); ChoiceY = (Px 52); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
         Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 10); BtnR = (Px 8)
         ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
         CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 14); Wheel = (Px 168)
@@ -8204,6 +8184,9 @@ function Ui-StyleBtn {
         $back = $Th.Card; $fore = $Th.Sub; $hover = $Th.Raised; $down = $Th.RaisedDown
     } elseif ($kind -eq 'chipon') {
         $back = $Th.AccentSoft; $fore = $Th.Accent; $hover = $Th.AccentSoft; $down = $Th.AccentSoft
+    } elseif ($kind -eq 'choice' -or $kind -eq 'choiceon') {
+        $back = $Th.SideBox; $fore = $Th.Mute; $hover = $Th.SideHot; $down = $Th.SideHot
+        if ($kind -eq 'choiceon') { $back = $Th.SideSel; $fore = $Th.Text }
     } elseif ($kind -eq 'tab') {
         $back = $Th.Bg; $fore = $Th.Mute; $hover = $Th.Bg; $down = $Th.Bg
     } elseif ($kind -eq 'tabon') {
@@ -8260,6 +8243,19 @@ function Ui-PaintBtn {
     if ($isTab) { $back = $behind }                      # a tab that is not open has no box, only its text
     $r = [Math]::Min($M.BtnR, [int]($h / 2))
     Ui-Fill $g $behind 0 0 $w $h
+    if ($kind -eq 'choice' -or $kind -eq 'choiceon') {
+        # a choice in a list (the preset window): the same flat box as a page of the side menu - a fill and a clean outline, the name at the left
+        $csel = ($kind -eq 'choiceon')
+        if ($csel) { Ui-PaintBox $g $Th.SideSel $Th.Accent 0 0 $w $h (Px 10) }
+        elseif ($hot) { Ui-PaintBox $g $Th.SideHot $Th.EdgeHot 0 0 $w $h (Px 10) }
+        else { Ui-PaintBox $g $Th.SideBox $Th.Edge 0 0 $w $h (Px 10) }
+        $ccol = $Th.Mute
+        $cfont = Ui-Font 'nav'
+        if ($csel) { $ccol = $Th.Text; $cfont = Ui-Font 'navb' } elseif ($hot) { $ccol = $Th.Text }
+        Ui-Text $g ([string]$b.Text) $cfont $ccol (Px 16) 0 ($w - (Px 32)) $h $TF.L
+        if ($on -and ($b.Focused -eq $true)) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h (Px 10) }
+        return
+    }
     if ($kind -eq 'tabon') {
         # the open tab is a filled box (no line under it): the soft purple, or a tint of the tab's own colour (the preset window's tabs)
         $boxFill = $Th.AccentSoft
@@ -8746,8 +8742,7 @@ function Ui-Layout {
             } else {
                 $r.W = $cw
                 if ($rowWide) { $r.W = $full }
-                $r.H = $M.Row
-                if ($r.Choices) { $r.H = $M.Row + $M.ChoiceExtra }
+                $r.H = (Ui-RowGeom $r).NatH                       # as tall as its title needs (one line: the usual height)
             }
             if ($wide) {
                 $r.X = 0
@@ -8807,7 +8802,7 @@ function Ui-RebuildList {
         if (-not $byCat.ContainsKey($cat)) { $byCat[$cat] = New-Object System.Collections.ArrayList }
         $rb = Get-RiskBadge $row.T
         $nrWhy = Get-NotRecReason $row.T
-        $e = @{ Kind = 'row'; Id = [string]$id; Key = [string]$id; Cat = $cat; Name = [string]$row.T.Name; Desc = (Get-ShortDesc $row.T); X = 0; W = 0; Y = 0; H = 0; Idx = 0
+        $e = @{ Kind = 'row'; Id = [string]$id; Key = [string]$id; Cat = $cat; Name = [string]$row.T.Name; X = 0; W = 0; Y = 0; H = 0; Idx = 0
                 Checked = $false; Enabled = $false; State = ''; Action = ''; StateText = ''; NextText = ''; HeadText = ''; Tint = ''
                 StateKey = 'Sub'; NextKey = 'Sub'; HeadKey = 'Sub'; ChipText = ''; ChipKey = 'Sub'; Failed = $false
                 Risk = [string]$rb.Text; RiskKey = [string]$rb.Key; Tags = @(Get-CardTags $row.T)
@@ -8946,8 +8941,9 @@ function Ui-SoftKey {
 }
 
 # ---- the compact settings row --------------------------------------------------------------------------------------
-# One row is: the title (with small marks after it), a one-line description, and at the right a status chip, the risk
-# pill and the switch. A row with options has the option pill on a second line under the text instead of the switch.
+# One row is: the title (with small marks after it, level with the middle of the card) and at the right a status chip, the risk
+# pill and the switch. There is no description line: the details panel has the whole text. A row with options has the option pill
+# on a second line under the title instead of the switch.
 # Ui-RowGeom works out where each part goes (offsets from the row's top-left corner); the painter and the hit test both
 # use it, so they cannot disagree.
 
@@ -8971,13 +8967,10 @@ function Ui-RowGeom {
     $f = Ui-Font 'smallb'
     $w = [int]$e.W
     $o = @{}
-    $o.TopH = $M.Row - $M.Gap
-    $o.CardH = [int]$e.H - $M.Gap
     $o.TextX = $M.Pad                                   # no icon tile: the title starts at the left padding
-    # from the right edge inwards: the switch (not on a row with options), the risk pill, the status chip
+    # from the right edge inwards: the switch (not on a row with options), the risk pill, the status chip (left to right here, up and down below)
     $x = $w - $M.Pad
     $o.TogX = -1
-    $o.TogY = [int](($o.TopH - $M.TogH) / 2)
     if (-not $e.Choices) { $x -= $M.TogW; $o.TogX = $x; $x -= (Px 12) }
     $rw = (Ui-TextWidth 'Medium risk' $f) + (Px 20)                    # one width for all three, so the pills line up in a column
     $o.RiskDot = $false
@@ -8985,33 +8978,48 @@ function Ui-RowGeom {
     if (($x - $rw - $o.TextX) -lt (Px 200)) { $o.RiskDot = $true; $rw = $M.RiskDot; $o.RiskH = $M.RiskDot }       # a narrow row: the risk is a coloured dot
     $o.RiskW = $rw
     $o.RiskX = $x - $rw
-    $o.RiskY = [int](($o.TopH - $o.RiskH) / 2)
     $x = $o.RiskX - (Px 10)
     $o.ChipX = -1
     $o.ChipW = 0
     $o.ChipH = Px 22
-    $o.ChipY = [int](($o.TopH - $o.ChipH) / 2)
     if ($e.ChipText) {
         $cw = (Ui-TextWidth ([string]$e.ChipText) $f) + (Px 22)
-        $need = Px 280
+        $need = [Math]::Max((Px 280), (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
         # the "Not recommended" mark matters more than a status chip: the chip only takes room the title and the mark can spare (except "Not on this PC": a setting that is not there cannot be switched, so its reason comes first)
         if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
         if ($e.Failed -or (($x - $cw - $o.TextX) -ge $need)) { $o.ChipW = $cw; $o.ChipX = $x - $cw; $x = $o.ChipX - (Px 10) }
     }
     $o.TextEnd = $x
     $o.TextW = [Math]::Max(0, $x - $o.TextX)
-    $o.TitleY = Px 14
+    # the title: one line (names are kept short; the details panel has the rest). A name that is still too long ends with "..."
     $o.TitleH = Px 24
-    $o.DescY = Px 40
-    $o.DescH = Px 20
-    # the title, and the small marks after it (the "Not recommended" mark first), as many as fit
-    $tw = Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')
-    $o.TitleCut = [bool]($tw -gt $o.TextW)
-    $o.TitleW = [Math]::Min($o.TextW, ($tw + (Px 4)))
-    $o.DescCut = [bool]((Ui-TextWidth ([string]$e.Desc) (Ui-Font 'cardDesc')) -gt $o.TextW)
-    $px = $o.TextX + $o.TitleW + (Px 8)
+    $tfont = Ui-Font 'cardName'
+    $tw = Ui-TextWidth ([string]$e.Name) $tfont
+    $o.Lines = @([string]$e.Name)
+    $nl = @($o.Lines).Count
+    $lastW = Ui-TextWidth ([string]$o.Lines[$nl - 1]) $tfont
+    $o.TitleCut = [bool]($lastW -gt $o.TextW)                          # still too long after all that: the last line ends with "..."
+    $o.TitleW = [Math]::Min($o.TextW, ($tw + (Px 4)))                  # (one line) as wide as the text
+    if ($nl -gt 1) { $o.TitleW = $o.TextW }
+    $o.LastW = [Math]::Min($o.TextW, ($lastW + (Px 4)))
+    # the height: the lines of the title with room above and below (a line holds the tallest card of its row, so the card may be taller than this)
+    $padV = Px 16
+    $o.NatTop = [Math]::Max(($M.Row - $M.Gap), ($nl * $o.TitleH + 2 * $padV))
+    $o.NatH = $o.NatTop + $M.Gap
+    if ($e.Choices) { $o.NatH += $M.ChoiceExtra }
+    $o.CardH = [int]$e.H - $M.Gap
+    if ([int]$e.H -le 0) { $o.CardH = $o.NatH - $M.Gap }
+    $o.TopH = $o.CardH
+    if ($e.Choices) { $o.TopH = $o.CardH - $M.ChoiceExtra }
+    $o.ChoiceY = $o.TopH - (Px 4)                                      # the option buttons: on a line of their own, under the title
+    $o.TogY = [int](($o.TopH - $M.TogH) / 2)
+    $o.RiskY = [int](($o.TopH - $o.RiskH) / 2)
+    $o.ChipY = [int](($o.TopH - $o.ChipH) / 2)
+    $o.TitleY = [int](($o.TopH - $nl * $o.TitleH) / 2)                 # the lines are level with the middle of the card, like the pills and the switch
+    # the small marks after the last line of the title (the "Not recommended" mark first), as many as fit
+    $px = $o.TextX + $o.LastW + (Px 8)
     $ph = Px 20
-    $py = $o.TitleY + [int](($o.TitleH - $ph) / 2)
+    $py = $o.TitleY + ($nl - 1) * $o.TitleH + [int](($o.TitleH - $ph) / 2)
     $o.Pills = @()
     $o.Hidden = 0
     $o.NotRec = $null
@@ -9078,11 +9086,10 @@ function Ui-PaintRow {
     }
     $on = [bool]$e.Enabled
     $nameCol = $Th.Text
-    $descCol = $Th.Mute
-    if (-not $on) { $nameCol = $Th.Dim; $descCol = $Th.Dim }
+    if (-not $on) { $nameCol = $Th.Dim }
     # the title, then the marks after it
     $textX = $x + $o.TextX
-    Ui-Text $g $e.Name (Ui-Font 'cardName') $nameCol $textX ($y + $o.TitleY) $o.TitleW $o.TitleH $TF.L
+    for ($li = 0; $li -lt @($o.Lines).Count; $li++) { Ui-Text $g ([string]$o.Lines[$li]) (Ui-Font 'cardName') $nameCol $textX ($y + $o.TitleY + $li * $o.TitleH) $o.TitleW $o.TitleH $TF.L }
     $tagFont = Ui-Font 'smallb'
     foreach ($p in @($o.Pills)) {
         if ($p.Kind -eq 'notrec') {
@@ -9095,10 +9102,8 @@ function Ui-PaintRow {
             Ui-Text $g $p.Text $tagFont $Th.TagText ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
         }
     }
-    # the one-line description (the details panel shows all of it)
-    if ($e.Desc) { Ui-Text $g $e.Desc (Ui-Font 'cardDesc') $descCol $textX ($y + $o.DescY) $o.TextW $o.DescH $TF.L }
     # a row with options has its option pill on a second line, under the text
-    if ($e.Choices) { Ui-DrawChoices $g $e $textX ($y + $M.ChoiceY) ($cw - $M.Pad - $o.TextX) $M.ChoiceH }
+    if ($e.Choices) { Ui-DrawChoices $g $e $textX ($y + $o.ChoiceY) ($cw - $M.Pad - $o.TextX) $M.ChoiceH }
     # the right side: status chip, risk pill (or dot), switch
     if ($o.ChipX -ge 0) {
         Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH (Px 6)
@@ -9229,7 +9234,7 @@ function Ui-Zone {
             # the option buttons: seg0, seg1, ... from the left
             $cl = [int]$e.X + $o.TextX
             $cwid = [int]$e.W - $M.Pad - $o.TextX
-            $ctop = $M.ChoiceY
+            $ctop = $o.ChoiceY
             if ($ry -ge $ctop -and $ry -lt ($ctop + $M.ChoiceH) -and $x -ge $cl -and $x -lt ($cl + $cwid)) {
                 $cn = @($e.Choices).Count
                 $segw = [Math]::Max(1, [int][Math]::Floor($cwid / $cn))          # the same split as Ui-DrawChoices: equal parts, the last takes the remainder
@@ -10128,7 +10133,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '85'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '87'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10975,10 +10980,11 @@ function Ui-Build {
     $barFill.Location = New-Object System.Drawing.Point(0, 0)
     $barFill.Size = New-Object System.Drawing.Size(0, (Px 2))
     $barTrack.Controls.Add($barFill)
-    $status = New-Lbl '' 'ui' $Th.Sub $Th.Bg $M.Gutter (Px 16)
+    $status = New-Lbl '' 'ui' $Th.Sub $Th.Bg $M.Gutter (Px 8)
     $status.AutoSize = $false
     $status.AutoEllipsis = $true
-    $status.Size = New-Object System.Drawing.Size(($mw - 2 * $M.Gutter), (Px 22))
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft       # room for two lines: a long summary wraps instead of being cut off
+    $status.Size = New-Object System.Drawing.Size(($mw - 2 * $M.Gutter), (Px 34))
     $btnLog = New-Btn 'Hide log' 86 'ghost' 'Show or hide the log below the list.' 36
     $btnOpenLog = New-Btn 'Open log' 92 'ghost' 'Open the log file in Notepad.' 36
     $btnRestart = New-Btn 'Restart PC...' 124 'secondary' 'Restart Windows (asks first).' 36
@@ -11383,8 +11389,8 @@ function Info-RamCard {
     if ($r.SpeedMT -gt 0) {
         $t = (Fmt-N $r.SpeedMT 0) + ' MT/s'
         if ($r.Type) { $t = [string]$r.Type + '-' + [string][int]$r.SpeedMT + '   (' + (Fmt-N $r.SpeedMT 0) + ' MT/s)' }
-        if ($sn -and $null -ne $sn.RamMclk) { $t += '   memory clock ' + (Fmt-N $sn.RamMclk 0) + ' MHz' }
         $lines += , (Info-Line 'Speed' $t)
+        if ($sn -and $null -ne $sn.RamMclk) { $lines += , (Info-Line 'Memory clock' ((Fmt-N $sn.RamMclk 0) + ' MHz')) }
         if ($r.RatedMT -gt 0 -and $r.RatedMT -ne $r.SpeedMT) { $lines += , (Info-Line 'Module rating' ((Fmt-N $r.RatedMT 0) + ' MT/s')) }
     } else { $lines += , (Info-Line 'Speed' 'not reported by Windows' 'Dim') }
     $tm = Info-Timings $sn
@@ -12287,7 +12293,7 @@ function Ui-WelcomeLayout {
         if (-not $b) { continue }
         if ($set.ContainsKey($k) -and -not $moving) {
             $b.Text = [string]$set[$k][0]
-            $b.Width = [Math]::Max((Px 180), ((Px 40) + (Px 12) * ([string]$set[$k][0]).Length))
+            $b.Width = [Math]::Max((Px 160), ((Ui-TextWidth ([string]$set[$k][0]) (Ui-Font 'bigbtn')) + (Px 64)))     # as wide as its text needs, so a plain button's words sit evenly in the row
             $acts[$k] = [string]$set[$k][1]
             $btns += $b
             if (-not [bool]$b.Visible) { $b.Visible = $true }
@@ -13133,8 +13139,8 @@ function Ui-PresetWinSelect {
     $pw.View = 'overview'
     foreach ($k in @($pw.Opt.Keys)) {
         $b = $pw.Opt[$k]
-        $kind = 'secondary'
-        if ($k -eq $key) { $kind = 'accent' }
+        $kind = 'choice'
+        if ($k -eq $key) { $kind = 'choiceon' }
         if ([string]$b.Tag -ne $kind) { $b.Tag = $kind; Ui-StyleBtn $b }
     }
     Ui-PresetWinFill
@@ -13239,11 +13245,6 @@ function Ui-BuildPresetWindow {
     $f.ClientSize = New-Object System.Drawing.Size($w, $h)
     $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 820), $w), [Math]::Min((Px 520), $h))
 
-    $strip = New-Object System.Windows.Forms.Panel
-    $strip.Dock = [System.Windows.Forms.DockStyle]::Top
-    $strip.Height = (Px 3)
-    $strip.BackColor = $Th.Accent
-
     # left: the heading, the three choices, Close
     $left = New-Pnl 'Left' (Px 280) $Th.Side
     $head = New-Object System.Windows.Forms.Label
@@ -13272,13 +13273,13 @@ function Ui-BuildPresetWindow {
         @('personal', 'Custom Preset', 'What is applied here, and your own saved configuration to apply again after a wipe.')
     )
     foreach ($d in $optDefs) {
-        $b = New-Btn ([string]$d[1]) 244 'secondary' ([string]$d[2]) 48
+        $b = New-Btn ([string]$d[1]) 244 'choice' ([string]$d[2]) 44
         $b.Name = [string]$d[0]
         $b.Location = New-Object System.Drawing.Point((Px 18), (Px $y))
         $b.Add_Click({ param($s, $e) try { Ui-PresetWinSelect ([string]$s.Name) } catch { Ui-Fail $_ } })
         $left.Controls.Add($b)
         $opts[[string]$d[0]] = $b
-        $y += 58
+        $y += 52
     }
     $lbar = New-Pnl 'Bottom' (Px 64) $Th.Side
     $close = New-Btn 'Close' 100 'secondary' 'Close this window. Nothing is changed.' 36
@@ -13364,7 +13365,6 @@ function Ui-BuildPresetWindow {
     $f.Controls.Add($status)
     $f.Controls.Add($bar)
     $f.Controls.Add($left)
-    $f.Controls.Add($strip)
     $f.CancelButton = $close
     $f.ActiveControl = $opts['recommended']
     $script:PW = @{ Form = $f; Rich = $rb; Key = 'recommended'; Result = ''; Opt = $opts; Act = $acts; Status = $status; Bar = $bar; Close = $close; Changed = $false; View = 'overview'; Tabs = $tabs }
