@@ -1,10 +1,10 @@
 # Headroom
 
-Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 170 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
+Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 180 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
 
 There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
 
-The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running.
+The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running. On an NVIDIA card the graphics card also shows whether Resizable BAR is on and the PCIe link generation and width, read from nvidia-smi.
 
 ## Requirements
 

@@ -4690,6 +4690,20 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and clo
         pReg $ssm 'IsDynamicSearchBoxEnabled' 0 1
     )
 
+Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Snap suggestions and layouts flyout' `
+    -Desc 'On: Windows shows what you can snap next to a window right after you snap it, the snap-layouts box when you point at a window''s maximize button, and the layouts bar when you drag a window to the top of the screen. Off: all three are switched off (the three "Snap windows" options in Settings > System > Multitasking). Snapping itself still works: dragging a window to a screen edge and Win+Arrow keys are not touched. File Explorer restarts when this is changed, so open Explorer windows close for a moment.' `
+    -Parts @(
+        pReg $adv 'SnapAssist' 0 1
+        pReg $adv 'EnableSnapAssistFlyout' 0 1
+        pReg $adv 'EnableSnapBar' 0 1
+    )
+
+Add-Tweak -Id 'window-shake' -Cat $cLook -Def 'Off' -Explorer -Name 'Block title bar window shake' `
+    -Desc 'On: grabbing a window by its title bar and shaking it no longer minimizes all the other windows (DisallowShaking = 1). Off: Windows decides. Windows 11 ships with this shake already switched off ("Title bar window shake" in Settings > System > Multitasking), so on most PCs this changes nothing; it only matters on a PC where the shake was switched on. File Explorer restarts when this is changed, so open Explorer windows close for a moment.' `
+    -Parts @(
+        pReg $adv 'DisallowShaking' 1
+    )
+
 # ------------------------------------------------------------------ AI ---------
 Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilot' `
     -Desc 'On: the old Windows Copilot side panel and the Copilot button on the taskbar are available. Off: the side panel is turned off by policy and the taskbar button is hidden. Microsoft has marked that policy as deprecated. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
@@ -4750,6 +4764,14 @@ Add-Tweak -Id 'ai-page' -Cat $cAi -Inv -Def 'On' -Preset -Name 'AI components pa
     -Desc 'On: the "AI components" page shows in Settings (System > AI components, on the Windows versions that have it). Off: it is hidden by adding it to the list of Settings pages that policy hides. Pages that are already in that list stay in it. The AI features themselves are not changed, the page only stops being shown. Switching it back on takes just that page off the list again. If Settings on this PC is limited to a "showonly" list of pages, this setting reads as not available.' `
     -Parts @(
         pCustom 'SettingsHide' 'adds aicomponents to the hide: list in HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\SettingsPageVisibility and leaves every other page in that list as it is    (undo: takes only aicomponents out again)' 'aicomponents'
+    )
+
+Add-Tweak -Id 'ai-agentic' -Cat $cAi -Def 'Off' -Reboot -Name 'Keep experimental agentic features off' `
+    -Desc 'On: the "Experimental agentic features" switch (Settings > System > AI components > Agent tools, on the Windows builds that have it) is held off, so AI agents cannot be given their own workspace and account on this PC. Off: Windows decides, and the switch in Settings stays yours; it is off by default. This uses the value Enabled (0 = off) under HKLM\SYSTEM\CurrentControlSet\Services\IsoEnvBroker. Only a Windows build that has the feature has that key, so on any other PC the setting reads as not available and nothing is written. Switching this off again removes the value, which is how Windows ships it (the feature off); the switch in Settings is then yours again. A restart makes sure Windows reads the change.' `
+    -Parts @(
+        pRegDyn -Info 'HKLM\SYSTEM\CurrentControlSet\Services\IsoEnvBroker: Enabled = 0, only when that key exists on this PC    (undo: the value Windows had)' -Gen {
+            if (Reg-KeyExists 'HKLM:\SYSTEM\CurrentControlSet\Services\IsoEnvBroker') { pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\IsoEnvBroker' 'Enabled' 0 }
+        }
     )
 
 $chrome = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
@@ -4971,6 +4993,12 @@ Add-Tweak -Id 'apps-recorder' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Sound Re
         pAppx 'Microsoft.WindowsSoundRecorder'
     )
 
+Add-Tweak -Id 'apps-journal' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Journal app' `
+    -Desc 'On: the Journal app (Microsoft.MicrosoftJournal, the pen and notebook app) is installed. Off: it is removed for all users. If it is not on this PC the setting reads as off and nothing happens. It cannot be switched back on from here; install it again from the Microsoft Store if you want it.' `
+    -Parts @(
+        pAppx 'Microsoft.MicrosoftJournal'
+    )
+
 Add-Tweak -Id 'store-policy' -Cat $cApps -Inv -Def 'On' -Name 'Store policy and install service' `
     -Desc 'On: the Microsoft Store and its Install Service work as Windows has them. Off: the "Turn off the Store application" policy is set and the Microsoft Store Install Service is disabled. Only Enterprise and Education editions honour the policy; on Home and Pro Windows ignores it, but the service part works on every edition and stops Store installs and updates. To make the Store app itself disappear, use "Microsoft Store app" above. Fully reversible.' `
     -Parts @(
@@ -5047,6 +5075,40 @@ Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task:
     -Desc 'On: the task that looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report, is enabled. Off: the task is disabled. Nothing else depends on it. If this PC does not have the task the setting reads as not available.' `
     -Parts @(
         pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
+    )
+
+Add-Tweak -Id 'task-winsat' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: WinSAT benchmark' `
+    -Desc 'On: the task that runs the Windows System Assessment Tool (WinSAT) in the background during automatic maintenance, to refresh the Windows performance score, is enabled. Off: the task is disabled, so no benchmark runs while the PC is idle. The score stays as last measured, and a few old programs read it. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Maintenance\WinSAT'
+    )
+
+Add-Tweak -Id 'task-pca' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Compatibility Assistant' `
+    -Desc 'On: the Program Compatibility Assistant task (PcaPatchDbTask) that keeps its list of known program-compatibility fixes up to date is enabled. Off: the task is disabled. The list stays as it is; the "this program might not have installed correctly" prompts for old software can then be out of date. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Application Experience\PcaPatchDbTask'
+    )
+
+Add-Tweak -Id 'task-dusm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Data usage' `
+    -Desc 'On: the Data Usage task (DUSM), which belongs with the data usage meter shown in Settings > Network & internet > Data usage, is enabled. Off: the task is disabled. "Data usage meter service" under Services is a separate setting. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\DUSM\dusmtask'
+    )
+
+Add-Tweak -Id 'task-xblsave' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Scheduled task: Xbox game save sync' `
+    -Desc 'On: the two Xbox game save tasks (XblGameSaveTask and XblGameSaveTaskLogon) that help sync cloud saves of Game Pass and Microsoft Store games are enabled. Off: both tasks are disabled, so those saves may not sync until you start the game or the Xbox app. Steam, Epic and GOG saves are not affected. If this PC does not have the tasks the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\XblGameSave\XblGameSaveTask'
+        pTask '\Microsoft\XblGameSave\XblGameSaveTaskLogon'
+    )
+
+Add-Tweak -Id 'task-officetelemetry' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Office telemetry' `
+    -Desc 'On: the four Office telemetry agent tasks (OfficeTelemetryAgentLogOn and OfficeTelemetryAgentFallBack, each with a 2016 version) that collect and upload Office usage data are enabled. Off: all four are disabled. Office itself keeps working. A PC without Microsoft Office does not have the tasks; the setting then reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack2016'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn2016'
     )
 }   # ---- end of $engine ----
 
@@ -5450,7 +5512,7 @@ function Sys-PickGpu {
     return ''
 }
 function Get-SysGpu {
-    $o = @{ Name = ''; Vendor = ''; Driver = ''; VramMB = 0; Others = @() }
+    $o = @{ Name = ''; Vendor = ''; Driver = ''; VramMB = 0; Others = @(); Bar1MB = $null }
     try {
         $v = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction Stop)
         $names = @($v | ForEach-Object { ([string]$_.Name).Trim() } | Where-Object { $_ })
@@ -5477,6 +5539,8 @@ function Get-SysGpu {
             if ($null -ne $q -and [double]$q -gt 0) { $o.VramMB = [int]([double]$q / 1MB); break }
         }
     } catch { }
+    # Resizable BAR is read from nvidia-smi (BAR1 size); other makers' cards are not read
+    if ($o.Vendor -eq 'NVIDIA') { try { $o.Bar1MB = Sys-Bar1MB } catch { } }
     return $o
 }
 
@@ -5620,6 +5684,7 @@ function Sys-CpuClock {
 # ---- NVIDIA ----
 $script:SysSmi = $null              # the path of nvidia-smi, '' when there is none, $null before the first look
 $script:SmiSets = @(
+    @('name', 'driver_version', 'temperature.gpu', 'power.draw', 'power.limit', 'clocks.gr', 'clocks.max.gr', 'clocks.mem', 'utilization.gpu', 'memory.used', 'memory.total', 'fan.speed', 'pstate', 'pcie.link.gen.current', 'pcie.link.gen.max', 'pcie.link.width.current', 'pcie.link.width.max'),
     @('name', 'driver_version', 'temperature.gpu', 'power.draw', 'power.limit', 'clocks.gr', 'clocks.max.gr', 'clocks.mem', 'utilization.gpu', 'memory.used', 'memory.total', 'fan.speed', 'pstate'),
     @('name', 'driver_version', 'temperature.gpu', 'power.draw', 'clocks.gr', 'utilization.gpu', 'memory.used', 'memory.total')
 )
@@ -5677,12 +5742,40 @@ function Sys-GpuFromSmi {
               ClockMHz = (Sys-Plausible (Sys-Num $h['clocks.gr']) 0 6000); ClockMaxMHz = (Sys-Plausible (Sys-Num $h['clocks.max.gr']) 1 6000)
               MemClockMHz = (Sys-Plausible (Sys-Num $h['clocks.mem']) 0 20000)
               Usage = (Sys-Plausible (Sys-Num $h['utilization.gpu']) 0 100); MemUsedMB = $used; MemTotalMB = $tot
-              Fan = (Sys-Plausible (Sys-Num $h['fan.speed']) 0 100); PState = [string]$h['pstate'] }
+              Fan = (Sys-Plausible (Sys-Num $h['fan.speed']) 0 100); PState = [string]$h['pstate']
+              # the PCIe link: generation and width now, and the most the card and this PC's slot allow (a driver that does not know the fields gives none)
+              PcieGen = (Sys-Plausible (Sys-Num $h['pcie.link.gen.current']) 1 7); PcieGenMax = (Sys-Plausible (Sys-Num $h['pcie.link.gen.max']) 1 7)
+              PcieWidth = (Sys-Plausible (Sys-Num $h['pcie.link.width.current']) 1 32); PcieWidthMax = (Sys-Plausible (Sys-Num $h['pcie.link.width.max']) 1 32) }
+}
+# Resizable BAR. The BAR1 aperture is the window the CPU has into video memory: 256 MB without Resizable BAR, as large as the video memory
+# (or a big part of it) with it. "nvidia-smi -q -d MEMORY" prints it as
+#     BAR1 Memory Usage
+#         Total                             : 16384 MiB
+# The size in MB of the first card's BAR1 Total, $null when there is no such line or no number in it ("N/A").
+function Sys-ParseBar1 {
+    param([string]$Text)
+    $in = $false
+    foreach ($line in ([string]$Text -split "`r?`n")) {
+        $l = $line.Trim()
+        if (-not $l) { continue }
+        if ($l -match '^BAR1 Memory Usage$') { $in = $true; continue }
+        if (-not $in) { continue }
+        if ($l -match '^Total\s*:\s*(\S+)\s*MiB$') { return (Sys-Plausible (Sys-Num $Matches[1]) 1 4000000) }
+        if ($l -notmatch ':') { break }         # the next heading: this section had no usable Total
+    }
+    return $null
+}
+function Sys-Bar1MB {
+    if ($null -eq $script:SysSmi) { $script:SysSmi = Sys-FindSmi }
+    if (-not $script:SysSmi) { return $null }
+    $txt = Sys-RunTool $script:SysSmi '-q -d MEMORY' 6000
+    if ($null -eq $txt) { return $null }
+    return (Sys-ParseBar1 $txt)
 }
 # without nvidia-smi: what Windows itself counts (usage of the 3D engine, video memory in use)
 function Sys-GpuWindows {
     $g = @{ Source = 'windows'; Name = ''; Driver = ''; Temp = $null; Power = $null; PowerLimit = $null; ClockMHz = $null; ClockMaxMHz = $null; MemClockMHz = $null
-            Usage = $null; MemUsedMB = $null; MemTotalMB = $null; Fan = $null; PState = '' }
+            Usage = $null; MemUsedMB = $null; MemTotalMB = $null; Fan = $null; PState = ''; PcieGen = $null; PcieGenMax = $null; PcieWidth = $null; PcieWidthMax = $null }
     try {
         $s = @((Get-Counter -Counter '\GPU Engine(*engtype_3D)\Utilization Percentage' -ErrorAction Stop).CounterSamples)
         if ($s.Count) { $sum = 0.0; foreach ($x in $s) { $sum += [double]$x.CookedValue }; $g.Usage = [Math]::Min(100.0, [Math]::Round($sum, 0)) }
@@ -10161,7 +10254,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '88'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '89'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11299,6 +11392,40 @@ function Info-CpuCard {
     return (Info-Card 'info:cpu' 'Processor' ([string]$c.Name) $lines '' $chip $ck)
 }
 
+# "Gen 5 x16": the PCIe link between the card and the CPU as it is right now. A card slows its link down when it is idle, so a lower
+# generation than the top one is normal at rest and is only shown; a link that is narrower than the card supports (x8 for an x16 card) is
+# flagged, and a link at the top is green.
+function Info-PcieLine {
+    param($lv, $x, [bool]$nv)
+    if (-not $lv) { return (Info-Line 'PCIe link' 'Reading...' 'Dim') }
+    if (-not $nv) { return (Info-Line 'PCIe link' 'needs nvidia-smi' 'Dim') }
+    if ($null -eq $x.PcieGen -or $null -eq $x.PcieWidth) { return (Info-Line 'PCIe link' 'not reported by this driver' 'Dim') }
+    $g = [int]$x.PcieGen; $w = [int]$x.PcieWidth
+    $gm = $g; if ($null -ne $x.PcieGenMax) { $gm = [Math]::Max($g, [int]$x.PcieGenMax) }
+    $wm = $w; if ($null -ne $x.PcieWidthMax) { $wm = [Math]::Max($w, [int]$x.PcieWidthMax) }
+    $t = ('Gen {0} x{1}' -f $g, $w)
+    if ($w -lt $wm) { return (Info-Line 'PCIe link' ($t + ('   (the card supports Gen {0} x{1})' -f $gm, $wm)) 'Warn') }
+    if ($g -lt $gm) {
+        $idle = ''; if ($null -ne $x.Usage -and [double]$x.Usage -lt 10) { $idle = '; slows down when idle' }
+        return (Info-Line 'PCIe link' ($t + ('   (up to Gen {0}{1})' -f $gm, $idle)) 'Text')
+    }
+    return (Info-Line 'PCIe link' $t 'Good')
+}
+# Resizable BAR: on when the window into video memory (BAR1) is bigger than the classic 256 MB
+function Info-BarLine {
+    param($g, [bool]$nv)
+    $mb = $g.Bar1MB
+    if ($null -ne $mb -and [double]$mb -gt 0) {
+        $m = [double]$mb
+        $size = (Fmt-N $m 0) + ' MB'
+        if ($m -ge 1024 -and (($m % 1024) -eq 0)) { $size = (Fmt-N ($m / 1024.0) 0) + ' GB' }
+        if ($m -gt 256) { return (Info-Line 'Resizable BAR' ('On   (BAR1 ' + $size + ')') 'Good') }
+        return (Info-Line 'Resizable BAR' ('Off   (BAR1 ' + $size + ')') 'Warn')
+    }
+    if ([string]$g.Vendor -ne 'NVIDIA') { return (Info-Line 'Resizable BAR' 'not read for this card' 'Dim') }
+    if ($nv) { return (Info-Line 'Resizable BAR' 'not reported by nvidia-smi' 'Dim') }
+    return (Info-Line 'Resizable BAR' 'needs nvidia-smi' 'Dim')
+}
 function Info-GpuCard {
     param($d)
     $g = $null; if ($d.Static) { $g = $d.Static.Gpu }
@@ -11334,6 +11461,8 @@ function Info-GpuCard {
             $lines += , (Info-Line 'Video memory' ((Fmt-N $x.MemUsedMB 0) + ' of ' + (Fmt-N $tot 0) + ' MB') 'Text' $pct)
         } else { $lines += , (Info-Line 'Video memory' ((Fmt-N $x.MemUsedMB 0) + ' MB in use')) }
     } elseif ($g.VramMB -gt 0) { $lines += , (Info-Line 'Video memory' ((Fmt-N $g.VramMB 0) + ' MB')) }
+    $lines += , (Info-BarLine $g $nv)
+    $lines += , (Info-PcieLine $lv $x $nv)
     if ($nv -and $null -ne $x.Fan) { $lines += , (Info-Line 'Fan' ((Fmt-N $x.Fan 0) + ' %')) }
     $drv = ''
     if ($nv -and $x.Driver) { $drv = [string]$x.Driver }
