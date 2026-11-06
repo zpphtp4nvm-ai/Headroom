@@ -6904,6 +6904,33 @@ function Get-GroupCountText {
 }
 
 # ---------------------------------------------------------------- names and counts for the window's pages ----
+# Titles (pages, groups, cards and boxes - not the descriptions) show every word with a capital letter. Only the first letter of a word is
+# changed, so OneDrive, HWiNFO, USB and (HAGS) stay as they are; file names and a few program names are left alone.
+$script:TitleKeep = @('svchost.exe', 'ms-gamebar', 'nvidia-smi', 'x')
+$script:TitleCache = @{}                 # (the same names are asked for again and again while the list is painted)
+function Get-TitleCase {
+    param([string]$s)
+    if (-not $s) { return $s }
+    if ($script:TitleCache.ContainsKey($s)) { return [string]$script:TitleCache[$s] }
+    $ev = [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $m.Groups[1].Value + $m.Groups[2].Value.ToUpperInvariant() }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($tok in [regex]::Split($s, '(\s+)')) {
+        $core = $tok.ToLowerInvariant().Trim('"', '(', ')', ',', ':', ';')
+        if ($tok -eq '' -or $tok -match '^\s+$' -or $script:TitleKeep -contains $core -or $core -match '^[a-z0-9_-]+\.(exe|dll|sys|msc|com|ps1)$') { [void]$sb.Append($tok); continue }
+        [void]$sb.Append([regex]::Replace($tok, '(^[^A-Za-z0-9]*|-|/)([a-z])', $ev))
+    }
+    $script:TitleCache[$s] = $sb.ToString()
+    return $script:TitleCache[$s]
+}
+
+# A page name for a title: the name itself in capitals, the hint in brackets after it as it is
+function Get-CatTitle {
+    param([string]$cat)
+    $i = $cat.IndexOf(' (')
+    if ($i -gt 0 -and $cat.EndsWith(')')) { return ((Get-TitleCase $cat.Substring(0, $i)) + $cat.Substring($i)) }
+    return (Get-TitleCase $cat)
+}
+
 # "Security prompts (turning these off lowers protection)" -> Short = "Security prompts", Hint = "Turning these off lowers protection"
 function Split-CatName {
     param([string]$cat)
@@ -7020,26 +7047,26 @@ function Get-PageInfo {
     param([string]$cat, [string]$text, [int]$shown)
     $c = Get-Counts
     if ($text) {
-        return @{ Title = 'Search results'; Sub = ('{0} setting(s) match "{1}"' -f $shown, $text) }
+        return @{ Title = 'Search Results'; Sub = ('{0} setting(s) match "{1}"' -f $shown, $text) }
     }
     if ($cat -eq $script:PageHome) { return @{ Title = 'Home'; Sub = 'Your PC right now, every 2 seconds. Changes nothing on its own.' } }
     if ($c.Checking -gt 0) {
-        $t = 'All settings'
-        if ($cat) { $t = (Split-CatName $cat).Short }
+        $t = 'All Settings'
+        if ($cat) { $t = Get-TitleCase (Split-CatName $cat).Short }
         return @{ Title = $t; Sub = 'Checking your PC...' }
     }
     if (-not $cat) {
         $s = ('{0} settings, {1} applied' -f ($c.Total - $c.NA), $c.On)
         $n = $c.Apply + $c.Undo
         if ($n -gt 0) { $s += (', {0} waiting to change' -f $n) }
-        return @{ Title = 'All settings'; Sub = $s }
+        return @{ Title = 'All Settings'; Sub = $s }
     }
     $nm = Split-CatName $cat
     $g = (Get-GroupCounts)[$cat]
     $s = ''
     if ($g) { $s = ('{0} of {1} applied' -f $g.On, $g.Total) }
     if ($nm.Hint) { if ($s) { $s += '  -  ' }; $s += $nm.Hint }
-    return @{ Title = $nm.Short; Sub = $s }
+    return @{ Title = (Get-TitleCase $nm.Short); Sub = $s }
 }
 
 # The text next to a setting, in styled pieces:  S = style (title|sub|now|wait|last|body|warn|note|head|mono),
@@ -7052,8 +7079,8 @@ function Get-DetailParts {
     $c = 'sub'
     if ([string]$row.State -eq 'On') { $c = 'good' }
     elseif ([string]$row.State -eq 'Partial' -or [string]$row.State -eq 'Unknown') { $c = 'warn' }
-    [void]$p.Add(@{ S = 'title'; C = ''; T = $t.Name + $nl })
-    [void]$p.Add(@{ S = 'sub'; C = ''; T = $t.Cat + $nl + $nl })
+    [void]$p.Add(@{ S = 'title'; C = ''; T = (Get-TitleCase ([string]$t.Name)) + $nl })
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = (Get-CatTitle ([string]$t.Cat)) + $nl + $nl })
     [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
     # the switch, in words: where it is now and what Windows has out of the box
     if (-not $t.Once) {
@@ -8922,7 +8949,7 @@ function Ui-PaintHead {
     }
     $tx0 = Px 26
     # the heading only carries its title and the count: "Turn all on" and "Turn all off" are the two buttons at the top right of the window
-    Ui-Text $g $e.Title (Ui-Font 'head') $Th.Text $tx0 $ty ($Cl.Right - $M.CountW - $tx0 - (Px 6)) $hh $TF.L
+    Ui-Text $g (Get-TitleCase ([string]$e.Title)) (Ui-Font 'head') $Th.Text $tx0 $ty ($Cl.Right - $M.CountW - $tx0 - (Px 6)) $hh $TF.L
     if ($e.CountText) {
         Ui-Text $g $e.CountText (Ui-Font 'small') $Th.Mute ($Cl.Right - $M.CountW) $ty $M.CountW $hh $TF.R
     }
@@ -8984,9 +9011,9 @@ function Ui-RowGeom {
     $o.ChipH = Px 22
     if ($e.ChipText) {
         $cw = (Ui-TextWidth ([string]$e.ChipText) $f) + (Px 22)
-        $need = [Math]::Max((Px 280), (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
+        $need = [Math]::Max((Px 280), (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) (Ui-Font 'cardName')) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
         # the "Not recommended" mark matters more than a status chip: the chip only takes room the title and the mark can spare (except "Not on this PC": a setting that is not there cannot be switched, so its reason comes first)
-        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth ([string]$e.Name) (Ui-Font 'cardName')) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
+        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) (Ui-Font 'cardName')) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
         if ($e.Failed -or (($x - $cw - $o.TextX) -ge $need)) { $o.ChipW = $cw; $o.ChipX = $x - $cw; $x = $o.ChipX - (Px 10) }
     }
     $o.TextEnd = $x
@@ -8994,8 +9021,9 @@ function Ui-RowGeom {
     # the title: one line (names are kept short; the details panel has the rest). A name that is still too long ends with "..."
     $o.TitleH = Px 24
     $tfont = Ui-Font 'cardName'
-    $tw = Ui-TextWidth ([string]$e.Name) $tfont
-    $o.Lines = @([string]$e.Name)
+    $shownName = Get-TitleCase ([string]$e.Name)
+    $tw = Ui-TextWidth $shownName $tfont
+    $o.Lines = @($shownName)
     $nl = @($o.Lines).Count
     $lastW = Ui-TextWidth ([string]$o.Lines[$nl - 1]) $tfont
     $o.TitleCut = [bool]($lastW -gt $o.TextW)                          # still too long after all that: the last line ends with "..."
@@ -10133,7 +10161,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '87'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '88'            # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10437,7 +10465,7 @@ function Ui-PaintNav {
             Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.C
             $limit = $pxx - (Px 6)
         }
-        Ui-Text $g $e.Title $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
+        Ui-Text $g (Get-TitleCase ([string]$e.Title)) $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
     }
     # the app name stays put: it is drawn over the pages that have scrolled under it
     Ui-Fill $g $Th.Side 0 0 $w $M.NavTop
@@ -10608,8 +10636,8 @@ function Ui-UpdatePage {
     $shown = 0
     foreach ($id in @($script:Rows.Keys)) { if ($script:Rows[$id].Visible) { $shown++ } }
     $info = Get-PageInfo ([string]$script:NavCat) $text $shown
-    if ($ui.title -and [string]$ui.title.Text -ne [string]$info.Title) { $ui.title.Text = [string]$info.Title; Ui-FitTitle }
-    if ($ui.sub -and [string]$ui.sub.Text -ne [string]$info.Sub) { $ui.sub.Text = [string]$info.Sub }
+    if ($ui.title -and [string]$ui.title.Text -cne [string]$info.Title) { $ui.title.Text = [string]$info.Title; Ui-FitTitle }
+    if ($ui.sub -and [string]$ui.sub.Text -cne [string]$info.Sub) { $ui.sub.Text = [string]$info.Sub }
     $cat = [string]$script:NavCat
     if ($text) { $cat = '' }
     $mc = Get-ModeCounts $cat $text ([string]$script:Mode) ([string]$script:Risk)
@@ -10844,7 +10872,7 @@ function Ui-Build {
 
     # --- header: page title, the filter buttons
     $header = New-Pnl 'Top' $M.HeaderH $Th.Bg
-    $title = New-Lbl 'All settings' 'title' $Th.Text $Th.Bg $M.Gutter (Px 20)
+    $title = New-Lbl 'All Settings' 'title' $Th.Text $Th.Bg $M.Gutter (Px 20)
     $title.AutoSize = $false
     $title.AutoEllipsis = $true
     $title.Size = New-Object System.Drawing.Size((Px 400), (Px 38))
@@ -11717,14 +11745,14 @@ function Ui-PaintInfo {
         Ui-Text $g ([string]$e.Title).ToUpperInvariant() (Ui-Font 'cap') $Th.Dim $tx0 ($y + (Px 15)) $tw (Px 14) $TF.L
         Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 31)) ($cw - 2 * $M.Pad - $M.IconD - $M.IconGap) (Px 26) $TF.L
     } else {
-        Ui-Text $g ([string]$e.Title) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 12)) $tw $M.IconD $TF.L
+        Ui-Text $g (Get-TitleCase ([string]$e.Title)) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 12)) $tw $M.IconD $TF.L
     }
     $ly = $y + [int]$e.Top
     $lw = [Math]::Min((Px 150), [int]($iw * 0.42))
     foreach ($l in @($e.Lines)) {
         $ck = [string]$l.K
         if (-not $ck) { $ck = 'Text' }
-        Ui-Text $g ([string]$l.L) (Ui-Font 'small') $Th.Mute $ix $ly $lw (Px 20) $TF.L
+        Ui-Text $g (Get-TitleCase ([string]$l.L)) (Ui-Font 'small') $Th.Mute $ix $ly $lw (Px 20) $TF.L
         Ui-Text $g ([string]$l.V) (Ui-Font 'uib') $Th[$ck] ($ix + $lw) $ly ($iw - $lw) (Px 20) $TF.L
         if ($null -ne $l.Bar) {
             $by = $ly + (Px 23)
@@ -12693,11 +12721,11 @@ function Add-AdvancedSummary {
     param($parts)
     $nl = "`r`n"
     $n = @($script:Catalog | Where-Object { $_.Preset }).Count
-    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + 'Everything in Recommended Debloat' + $nl })
+    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Everything in Recommended Debloat'))) + $nl })
     [void]$parts.Add(@{ S = 'line'; C = ''; T = ('  - All {0} of its changes, Game Mode, HAGS and windowed games included' -f $n) + $nl })
-    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + 'And on top of that' + $nl })
+    [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('And on top of that'))) + $nl })
     foreach ($g in $script:AdvancedSummary) {
-        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + [string]$g.H + $nl })
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]([string]$g.H))) + $nl })
         foreach ($l in @($g.L)) { [void]$parts.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$l + $nl }) }
     }
 }
@@ -12705,7 +12733,7 @@ function Add-RecommendedSummary {
     param($parts)
     $nl = "`r`n"
     foreach ($g in $script:RecommendedSummary) {
-        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + [string]$g.H + $nl })
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]([string]$g.H))) + $nl })
         foreach ($l in @($g.L)) { [void]$parts.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$l + $nl }) }
     }
 }
@@ -12731,7 +12759,7 @@ function Add-PresetCatLines {
     foreach ($cat in @($script:Cats)) {
         $in = @($rows | Where-Object { [string]$_.T.Cat -eq [string]$cat })
         if ($in.Count -eq 0) { continue }
-        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Split-CatName ([string]$cat)).Short + $nl })
+        [void]$parts.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]((Split-CatName ([string]$cat)).Short))) + $nl })
         foreach ($r in $in) {
             [void]$parts.Add(@{ S = $style; C = ''; T = '  - ' + [string]$r.T.Name })
             $m = ''
@@ -12867,12 +12895,12 @@ function Get-PresetWinParts {
     [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + $desc + $nl })
     if ($key -eq 'recommended') { Add-RecommendedSummary $p }
     if ($key -eq 'advanced') {
-        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Warning' + $nl })
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Warning'))) + $nl })
         [void]$p.Add(@{ S = 'warn'; C = ''; T = [string]$script:AdvancedWarningText + $nl })
         if (@($script:AdvancedExtra).Count -gt 0) { Add-AdvancedSummary $p }
     }
     # how far it is on this PC: what is already enabled and what will be changed
-    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'On this PC right now' + $nl })
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('On this PC right now'))) + $nl })
     if ($sp.Checking -gt 0 -or $script:Scanning) {
         [void]$p.Add(@{ S = 'note'; C = ''; T = 'Still checking your PC...' + $nl })
     } else {
@@ -12918,7 +12946,7 @@ function Get-CustomWinParts {
     [void]$p.Add(@{ S = 'title'; C = ''; T = ([string]$script:PresetNames['personal']) + $nl })
     [void]$p.Add(@{ S = 'sub'; C = ''; T = 'Your own set of settings, kept in a file you can take with you' + $nl })
     [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + [string]$script:PresetDesc.custom + $nl })
-    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + 'Saved configuration' + $nl })
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Saved configuration'))) + $nl })
     if (@($script:Personal.Picks.Keys).Count -eq 0) {
         [void]$p.Add(@{ S = 'note'; C = ''; T = 'None yet. Press "Save configuration..." to keep everything that is switched on in the app right now (settings that are applied, and ones you have lined up) in a file.' + $nl })
     } else {
@@ -12969,9 +12997,9 @@ function Get-CustomWinParts {
         if ($saved.ContainsKey([string]$r.T.Id)) { $m += 'in your saved configuration' }
         return ($m -join ', ')
     }
-    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + ('Applied on this PC now ({0})' -f $applied.Count) })
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string](('Applied on this PC now ({0})' -f $applied.Count)))) })
     Add-PresetCatLines $p $applied $markOn
-    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + $nl + ('Not applied ({0})' -f $not.Count) })
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + $nl + (Get-TitleCase ([string](('Not applied ({0})' -f $not.Count)))) })
     Add-PresetCatLines $p $not $markOff
     if ($na -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + ('{0} more settings are not available on this PC and are not listed.' -f $na) + $nl }) }
     return $p
