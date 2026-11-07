@@ -62,7 +62,8 @@ Select Optimization Preset offers two presets. Each one lists what it will chang
 
 How the Question Preset works:
 
-- Each question is Yes, No or Not sure, with a short explanation and the settings the answer would change. You can go back to an earlier question and start again.
+- Each question is Yes, No, Not sure or Use default, with a short explanation and the settings the answer would change. You can go back to an earlier question and start again.
+- Use default leaves that question's settings as Windows has them. Any of them that are changed on your PC are put back to the Windows default when you press Confirm changes. Settings that remove an app cannot be put back, so those stay as they are.
 - Not sure and a skipped question change nothing. A Yes to a question that protects a setting (for example a Yes to Riot or FACEIT games, virtual machines or printing) beats any other answer that would change it.
 - The questions are grouped: your PC, work and network, accounts and cloud, privacy, AI and Edge, look and feel, and built-in apps. Questions that only matter for gaming PCs are left out if you say you do not game. Removing built-in apps is its own question at the start, and settings that cannot be undone are only applied if you say Yes to it.
 - Near the start it also asks whether you want the advanced questions. Those cover settings that lower protection or can get in the way of other things (User Account Control, drive encryption, driver updates, the Microsoft Store and similar). If you say No or Not sure they are not asked and nothing in them changes.

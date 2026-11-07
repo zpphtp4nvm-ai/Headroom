@@ -2907,7 +2907,7 @@ function Vrr-Screens {
             if ($fn.Count) { $name = ([System.Text.Encoding]::ASCII.GetString([byte[]]$fn)).Trim() }
             if (-not $name) { $name = $code }
             if (-not $name) { $name = 'a screen' }
-            $out += ,@{ Name = $name; Tech = $conn[$inst.ToUpperInvariant()]; Edid = $edid }
+            $out += ,@{ Name = $name; Tech = $conn[$inst.ToUpperInvariant()]; Edid = $edid; Code = $code }
         }
     } catch { }
     return $out
@@ -3044,6 +3044,98 @@ function Custom-GameMode-Revert {
     param($p, $mine)
     # Windows' default is Game Mode on, so removing the entries would leave this setting reading as on: switching it off needs an explicit 0
     foreach ($n in $script:GmNames) { [void](Reg-Write $script:GmPath $n 0 'DWord') }
+}
+
+# ------------------------------- Automatic color management -----
+# "Automatically manage color for apps" (Settings > System > Display > Color profile; on some builds under Advanced display) is kept for each
+# screen on its own: a DWord AutoColorManagementEnabled (1 on, 0 off) in one key per screen under ...\GraphicsDrivers\MonitorDataStore.
+# Windows ships it off, and a missing value is read as off. The name of a screen's key starts with the 7-character code of the screen in the
+# monitor list (SAM105C, say), which is how the keys of the screens that are connected now are found. A screen with no key of its own is left
+# alone: the name of a key cannot be worked out from here, and this app does not make up keys. The switch exists from Windows 11 22H2 with the
+# October 2023 update (build 22621.2506) and applies to screens in standard dynamic range (SDR) only.
+$script:AcmRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore'
+$script:AcmName = 'AutoColorManagementEnabled'
+# False on a Windows build that is older than the one with the switch (a build that cannot be read counts as supported)
+function Acm-Supported {
+    $b = Dx-Build
+    if ($b -le 0) { return $true }
+    if ($b -lt 22621) { return $false }
+    if ($b -gt 22621) { return $true }
+    $u = Reg-Read 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' 'UBR'
+    $n = 0
+    if ($u.Exists) { [void][int]::TryParse([string]$u.Value, [ref]$n) }
+    return ($n -le 0 -or $n -ge 2506)
+}
+# The color keys of the screens that are connected now: @{ Name = the screen; Key = the full registry path }, each key once
+function Acm-Keys {
+    Scan-Memo 'acm' {
+        $leaves = @()
+        foreach ($k in @(Reg-SubKeys $script:AcmRoot)) { $s = [string]$k; $leaves += $s.Substring($s.LastIndexOf('\') + 1) }
+        $out = @(); $seen = @{}
+        foreach ($sc in @(Vrr-Screens)) {
+            $code = [string]$sc.Code
+            if ($code.Length -lt 3) { continue }
+            foreach ($l in $leaves) {
+                if (-not $l.StartsWith($code, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+                $full = $script:AcmRoot + '\' + $l
+                if ($seen.ContainsKey($full)) { continue }
+                $seen[$full] = 1
+                $out += ,@{ Name = [string]$sc.Name; Key = $full }
+            }
+        }
+        return $out
+    }
+}
+function Custom-AcmApps-Detect {
+    param($p)
+    if (-not (Acm-Supported)) {
+        $script:Why = 'this switch exists on Windows 11 22H2 with the October 2023 update (build 22621.2506) and newer'
+        $script:Now = ('Automatic color management: needs Windows build 22621.2506, this PC has build {0}' -f (Dx-Build))
+        return 'NA'
+    }
+    $ks = @(Acm-Keys)
+    if ($ks.Count -eq 0) {
+        $script:Why = 'Windows keeps this switch in a color entry of each screen, and none of the screens that are connected has one'
+        $script:Now = 'Automatic color management: no color entry found for the connected screens'
+        return 'NA'
+    }
+    $on = 0; $off = 0; $txt = @()
+    foreach ($k in $ks) {
+        $r = Reg-Read $k.Key $script:AcmName
+        $v = 'no value (Windows treats that as off)'
+        if ($r.Exists) { $v = [string]$r.Value }
+        if ($r.Exists -and [string]$r.Value -eq '1') { $on++ } else { $off++ }
+        $txt += ('{0}: {1}' -f $k.Name, $v)
+    }
+    $script:Now = ('{0}, wanted 1. Screens: {1}' -f $script:AcmName, ($txt -join '; '))
+    return (Count-State $on $off)
+}
+function Custom-AcmApps-Snapshot {
+    param($p)
+    $dev = @{}
+    foreach ($k in @(Acm-Keys)) {
+        $r = Reg-Read $k.Key $script:AcmName
+        $dev[$k.Key] = @{ Had = [bool]$r.Exists; Was = $r.Value; Kind = [string]$r.Kind }
+    }
+    return @{ Dev = $dev }
+}
+function Custom-AcmApps-Apply {
+    param($p, $mine)
+    # a Windows build without the switch is never written (the plan skips it too; this is the second lock)
+    if (-not (Acm-Supported)) { return }
+    $n = 0
+    foreach ($k in @(Acm-Keys)) { if (Reg-Write $k.Key $script:AcmName 1 'DWord') { $n++ } }
+    Say "  ($n screen(s). A screen that is connected later gets Windows' default - switch this on again after adding one.)" 'DarkGray'
+}
+function Custom-AcmApps-Revert {
+    param($p, $mine)
+    if (-not (Acm-Supported)) { return }
+    foreach ($k in @(Acm-Keys)) {
+        $s = $null; if ($mine -and $mine.Dev) { $s = $mine.Dev[$k.Key] }
+        # a value that was 0 before comes back as 0; anything else (no value, or a 1 that was there already) goes back to Windows' default, which is off
+        if ($s -and $s.Had -and [string]$s.Was -eq '0') { [void](Reg-Write $k.Key $script:AcmName 0 'DWord') }
+        else { [void](Reg-Remove $k.Key $script:AcmName) }
+    }
 }
 
 # ------------------------------- Windows AI core package -----
@@ -4134,6 +4226,12 @@ Add-Tweak -Id 'game-mode' -Cat $cDisplay -Def 'On' -Preset -Name 'Game Mode' `
     -Desc 'On: Windows Game Mode (Settings > Gaming > Game Mode) is on, as Windows has it by default. Microsoft describes Game Mode as giving a game priority for the processor and graphics card and holding back some background work, such as driver installs by Windows Update, while it runs. How much that changes depends on the game and the PC, and it is not a speed-up by itself. Off: Game Mode is turned off (an explicit 0 is written). It is a setting of your Windows account (stored under HKEY_CURRENT_USER), so it applies to the account you run this app from. A missing entry is shown as on, because that is what Windows does when nothing has been changed. Windows also keeps an older value, AllowAutoGameMode, in the same key: it is read too (Game Mode counts as on only when neither value is 0), and this setting writes it only where it already exists.' `
     -Parts @(
         pCustom 'GameMode' 'sets AutoGameModeEnabled = 1 in HKCU\Software\Microsoft\GameBar (and AllowAutoGameMode = 1 there when that older value exists); a missing entry already counts as on    (undo: both are set to 0, which is Game Mode off)'
+    )
+
+Add-Tweak -Id 'auto-color' -Cat $cDisplay -Reboot -Name 'Automatically manage color for apps' `
+    -Desc 'On: Windows applies automatic color management (ACM) to the apps on the screen. Microsoft describes it as making colors look more accurate and consistent across apps, whether or not an app manages color itself, and as letting newer apps show more colors with finer steps, which reduces banding in gradients, shadows and dark scenes (on a screen with 8 bits per color it uses dithering for that). Off: apps send their colors to the screen as they are, which is how Windows ships. This is a color-quality setting and not a speed-up: it is not part of the question preset, and it is only worth turning on if color accuracy matters to you. It is the switch "Automatically manage color for apps" under Settings > System > Display > Color profile (on some builds under Advanced display), so you can also change it there. It exists from Windows 11 22H2 with the October 2023 update (build 22621.2506) and newer, and it applies to screens in standard dynamic range (SDR) only. Windows keeps the switch for each screen on its own, in the color entry it stores for that screen (HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore): this app sets it for every screen that is connected now and has such an entry, and shows the setting as not available when the build is older or no connected screen has an entry. A screen that is connected later gets Windows'' default, so turn this on again after adding one. Windows applies the switch at once when you change it in Settings, but a value written to the registry is read at the next start, so restart the PC after turning it on or off here. A missing value is shown as off. Undo puts a value that was 0 back to 0 and removes any other, which leaves the Windows default (off). A value of 1 can come from this app or from Windows itself when you changed the switch in Settings, and this app cannot tell which.' `
+    -Parts @(
+        pCustom 'AcmApps' 'sets AutoColorManagementEnabled = 1 in the color entry of every connected screen under HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore    (undo: a value that was 0 goes back to 0, otherwise the value is removed, which leaves the Windows default, off)'
     )
 
 # ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
@@ -6604,6 +6702,18 @@ function Select-PresetKey {
         if ($row.State -eq 'On') { continue }
         if ((Try-SetWant $id $true) -eq '') { $n++ }
     }
+    if ($key -eq 'guided') {
+        # the questions answered Use default: their settings that are not at the Windows default are put back (see Get-GuidedResetAction)
+        foreach ($row in @(Get-GuidedResetRows)) {
+            $id = [string]$row.T.Id
+            $act = Get-GuidedResetAction $row
+            $r = ''
+            if ($act -eq 'Apply') { $r = Try-SetWant $id $true }
+            elseif ([string]$row.State -eq 'Partial') { $r = Try-ForceUndo $id }
+            else { $r = Try-SetWant $id $false }
+            if ($r -eq '') { $n++ }
+        }
+    }
     return $n
 }
 
@@ -7367,11 +7477,24 @@ function Get-PresetNote {
     $Plan = @($Plan)
     $apply = @($Plan | Where-Object { $_.Action -eq 'Apply' })
     $name = [string]$script:PresetNames[$Key]
-    $s = ('{0}: this applies {1} setting(s) in one go. Each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on).' -f $name.ToUpper(), $apply.Count) + $nl
+    $back = @()
+    if ($Key -eq 'guided') {
+        # the settings of the questions answered Use default go back to the Windows default: they are not "applied" and carry no warnings
+        $rs = (Get-GuidedSets).Reset
+        $back = @($Plan | Where-Object { $rs.Contains([string]$_.Id) } | ForEach-Object { [string]$script:ById[[string]$_.Id].Name })
+        $apply = @($apply | Where-Object { -not $rs.Contains([string]$_.Id) })
+    }
+    if ($Key -eq 'guided' -and $back.Count -gt 0 -and $apply.Count -eq 0) {
+        $s = ('{0}: this puts {1} setting(s) back to the Windows default in one go.' -f $name.ToUpper(), $back.Count) + $nl
+    } else {
+        $s = ('{0}: this applies {1} setting(s) in one go. Each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on).' -f $name.ToUpper(), $apply.Count) + $nl
+    }
     if ($Key -eq 'advanced') {
         $s += 'Advanced Debloat is only recommended for PCs that are used mainly for gaming: it can remove services other uses need.' + $nl
     } elseif ($Key -eq 'guided') {
         $s += 'These are the settings your answers to the questions come to. Settings you said you use are not in the list.' + $nl
+        if ($back.Count -gt 0 -and $apply.Count -gt 0) { $s += ('You answered Use default to some questions, so {0} more setting(s) go back to the Windows default.' -f $back.Count) + $nl }
+        if ($back.Count -gt 0) { $s += ('Put back to the Windows default ({0}):' -f $back.Count) + $nl + (Format-NameList $back 40) + $nl }
     } elseif ($Key -eq 'personal') {
         $s += ('These are the settings of your Custom Preset (saved {0}).' -f [string]$script:Personal.Saved) + $nl
     }
@@ -7537,11 +7660,14 @@ function Handle-Event {
 # a gate with a plus ('uninstall+') needs a Yes (no uninstalling: no questions about which apps to remove; no advanced questions
 # unless the user wants them). Several gates are written as a comma-separated list.
 # The settings that remove something for good (T.OneWay) are only applied when the "uninstall" question was answered Yes.
-# Applying is all a preset does: it never switches anything off again. A setting is applied by at most one question, and a Keep from
-# any question beats an Apply from any other.
+# A fourth answer, Use default, leaves a question's own settings (the Yes and No lists) as Windows has them: the ones that are changed on
+# this PC are put back to the Windows default when the answers are confirmed (the same position "Reset all" uses). It protects the Keep
+# list like Not sure. The settings that remove something for good cannot be put back, so they are skipped.
+# Apart from that a preset only applies settings: it never switches anything off again. A setting is applied by at most one question,
+# and a Keep from any question beats an Apply from any other.
 # =============================================================================
 $script:GuidedQuestions = New-Object System.Collections.ArrayList
-$script:GuidedAnswers = @{}          # question id -> 'Yes' | 'No' | 'Unsure'
+$script:GuidedAnswers = @{}          # question id -> 'Yes' | 'No' | 'Unsure' | 'Default'
 $script:GuidedPos = 0                # the question the window shows: 0..Count-1, or Count for the review page
 $script:GuidedCache = $null          # the worked-out sets (cleared whenever an answer changes)
 
@@ -7834,7 +7960,7 @@ function Test-GuidedAsked {
         $gq = Get-GuidedQuestion $gate
         if ($gq -and -not (Test-GuidedAsked $gq)) { return $false }
         $ans = [string]$script:GuidedAnswers[$gate]
-        if ($needYes) { if ($ans -ceq 'No' -or $ans -ceq 'Unsure') { return $false } }
+        if ($needYes) { if ($ans -ceq 'No' -or $ans -ceq 'Unsure' -or $ans -ceq 'Default') { return $false } }
         elseif ($ans -ceq 'No') { return $false }
     }
     return $true
@@ -7847,7 +7973,7 @@ function Get-GuidedAsked {
 
 function Set-GuidedAnswer {
     param([string]$Id, [string]$Answer)
-    if ($Answer -cne 'Yes' -and $Answer -cne 'No' -and $Answer -cne 'Unsure') { return }
+    if ($Answer -cne 'Yes' -and $Answer -cne 'No' -and $Answer -cne 'Unsure' -and $Answer -cne 'Default') { return }
     $script:GuidedAnswers[$Id] = $Answer
     $script:GuidedCache = $null
 }
@@ -7864,12 +7990,16 @@ function Reset-GuidedAnswers {
 #   Final   the setting ids that are applied, in catalog order
 #   Blocked setting id -> the question that kept it, for the ones some other question would have applied
 #   NoUninstall  the ids left out because uninstalling was not allowed
+#   Reset   setting id -> the question answered Use default that owns it (its Yes and No lists), minus the settings that cannot be put
+#           back (T.OneWay) and the ones another question applies; whether each one needs putting back depends on the PC (Get-GuidedResetRows)
+#   ResetList  those ids, in catalog order
 function Get-GuidedSets {
     if ($script:GuidedCache) { return $script:GuidedCache }
-    $apply = [ordered]@{}; $keep = @{}
+    $apply = [ordered]@{}; $keep = @{}; $resetQ = [ordered]@{}
     foreach ($q in $script:GuidedQuestions) {
         if (-not (Test-GuidedAsked $q)) { continue }
         $a = [string]$script:GuidedAnswers[[string]$q.Id]
+        if ($a -ceq 'Default') { foreach ($id in @(@($q.Yes) + @($q.No))) { if (-not $resetQ.Contains($id)) { $resetQ[$id] = [string]$q.Id } } }
         if ($a -ceq 'Yes') { foreach ($id in @($q.Yes)) { if (-not $apply.Contains($id)) { $apply[$id] = [string]$q.Id } } }
         if ($a -ceq 'No')  { foreach ($id in @($q.No))  { if (-not $apply.Contains($id)) { $apply[$id] = [string]$q.Id } } }
         # a Yes, a Not sure and a question not answered yet all protect the Keep list
@@ -7888,7 +8018,15 @@ function Get-GuidedSets {
         if ($row.T.OneWay -and -not $allowOneWay) { $noUn += [string]$id; continue }
         $final += [string]$id
     }
-    $script:GuidedCache = @{ Apply = $apply; Keep = $keep; Final = @{}; FinalList = @($final); Blocked = $blocked; NoUninstall = @($noUn) }
+    $reset = [ordered]@{}
+    foreach ($id in @($script:Rows.Keys)) {
+        if (-not $resetQ.Contains([string]$id)) { continue }
+        if ($apply.Contains([string]$id)) { continue }          # another question applies it: that answer is the more definite one
+        $row = $script:Rows[$id]
+        if ($row.T.OneWay -or $row.T.Once) { continue }         # removed apps cannot be put back
+        $reset[[string]$id] = [string]$resetQ[[string]$id]
+    }
+    $script:GuidedCache = @{ Apply = $apply; Keep = $keep; Final = @{}; FinalList = @($final); Blocked = $blocked; NoUninstall = @($noUn); Reset = $reset; ResetList = @($reset.Keys) }
     foreach ($id in $final) { $script:GuidedCache.Final[[string]$id] = [string]$apply[[string]$id] }
     return $script:GuidedCache
 }
@@ -7901,9 +8039,39 @@ function Get-GuidedInUseApplied {
         if (-not $sets.Keep.ContainsKey([string]$id)) { continue }
         $row = $script:Rows[$id]
         if ($row.T.Once -or $row.State -ne 'On') { continue }
+        if ($sets.Reset.Contains([string]$id)) { continue }          # its question was answered Use default: it is put back, not left
         $qid = [string]$sets.Keep[[string]$id]
         if ([string]$script:GuidedAnswers[$qid] -cne 'Yes') { continue }      # only where the user really said Yes
         $out += $row
+    }
+    return $out
+}
+
+# What Use default does to one setting on this PC: 'Undo' or 'Apply' when it is not at its Windows default, '' when it is (or cannot be
+# changed). The Windows default is the position "Reset all" lines up: not applied, except for a setting whose Windows default is the
+# position the app applies (Game Mode on), which has to be on.
+function Get-GuidedResetAction {
+    param($row)
+    $st = [string]$row.State
+    if ($st -eq 'NA' -or $st -eq 'Checking' -or $st -eq 'Unknown') { return '' }
+    if ($row.T.OneWay -or $row.T.Once) { return '' }
+    if ($row.T.Choices) { if ($st -eq 'On') { return 'Undo' }; return '' }       # an option is in force: back to the Windows default option
+    if (Test-OffIsExplicit $row.T) {
+        if ($st -eq 'On') { return '' }
+        return 'Apply'
+    }
+    if ($st -eq 'On' -or $st -eq 'Partial') { return 'Undo' }
+    return ''
+}
+
+# The settings that Use default puts back on this PC right now, in catalog order (the rows, not the ids)
+function Get-GuidedResetRows {
+    $sets = Get-GuidedSets
+    $out = @()
+    foreach ($id in @($sets.ResetList)) {
+        $row = $script:Rows[[string]$id]
+        if (-not $row) { continue }
+        if ((Get-GuidedResetAction $row) -ne '') { $out += $row }
     }
     return $out
 }
@@ -10649,7 +10817,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '90'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '92'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -13277,7 +13445,7 @@ function Get-PresetWinRows {
 # One line per setting, under its page's name. $mark = a script block that gives text to put after a row's name ('' for none).
 # $style / $markStyle = the look of the name and of the text after it (the already-enabled list is quieter than the one to change).
 function Add-PresetCatLines {
-    param($parts, $rows, $mark, [string]$style = 'line', [string]$markStyle = 'last')
+    param($parts, $rows, $mark, [string]$style = 'line', [string]$markStyle = 'last', $resetIds = $null)
     $nl = "`r`n"
     $rows = @($rows)
     foreach ($cat in @($script:Cats)) {
@@ -13287,9 +13455,14 @@ function Add-PresetCatLines {
         foreach ($r in $in) {
             [void]$parts.Add(@{ S = $style; C = ''; T = '  - ' + [string]$r.T.Name })
             $m = ''
-            if ($mark) { $m = [string](& $mark $r) }
-            # where the preset puts the switch: a setting that turns its feature off when applied is listed as "switch off"
-            if (-not $r.T.Choices -and -not $r.T.Once) { $sw = 'switch off'; if (Get-SwitchOn $r.T $true) { $sw = 'switch on' }; if ($m) { $m = $sw + ', ' + $m } else { $m = $sw } }
+            if ($resetIds -and $resetIds.ContainsKey([string]$r.T.Id)) {
+                # a Use default answer: the setting goes back to the Windows default
+                $m = 'back to the Windows default'
+            } else {
+                if ($mark) { $m = [string](& $mark $r) }
+                # where the preset puts the switch: a setting that turns its feature off when applied is listed as "switch off"
+                if (-not $r.T.Choices -and -not $r.T.Once) { $sw = 'switch off'; if (Get-SwitchOn $r.T $true) { $sw = 'switch on' }; if ($m) { $m = $sw + ', ' + $m } else { $m = $sw } }
+            }
             if ($m) { [void]$parts.Add(@{ S = $markStyle; C = ''; T = '   (' + $m + ')' }) }
             [void]$parts.Add(@{ S = $style; C = ''; T = $nl })
         }
@@ -13313,7 +13486,25 @@ function Get-PresetSplit {
         }
         if ($isOn) { $on += $r } else { $chg += $r }
     }
-    return @{ Rows = $rows; Avail = $avail; Na = ($rows.Count - $avail.Count); On = $on; Change = $chg; Checking = @($avail | Where-Object { $_.State -eq 'Checking' }).Count }
+    # the Question Preset's Use default answers: their settings that are not at the Windows default are changes too (put back), kept apart
+    # in ResetIds so the lists can say so; they are not part of Rows / Avail / On
+    $resetIds = @{}
+    $resetChecking = 0
+    if ($key -eq 'guided') {
+        foreach ($id in @((Get-GuidedSets).ResetList)) {
+            $rr = $script:Rows[[string]$id]
+            if (-not $rr) { continue }
+            if ([string]$rr.State -eq 'Checking') { $resetChecking++; continue }
+            if ((Get-GuidedResetAction $rr) -ne '') { $resetIds[[string]$id] = $true }
+        }
+        if ($resetIds.Count -gt 0) {
+            $have = @{}
+            foreach ($r in $chg) { $have[[string]$r.T.Id] = $true }
+            foreach ($id in $resetIds.Keys) { $have[[string]$id] = $true }
+            $chg = @(foreach ($id in @($script:Rows.Keys)) { if ($have.ContainsKey([string]$id)) { $script:Rows[$id] } })
+        }
+    }
+    return @{ Rows = $rows; Avail = $avail; Na = ($rows.Count - $avail.Count); On = $on; Change = $chg; ResetIds = $resetIds; Checking = (@($avail | Where-Object { $_.State -eq 'Checking' }).Count + $resetChecking) }
 }
 
 # What is written after a setting that will be changed: the things to know before confirming
@@ -13331,13 +13522,19 @@ function Get-PresetChangeMark {
     return ($m -join ', ')
 }
 
+# The settings of the list of changes that are applied (not the ones a Use default answer puts back)
+function Get-PresetApplyRows {
+    param($sp)
+    return @($sp.Change | Where-Object { -not $sp.ResetIds.ContainsKey([string]$_.T.Id) })
+}
+
 # The list of what will be changed (to look at before pressing Confirm changes), grouped under the pages' names
 function Add-PresetChangeList {
     param($p, $sp)
     $nl = "`r`n"
     if ($sp.Change.Count -gt 0) {
         [void]$p.Add(@{ S = 'wait'; C = ''; T = $nl + ('Will be changed ({0})' -f $sp.Change.Count) + $nl })
-        Add-PresetCatLines $p $sp.Change { param($r) Get-PresetChangeMark $r }
+        Add-PresetCatLines $p $sp.Change { param($r) Get-PresetChangeMark $r } 'line' 'last' $sp.ResetIds
     } elseif ($sp.Checking -eq 0 -and $sp.Avail.Count -gt 0) {
         [void]$p.Add(@{ S = 'good'; C = ''; T = $nl + 'Nothing to change: everything in this preset is already enabled on this PC.' + $nl })
     }
@@ -13377,8 +13574,13 @@ function Get-PresetViewParts {
     }
     $avail = $sp.Avail.Count
     if ($view -eq 'change') {
-        [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings will be changed when you press Confirm changes' -f $sp.Change.Count, $avail) + $nl })
-        $ac = Get-PresetAntiCheatText $sp.Change
+        $back = $sp.ResetIds.Count
+        if ($back -gt 0) {
+            [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings will be changed when you press Confirm changes, and {2} will be put back to the Windows default' -f ($sp.Change.Count - $back), $avail, $back) + $nl })
+        } else {
+            [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} settings will be changed when you press Confirm changes' -f $sp.Change.Count, $avail) + $nl })
+        }
+        $ac = Get-PresetAntiCheatText (Get-PresetApplyRows $sp)
         if ($ac) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $ac + $nl }) }
         Add-PresetChangeList $p $sp
         if ($sp.Change.Count -gt 0) {
@@ -13429,6 +13631,7 @@ function Get-GuidedAnswerText {
     if ($a -ceq 'Yes') { return 'Yes' }
     if ($a -ceq 'No') { return 'No' }
     if ($a -ceq 'Unsure') { return 'Not sure' }
+    if ($a -ceq 'Default') { return 'Use default' }
     return 'not answered'
 }
 
@@ -13462,6 +13665,14 @@ function Get-GuidedQuestionParts {
     } else {
         [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'No or Not sure changes nothing for this question.' + $nl })
     }
+    $owned = @(@($q.Yes) + @($q.No))
+    if ($owned.Count) {
+        $dt = 'Use default leaves all of these as Windows has them: the ones that are changed on this PC are put back to the Windows default when you press Confirm changes.'
+        if (@($owned | Where-Object { $script:ById[[string]$_] -and $script:ById[[string]$_].OneWay }).Count) { $dt += ' Settings that remove an app cannot be put back, so those stay as they are.' }
+    } else {
+        $dt = 'Use default does the same as Not sure for this question.'
+    }
+    [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + $dt + $nl })
     $a = [string]$script:GuidedAnswers[[string]$q.Id]
     if ($a) {
         [void]$p.Add(@{ S = 'good'; C = ''; T = $nl + ('Your answer: ' + (Get-GuidedAnswerText $a)) + $nl })
@@ -13480,24 +13691,31 @@ function Get-GuidedReviewParts {
     $sets = Get-GuidedSets
     [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} questions answered' -f $c.Done, $c.Asked) + $nl })
     [void]$p.Add(@{ S = 'title'; C = ''; T = $nl + 'Review your answers' + $nl })
-    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab: the ones your answers come to that are not enabled yet. Questions you answered Not sure, or have not answered, change nothing. Use Back to change an answer.' + $nl })
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab: the ones your answers come to that are not enabled yet. Questions you answered Not sure, or have not answered, change nothing. A question you answered Use default leaves its settings as Windows has them, and puts back the ones that are changed. Use Back to change an answer.' + $nl })
     $sp = Get-PresetSplit 'guided'
     [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'On this PC right now')) + $nl })
     if ($sp.Checking -gt 0 -or $script:Scanning) {
         [void]$p.Add(@{ S = 'note'; C = ''; T = 'Still checking your PC...' + $nl })
     } else {
-        $t = ('{0} settings come out of your answers: {1} are already enabled, {2} will be changed.' -f $sp.Avail.Count, $sp.On.Count, $sp.Change.Count)
+        $applyRows = @(Get-PresetApplyRows $sp)
+        $t = ('{0} settings come out of your answers: {1} are already enabled, {2} will be changed.' -f $sp.Avail.Count, $sp.On.Count, $applyRows.Count)
+        if ($sp.ResetIds.Count -gt 0) { $t += (' {0} more will be put back to the Windows default (Use default).' -f $sp.ResetIds.Count) }
         if ($sp.Na -gt 0) { $t += (' Not available on this PC, so skipped: {0}.' -f $sp.Na) }
         [void]$p.Add(@{ S = 'line'; C = ''; T = $t + $nl })
     }
-    $ac = Get-PresetAntiCheatText $sp.Change
+    $ac = Get-PresetAntiCheatText (Get-PresetApplyRows $sp)
     if ($ac) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $ac + $nl }) }
     # the settings that lower protection or that other programs may need: only the advanced questions apply these
-    $nr = @($sp.Change | Where-Object { (Get-NotRecReason $_.T) -or ([string]$_.T.Risk -ceq 'security') } | ForEach-Object { [string]$_.T.Name })
+    $nr = @(Get-PresetApplyRows $sp | Where-Object { (Get-NotRecReason $_.T) -or ([string]$_.T.Risk -ceq 'security') } | ForEach-Object { [string]$_.T.Name })
     if ($nr.Count) {
         [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Marked Not recommended or lowering protection ({0})' -f $nr.Count))) + $nl })
         [void]$p.Add(@{ S = 'warn'; C = ''; T = 'These come from the advanced questions. Each one''s description says why it carries a mark. Use Back to change the answer if you are not sure.' + $nl })
         foreach ($n in $nr) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + $n + $nl }) }
+    }
+    if ($sp.ResetIds.Count -gt 0) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Put back to the Windows default ({0})' -f $sp.ResetIds.Count))) + $nl })
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'You answered Use default to these questions. These settings are changed on this PC right now, so Confirm changes puts them back.' + $nl })
+        foreach ($r in @($sp.Change | Where-Object { $sp.ResetIds.ContainsKey([string]$_.T.Id) })) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$r.T.Name + $nl }) }
     }
     $bl = @($sets.Blocked.Keys)
     if ($bl.Count) {
@@ -13787,8 +14005,11 @@ function Get-PresetConfirmHint {
     if ($sp.Checking -gt 0 -or $script:Scanning) { return 'Still checking your PC...' }
     if ($key -eq 'guided') {
         $gc = Get-GuidedCounts
-        if ($gc.Done -eq 0) { return 'Answer the questions: Yes, No or Not sure. Nothing is changed until you press Confirm changes.' }
+        if ($gc.Done -eq 0) { return 'Answer the questions: Yes, No, Not sure or Use default. Nothing is changed until you press Confirm changes.' }
         if ($sp.Change.Count -eq 0) { return ('{0} of {1} questions answered. Nothing to change yet: the settings your answers come to are already enabled, or there are none.' -f $gc.Done, $gc.Asked) }
+        if ($sp.ResetIds.Count -gt 0) {
+            return ('{0} of {1} questions answered. Confirm changes makes the {2} change(s) on the "Will be changed" tab ({3} of them put settings back to the Windows default); {4} already enabled stay as they are.' -f $gc.Done, $gc.Asked, $sp.Change.Count, $sp.ResetIds.Count, $sp.On.Count)
+        }
         return ('{0} of {1} questions answered. Confirm changes applies the {2} settings on the "Will be changed" tab; {3} already enabled stay as they are.' -f $gc.Done, $gc.Asked, $sp.Change.Count, $sp.On.Count)
     }
     if ($sp.Change.Count -eq 0) { return 'Everything in this preset is already enabled on this PC, so there is nothing to confirm.' }
@@ -13838,16 +14059,26 @@ function Ui-PresetWinButtons {
         'guided'      {
             if ([string]$pw.View -ne 'overview') { $show = @('act-guided') }
             elseif ([int]$script:GuidedPos -ge @(Get-GuidedAsked).Count) { $show = @('act-back', 'act-restart', 'act-guided') }
-            else { $show = @('act-yes', 'act-no', 'act-unsure', 'act-back', 'act-guided') }
+            else { $show = @('act-yes', 'act-no', 'act-unsure', 'act-default', 'act-back', 'act-guided') }
         }
     }
     $busy = [bool](Get-BusyReason)
     $x = Px 24
+    # when the window is narrow the visible buttons are made narrower (down to 60 %) so that they all fit in the row
+    $scale = 1.0
+    $tot = 0; $nVis = 0; $bw = 0
+    foreach ($k in @($pw.Act.Keys)) {
+        if ($show -contains $k) { $tot += [int]$script:PresetActW[[string]$k]; $nVis++; if ($bw -eq 0) { try { $bw = [int]$pw.Bar.Width } catch { $bw = 0 } } }
+    }
+    $room = $bw - (Px 48) - (Px 10) * [Math]::Max(0, $nVis - 1)
+    if ($bw -gt 0 -and $tot -gt 0 -and $room -gt 0 -and $tot -gt $room) { $scale = [Math]::Max(0.6, [double]$room / [double]$tot) }
     foreach ($k in @($pw.Act.Keys)) {
         $b = $pw.Act[$k]
         $v = ($show -contains $k)
         if ([bool]$b.Visible -ne $v) { $b.Visible = $v }
         if ($v) {
+            $wd = [int][Math]::Round([double]$script:PresetActW[[string]$k] * $scale)
+            if ($wd -gt 0 -and [int]$b.Width -ne $wd) { $b.Width = $wd }
             $b.Left = $x
             $x += $b.Width + (Px 10)
         }
@@ -13897,6 +14128,7 @@ function Ui-PresetWinAct {
         'act-yes'         { Ui-GuidedAnswer 'Yes' }
         'act-no'          { Ui-GuidedAnswer 'No' }
         'act-unsure'      { Ui-GuidedAnswer 'Unsure' }
+        'act-default'     { Ui-GuidedAnswer 'Default' }
         'act-back'        { Ui-GuidedBack }
         'act-restart'     { Ui-GuidedRestart }
         'act-save'        { Ui-PresetWinSave }
@@ -14069,22 +14301,26 @@ function Ui-BuildPresetWindow {
         @('act-save', 'Save configuration...', 190, 'secondary', 'Save everything that is switched on in the app right now to a file you keep.'),
         @('act-open', 'Open configuration...', 190, 'secondary', 'Open a configuration file you saved earlier (for example after installing Windows again).'),
         @('act-apply', 'Confirm changes', 190, 'primary', 'Apply the settings of the saved configuration that are not enabled yet. A restore point is created first.'),
-        @('act-yes', 'Yes', 90, 'secondary', 'Answer Yes to this question.'),
-        @('act-no', 'No', 90, 'secondary', 'Answer No to this question.'),
-        @('act-unsure', 'Not sure', 110, 'secondary', 'Not sure: this question changes nothing, and the settings that depend on it are left as Windows has them.'),
-        @('act-back', 'Back', 90, 'secondary', 'Go back to the question before.'),
+        @('act-yes', 'Yes', 80, 'secondary', 'Answer Yes to this question.'),
+        @('act-no', 'No', 80, 'secondary', 'Answer No to this question.'),
+        @('act-unsure', 'Not sure', 100, 'secondary', 'Not sure: this question changes nothing, and the settings that depend on it are left as Windows has them.'),
+        @('act-default', 'Use default', 124, 'secondary', 'Use default: this question''s settings stay as Windows has them. The ones that are changed on this PC are put back to the Windows default when you press Confirm changes.'),
+        @('act-back', 'Back', 80, 'secondary', 'Go back to the question before.'),
         @('act-restart', 'Start over', 120, 'secondary', 'Clear every answer and begin again.'),
-        @('act-guided', 'Confirm changes', 170, 'primary', 'Apply the settings your answers come to that are not enabled yet. A restore point is created first.')
+        @('act-guided', 'Confirm changes', 150, 'primary', 'Apply the settings your answers come to that are not enabled yet. A restore point is created first.')
     )
+    $script:PresetActW = @{}
     foreach ($d in $actDefs) {
         $b = New-Btn ([string]$d[1]) ([int]$d[2]) ([string]$d[3]) ([string]$d[4]) 36
         $b.Name = [string]$d[0]
+        $script:PresetActW[[string]$d[0]] = [int]$b.Width
         $b.Top = (Px 14)
         $b.Visible = $false
         $b.Add_Click({ param($s, $e) try { Ui-PresetWinAct ([string]$s.Name) } catch { Ui-Fail $_ } })
         $bar.Controls.Add($b)
         $acts[[string]$d[0]] = $b
     }
+    $bar.Add_Resize({ try { Ui-PresetWinButtons } catch { } })        # (the buttons are made narrower when the window is)
     $status = New-Object System.Windows.Forms.Label
     $status.Dock = [System.Windows.Forms.DockStyle]::Bottom
     $status.Height = (Px 56)
