@@ -17,9 +17,10 @@
     those come from HWiNFO or LibreHardwareMonitor. The Start HWiNFO button turns on HWiNFO's sensor sharing for you, after
     asking, and keeps a copy of its settings file. Headroom installs no driver and downloads nothing.
 
-    Select Optimization Preset offers three presets, and each one lists what it will change before anything is applied:
-      Recommended Debloat   a set of gaming-oriented settings that removes no app
-      Advanced Debloat      for PCs used mainly for gaming; it may remove services that other uses need
+    Select Optimization Preset offers two presets, and each one lists what it will change before anything is applied:
+      Question Preset       you answer short questions about how you use this PC (gaming, Riot or FACEIT games, VPN, virtual
+                            machines, printing and so on) and it changes only what fits your answers; a setting you are unsure
+                            about is left alone
       Custom Preset         your own saved configuration, which can be applied again after a clean install of Windows
 
     Preview only lists what would happen and changes nothing. Settings that can stop FACEIT or Riot Vanguard, printing, or
@@ -2724,7 +2725,7 @@ function Custom-DefenderIdle-Revert {
 
 # ------------------------------- Display: graphics switches that share one text -----
 # Settings > System > Display > Graphics > Default graphics settings keeps its switches in ONE text value, a list of NAME=value;
-# pairs (for example "SwapEffectUpgradeEnable=1;VRROptimizeEnable=0;"). Each switch here changes only its own pair and leaves every
+# pairs (for example "SwapEffectUpgradeEnable=1;VRROptimizeEnable=1;"). Each switch here changes only its own pair and leaves every
 # other pair in the text exactly as it was, whoever wrote it.
 $script:DxPath = 'HKCU:\Software\Microsoft\DirectX\UserGpuPreferences'
 $script:DxName = 'DirectXUserGlobalSettings'
@@ -2768,12 +2769,12 @@ function Dx-WriteText {
 }
 # The lowest Windows build that has the switch, as the build number is known: an unknown build counts as supported
 $script:DxMinBuild = @{ 'SwapEffectUpgradeEnable' = 22621; 'VRROptimizeEnable' = 19041 }
-# The value each setting writes into its own pair. The two switches go in opposite directions: "Optimizations for windowed games" is
-# turned ON (1) and "Variable refresh rate" is turned OFF (0), so for the second one "applied" means the entry reads 0 and a missing
-# entry (Windows' own default, which Settings may show as on) means it is not applied yet. Windows shows the variable refresh rate
-# switch in Settings only where the monitor and the graphics driver support it, so on a PC where no screen can do it (Vrr-Check) the
-# setting reads "not available" and is never written.
-$script:DxWant = @{ 'SwapEffectUpgradeEnable' = '1'; 'VRROptimizeEnable' = '0' }
+# The value each setting writes into its own pair: both switches are turned ON (1). "Applied" means the entry reads 1. A missing entry
+# means Windows' own default: on for "Optimizations for windowed games" from Windows 11 24H2 (see Dx-DefaultOn), and off for "Variable
+# refresh rate" (the Windows guides list it as off out of the box; Microsoft does not publish it). Windows shows the variable refresh
+# rate switch in Settings only where the monitor and the graphics driver support it, so on a PC where no screen can do it (Vrr-Check)
+# the setting reads "not available" and is never written.
+$script:DxWant = @{ 'SwapEffectUpgradeEnable' = '1'; 'VRROptimizeEnable' = '1' }
 function Dx-Want {
     param([string]$Key)
     $w = [string]$script:DxWant[$Key]
@@ -2786,10 +2787,13 @@ function Dx-Build {
     if ($r.Exists) { [void][int]::TryParse([string]$r.Value, [ref]$n) }
     return $n
 }
-# From this build on (Windows 11 24H2) a clean Windows has no entry for these two switches and Settings shows them ON, so a missing
-# entry is read as On there. Older builds, and a PC whose build cannot be read, keep reading a missing entry as Off.
+# From this build on (Windows 11 24H2) a clean Windows has no entry for "Optimizations for windowed games" and Settings shows it ON, so a
+# missing entry is read as On there. Older builds, and a PC whose build cannot be read, read a missing entry as Off. For "Variable refresh
+# rate" a missing entry is Off on every build: it is never turned on by Windows itself.
 $script:DxDefaultOnBuild = 26100
 function Dx-DefaultOn {
+    param([string]$Key)
+    if ($Key -ne 'SwapEffectUpgradeEnable') { return $false }
     $b = Dx-Build
     return ($b -ge $script:DxDefaultOnBuild)
 }
@@ -2948,9 +2952,7 @@ function Custom-DxGlobal-Detect {
     $shown = $v
     if ($null -eq $v) {
         $shown = 'no entry'
-        # only the windowed-games switch has a known default; for variable refresh rate Microsoft does not say, so nothing is claimed
-        if ($key -eq 'VRROptimizeEnable') { $shown += ' (Windows uses its own default for this PC)' }
-        elseif (Dx-DefaultOn) { $shown += ' (Windows treats that as on)' }
+        if (Dx-DefaultOn $key) { $shown += ' (Windows treats that as on)' }
         else { $shown += ' (Windows treats that as off)' }
     }
     $want = Dx-Want $key
@@ -2961,9 +2963,9 @@ function Custom-DxGlobal-Detect {
         if ($seen.Count -gt 0) { $script:Now += ('. Screens: ' + ($seen -join '; ')) } else { $script:Now += '. No screen could be read, so the switch is left available' }
     }
     if ($v -eq $want) { return 'On' }
-    # no entry: Windows' own default. Where the wanted value is 1 and Windows' default is on (Windows 11 24H2 and newer) that already counts as applied;
-    # where the wanted value is 0 (variable refresh rate) a missing entry is never "applied", the setting is simply there to be turned on
-    if ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn)) { return 'On' }
+    # no entry: Windows' own default. Where Windows' default is on (the windowed-games switch on Windows 11 24H2 and newer) that already counts as
+    # applied; for variable refresh rate a missing entry is Off, the setting is there to be turned on
+    if ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn $key)) { return 'On' }
     return 'Off'
 }
 function Custom-DxGlobal-Snapshot {
@@ -2971,9 +2973,9 @@ function Custom-DxGlobal-Snapshot {
     $key = [string]$p.Data
     $v = Dx-Get (Dx-ReadText) $key
     $want = Dx-Want $key
-    # a switch that already has the wanted value when this app first looks (an entry with it, or for a wanted 1 no entry on a build where
-    # Windows' default is on): what it was before is unknown, undo then puts it back to the other value (or to no entry)
-    return @{ Key = $key; Had = ($null -ne $v); Was = [string]$v; Unknown = ($v -eq $want -or ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn))) }
+    # a switch that already has the wanted value when this app first looks (an entry with it, or no entry on a build where Windows'
+    # default is on): what it was before is unknown, undo then puts it back to the other value (or to no entry)
+    return @{ Key = $key; Had = ($null -ne $v); Was = [string]$v; Unknown = ($v -eq $want -or ($null -eq $v -and $want -eq '1' -and (Dx-DefaultOn $key))) }
 }
 function Custom-DxGlobal-Apply {
     param($p, $mine)
@@ -2990,8 +2992,8 @@ function Custom-DxGlobal-Revert {
     if (Vrr-Missing $key) { return }
     $want = Dx-Want $key
     $val = $null
-    if ($want -eq '1' -and (Dx-DefaultOn)) { $val = '0' }          # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
-    # otherwise the entry is removed, which leaves the Windows default (for variable refresh rate that is whatever Windows decides for this PC)
+    if ($want -eq '1' -and (Dx-DefaultOn $key)) { $val = '0' }     # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
+    # otherwise the entry is removed, which leaves the Windows default (off, for variable refresh rate)
     [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
 }
 
@@ -4122,10 +4124,10 @@ Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Def 'On' -Preset -Name 'Optimizatio
         pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
     )
 
-Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Inv -Def 'On' -Name 'Variable refresh rate (DirectX 11 games)' `
-    -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Microsoft does not say what Windows does when there is no entry, so a missing entry is shown here as on (not turned off yet); switching it off writes an explicit 0. An entry of 0 can come from this app, from a guide or tool used earlier, or from Windows itself, and this app cannot tell which. Switching it back on removes the entry, which leaves the Windows default.' `
+Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Variable refresh rate (DirectX 11 games)' `
+    -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate of the game. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen, which is how Windows ships. Only turn it on if you have a variable refresh rate screen: on any other screen it does nothing. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off again for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Windows has no entry for this switch out of the box, and a missing entry is shown here as off. Turning it on writes an explicit 1; turning it off removes the entry, which leaves the Windows default. An entry of 1 can come from this app, from a guide or tool used earlier, or from Windows itself when you changed the switch in Settings, and this app cannot tell which.' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets VRROptimizeEnable=0; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default)' 'VRROptimizeEnable'
+        pCustom 'DxGlobal' 'sets VRROptimizeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default, off)' 'VRROptimizeEnable'
     )
 
 Add-Tweak -Id 'game-mode' -Cat $cDisplay -Def 'On' -Preset -Name 'Game Mode' `
@@ -6534,7 +6536,7 @@ function Get-GroupLeftOut {
 #   advanced     the Recommended set plus $script:AdvancedExtra ("Advanced Debloat"): the further settings the user chose, in catalog
 #                order by page. Every entry must be a setting id, and none may be a run-once or an option (Choices) setting.
 #   personal     the settings the user saved from this PC ("Custom Preset"), kept in a file the user can take along
-$script:PresetNames = @{ recommended = 'Recommended Debloat'; advanced = 'Advanced Debloat'; personal = 'Custom Preset' }
+$script:PresetNames = @{ recommended = 'Recommended Debloat'; advanced = 'Advanced Debloat'; guided = 'Question Preset'; personal = 'Custom Preset' }
 $script:AdvancedExtra = @(
     # Cloud, sync and OneDrive (all)
     'settingsync', 'clipboard', 'crossdevice', 'syncsvc', 'offlinefiles', 'onedrive-policy', 'onedrive-remove', 'deliveryopt',
@@ -6579,6 +6581,7 @@ function Test-InPreset {
         'recommended' { return [bool]$row.T.Preset }
         'advanced'    { return ([bool]$row.T.Preset -or (@($script:AdvancedExtra) -contains $id)) }
         'personal'    { return $script:Personal.Picks.ContainsKey($id) }
+        'guided'      { return (Get-GuidedSets).Final.ContainsKey($id) }       # worked out from the answers (u1b-guided.ps1)
     }
     return $false
 }
@@ -7367,6 +7370,8 @@ function Get-PresetNote {
     $s = ('{0}: this applies {1} setting(s) in one go. Each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on).' -f $name.ToUpper(), $apply.Count) + $nl
     if ($Key -eq 'advanced') {
         $s += 'Advanced Debloat is only recommended for PCs that are used mainly for gaming: it can remove services other uses need.' + $nl
+    } elseif ($Key -eq 'guided') {
+        $s += 'These are the settings your answers to the questions come to. Settings you said you use are not in the list.' + $nl
     } elseif ($Key -eq 'personal') {
         $s += ('These are the settings of your Custom Preset (saved {0}).' -f [string]$script:Personal.Saved) + $nl
     }
@@ -7517,6 +7522,396 @@ function Handle-Event {
             Ui-RunFinished $ev
         }
     }
+}
+
+# =============================================================================
+# THE QUESTION PRESET (DRAFT): a preset that is worked out from the user's answers instead of a fixed list.
+#
+# Every question is a yes / no / not sure question about how the PC is used. A question owns some settings:
+#   Yes   the settings that are applied when the answer is Yes ("Do you want ...?" questions)
+#   No    the settings that are applied when the answer is No  ("Do you use ...?" questions: no use, so switch the feature off)
+#   Keep  the settings that a Yes (or Not sure) protects: no other question may apply them, and they are left as Windows has them.
+#         When it is left out it is the same list as No ("I use it, so leave it on" is the usual meaning of Yes).
+# Not sure (and a question that was not answered yet) applies nothing and keeps whatever Keep names, so the careful side wins.
+# A question with a Gate is only asked when the answer to the gate question is not No (no gaming: no questions about anti-cheat);
+# a gate with a plus ('uninstall+') needs a Yes (no uninstalling: no questions about which apps to remove; no advanced questions
+# unless the user wants them). Several gates are written as a comma-separated list.
+# The settings that remove something for good (T.OneWay) are only applied when the "uninstall" question was answered Yes.
+# Applying is all a preset does: it never switches anything off again. A setting is applied by at most one question, and a Keep from
+# any question beats an Apply from any other.
+# =============================================================================
+$script:GuidedQuestions = New-Object System.Collections.ArrayList
+$script:GuidedAnswers = @{}          # question id -> 'Yes' | 'No' | 'Unsure'
+$script:GuidedPos = 0                # the question the window shows: 0..Count-1, or Count for the review page
+$script:GuidedCache = $null          # the worked-out sets (cleared whenever an answer changes)
+
+function Add-GQ {
+    param([string]$Id, [string]$Group, [string]$Q, [string]$Help, [string[]]$Yes = @(), [string[]]$No = @(), $Keep = $null, [string]$Gate = '')
+    if ($null -eq $Keep) { $Keep = @($No) }
+    [void]$script:GuidedQuestions.Add(@{ Id = $Id; Group = $Group; Q = $Q; Help = $Help; Yes = @($Yes); No = @($No); Keep = @($Keep); Gate = $Gate })
+}
+
+Add-GQ -Id 'uninstall' -Group 'Before you start' -Gate '' `
+    -Q 'Are you OK with uninstalling built-in apps and components that you do not use?' `
+    -Help 'Some settings do not just switch a feature off, they remove something for good: built-in apps, OneDrive, Quick Assist and the Windows AI package. Headroom cannot put those back (most apps can be installed again from the Microsoft Store). Yes allows them. No or Not sure skips every setting that removes something, and the questions about the built-in apps are not asked. Settings that only switch features off are still applied, and each of those can be undone from this app.'
+Add-GQ -Id 'advanced' -Group 'Before you start' `
+    -Q 'Do you also want to be asked the advanced questions?' `
+    -Help 'The everyday questions are about how you use this PC. The advanced ones are about settings that lower protection or can get in the way of other things: Windows security prompts (UAC), drive encryption, Windows Update and drivers, the file indexer, troubleshooters, power plans, firmware programs, the Microsoft Store and similar. They are what the old Advanced Debloat was made of, and each one is marked in the lists. Yes asks them. No or Not sure skips all of them and applies nothing from them.'
+Add-GQ -Id 'laptop' -Group 'Your PC' `
+    -Q 'Is this a laptop or a tablet that often runs on battery?' `
+    -Help 'Laptops need power saving to make the battery last. A desktop does not, and power saving there can cause stutter, dropped network connections and USB devices that go to sleep. Answer No (a desktop) and power saving is switched off for network adapters and USB devices, and the Health and Optimized Experiences and sensor services are switched off. Yes keeps all of that as Windows has it, and keeps the Ultimate Performance plan and Fast Startup and hibernation off the list too.' `
+    -No @('nic-turnoff', 'nic-eee', 'nic-suspend', 'usb-power', 'svc-whe', 'svc-sensormon', 'svc-sensordata') `
+    -Keep @('nic-turnoff', 'nic-eee', 'nic-suspend', 'usb-power', 'svc-whe', 'svc-sensormon', 'svc-sensordata', 'ultimate', 'hibernate', 'plans-delete')
+Add-GQ -Id 'gaming' -Group 'Your PC' `
+    -Q 'Do you play games on this PC?' `
+    -Help 'Yes tunes Windows for games: Game Mode, hardware-accelerated GPU scheduling (HAGS), optimizations for windowed games, the Ultimate Performance power plan, and Windows Security scans that only run while the PC is idle. No skips all of that and the questions that only matter for games.' `
+    -Yes @('game-mode', 'hags', 'windowed-opt', 'ultimate', 'defender-idle')
+Add-GQ -Id 'shooters' -Group 'Your PC' -Gate 'gaming' `
+    -Q 'Do you play shooters or other games where precise aiming matters?' `
+    -Help 'Mouse acceleration moves the pointer farther when you move the mouse faster, which works against muscle memory in aim-heavy games. Yes turns it off, so the pointer moves 1:1 with your hand. Most people notice little on the desktop, but some like acceleration for work.' `
+    -Yes @('mouse')
+Add-GQ -Id 'riot' -Group 'Your PC' -Gate 'gaming,advanced+' `
+    -Q 'Do you play Riot games (Valorant, League of Legends) or use FACEIT?' `
+    -Help 'Riot Vanguard and FACEIT Anti-Cheat can refuse to start, or refuse to let you play, when Memory Integrity (virtualization-based security) is off. Yes or Not sure means the two settings that turn those off are never applied, whatever else you answer. Valve games (Counter-Strike 2, Dota 2) and VAC do not need them.' `
+    -Keep @('vbs', 'hypervisor')
+Add-GQ -Id 'perfsec' -Group 'Your PC' -Gate 'gaming,advanced+' `
+    -Q 'Do you want a few percent more FPS even if it lowers some of the protection in Windows?' `
+    -Help 'Memory Integrity and the Windows hypervisor are security features that protect against malicious drivers. Switching them off can give a few percent more FPS in some games, and removes that protection. Yes lines both up (each one asks once more before it is switched on). A Yes to Riot / FACEIT or to virtual machines overrules it.' `
+    -Yes @('vbs', 'hypervisor')
+Add-GQ -Id 'vrr' -Group 'Your PC' -Gate 'gaming' `
+    -Q 'Do you have a variable refresh rate monitor (G-SYNC, FreeSync or Adaptive-Sync)?' `
+    -Help 'Yes turns on variable refresh rate for full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate. Windows ships with this off. Some games flicker or change brightness while the refresh rate varies; this is the switch to turn off again for them. No or Not sure leaves it off, as Windows has it, and it does nothing on a screen without variable refresh rate.' `
+    -Yes @('vrr-games')
+Add-GQ -Id 'vm' -Group 'Your PC' `
+    -Q 'Do you use virtual machines, WSL, Docker, Windows Sandbox or Android emulators?' `
+    -Help 'Hyper-V, WSL2, Docker Desktop, Windows Sandbox and many emulators need the Windows hypervisor, and their network uses Internet Connection Sharing. Yes or Not sure leaves the hypervisor, Memory Integrity and connection sharing as Windows has them.' `
+    -Keep @('hypervisor', 'vbs', 'ics')
+Add-GQ -Id 'xbox' -Group 'Your PC' `
+    -Q 'Do you use Game Pass, the Xbox app, Microsoft Store games or Game Bar clips?' `
+    -Help 'Without the Xbox services, Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG games are not affected. Game Bar (Win+G) records clips in the background, which can cost frames. No switches off the Xbox services, Game Bar recording and its save-sync task, and (if you allowed uninstalling) removes the Game Bar app and the Xbox app with its sign-in. Yes also keeps the Microsoft Store and merged service hosts off the advanced list, because Game Pass and Xbox need them.' `
+    -No @('xbox-svc', 'gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave') `
+    -Keep @('xbox-svc', 'gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave', 'svchost-merge', 'apps-store', 'store-policy')
+Add-GQ -Id 'rgb' -Group 'Your PC' `
+    -Q 'Do you control RGB lighting with Windows Dynamic Lighting?' `
+    -Help 'That is the Dynamic Lighting page in Settings > Personalization. RGB software from your hardware maker (iCUE, G HUB, Armoury Crate, OpenRGB and so on) is not affected. No stops Windows from controlling the lights, so only that software does, and Windows cannot fight with it.' `
+    -No @('dynamic-lighting', 'dynamic-lighting-foreground')
+Add-GQ -Id 'ducking' -Group 'Your PC' -Gate 'gaming' `
+    -Q 'Do you want Windows to turn other sounds down when it sees a call or voice chat start?' `
+    -Help 'That is Sound > Communications: reduce other sounds by 80 %. With voice chat running, the game volume can drop every time someone talks. No sets it to Do nothing, so the game keeps its full volume while you talk.' `
+    -No @('audio-ducking')
+Add-GQ -Id 'vr' -Group 'Your PC' -Gate 'gaming' `
+    -Q 'Do you use a Windows Mixed Reality headset?' `
+    -Help 'Other headsets (Quest, Index, Vive) bring their own software and do not need the Windows Mixed Reality service. No switches that service off. On Windows versions that no longer have it, the setting is skipped.' `
+    -No @('svc-mixedreality')
+Add-GQ -Id 'noreboot' -Group 'Your PC' `
+    -Q 'Do you want Windows to restart this PC by itself after installing updates while you are signed in?' `
+    -Help 'Windows can restart about five minutes after a scheduled update install, which can be in the middle of a game or of unsaved work. No stops that: it shows a notice and waits for you to restart. The update stays unfinished until you restart yourself, so do that now and then.' `
+    -No @('wu-noreboot')
+Add-GQ -Id 'storagesense' -Group 'Your PC' `
+    -Q 'Do you want Windows to delete temporary files and old Recycle Bin items by itself (Storage Sense)?' `
+    -Help 'Storage Sense deletes temporary files and old Recycle Bin files on its own, and can clear Downloads too if it is set up that way. No turns it off, so Windows deletes nothing by itself and you decide when to clear space. Yes or Not sure leaves it as Windows has it.' `
+    -No @('storage-sense')
+Add-GQ -Id 'work' -Group 'Work and network' `
+    -Q 'Is this PC on a company or school network, or do you sign in with a smart card or security key?' `
+    -Help 'Company and school PCs can rely on Offline Files, smart cards and remote management. No switches off Offline Files, the smart card services, PowerShell remoting (WinRM) and the other remote-management services. Yes or Not sure leaves them alone.' `
+    -No @('offlinefiles', 'svc-smartcard', 'svc-scpolicy', 'winrm', 'remote-mgmt')
+Add-GQ -Id 'remote' -Group 'Work and network' `
+    -Q 'Do you use Remote Desktop, Remote Assistance or Quick Assist to reach this PC or to get help?' `
+    -Help 'No blocks Remote Desktop, turns off Remote Assistance and removes the Quick Assist app (it cannot be put back from this app). Remote play and streaming apps such as Steam Remote Play and Parsec are separate and are not affected by these three.' `
+    -No @('rdp', 'remote-assist', 'quickassist')
+Add-GQ -Id 'vpn' -Group 'Work and network' `
+    -Q 'Do you use a VPN (a work VPN, or an app such as NordVPN, ProtonVPN or WireGuard)?' `
+    -Help 'Windows has its own VPN client (IKEv2, SSTP, L2TP). VPN apps that bring their own driver, such as WireGuard, usually keep working without it, but some VPN clients need it. No switches the Windows VPN services off, which also breaks PPPoE broadband dial-ups. Yes or Not sure leaves them on.' `
+    -No @('vpn')
+Add-GQ -Id 'lan' -Group 'Work and network' `
+    -Q 'Do you share files, printers or media with other PCs, a NAS or a TV on your home network?' `
+    -Help 'No turns off file and printer sharing, network discovery, UPnP hosting, the old name lookups (LLMNR, mDNS, NetBIOS) and SMB1. This PC can still open shared folders and printers on other devices; what stops is other devices reaching this one. A few old NAS boxes or printers that are only found by NetBIOS name may stop showing up by name.' `
+    -No @('fileshare', 'discovery', 'legacy-names', 'svc-netbios', 'smb1')
+Add-GQ -Id 'hotspot' -Group 'Work and network' `
+    -Q 'Do you share this PC''s internet connection with other devices (Mobile Hotspot, Internet Connection Sharing)?' `
+    -Help 'No turns off Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing. WSL2, Hyper-V and Windows Sandbox use connection sharing too, and the virtual machine question above protects it for them.' `
+    -No @('ics')
+Add-GQ -Id 'print' -Group 'Work and network' `
+    -Q 'Do you print, or use Microsoft Print to PDF?' `
+    -Help 'No switches the Print Spooler off, so this PC cannot print at all, and Microsoft Print to PDF and the XPS Document Writer go away. You are asked once more before it is switched on.' `
+    -No @('printing')
+Add-GQ -Id 'hello' -Group 'Work and network' `
+    -Q 'Do you sign in with Windows Hello (a fingerprint reader or a face camera)?' `
+    -Help 'A PIN or a password does not use the Windows Biometric Service. No switches it off; Yes or Not sure leaves it on.' `
+    -No @('svc-biometric')
+Add-GQ -Id 'legacy' -Group 'Work and network' `
+    -Q 'Do you use Internet Explorer mode, Work Folders, Fax or the Steps Recorder?' `
+    -Help 'These four legacy Windows features are only needed for old company sites, Work Folders sync, faxing and recording steps for support. No removes them; they can be added again from Windows Update (internet connection needed).' `
+    -No @('legacy')
+Add-GQ -Id 'onedrive' -Group 'Accounts and cloud' `
+    -Q 'Do you use OneDrive (cloud backup or sync of your files)?' `
+    -Help 'No stops OneDrive from syncing, hides it in File Explorer and, if you allowed uninstalling, removes the app (a OneDrive folder that still has files in it is left alone). Reinstall later with winget install Microsoft.OneDrive.' `
+    -No @('onedrive-policy', 'onedrive-remove')
+Add-GQ -Id 'phone' -Group 'Accounts and cloud' `
+    -Q 'Do you use Phone Link, Nearby Sharing or text messages on this PC?' `
+    -Help 'No turns off Nearby Sharing and Continue on this PC, the text message (SMS) router, and removes the Phone Link and Cross Device apps.' `
+    -No @('crossdevice', 'svc-smsrouter', 'apps-phone')
+Add-GQ -Id 'settingsync' -Group 'Accounts and cloud' `
+    -Q 'Do you want your theme, Wi-Fi passwords and other Windows settings to sync with your Microsoft account?' `
+    -Help 'No blocks settings sync and disables its two background tasks. Your files and apps are not affected.' `
+    -No @('settingsync')
+Add-GQ -Id 'mail' -Group 'Accounts and cloud' `
+    -Q 'Do you use the Mail, Calendar, People, Outlook (new) or Teams (chat) apps that come with Windows?' `
+    -Help 'No removes those apps and switches off the background services behind them. Yes or Not sure keeps them. Outlook and Teams that you installed yourself are not affected.' `
+    -No @('apps-mail', 'syncsvc')
+Add-GQ -Id 'clip' -Group 'Accounts and cloud' `
+    -Q 'Do you use clipboard history (Win+V) or the cloud clipboard?' `
+    -Help 'No stops Windows from keeping a list of what you copied and from syncing the clipboard between your devices. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected.' `
+    -No @('clipboard-history', 'clipboard')
+Add-GQ -Id 'diag' -Group 'Privacy' `
+    -Q 'Do you want to stop Windows sending diagnostic data and error reports to Microsoft, and update sharing with other PCs?' `
+    -Help 'Yes sets diagnostic data to the least Windows allows, turns off error reporting, the telemetry services and scheduled tasks, the data usage meter, Defender sample sending, Defender Core telemetry, inking and typing data collection, the data usage and Office telemetry tasks, and Windows Update sharing with other PCs. Windows Security keeps scanning and updating as normal.' `
+    -Yes @('telemetry', 'telemetry-tasks', 'telemetry-svc', 'svc-telemetry2', 'task-sqm', 'svc-datausage', 'defender-samples', 'defender-core', 'inking', 'deliveryopt', 'task-dusm', 'task-officetelemetry')
+Add-GQ -Id 'ads' -Group 'Privacy' `
+    -Q 'Do you want to stop ads, suggestions and tracking in Windows?' `
+    -Help 'Yes turns off the advertising ID, tailored tips, suggested and auto-installed apps, promo cards in Settings, feedback pop-ups, activity history, app-launch tracking and web results in Start search.' `
+    -Yes @('ads', 'tracking', 'suggestions', 'settings-promo', 'feedback', 'activity', 'search-web')
+Add-GQ -Id 'location' -Group 'Privacy' `
+    -Q 'Do you use location (Weather, Maps, automatic time zone) or Find my device?' `
+    -Help 'No turns location off for the whole PC and turns Find my device off, so the PC is not registered with your Microsoft account. Weather and Maps no longer know where you are, and Set time zone automatically stops working, so the clock will not follow you to a new time zone by itself. Yes or Not sure leaves both as Windows has them.' `
+    -No @('location', 'find-my-device')
+Add-GQ -Id 'devmeta' -Group 'Privacy' `
+    -Q 'Do you want Windows to look up device names, pictures and maker apps online when you plug in hardware?' `
+    -Help 'No stops Windows from downloading device information from the internet. Drivers are not affected: they still come from Windows Update or your own installer. A new device may show with a generic icon and name.' `
+    -No @('device-metadata')
+Add-GQ -Id 'trouble' -Group 'Privacy' `
+    -Q 'Do you run old games or programs and rely on the compatibility prompts that Windows shows?' `
+    -Help 'That is the Program Compatibility Assistant ("this program might not have installed correctly"), its update task and the power diagnostics task. Compatibility settings you choose yourself in a program''s Properties still apply without it. No switches the assistant off.' `
+    -No @('svc-pca', 'task-pca', 'task-powerdiag')
+Add-GQ -Id 'rare' -Group 'Privacy' `
+    -Q 'Do you use Fax, NFC or tap-to-pay, Parental Controls or Family Safety, Windows Insider builds or offline maps?' `
+    -Help 'No switches off the rarely used services for those (Retail Demo, Fax, Parental Controls, NFC and payments, Wallet, Phone service, Windows Insider, Downloaded Maps Manager, Distributed Link Tracking) and the Family Safety and Maps update tasks.' `
+    -No @('svc-misc', 'svc-wallet', 'task-familysafety', 'task-maps')
+Add-GQ -Id 'ai' -Group 'AI and Edge' `
+    -Q 'Do you use Copilot or other AI features in Windows, Edge or Chrome?' `
+    -Help 'No switches off Copilot, Recall, Click to Do, AI in Notepad and Paint, text and image generation for apps, voice activation, the AI page in Settings, experimental agentic features and AI in Edge and Chrome. If you allowed uninstalling, it also removes the Copilot app and the Windows AI package.' `
+    -No @('copilot', 'recall', 'ai-apps', 'ai-generative', 'ai-voice', 'ai-page', 'ai-agentic', 'ai-core', 'apps-ai', 'edge-ai', 'edge-ai-more', 'chrome-ai')
+Add-GQ -Id 'edge' -Group 'AI and Edge' `
+    -Q 'Do you use Microsoft Edge as a browser?' `
+    -Help 'Yes still hides the first-run page, rewards and nags and stops Edge from running in the background when it is closed, but leaves Edge''s telemetry and profile sync, its update tasks and its update services as they are. No switches all of that off. The update tasks also keep the WebView2 component up to date, which many apps use: they are only switched off when you answer No.' `
+    -Yes @('edge-debloat', 'edge-bg') `
+    -No @('edge-debloat', 'edge-bg', 'edge-tele', 'edge-newtab', 'edge-tasks', 'edge-upd') `
+    -Keep @('edge-tele', 'edge-tasks', 'edge-upd')
+Add-GQ -Id 'theme' -Group 'Look and feel' `
+    -Q 'Do you want dark mode and a solid black desktop (no wallpaper)?' `
+    -Help 'Yes turns on dark mode for apps and Windows and sets a plain black desktop.' `
+    -Yes @('dark', 'blackdesk')
+Add-GQ -Id 'taskbar' -Group 'Look and feel' `
+    -Q 'Do you want the taskbar tidied: icons on the left, no Search or Task View button, and End task in the right-click menu?' `
+    -Help 'Yes moves the taskbar icons to the left (Windows 10 style), hides the Search and Task View buttons and adds End task to the taskbar right-click menu.' `
+    -Yes @('taskbar-left', 'taskbar-search', 'taskbar-taskview', 'taskbar-endtask')
+Add-GQ -Id 'widgets' -Group 'Look and feel' `
+    -Q 'Do you use Widgets (the weather, news and stocks panel) or Chat on the taskbar?' `
+    -Help 'No hides the Widgets and Chat buttons, turns the Widgets feed off by policy and, if you allowed uninstalling, removes the Widgets panel.' `
+    -No @('taskbar-clutter', 'apps-widgets')
+Add-GQ -Id 'effects' -Group 'Look and feel' `
+    -Q 'Do you want Windows without animations, shadows and transparency?' `
+    -Help 'Yes turns off window animations and shadows and the transparency effects: a plainer, snappier look.' `
+    -Yes @('animations', 'transparency')
+Add-GQ -Id 'notif' -Group 'Look and feel' `
+    -Q 'Do you want Windows notifications (pop-ups from apps, games, the calendar)?' `
+    -Help 'No turns off all pop-up notifications and the notification centre. Windows Security pop-ups may be hidden too, so look at its status page now and then.' `
+    -No @('notifications')
+Add-GQ -Id 'startrec' -Group 'Look and feel' `
+    -Q 'Do you want the Recommended section (recent files and suggested apps) in the Start menu?' `
+    -Help 'No hides the Recommended section of the Start menu.' `
+    -No @('start-recommended')
+Add-GQ -Id 'explorer' -Group 'Look and feel' `
+    -Q 'Do you want File Explorer the classic way (full right-click menu, no Home or Gallery, opens to This PC)?' `
+    -Help 'Yes brings back the full right-click menu, removes Home and Gallery from the side pane and makes File Explorer open to This PC.' `
+    -Yes @('classic-menu', 'nav-home', 'nav-gallery', 'launchto')
+Add-GQ -Id 'showext' -Group 'Look and feel' `
+    -Q 'Do you want File Explorer to show file extensions (.exe, .txt, .jpg)?' `
+    -Help 'Yes shows the full file names, which makes disguised files (a program named like a picture) easier to spot.' `
+    -Yes @('showext')
+Add-GQ -Id 'snap' -Group 'Look and feel' `
+    -Q 'Do you use Snap layouts, snap suggestions or shaking a window to minimize the others?' `
+    -Help 'No switches off the snap suggestions and layouts flyouts and the title bar window shake.' `
+    -No @('snap-suggestions', 'window-shake')
+Add-GQ -Id 'shortcuts' -Group 'Look and feel' `
+    -Q 'Do you use the Sticky Keys, Filter Keys, Toggle Keys, Mouse Keys or High Contrast keyboard shortcuts?' `
+    -Help 'These are accessibility shortcuts that pop up a box when a key is held or pressed five times, which is a nuisance in games. No switches all five shortcuts off.' `
+    -No @('sticky-keys', 'filter-keys', 'toggle-keys', 'mouse-keys', 'contrast-keys')
+Add-GQ -Id 'faststart' -Group 'Look and feel' `
+    -Q 'Do you use Fast Startup or Hibernate?' `
+    -Help 'No turns both off: Shut down becomes a real shutdown and the hiberfil.sys file (several GB) is deleted, which can help with driver and update glitches. Sleep still works.' `
+    -No @('hibernate')
+Add-GQ -Id 'newsmedia' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use the News, Weather, Maps, Bing, Media Player or Movies & TV apps?' `
+    -Help 'No removes those apps.' `
+    -No @('apps-news', 'apps-media')
+Add-GQ -Id 'notesextras' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use Sticky Notes, To Do, OneNote, Clipchamp, Tips or other Microsoft extras?' `
+    -Help 'No removes those apps and the other small Microsoft extras.' `
+    -No @('apps-notes', 'apps-extras', 'apps-startexp')
+Add-GQ -Id 'promo' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use the promo apps that come with Windows (LinkedIn, Spotify, TikTok, Netflix, Disney+ and so on)?' `
+    -Help 'No removes them by name. That includes the Microsoft Store versions of these apps, so answer Yes if you installed Spotify, Netflix or similar from the Store.' `
+    -No @('apps-promo')
+Add-GQ -Id 'dolby' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use Dolby Atmos (the Dolby Access app) for headphones or a home theatre?' `
+    -Help 'Without the app, Dolby Atmos stops working (the Dolby drivers stay). No removes it.' `
+    -No @('apps-dolby')
+Add-GQ -Id 'smallapps' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use the Clock, Camera, Paint, Sound Recorder or Journal apps?' `
+    -Help 'No removes those apps.' `
+    -No @('apps-clock', 'apps-camera', 'apps-paint', 'apps-recorder', 'apps-journal')
+Add-GQ -Id 'snip' -Group 'Built-in apps' -Gate 'uninstall+' `
+    -Q 'Do you use the Snipping Tool (Win+Shift+S or Print Screen screenshots)?' `
+    -Help 'The editing window that follows Win+Shift+S and what the Print Screen key opens go with the app, so answer Yes if you use them. Screenshots from Steam, the NVIDIA overlay and other programs are not affected. No removes it.' `
+    -No @('apps-snip')
+Add-GQ -Id 'uac' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you want Windows to ask before programs get administrator rights (UAC prompts)?' `
+    -Help 'No turns the prompts off and switches the User Account Control engine off completely. That removes a safety net: programs can get administrator rights without asking, and malware benefits too. With the engine off, modern apps (Settings, Calculator, Photos, Terminal) can refuse to open. Yes or Not sure leaves UAC as Windows has it.' `
+    -No @('uac', 'uac-lua')
+Add-GQ -Id 'encrypt' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you want Windows to turn on drive encryption (Device encryption) by itself?' `
+    -Help 'Windows 11 can start Device encryption (the simple form of BitLocker) on its own on a new install, or when you sign in with a Microsoft account. No stops that automatic start. It does not decrypt anything and does not touch a drive that is already encrypted.' `
+    -No @('device-encryption-block')
+Add-GQ -Id 'drivers' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you want Windows Update to install and replace drivers for you?' `
+    -Help 'Windows Update can replace a driver you installed yourself (a graphics driver, for example) and searches for one when you plug in new hardware. No leaves your drivers alone: you update them yourself from the maker (the GPU maker''s installer, your motherboard''s site). Yes or Not sure leaves it as Windows has it.' `
+    -No @('wu-drivers')
+Add-GQ -Id 'wpbt' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you want your motherboard firmware to be able to install its own software in Windows?' `
+    -Help 'That is the Windows Platform Binary Table (WPBT). Some boards use it to deliver their own software (a Gigabyte updater, Armoury Crate on ASUS boards with that BIOS option on), and some anti-theft tools use it. No stops Windows from running such programs, so tools delivered that way are no longer installed.' `
+    -No @('wpbt')
+Add-GQ -Id 'indexer' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you search for files with the Windows Search index (File Explorer and Start search)?' `
+    -Help 'No stops the indexer from starting with Windows (it starts when needed). Start menu results for installed apps keep working, but results that come from the index can stop appearing: files, and programs that are not installed, such as a portable program that runs from its own folder. The gain is a little less background disk and CPU use.' `
+    -No @('svc-search')
+Add-GQ -Id 'troubleshoot' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you use the built-in Windows troubleshooters (network, audio, Windows Update)?' `
+    -Help 'No switches off the three diagnostic services, so those Troubleshoot wizards stop working until you switch this back on.' `
+    -No @('svc-diag')
+Add-GQ -Id 'svchost' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you look at single Windows services in Task Manager, or troubleshoot them?' `
+    -Help 'No lets Windows group its services again after a restart (about 50 fewer svchost.exe processes, a little less memory). The costs: one service that crashes can take others in its group with it, and Task Manager can no longer show which service uses the CPU. It can interfere with the Xbox services, so a Yes to the Xbox question keeps it off the list too.' `
+    -No @('svchost-merge')
+Add-GQ -Id 'bgapps' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you use Microsoft Store apps that need to update or notify you in the background?' `
+    -Help 'No stops Store apps from running and fetching data while you are not using them. Normal desktop programs such as Steam, Discord and browsers are not affected. Store apps such as Mail, Weather or a Store game may then only update when you open them.' `
+    -No @('bgapps')
+Add-GQ -Id 'powerplans' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you switch between Windows power plans, or use a plan from your PC maker?' `
+    -Help 'No deletes every power plan except the one in use (Balanced, High Performance, Power Saver). Switching the setting off again recreates the three standard plans. It is not offered on laptops, where you keep Balanced for when you unplug.' `
+    -No @('plans-delete')
+Add-GQ -Id 'automaint' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you want Windows to run automatic maintenance while the PC is idle?' `
+    -Help 'Automatic Maintenance runs Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up in the background. No stops those tasks from starting on their own, and the WinSAT benchmark task with them. You can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update.' `
+    -No @('auto-maintenance', 'task-winsat')
+Add-GQ -Id 'storagesvc' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you rely on Windows to check a drive by itself when it notices a problem?' `
+    -Help 'No sets the Storage Service to start on demand and turns off the automatic check of a drive after Windows notices damage (Spot Verifier). You can still run a check yourself with chkdsk.' `
+    -No @('svc-storage', 'svc-spotverifier')
+Add-GQ -Id 'store' -Group 'Advanced' -Gate 'advanced+' `
+    -Q 'Do you install or update apps from the Microsoft Store?' `
+    -Help 'No stops Store installs and updates (the install service is disabled) and, if you allowed uninstalling, removes the Store app. Apps that come from the Store (the NVIDIA Control Panel and Photos, for example) stop receiving updates; winget keeps working. Game Pass and Xbox need the Store, so a Yes to the Xbox question keeps this one off the list too.' `
+    -No @('apps-store', 'store-policy')
+
+Remove-Variable g -ErrorAction SilentlyContinue
+
+# ------------------------------------------------------------------- the engine ----
+function Get-GuidedQuestion {
+    param([string]$Id)
+    foreach ($q in $script:GuidedQuestions) { if ([string]$q.Id -ceq $Id) { return $q } }
+    return $null
+}
+
+# Is this question asked? A Gate is a comma-separated list of question ids; the question is asked only when every one of them lets it
+# through. 'gaming' lets it through unless the answer is No; 'advanced+' (with a plus) only when the answer is Yes or not given yet.
+# A gate question that is not asked itself counts as No.
+function Test-GuidedAsked {
+    param($q)
+    foreach ($entry in @(([string]$q.Gate) -split ',' | Where-Object { $_ })) {
+        $needYes = $entry.EndsWith('+')
+        $gate = $entry.TrimEnd('+')
+        $gq = Get-GuidedQuestion $gate
+        if ($gq -and -not (Test-GuidedAsked $gq)) { return $false }
+        $ans = [string]$script:GuidedAnswers[$gate]
+        if ($needYes) { if ($ans -ceq 'No' -or $ans -ceq 'Unsure') { return $false } }
+        elseif ($ans -ceq 'No') { return $false }
+    }
+    return $true
+}
+
+# The questions that are asked right now, in order
+function Get-GuidedAsked {
+    return @($script:GuidedQuestions | Where-Object { Test-GuidedAsked $_ })
+}
+
+function Set-GuidedAnswer {
+    param([string]$Id, [string]$Answer)
+    if ($Answer -cne 'Yes' -and $Answer -cne 'No' -and $Answer -cne 'Unsure') { return }
+    $script:GuidedAnswers[$Id] = $Answer
+    $script:GuidedCache = $null
+}
+
+function Reset-GuidedAnswers {
+    $script:GuidedAnswers = @{}
+    $script:GuidedPos = 0
+    $script:GuidedCache = $null
+}
+
+# What the answers come to:
+#   Apply   setting id -> the question that applies it (before the Keep and uninstall filters)
+#   Keep    setting id -> the question that protects it
+#   Final   the setting ids that are applied, in catalog order
+#   Blocked setting id -> the question that kept it, for the ones some other question would have applied
+#   NoUninstall  the ids left out because uninstalling was not allowed
+function Get-GuidedSets {
+    if ($script:GuidedCache) { return $script:GuidedCache }
+    $apply = [ordered]@{}; $keep = @{}
+    foreach ($q in $script:GuidedQuestions) {
+        if (-not (Test-GuidedAsked $q)) { continue }
+        $a = [string]$script:GuidedAnswers[[string]$q.Id]
+        if ($a -ceq 'Yes') { foreach ($id in @($q.Yes)) { if (-not $apply.Contains($id)) { $apply[$id] = [string]$q.Id } } }
+        if ($a -ceq 'No')  { foreach ($id in @($q.No))  { if (-not $apply.Contains($id)) { $apply[$id] = [string]$q.Id } } }
+        # a Yes, a Not sure and a question not answered yet all protect the Keep list
+        if ($a -cne 'No') {
+            foreach ($id in @($q.Keep)) { if (-not $keep.ContainsKey($id)) { $keep[$id] = [string]$q.Id } }
+        }
+    }
+    # a "Do you want X?" question (Yes applies, No / Not sure applies nothing) protects nothing when it is not Yes: its Keep list is
+    # empty then. A question that applies on Yes and keeps on No (none yet) would need its own rule.
+    $allowOneWay = ([string]$script:GuidedAnswers['uninstall'] -ceq 'Yes')
+    $final = @(); $blocked = [ordered]@{}; $noUn = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        if (-not $apply.Contains([string]$id)) { continue }
+        if ($keep.ContainsKey([string]$id)) { $blocked[[string]$id] = [string]$keep[[string]$id]; continue }
+        $row = $script:Rows[$id]
+        if ($row.T.OneWay -and -not $allowOneWay) { $noUn += [string]$id; continue }
+        $final += [string]$id
+    }
+    $script:GuidedCache = @{ Apply = $apply; Keep = $keep; Final = @{}; FinalList = @($final); Blocked = $blocked; NoUninstall = @($noUn) }
+    foreach ($id in $final) { $script:GuidedCache.Final[[string]$id] = [string]$apply[[string]$id] }
+    return $script:GuidedCache
+}
+
+# Settings that are applied on this PC right now but that the answers say are in use: the preset leaves them as they are.
+function Get-GuidedInUseApplied {
+    $sets = Get-GuidedSets
+    $out = @()
+    foreach ($id in @($script:Rows.Keys)) {
+        if (-not $sets.Keep.ContainsKey([string]$id)) { continue }
+        $row = $script:Rows[$id]
+        if ($row.T.Once -or $row.State -ne 'On') { continue }
+        $qid = [string]$sets.Keep[[string]$id]
+        if ([string]$script:GuidedAnswers[$qid] -cne 'Yes') { continue }      # only where the user really said Yes
+        $out += $row
+    }
+    return $out
+}
+
+function Get-GuidedCounts {
+    $asked = @(Get-GuidedAsked)
+    $done = @($asked | Where-Object { $script:GuidedAnswers.ContainsKey([string]$_.Id) }).Count
+    return @{ Asked = $asked.Count; Done = $done; Left = ($asked.Count - $done) }
 }
 
 # =============================================================================
@@ -10254,7 +10649,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '89'            # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '90'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -10928,7 +11323,7 @@ function Ui-Build {
     $nav.TabStop = $true
     Ui-DoubleBuffer $nav
     $sideBottom = New-Pnl 'Bottom' (Px 140) $Th.Side
-    $btnPresets = New-Btn 'Select Optimization Preset' 220 'accent' 'Choose how to set up this PC: Recommended Debloat, Advanced Debloat, or your own Custom Preset. Each one shows what it changes first, and nothing is changed until you confirm.' 40
+    $btnPresets = New-Btn 'Select Optimization Preset' 220 'accent' 'Choose how to set up this PC: answer a few questions (Question Preset) or use your own Custom Preset. Each one shows what it changes first, and nothing is changed until you confirm.' 40
     $btnPresets.Location = New-Object System.Drawing.Point((Px 12), (Px 6))
     $dry = New-Object System.Windows.Forms.CheckBox
     $dry.Appearance = [System.Windows.Forms.Appearance]::Button
@@ -13000,9 +13395,176 @@ function Get-PresetViewParts {
     return $p
 }
 
+# ------------------------------------------------ the Question Preset (DRAFT): its part of the window ----------
+# The name of a setting, and the lines of a list of settings ("  - name", with a note for the ones that remove something for good)
+function Get-GuidedSettingName {
+    param([string]$id)
+    $t = $script:ById[$id]
+    if ($t) { return [string]$t.Name }
+    return $id
+}
+function Add-GuidedNameLines {
+    param($parts, $ids)
+    $nl = "`r`n"
+    $allow = ([string]$script:GuidedAnswers['uninstall'] -ceq 'Yes')
+    foreach ($id in @($ids)) {
+        $t = $script:ById[[string]$id]
+        [void]$parts.Add(@{ S = 'line'; C = ''; T = '  - ' + (Get-GuidedSettingName ([string]$id)) })
+        if ($t -and $t.OneWay) {
+            $m = '   (removes it for good'
+            if (-not $allow) { $m += '; skipped unless you allow uninstalling' }
+            [void]$parts.Add(@{ S = 'note'; C = ''; T = $m + ')' })
+        }
+        [void]$parts.Add(@{ S = 'line'; C = ''; T = $nl })
+    }
+}
+function Get-GuidedShort {
+    param($q)
+    $t = [string]$q.Q
+    if ($t.Length -gt 66) { $t = $t.Substring(0, 63).TrimEnd() + '...' }
+    return $t
+}
+function Get-GuidedAnswerText {
+    param([string]$a)
+    if ($a -ceq 'Yes') { return 'Yes' }
+    if ($a -ceq 'No') { return 'No' }
+    if ($a -ceq 'Unsure') { return 'Not sure' }
+    return 'not answered'
+}
+
+# One question: what it is, what Yes / No / Not sure do, and the answer given so far
+function Get-GuidedQuestionParts {
+    param($q, [int]$pos, [int]$count)
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = ('Question {0} of {1}  -  {2}' -f ($pos + 1), $count, [string]$q.Group) + $nl })
+    [void]$p.Add(@{ S = 'title'; C = ''; T = $nl + [string]$q.Q + $nl })
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + [string]$q.Help + $nl })
+    $yes = @($q.Yes); $no = @($q.No); $keep = @($q.Keep)
+    if ($yes.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'If you answer Yes, Headroom applies'))  + $nl })
+        Add-GuidedNameLines $p $yes
+    }
+    if ($no.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'If you answer No, Headroom applies')) + $nl })
+        Add-GuidedNameLines $p $no
+    }
+    $sameAsNo = ($keep.Count -eq $no.Count -and @($keep | Where-Object { $no -contains $_ }).Count -eq $keep.Count)
+    if ($keep.Count -and -not $sameAsNo) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'Yes or Not sure keeps these as Windows has them')) + $nl })
+        foreach ($id in $keep) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + (Get-GuidedSettingName ([string]$id)) + $nl }) }
+    } elseif ($keep.Count) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Yes or Not sure leaves all of these as Windows has them.' + $nl })
+    } elseif ([string]$q.Id -ceq 'uninstall') {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Yes allows the settings that remove something for good (they are marked in the lists). No or Not sure skips all of them.' + $nl })
+    } elseif ([string]$q.Id -ceq 'advanced') {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Yes adds the advanced questions at the end, and the anti-cheat questions in the gaming part. No or Not sure skips all of them, and nothing from them is applied.' + $nl })
+    } else {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'No or Not sure changes nothing for this question.' + $nl })
+    }
+    $a = [string]$script:GuidedAnswers[[string]$q.Id]
+    if ($a) {
+        [void]$p.Add(@{ S = 'good'; C = ''; T = $nl + ('Your answer: ' + (Get-GuidedAnswerText $a)) + $nl })
+    } else {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $nl + 'Not answered yet.' + $nl })
+    }
+    return $p
+}
+
+# The last page: what the answers come to, what was left alone and why, and the answers themselves
+function Get-GuidedReviewParts {
+    $nl = "`r`n"
+    $p = New-Object System.Collections.ArrayList
+    $asked = @(Get-GuidedAsked)
+    $c = Get-GuidedCounts
+    $sets = Get-GuidedSets
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = ('{0} of {1} questions answered' -f $c.Done, $c.Asked) + $nl })
+    [void]$p.Add(@{ S = 'title'; C = ''; T = $nl + 'Review your answers' + $nl })
+    [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + 'Confirm changes applies the settings on the "Will be changed" tab: the ones your answers come to that are not enabled yet. Questions you answered Not sure, or have not answered, change nothing. Use Back to change an answer.' + $nl })
+    $sp = Get-PresetSplit 'guided'
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'On this PC right now')) + $nl })
+    if ($sp.Checking -gt 0 -or $script:Scanning) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'Still checking your PC...' + $nl })
+    } else {
+        $t = ('{0} settings come out of your answers: {1} are already enabled, {2} will be changed.' -f $sp.Avail.Count, $sp.On.Count, $sp.Change.Count)
+        if ($sp.Na -gt 0) { $t += (' Not available on this PC, so skipped: {0}.' -f $sp.Na) }
+        [void]$p.Add(@{ S = 'line'; C = ''; T = $t + $nl })
+    }
+    $ac = Get-PresetAntiCheatText $sp.Change
+    if ($ac) { [void]$p.Add(@{ S = 'warn'; C = ''; T = $nl + $ac + $nl }) }
+    # the settings that lower protection or that other programs may need: only the advanced questions apply these
+    $nr = @($sp.Change | Where-Object { (Get-NotRecReason $_.T) -or ([string]$_.T.Risk -ceq 'security') } | ForEach-Object { [string]$_.T.Name })
+    if ($nr.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Marked Not recommended or lowering protection ({0})' -f $nr.Count))) + $nl })
+        [void]$p.Add(@{ S = 'warn'; C = ''; T = 'These come from the advanced questions. Each one''s description says why it carries a mark. Use Back to change the answer if you are not sure.' + $nl })
+        foreach ($n in $nr) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + $n + $nl }) }
+    }
+    $bl = @($sets.Blocked.Keys)
+    if ($bl.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Left alone because of your answers ({0})' -f $bl.Count))) + $nl })
+        foreach ($id in $bl) {
+            $q = Get-GuidedQuestion ([string]$sets.Blocked[$id])
+            $why = Get-GuidedAnswerText ([string]$script:GuidedAnswers[[string]$q.Id])
+            [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + (Get-GuidedSettingName ([string]$id)) })
+            [void]$p.Add(@{ S = 'note'; C = ''; T = ('   ({0} to: {1})' -f $why, (Get-GuidedShort $q)) })
+            [void]$p.Add(@{ S = 'line'; C = ''; T = $nl })
+        }
+    }
+    $nu = @($sets.NoUninstall)
+    if ($nu.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Not removed, because uninstalling is not allowed ({0})' -f $nu.Count))) + $nl })
+        foreach ($id in $nu) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + (Get-GuidedSettingName ([string]$id)) + $nl }) }
+    }
+    $use = @(Get-GuidedInUseApplied)
+    if ($use.Count) {
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Applied now, but you said you use them ({0})' -f $use.Count))) + $nl })
+        [void]$p.Add(@{ S = 'note'; C = ''; T = 'A preset only applies settings, so these stay as they are. Switch them off on their page if you want Windows to have them back.' + $nl })
+        foreach ($r in $use) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$r.T.Name + $nl }) }
+    }
+    [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]'Your answers')) + $nl })
+    foreach ($q in $asked) {
+        $a = Get-GuidedAnswerText ([string]$script:GuidedAnswers[[string]$q.Id])
+        [void]$p.Add(@{ S = 'line'; C = ''; T = ('  {0}  -  {1}' -f $a, (Get-GuidedShort $q)) + $nl })
+    }
+    return $p
+}
+
+# The text of the Question Preset part of the window: the question that is open (or the review page), or the two lists
+function Get-GuidedWinParts {
+    param([string]$view = 'overview')
+    $nl = "`r`n"
+    $c = Get-GuidedCounts
+    if ($view -eq 'change' -or $view -eq 'enabled') {
+        if ($c.Done -eq 0) {
+            $p = New-Object System.Collections.ArrayList
+            [void]$p.Add(@{ S = 'title'; C = ''; T = ([string]$script:PresetNames['guided']) + $nl })
+            [void]$p.Add(@{ S = 'note'; C = ''; T = 'Answer some questions first (the Questions tab): the lists show what your answers come to.' + $nl })
+            return $p
+        }
+        $p = Get-PresetViewParts 'guided' $view
+        if ($view -eq 'change') {
+            $use = @(Get-GuidedInUseApplied)
+            if ($use.Count) {
+                [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + (Get-TitleCase ([string]('Applied now, but you said you use them ({0})' -f $use.Count))) + $nl })
+                [void]$p.Add(@{ S = 'note'; C = ''; T = 'A preset only applies settings, so these stay as they are.' + $nl })
+                foreach ($r in $use) { [void]$p.Add(@{ S = 'line'; C = ''; T = '  - ' + [string]$r.T.Name + $nl }) }
+            }
+        }
+        return $p
+    }
+    $asked = @(Get-GuidedAsked)
+    $pos = [int]$script:GuidedPos
+    if ($pos -lt 0) { $pos = 0 }
+    if ($pos -gt $asked.Count) { $pos = $asked.Count }
+    $script:GuidedPos = $pos
+    if ($pos -ge $asked.Count) { return (Get-GuidedReviewParts) }
+    return (Get-GuidedQuestionParts $asked[$pos] $pos $asked.Count)
+}
+
 # The text of the window for one choice: recommended | advanced | personal. Pieces like the details panel's (see Ui-PartStyle).
 function Get-PresetWinParts {
     param([string]$key, [string]$view = 'overview')
+    if ($key -eq 'guided') { return (Get-GuidedWinParts $view) }
     if ($key -eq 'personal') { return (Get-CustomWinParts $view) }
     if ($view -eq 'change' -or $view -eq 'enabled') { return (Get-PresetViewParts $key $view) }
     $nl = "`r`n"
@@ -13194,6 +13756,9 @@ function Ui-PresetWinTabs {
     $show = $true
     if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) { $show = $false }
     if ([bool]$pw.Tabs.Panel.Visible -ne $show) { $pw.Tabs.Panel.Visible = $show }
+    $first = 'Overview'
+    if ($key -eq 'guided') { $first = 'Questions' }
+    if ([string]$pw.Tabs['pv-over'].Text -ne $first) { $pw.Tabs['pv-over'].Text = $first; $pw.Tabs['pv-over'].Invalidate() }
     if (-not $show) { return }
     $sp = Get-PresetSplit $key
     $nChg = '...'; $nOn = '...'
@@ -13220,6 +13785,12 @@ function Get-PresetConfirmHint {
     $sp = Get-PresetSplit $key
     if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) { return '' }
     if ($sp.Checking -gt 0 -or $script:Scanning) { return 'Still checking your PC...' }
+    if ($key -eq 'guided') {
+        $gc = Get-GuidedCounts
+        if ($gc.Done -eq 0) { return 'Answer the questions: Yes, No or Not sure. Nothing is changed until you press Confirm changes.' }
+        if ($sp.Change.Count -eq 0) { return ('{0} of {1} questions answered. Nothing to change yet: the settings your answers come to are already enabled, or there are none.' -f $gc.Done, $gc.Asked) }
+        return ('{0} of {1} questions answered. Confirm changes applies the {2} settings on the "Will be changed" tab; {3} already enabled stay as they are.' -f $gc.Done, $gc.Asked, $sp.Change.Count, $sp.On.Count)
+    }
     if ($sp.Change.Count -eq 0) { return 'Everything in this preset is already enabled on this PC, so there is nothing to confirm.' }
     return ('Confirm changes applies the {0} settings on the "Will be changed" tab. Settings that are already enabled ({1}) are left as they are.' -f $sp.Change.Count, $sp.On.Count)
 }
@@ -13252,6 +13823,7 @@ function Ui-PresetWinView {
     if ($view -ne 'change' -and $view -ne 'enabled') { $view = 'overview' }
     $pw.View = $view
     Ui-PresetWinFill
+    Ui-PresetWinButtons      # (the Question Preset shows other buttons on its lists than on its questions)
 }
 
 # Show / hide the buttons under the text for the choice that is open, and put the visible ones in a row
@@ -13263,6 +13835,11 @@ function Ui-PresetWinButtons {
         'recommended' { $show = @('act-recommended') }
         'advanced'    { $show = @('act-advanced') }
         'personal'    { $show = @('act-save', 'act-open', 'act-apply') }
+        'guided'      {
+            if ([string]$pw.View -ne 'overview') { $show = @('act-guided') }
+            elseif ([int]$script:GuidedPos -ge @(Get-GuidedAsked).Count) { $show = @('act-back', 'act-restart', 'act-guided') }
+            else { $show = @('act-yes', 'act-no', 'act-unsure', 'act-back', 'act-guided') }
+        }
     }
     $busy = [bool](Get-BusyReason)
     $x = Px 24
@@ -13275,10 +13852,12 @@ function Ui-PresetWinButtons {
             $x += $b.Width + (Px 10)
         }
         $en = (-not $busy)
-        if ($k -eq 'act-recommended' -or $k -eq 'act-advanced' -or $k -eq 'act-apply') {
+        if ($k -eq 'act-back') { $en = ($en -and [int]$script:GuidedPos -gt 0) }
+        if ($k -eq 'act-recommended' -or $k -eq 'act-advanced' -or $k -eq 'act-apply' -or $k -eq 'act-guided') {
             # Confirm changes: only when there is something to change on this PC
             $kk = [string]$pw.Key
             if ($k -eq 'act-apply') { $kk = 'personal' }
+            if ($k -eq 'act-guided') { $kk = 'guided' }
             $spb = Get-PresetSplit $kk
             $en = ($en -and $spb.Change.Count -gt 0 -and $spb.Checking -eq 0)
             if ($k -eq 'act-apply') { $en = ($en -and @($script:Personal.Picks.Keys).Count -gt 0) }
@@ -13314,9 +13893,42 @@ function Ui-PresetWinAct {
         'act-recommended' { Ui-PresetWinFinish 'recommended' }
         'act-advanced'    { Ui-PresetWinFinish 'advanced' }
         'act-apply'       { Ui-PresetWinFinish 'personal' }
+        'act-guided'      { Ui-PresetWinFinish 'guided' }
+        'act-yes'         { Ui-GuidedAnswer 'Yes' }
+        'act-no'          { Ui-GuidedAnswer 'No' }
+        'act-unsure'      { Ui-GuidedAnswer 'Unsure' }
+        'act-back'        { Ui-GuidedBack }
+        'act-restart'     { Ui-GuidedRestart }
         'act-save'        { Ui-PresetWinSave }
         'act-open'        { Ui-PresetWinOpen }
     }
+}
+
+# Redraw the Question Preset part after an answer, Back or Start over
+function Ui-GuidedRefresh {
+    Ui-PresetWinFill
+    Ui-PresetWinButtons
+    Ui-PresetWinStatus (Get-PresetConfirmHint 'guided')
+}
+# Yes / No / Not sure: keep the answer and go on to the next question (the answers can change which questions are asked later)
+function Ui-GuidedAnswer {
+    param([string]$ans)
+    $asked = @(Get-GuidedAsked)
+    $pos = [int]$script:GuidedPos
+    if ($pos -lt 0 -or $pos -ge $asked.Count) { return }
+    Set-GuidedAnswer ([string]$asked[$pos].Id) $ans
+    $script:GuidedPos = $pos + 1
+    Ui-GuidedRefresh
+}
+function Ui-GuidedBack {
+    if ([int]$script:GuidedPos -gt 0) { $script:GuidedPos = [int]$script:GuidedPos - 1 }
+    if ($script:PW) { $script:PW.View = 'overview' }
+    Ui-GuidedRefresh
+}
+function Ui-GuidedRestart {
+    Reset-GuidedAnswers
+    if ($script:PW) { $script:PW.View = 'overview' }
+    Ui-GuidedRefresh
 }
 
 # Confirm changes: close the window and let the main window apply this preset (after the questions some settings ask)
@@ -13328,6 +13940,10 @@ function Ui-PresetWinFinish {
     if ($b) { Ui-PresetWinStatus $b; return }
     if ($key -eq 'personal' -and @($script:Personal.Picks.Keys).Count -eq 0) {
         Ui-PresetWinStatus 'There is no saved configuration yet. Save one, or open a saved file, first.'
+        return
+    }
+    if ($key -eq 'guided' -and (Get-GuidedCounts).Done -eq 0) {
+        Ui-PresetWinStatus 'Answer some of the questions first: the settings come from your answers.'
         return
     }
     if ((Get-PresetSplit $key).Change.Count -eq 0) {
@@ -13413,7 +14029,7 @@ function Ui-BuildPresetWindow {
     $head.Location = New-Object System.Drawing.Point((Px 20), (Px 22))
     $head.Size = New-Object System.Drawing.Size((Px 244), (Px 62))
     $hint = New-Object System.Windows.Forms.Label
-    $hint.Text = 'Pick one to see what it does, what is already enabled and what will be changed. Nothing is changed until you press Confirm changes.'
+    $hint.Text = 'Answer questions about how you use this PC. Nothing is changed until you press Confirm changes.'
     $hint.Font = (Ui-Font 'small')
     $hint.ForeColor = $Th.Mute
     $hint.BackColor = $Th.Side
@@ -13425,8 +14041,7 @@ function Ui-BuildPresetWindow {
     $opts = [ordered]@{}
     $y = 150
     $optDefs = @(
-        @('recommended', 'Recommended Debloat', 'The recommended set for a gaming PC. See what it changes.'),
-        @('advanced', 'Advanced Debloat', 'A deeper clean-up for PCs used mainly for gaming. Read the warning first.'),
+        @('guided', 'Question Preset', 'Answer questions about how you use this PC. It works out which settings to change.'),
         @('personal', 'Custom Preset', 'What is applied here, and your own saved configuration to apply again after a wipe.')
     )
     foreach ($d in $optDefs) {
@@ -13453,7 +14068,13 @@ function Ui-BuildPresetWindow {
         @('act-advanced', 'Confirm changes', 190, 'primary', 'Apply the Advanced Debloat settings that are not enabled yet. The warning is shown first, and a restore point is created first.'),
         @('act-save', 'Save configuration...', 190, 'secondary', 'Save everything that is switched on in the app right now to a file you keep.'),
         @('act-open', 'Open configuration...', 190, 'secondary', 'Open a configuration file you saved earlier (for example after installing Windows again).'),
-        @('act-apply', 'Confirm changes', 190, 'primary', 'Apply the settings of the saved configuration that are not enabled yet. A restore point is created first.')
+        @('act-apply', 'Confirm changes', 190, 'primary', 'Apply the settings of the saved configuration that are not enabled yet. A restore point is created first.'),
+        @('act-yes', 'Yes', 90, 'secondary', 'Answer Yes to this question.'),
+        @('act-no', 'No', 90, 'secondary', 'Answer No to this question.'),
+        @('act-unsure', 'Not sure', 110, 'secondary', 'Not sure: this question changes nothing, and the settings that depend on it are left as Windows has them.'),
+        @('act-back', 'Back', 90, 'secondary', 'Go back to the question before.'),
+        @('act-restart', 'Start over', 120, 'secondary', 'Clear every answer and begin again.'),
+        @('act-guided', 'Confirm changes', 170, 'primary', 'Apply the settings your answers come to that are not enabled yet. A restore point is created first.')
     )
     foreach ($d in $actDefs) {
         $b = New-Btn ([string]$d[1]) ([int]$d[2]) ([string]$d[3]) ([string]$d[4]) 36
@@ -13523,11 +14144,11 @@ function Ui-BuildPresetWindow {
     $f.Controls.Add($bar)
     $f.Controls.Add($left)
     $f.CancelButton = $close
-    $f.ActiveControl = $opts['recommended']
-    $script:PW = @{ Form = $f; Rich = $rb; Key = 'recommended'; Result = ''; Opt = $opts; Act = $acts; Status = $status; Bar = $bar; Close = $close; Changed = $false; View = 'overview'; Tabs = $tabs }
+    $f.ActiveControl = $opts['guided']
+    $script:PW = @{ Form = $f; Rich = $rb; Key = 'guided'; Result = ''; Opt = $opts; Act = $acts; Status = $status; Bar = $bar; Close = $close; Changed = $false; View = 'overview'; Tabs = $tabs }
     $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
     # the text goes in once the window exists (formatting a rich text box needs its handle), before it is shown
-    $f.Add_Load({ param($s, $e) try { Ui-PresetWinSelect 'recommended' } catch { Ui-Fail $_ } })
+    $f.Add_Load({ param($s, $e) try { Ui-PresetWinSelect 'guided' } catch { Ui-Fail $_ } })
     return $f
 }
 

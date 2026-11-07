@@ -2,7 +2,7 @@
 
 Headroom is a Windows 11 debloat and gaming tune-up tool, written as a single PowerShell script with a window you click through. It has about 180 settings in 20 groups, and each one is its own switch. Every setting says what it changes and lists the registry values, services, scheduled tasks, features or apps it touches. It reads the current state from your PC, so you can see what’s already on or off before you change anything. Each card also says what Windows itself does by default ("Windows default: On" or "Windows default: Off").
 
-There are three presets. Recommended Debloat is a set of gaming-oriented settings that removes no apps. Advanced Debloat is meant for PCs used mostly for gaming and may remove services needed for certain applications or features to work properly. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) informs you it will break these services.
+There are two presets. The Question Preset asks short questions about how you use the PC (gaming, Riot or FACEIT games, a VPN, virtual machines, printing and so on) and changes only what fits your answers; a question you answer Not sure to, or skip, changes nothing. Custom Preset saves your own choices so you can reapply them after a clean install. Each preset lists exactly what it will change before it does anything. A Preview only switch shows what would happen without changing anything, and a few settings (anything that could break FACEIT or Riot Vanguard, printing, or virtual machines) inform you they will break these services.
 
 The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running. On an NVIDIA card the graphics card also shows whether Resizable BAR is on and the PCIe link generation and width, read from nvidia-smi.
 
@@ -53,13 +53,20 @@ The Preview only switch (or `-DryRun` in the console) lists what would happen an
 
 ## Presets
 
-Select Optimization Preset offers three presets. Each one lists what it will change before anything is applied.
+Select Optimization Preset offers two presets. Each one lists what it will change before anything is applied.
 
 | Preset | What it is |
 | --- | --- |
-| Recommended Debloat | A set of gaming-oriented settings that removes no app. |
-| Advanced Debloat | For PCs used mainly for gaming. It may remove services that other uses need. |
+| Question Preset | A list of questions about how you use the PC. Your answers decide which settings change, and a setting you are unsure about is left as it is. |
 | Custom Preset | Your own saved configuration, which can be applied again after a clean install of Windows. |
+
+How the Question Preset works:
+
+- Each question is Yes, No or Not sure, with a short explanation and the settings the answer would change. You can go back to an earlier question and start again.
+- Not sure and a skipped question change nothing. A Yes to a question that protects a setting (for example a Yes to Riot or FACEIT games, virtual machines or printing) beats any other answer that would change it.
+- The questions are grouped: your PC, work and network, accounts and cloud, privacy, AI and Edge, look and feel, and built-in apps. Questions that only matter for gaming PCs are left out if you say you do not game. Removing built-in apps is its own question at the start, and settings that cannot be undone are only applied if you say Yes to it.
+- Near the start it also asks whether you want the advanced questions. Those cover settings that lower protection or can get in the way of other things (User Account Control, drive encryption, driver updates, the Microsoft Store and similar). If you say No or Not sure they are not asked and nothing in them changes.
+- Before anything is applied, a review page lists every setting that will change, every setting that is kept as it is and why, and the ones marked Not recommended or lowering protection. A restore point is created first.
 
 Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines ask first.
 
@@ -68,7 +75,7 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 ```powershell
 .\Headroom.ps1                                    # opens the window
 .\Headroom.ps1 -NoGui -List                       # every setting, its switch, and the Windows default
-.\Headroom.ps1 -NoGui -Preset -DryRun             # preview the Recommended preset
+.\Headroom.ps1 -NoGui -Preset -DryRun             # preview the built-in recommended set (the Question Preset is only in the window)
 .\Headroom.ps1 -NoGui -Apply mouse,gamedvr        # just those two
 .\Headroom.ps1 -NoGui -Apply mpo=full             # Multiplane Overlay: Fully disabled
 .\Headroom.ps1 -NoGui -Undo mpo                   # and back to Enabled (the Windows default)
@@ -79,7 +86,7 @@ Settings that can stop FACEIT or Riot Vanguard, printing, or virtual machines as
 | `-NoGui` | Do not open the window; work in the console. Without `-List`, `-Preset`, `-Apply` or `-Undo` it shows the state of every setting. |
 | `-DryRun` | Window: starts with Preview only switched on. Console: shows what would happen and changes nothing. |
 | `-List` | Console: print every setting with its id, whether its switch is on or off, the Windows default, and which way `-Apply` turns the switch. |
-| `-Preset` | Console: turn on the Recommended preset. |
+| `-Preset` | Console: turn on the built-in recommended set, a group of gaming-oriented settings that removes no app. The Question Preset is only in the window. |
 | `-Apply` | Console: apply these setting ids (see `-List`; each one says whether `-Apply` turns its switch on or off). A setting with options takes one as `id=option`. |
 | `-Undo` | Console: put the Windows default back for these setting ids. |
 
