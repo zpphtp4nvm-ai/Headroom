@@ -4099,7 +4099,6 @@ Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar 
         pReg "$pol\GameDVR" 'AllowGameDVR' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
-        pReg 'HKCU:\Software\Microsoft\GameBar' 'AutoGameModeEnabled' 1 1
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
     )
 
@@ -10819,7 +10818,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '93'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '94'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
