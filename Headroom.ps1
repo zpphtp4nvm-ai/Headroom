@@ -3110,6 +3110,7 @@ function Custom-AcmApps-Detect {
     $script:Now = ('{0}, wanted 1. Screens: {1}' -f $script:AcmName, ($txt -join '; '))
     return (Count-State $on $off)
 }
+# (kept as a record of what this app found; the undo does not depend on it)
 function Custom-AcmApps-Snapshot {
     param($p)
     $dev = @{}
@@ -3131,10 +3132,11 @@ function Custom-AcmApps-Revert {
     param($p, $mine)
     if (-not (Acm-Supported)) { return }
     foreach ($k in @(Acm-Keys)) {
-        $s = $null; if ($mine -and $mine.Dev) { $s = $mine.Dev[$k.Key] }
-        # a value that was 0 before comes back as 0; anything else (no value, or a 1 that was there already) goes back to Windows' default, which is off
-        if ($s -and $s.Had -and [string]$s.Was -eq '0') { [void](Reg-Write $k.Key $script:AcmName 0 'DWord') }
-        else { [void](Reg-Remove $k.Key $script:AcmName) }
+        # Off is an explicit 0 on every screen that has a value (whatever it is now: our 1, one that Windows or a graphics driver wrote, or none of
+        # ours). Removing the value would also read as off, but users report that a graphics driver install or a change of the color depth turns the
+        # switch on again, and a 0 is the one answer that reads as off with certainty. A screen with no value at all is left alone: nothing to undo.
+        $cur = Reg-Read $k.Key $script:AcmName
+        if ($cur.Exists -and [string]$cur.Value -ne '0') { [void](Reg-Write $k.Key $script:AcmName 0 'DWord') }
     }
 }
 
@@ -4229,9 +4231,9 @@ Add-Tweak -Id 'game-mode' -Cat $cDisplay -Def 'On' -Preset -Name 'Game Mode' `
     )
 
 Add-Tweak -Id 'auto-color' -Cat $cDisplay -Reboot -Name 'Automatically manage color for apps' `
-    -Desc 'On: Windows applies automatic color management (ACM) to the apps on the screen. Microsoft describes it as making colors look more accurate and consistent across apps, whether or not an app manages color itself, and as letting newer apps show more colors with finer steps, which reduces banding in gradients, shadows and dark scenes (on a screen with 8 bits per color it uses dithering for that). Off: apps send their colors to the screen as they are, which is how Windows ships. This is a color-quality setting and not a speed-up: it is not part of the question preset, and it is only worth turning on if color accuracy matters to you. It is the switch "Automatically manage color for apps" under Settings > System > Display > Color profile (on some builds under Advanced display), so you can also change it there. It exists from Windows 11 22H2 with the October 2023 update (build 22621.2506) and newer, and it applies to screens in standard dynamic range (SDR) only. Windows keeps the switch for each screen on its own, in the color entry it stores for that screen (HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore): this app sets it for every screen that is connected now and has such an entry, and shows the setting as not available when the build is older or no connected screen has an entry. A screen that is connected later gets Windows'' default, so turn this on again after adding one. Windows applies the switch at once when you change it in Settings, but a value written to the registry is read at the next start, so restart the PC after turning it on or off here. A missing value is shown as off. Undo puts a value that was 0 back to 0 and removes any other, which leaves the Windows default (off). A value of 1 can come from this app or from Windows itself when you changed the switch in Settings, and this app cannot tell which.' `
+    -Desc 'On: Windows applies automatic color management (ACM) to the apps on the screen. Microsoft describes it as making colors look more accurate and consistent across apps, whether or not an app manages color itself, and as letting newer apps show more colors with finer steps, which reduces banding in gradients, shadows and dark scenes (on a screen with 8 bits per color it uses dithering for that). Off: apps send their colors to the screen as they are, which is how Windows ships. This is a color-quality setting and not a speed-up: it is not part of the question preset, and it is only worth turning on if color accuracy matters to you. It is the switch "Automatically manage color for apps" under Settings > System > Display > Color profile (on some builds under Advanced display), so you can also change it there. It exists from Windows 11 22H2 with the October 2023 update (build 22621.2506) and newer, and it applies to screens in standard dynamic range (SDR) only. Windows keeps the switch for each screen on its own, in the color entry it stores for that screen (HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore): this app sets it for every screen that is connected now and has such an entry, and shows the setting as not available when the build is older or no connected screen has an entry. A screen that is connected later gets Windows'' default, so turn this on again after adding one. Windows applies the switch at once when you change it in Settings, but a value written to the registry is read at the next start, so restart the PC after turning it on or off here. A missing value is shown as off. Switching it off here writes an explicit 0 for every connected screen that has a value (a screen with no value is left alone), because a 0 reads as off with certainty. A value of 1 can come from this app, from Windows itself when you changed the switch in Settings, or from the graphics driver, and this app cannot tell which. Users report that on PCs with an NVIDIA card, installing a driver, or changing the color depth (bits per color) in the NVIDIA settings, turns this switch on again; when that happens this setting shows as on, and switching it off here (and restarting) turns it off again.' `
     -Parts @(
-        pCustom 'AcmApps' 'sets AutoColorManagementEnabled = 1 in the color entry of every connected screen under HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore    (undo: a value that was 0 goes back to 0, otherwise the value is removed, which leaves the Windows default, off)'
+        pCustom 'AcmApps' 'sets AutoColorManagementEnabled = 1 in the color entry of every connected screen under HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers\MonitorDataStore    (undo: sets 0, which is off, on every connected screen that has a value; a screen with no value is left alone)'
     )
 
 # ------------------------------------------------------- Placebo Tweaks - Not Recommended (may do nothing) -------
@@ -10817,7 +10819,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '92'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '93'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
