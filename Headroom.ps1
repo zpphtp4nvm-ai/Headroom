@@ -7513,21 +7513,32 @@ function Get-PresetNote {
 }
 
 # ------------------------------------------------ settings that are only partly applied ----
-# After a check, a setting that reads "partly applied" (some of its values are set, the others are not) is offered for applying again.
-# That happens when a newer version of this app adds values to a setting an older version applied, and when Windows or another
-# program changes one value back. Nothing is written to disk for this: the check only reads, and the question is made from what
-# the check found. The settings asked about stay in memory, so the question is not repeated for them until the window is opened again.
-# Left out: run-once actions, and settings with options (T.Choices), because there is no telling which option was meant.
+# After a check, two kinds of setting are offered for applying again:
+#   - one that reads "partly applied" (some of its values are set, the others are not), and
+#   - one that this app applied earlier (it has an undo record) and that now reads off.
+# That happens when a newer version of this app changes a setting an older version applied, and when Windows or another
+# program (a driver install, for example) changes a value back. Nothing is written to disk for this: the check only reads,
+# and the question is made from what the check found. The settings asked about stay in memory, so the question is not repeated
+# for them until the window is opened again.
+# Left out: run-once actions, settings with options (T.Choices, because there is no telling which option was meant), and, for the
+# second kind only, a setting whose Windows default is the position the app applies (Game Mode): reading off there is a choice
+# somebody made in Windows, not something that was put back.
 $script:ReapplyAsked = @{}
 $script:ReapplyPending = $false      # a check has finished and the offer has not been made yet (the timer makes it when the window is free)
 
-# The ids (in list order) of the partly applied settings that have not been asked about since the window was opened
+# The ids (in list order) of the settings to offer that have not been asked about since the window was opened
 function Get-ReapplyOffer {
     $out = @()
+    $store = $null
+    try { $store = Get-Store } catch { $store = $null }      # read only: which settings this app has applied before
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
-        if ([string]$row.State -ne 'Partial' -or $row.T.Once -or $row.T.Choices) { continue }
+        if ($row.T.Once -or $row.T.Choices) { continue }
         if ($script:ReapplyAsked.ContainsKey([string]$id)) { continue }
+        $st = [string]$row.State
+        if ($st -eq 'Partial') { }
+        elseif ($st -eq 'Off' -and $store -and $store.ContainsKey([string]$id) -and -not (Test-OffIsExplicit $row.T)) { }
+        else { continue }
         $out += [string]$id
     }
     return $out
@@ -7539,14 +7550,26 @@ function Set-ReapplyAsked {
     foreach ($id in @($ids)) { $script:ReapplyAsked[[string]$id] = $true }
 }
 
-# The heads-up at the top of the question, above the usual list of changes
+# The heads-up at the top of the question, above the usual list of changes: which settings are listed and why
 function Get-ReapplyNote {
     param($Plan)
     $nl = "`r`n"
     $apply = @(@($Plan) | Where-Object { $_.Action -eq 'Apply' })
-    $s = ('{0} setting(s) are only partly applied on this PC: some of their values are set and the others are not.' -f $apply.Count) + $nl
-    $s += 'That happens when a newer version of Headroom adds values to a setting, or when Windows or another program changes one back.' + $nl
-    $s += 'Yes sets the values that are missing. No leaves everything as it is.' + $nl + $nl
+    $part = @(); $back = @()
+    foreach ($p in $apply) {
+        $row = $script:Rows[[string]$p.Id]
+        if (-not $row) { continue }
+        if ([string]$row.State -eq 'Partial') { $part += [string]$row.T.Name } else { $back += [string]$row.T.Name }
+    }
+    $s = ''
+    if ($part.Count) {
+        $s += ('{0} setting(s) are only partly applied on this PC: some of their values are set and the others are not.' -f $part.Count) + $nl + (Format-NameList $part 12) + $nl
+    }
+    if ($back.Count) {
+        $s += ('{0} setting(s) that Headroom applied earlier are off now.' -f $back.Count) + $nl + (Format-NameList $back 12) + $nl
+    }
+    $s += 'That happens when a newer version of Headroom changes a setting you applied, or when Windows or another program (a driver install, for example) changes a value back.' + $nl
+    $s += 'Yes applies them again. No leaves everything as it is.' + $nl + $nl
     $s += Get-NoteSections $apply
     return $s
 }
@@ -7639,7 +7662,7 @@ function Handle-Event {
                 if ($r.State -eq 'Checking') { $r.State = 'Unknown'; $r.Detail = 'Not checked - press "Check again"' }
             }
             Ui-ScanFinished
-            $script:ReapplyPending = $true      # partly applied settings are offered for applying again (Ui-OfferReapply)
+            $script:ReapplyPending = $true      # partly applied and put-back settings are offered for applying again (Ui-OfferReapply)
         }
         'finished' {
             $script:Applying = $false
@@ -10488,7 +10511,7 @@ function Test-MainWindowActive {
     return [bool]($af -and $script:UI.form -and [object]::ReferenceEquals($af, $script:UI.form))
 }
 
-# After a check: the settings that are only partly applied are offered for applying again (Get-ReapplyOffer says which). One question
+# After a check: the settings that are only partly applied, or that this app applied earlier and that read off now, are offered for applying again (Get-ReapplyOffer says which). One question
 # lists them all. Yes ticks them and goes through the usual Apply (the questions some settings ask, the restore point, the undo
 # record); No leaves them as they are. A setting is asked about once each time the window is opened, whatever the answer was.
 function Ui-OfferReapply {
@@ -10783,7 +10806,7 @@ function Ui-Tick {
     if ($script:Job -and $script:Job.Async.IsCompleted -and $script:Q.IsEmpty) {
         try { Finish-Job } catch { Ui-Fail $_ }
     }
-    # a check has finished: offer to apply the partly applied settings again, once the welcome screen is gone and nothing else is open
+    # a check has finished: offer to apply the partly applied (or put-back) settings again, once the welcome screen is gone and nothing else is open
     if ($script:ReapplyPending -and -not $script:Job -and -not $script:Scanning -and -not $script:Applying -and -not (Test-WelcomeShowing) -and (Test-MainWindowActive)) {
         $script:ReapplyPending = $false
         try { Ui-OfferReapply } catch { Ui-Fail $_ }
@@ -10818,7 +10841,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '94'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '95'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
