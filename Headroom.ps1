@@ -4064,13 +4064,13 @@ Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power sav
 
 # --------------------------------------------------------------- Power --------
 Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Performance power plan' `
-    -Desc 'On: the Ultimate Performance plan is created and made the active plan. High Performance is used if your PC hides it, and inside the plan USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving are turned off. Off: your PC goes back to the plan you used before, and the plan this app made is deleted. Windows normally uses the Balanced plan.' `
+    -Desc 'On: the Ultimate Performance plan is created and made the active plan. High Performance is used if your PC hides it, and inside the plan USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving are turned off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses (not necessarily the plan you used before), and the plan this app made is deleted.' `
     -Parts @(
         pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
     )
 
 Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
-    -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Switching it back on recreates the three standard plans. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
+    -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Plans that your PC maker or a driver added (the AMD chipset driver adds AMD Ryzen Balanced, for example) are deleted too. Switching it back on recreates the three standard plans only. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
     -Parts @(
         pCustom 'PlansDelete' 'powercfg /delete for every plan except the active one'
     )
@@ -10841,7 +10841,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '95'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '96'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
