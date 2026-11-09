@@ -6,6 +6,8 @@ There are two presets. The Question Preset asks short questions about how you us
 
 The Home page shows your Windows version, CPU, graphics card, memory, motherboard, displays and drives. Windows doesn’t report CPU temperature, CPU power or memory timings, so those come from HWiNFO or LibreHardwareMonitor if one is running. On an NVIDIA card the graphics card also shows whether Resizable BAR is on and the PCIe link generation and width, read from nvidia-smi.
 
+The Windows card also shows the timer resolution Windows is using right now (how often its clock ticks; a program can ask for a finer tick), whether the HPET is present and enabled, which clock sits behind QueryPerformanceCounter (TSC, HPET or ACPI timer, worked out from how long one read takes), and any timer options set in the boot entry (useplatformclock, useplatformtick, disabledynamictick, tscsyncpolicy). Everything on these pages is read only: the timer is only asked for, the boot entry is only listed with `bcdedit /enum` and the device list is only read. The one exception is the Start HWiNFO button, which changes HWiNFO's own settings file after asking.
+
 ## Requirements
 
 - Windows 11

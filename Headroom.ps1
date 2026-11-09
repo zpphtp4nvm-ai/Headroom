@@ -5227,6 +5227,9 @@ Add-Tweak -Id 'task-officetelemetry' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled
 #                                              OpenHardwareMonitor (their WMI provider), but only while one of those programs is
 #                                              running; otherwise the page says so.
 #   Resolution, refresh rate, HDR              the display driver (EnumDisplaySettings, QueryDisplayConfig)
+#   Timer resolution                           NtQueryTimerResolution (it only asks what the tick is; it never sets one)
+#   HPET, TSC, ACPI timer, boot timer options  the device list (Win32_PnPEntity), "bcdedit /enum {current}" (it only lists) and how long
+#                                              one read of the performance counter takes
 #
 # Everything lives in $sysEngine so the same text can run in a background worker and in the tests.
 # C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
@@ -5421,11 +5424,53 @@ public static class SysColor
 }
 '@
 
+# The tick of Windows' clock, and how long a read of the performance counter takes. Both only look: NtQueryTimerResolution reports the tick
+# (it is not the call that sets one), and Stopwatch.GetTimestamp reads the counter.
+$script:SysSrcClock = @'
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class SysClock
+{
+    [DllImport("ntdll.dll")]
+    static extern int NtQueryTimerResolution(out uint maximum, out uint minimum, out uint current);
+
+    // "coarsest|finest|current" in units of 100 ns, or "" when Windows does not answer. The coarsest tick is the default (156250 = 15.625 ms),
+    // the finest is the shortest this PC allows (often 5000 = 0.5 ms) and the current one is the tick in use now.
+    public static string Timer()
+    {
+        uint mx = 0;
+        uint mn = 0;
+        uint cur = 0;
+        if (NtQueryTimerResolution(out mx, out mn, out cur) != 0) { return ""; }
+        return mx + "|" + mn + "|" + cur;
+    }
+
+    // How long one read of the performance counter takes, in nanoseconds: the fastest of five short runs, so that a busy moment does not count
+    public static double CounterCostNs()
+    {
+        const int N = 20000;
+        double best = -1;
+        for (int run = 0; run < 5; run++)
+        {
+            long t0 = Stopwatch.GetTimestamp();
+            for (int i = 0; i < N; i++) { Stopwatch.GetTimestamp(); }
+            long t1 = Stopwatch.GetTimestamp();
+            double ns = (double)(t1 - t0) * 1000000000.0 / (double)Stopwatch.Frequency / (double)N;
+            if (best < 0 || ns < best) { best = ns; }
+        }
+        return best;
+    }
+}
+'@
+
 # Returns '' when the helper is ready, otherwise the reason it could not be built.
 function Sys-Ensure {
     param([string]$Which)
     $type = 'SysDisp'; $src = $script:SysSrcDisp
     if ($Which -eq 'Color') { $type = 'SysColor'; $src = $script:SysSrcColor }
+    elseif ($Which -eq 'Clock') { $type = 'SysClock'; $src = $script:SysSrcClock }
     if ($type -as [type]) { return '' }
     try {
         Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
@@ -5713,6 +5758,95 @@ function Get-SysStatic {
     try { $s.Board = Get-SysBoard } catch { }
     try { $s.Storage = @(Get-SysStorage) } catch { }
     return $s
+}
+
+# ------------------------------------------------- the clock and the timer (read only) ----
+# Nothing here sets a timer, changes a boot option or switches a device. Four things are read:
+#   the timer resolution    how often Windows' system clock ticks right now. A program can ask for a finer tick and Windows then runs at the
+#                           finest one asked for. NtQueryTimerResolution only reports it: 156250 (15.625 ms) is the default tick.
+#   the boot timer options  "bcdedit /enum {current}" prints the boot entry; the lines of the timer options are picked out of it. (It only
+#                           lists: the other forms of bcdedit, which change the entry, are never used.)
+#   the HPET device         Windows' device list (Win32_PnPEntity). ACPI\PNP0103 is the ID of the HPET (high precision event timer).
+#   the cost of a read      how long one read of the performance counter takes. Windows picks the clock behind QueryPerformanceCounter when
+#                           it starts: a read of the CPU's own counter (the TSC) takes some 20 nanoseconds, a read of the HPET or the ACPI
+#                           power management timer goes through the kernel and takes far longer (hundreds to thousands).
+
+# "156250|5000|10000" (100 ns units: coarsest, finest, current) -> milliseconds. $null for anything that is not a plausible answer.
+function Sys-TimerParse {
+    param([string]$Text)
+    $p = @(([string]$Text).Trim() -split '\|')
+    if ($p.Count -ne 3) { return $null }
+    $v = @()
+    foreach ($x in $p) {
+        $n = 0.0
+        if (-not [double]::TryParse($x, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$n)) { return $null }
+        if ($n -le 0 -or $n -gt 1000000) { return $null }          # 100 ms and more is not a tick of any real PC
+        $v += $n
+    }
+    if ($v[1] -gt $v[0]) { return $null }                           # the finest tick cannot be coarser than the coarsest
+    return @{ CoarsestMs = ($v[0] / 10000.0); FinestMs = ($v[1] / 10000.0); CurrentMs = ($v[2] / 10000.0) }
+}
+# The helper is built once; when it cannot be built (the compiler is not there) this says so at once afterwards instead of trying again every pass
+$script:SysClockBroken = $false
+function Sys-TimerRead {
+    if ($script:SysClockBroken) { return $null }
+    if ((Sys-Ensure 'Clock') -ne '') { $script:SysClockBroken = $true; return $null }
+    try { return (Sys-TimerParse ([string][SysClock]::Timer())) } catch { return $null }
+}
+
+# The timer options out of the text "bcdedit /enum {current}" prints. Read = $true when the text is a boot entry (an error message or nothing
+# is not). Opts = option name (lower case) -> the text after it, only for the options that are set in the entry.
+function Sys-ParseBcd {
+    param([string]$Text)
+    $o = @{ Read = $false; Opts = @{} }
+    $t = [string]$Text
+    if (-not $t) { return $o }
+    if ($t -notmatch '(?im)^\s*identifier\s+\S') { return $o }
+    $o.Read = $true
+    foreach ($line in ($t -split "`r?`n")) {
+        $m = [regex]::Match($line, '^\s*(useplatformclock|useplatformtick|disabledynamictick|tscsyncpolicy)\s+(\S.*?)\s*$', 'IgnoreCase')
+        if ($m.Success) { $o.Opts[$m.Groups[1].Value.ToLowerInvariant()] = $m.Groups[2].Value }
+    }
+    return $o
+}
+function Get-SysBcd {
+    $o = $null
+    try {
+        $exe = "$env:SystemRoot\System32\bcdedit.exe"
+        $txt = Sys-RunTool $exe '/enum {current}' 6000
+        $o = Sys-ParseBcd ([string]$txt)
+    } catch { }
+    if (-not $o) { $o = @{ Read = $false; Opts = @{} } }
+    return $o
+}
+
+# The HPET as Windows lists it. Read = the list could be asked; Present = the firmware offers an HPET and Windows has it; Disabled = it is
+# switched off in Device Manager (problem code 22). A device that is not there any more (code 45, or Present = false) does not count.
+function Get-SysHpet {
+    $o = @{ Read = $false; Present = $false; Disabled = $false }
+    $d = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "PNPDeviceID LIKE 'ACPI\\PNP0103%'" -ErrorAction Stop)
+    $o.Read = $true
+    foreach ($x in $d) {
+        $code = 0
+        try { $code = [int]$x.ConfigManagerErrorCode } catch { }
+        if ($code -eq 45) { continue }
+        if ($null -ne $x.Present -and -not [bool]$x.Present) { continue }
+        $o.Present = $true
+        $o.Disabled = ($code -eq 22)
+        break
+    }
+    return $o
+}
+
+# Everything about the clock that does not change while Windows runs, read once: the speed of the performance counter (Hz), how long one read
+# of it takes (CostNs), the boot timer options (Bcd) and the HPET device (Hpet, $null when the list could not be asked).
+function Get-SysClock {
+    $o = @{ Hz = $null; CostNs = $null; Bcd = $null; Hpet = $null }
+    try { $o.Hz = [double][System.Diagnostics.Stopwatch]::Frequency } catch { }
+    if ((Sys-Ensure 'Clock') -eq '') { try { $o.CostNs = [double][SysClock]::CounterCostNs() } catch { } }
+    try { $o.Bcd = Get-SysBcd } catch { }
+    try { $o.Hpet = Get-SysHpet } catch { }
+    return $o
 }
 
 # --------------------------------------------------------------- drives ----
@@ -6360,7 +6494,7 @@ function Get-SysDisplays {
 function Get-SysLive {
     param([int]$Round, $Static)
     $o = @{ At = (Get-Date); CpuUsage = $null; CpuClockMHz = $null; Procs = $null; Threads = $null; RamUsedMB = $null; RamTotalMB = $null; Uptime = $null
-            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null }
+            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null; Timer = $null }
     if ($null -eq $script:SysPc) {
         $script:SysPc = Sys-PcNew
         Start-Sleep -Milliseconds 700          # a rate counter needs two readings a little apart
@@ -6385,6 +6519,8 @@ function Get-SysLive {
     if (-not $g) { try { $g = Sys-GpuWindows } catch { } }
     $o.Gpu = $g
     $o.Smi = [string]$script:SysSmi
+    # the tick of Windows' clock changes whenever a program asks for another one, so it is read in every pass (it only asks)
+    try { $o.Timer = Sys-TimerRead } catch { }
     # sensors
     $hwi = $null; $lhm = $null
     try { $hwi = Sys-ReadHwi } catch { }
@@ -6405,6 +6541,8 @@ function Get-SysLive {
 function Invoke-SysLoop {
     try { $SysShared.Static = Get-SysStatic } catch { }
     $SysShared.Ver = [int]$SysShared.Ver + 1
+    # the clock facts come after the cards have their first data (asking for them takes a moment); the next live pass draws them
+    try { $SysShared.Clock = Get-SysClock } catch { }
     $round = 0
     $lastDisp = $null
     $lastSto = $null
@@ -10841,7 +10979,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '96'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '97'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11908,9 +12046,9 @@ function Info-Reading { return (Info-Line 'Status' 'Reading your PC...' 'Dim') }
 
 # what the background reader has so far
 function Info-Data {
-    $d = @{ Static = $null; Live = $null }
+    $d = @{ Static = $null; Live = $null; Clock = $null }
     $s = $script:SysShared
-    if ($s) { $d.Static = $s.Static; $d.Live = $s.Live }
+    if ($s) { $d.Static = $s.Static; $d.Live = $s.Live; $d.Clock = $s.Clock }
     return $d
 }
 # a temperature as a line: green is not used, only a warning when it is hot
@@ -11930,6 +12068,124 @@ function Info-UsageKey {
 }
 
 $script:NeedSensors = 'needs HWiNFO or LibreHardwareMonitor'
+
+# ----------------------------------------------------------- the timer lines of the Windows card (read only) ----
+# The speed the performance counter has when Windows uses the ACPI power management timer (3.579545 MHz); no other clock runs at it
+$script:AcpiPmHz = 3579545
+# The speed of the HPET as most boards give it (14.31818 MHz). Some chipsets use a faster one, so this is only used as one more hint.
+$script:HpetHz = 14318180
+$script:BcdOrder = @('useplatformclock', 'useplatformtick', 'disabledynamictick', 'tscsyncpolicy')
+
+# A boot option of "bcdedit /enum": $true when it is set to Yes, $false when it is not in the entry or is No, $null when it could not be read
+# or its value is not a Yes / No spelling (another language, or tscsyncpolicy's own words)
+function Info-BcdOn {
+    param($Bcd, [string]$Name)
+    if (-not $Bcd -or -not $Bcd.Read) { return $null }
+    $v = $Bcd.Opts[$Name]
+    if ($null -eq $v) { return $false }
+    $t = ([string]$v).Trim().ToLowerInvariant()
+    if ($t -match '^(yes|true|on|1)$') { return $true }
+    if ($t -match '^(no|false|off|0)$') { return $false }
+    return $null
+}
+
+# Which clock sits behind QueryPerformanceCounter, worked out from how long one read of it takes (the PC is only measured, nothing is changed).
+#   Speed  'fast' (under 120 ns: the CPU's own counter, the TSC), 'mid' (120 to 400 ns: through the kernel, most likely the TSC), 'slow' (400 ns
+#          and more: a platform timer, the HPET or the ACPI timer), '' (not measured)
+#   Which  'tsc', 'maybe-tsc', 'hpet', 'acpi', 'platform' (one of the two platform timers, not known which), '' (not known)
+# The ACPI timer is named only when the counter runs at its own speed (3.579545 MHz), and the HPET only when Windows is told to use the
+# platform clock on a PC that has an enabled HPET, or the counter runs at the HPET's usual speed. A guess is never made beyond that.
+function Info-ClockSource {
+    param($c)
+    $r = @{ Speed = ''; Which = ''; CostNs = $null }
+    if (-not $c) { return $r }
+    $hz = $null; if ($null -ne $c.Hz) { $hz = [double]$c.Hz }
+    $cost = $null; if ($null -ne $c.CostNs) { $cost = [double]$c.CostNs }
+    $r.CostNs = $cost
+    if ($null -ne $cost) {
+        if ($cost -lt 120) { $r.Speed = 'fast' } elseif ($cost -lt 400) { $r.Speed = 'mid' } else { $r.Speed = 'slow' }
+    }
+    if ($null -ne $hz -and [Math]::Abs($hz - $script:AcpiPmHz) -le ($script:AcpiPmHz * 0.005)) { $r.Which = 'acpi'; return $r }
+    if ($r.Speed -eq 'fast') { $r.Which = 'tsc' }
+    elseif ($r.Speed -eq 'mid') { $r.Which = 'maybe-tsc' }
+    elseif ($r.Speed -eq 'slow') {
+        $h = $c.Hpet
+        $hpetOk = ($h -and $h.Read -and $h.Present -and -not $h.Disabled)
+        $forced = (Info-BcdOn $c.Bcd 'useplatformclock')
+        if ($hpetOk -and $forced -eq $true) { $r.Which = 'hpet' }
+        elseif ($null -ne $hz -and [Math]::Abs($hz - $script:HpetHz) -le ($script:HpetHz * 0.005)) { $r.Which = 'hpet' }
+        else { $r.Which = 'platform' }
+    }
+    return $r
+}
+
+function Info-TimerLine {
+    param($lv)
+    if (-not $lv) { return (Info-Line 'Timer resolution' 'Reading...' 'Dim') }
+    $t = $lv.Timer
+    if (-not $t) { return (Info-Line 'Timer resolution' 'not available' 'Dim') }
+    $v = (Fmt-N $t.CurrentMs 3) + ' ms   (default ' + (Fmt-N $t.CoarsestMs 3) + ', finest ' + (Fmt-N $t.FinestMs 3) + ')'
+    return (Info-Line 'Timer resolution' $v 'Text')
+}
+function Info-HpetLine {
+    param($c, $src)
+    if (-not $c) { return (Info-Line 'HPET' 'Reading...' 'Dim') }
+    $h = $c.Hpet
+    if (-not $h -or -not $h.Read) { return (Info-Line 'HPET' 'could not be read' 'Dim') }
+    if (-not $h.Present) { return (Info-Line 'HPET' 'Not found   (off in the BIOS, or none)' 'Text') }
+    if ($h.Disabled) { return (Info-Line 'HPET' 'Switched off in Device Manager' 'Text') }
+    $w = [string]$src.Which
+    if ($w -eq 'hpet') { return (Info-Line 'HPET' 'Enabled, used as the clock' 'Text') }
+    if ($w -eq 'tsc' -or $w -eq 'maybe-tsc' -or $w -eq 'acpi') { return (Info-Line 'HPET' 'Enabled, not used as the clock' 'Text') }
+    return (Info-Line 'HPET' 'Enabled' 'Text')
+}
+function Info-TscLine {
+    param($c, $src)
+    if (-not $c) { return (Info-Line 'TSC' 'Reading...' 'Dim') }
+    $w = [string]$src.Which
+    $ns = ''; if ($null -ne $src.CostNs) { $ns = '   (' + (Fmt-N $src.CostNs 0) + ' ns per read)' }
+    if ($w -eq 'tsc') { return (Info-Line 'TSC' ('Used as the clock' + $ns) 'Text') }
+    if ($w -eq 'maybe-tsc') { return (Info-Line 'TSC' ('Probably used as the clock' + $ns) 'Text') }
+    if ($w -eq 'acpi') { return (Info-Line 'TSC' 'Not used as the clock' 'Text') }
+    if ($w -eq 'hpet' -or $w -eq 'platform') { return (Info-Line 'TSC' ('Not used as the clock' + $ns) 'Text') }
+    return (Info-Line 'TSC' 'not measured' 'Dim')
+}
+function Info-AcpiLine {
+    param($c, $src)
+    if (-not $c) { return (Info-Line 'ACPI timer' 'Reading...' 'Dim') }
+    $w = [string]$src.Which
+    if ($w -eq 'acpi') { return (Info-Line 'ACPI timer' 'Used as the clock   (counter at 3.58 MHz)' 'Text') }
+    if ($w -eq 'platform') { return (Info-Line 'ACPI timer' 'May be used as the clock' 'Text') }
+    if ($w -eq 'tsc' -or $w -eq 'maybe-tsc' -or $w -eq 'hpet') { return (Info-Line 'ACPI timer' 'Not used as the clock' 'Text') }
+    return (Info-Line 'ACPI timer' 'not measured' 'Dim')
+}
+# The timer options set in the boot entry ("bcdedit /enum {current}"), as the entry writes them, one line each (the first line carries the label);
+# any of them overrides what Windows would choose. Returns the lines.
+function Info-BootTimerLines {
+    param($c)
+    if (-not $c) { return @((Info-Line 'Boot timer options' 'Reading...' 'Dim')) }
+    $b = $c.Bcd
+    if (-not $b -or -not $b.Read) { return @((Info-Line 'Boot timer options' 'could not be read' 'Dim')) }
+    $set = @()
+    $warn = $false
+    foreach ($n in $script:BcdOrder) {
+        $v = $b.Opts[$n]
+        if ($null -eq $v) { continue }
+        $set += ($n + ' ' + [string]$v)
+        $on = Info-BcdOn $b $n
+        if ($n -eq 'tscsyncpolicy') { if (([string]$v).Trim() -notmatch '^default$') { $warn = $true } }
+        elseif ($on -ne $false) { $warn = $true }
+    }
+    if ($set.Count -eq 0) { return @((Info-Line 'Boot timer options' 'none set   (Windows decides)' 'Text')) }
+    $k = 'Text'; if ($warn) { $k = 'Warn' }
+    $out = @()
+    for ($i = 0; $i -lt $set.Count; $i++) {
+        $lab = ''; if ($i -eq 0) { $lab = 'Boot timer options' }
+        $out += , (Info-Line $lab ([string]$set[$i]) $k)
+    }
+    return $out
+}
+$script:TimerNote = 'Timer resolution is how often Windows'' clock ticks right now; a program can ask for a finer tick. HPET, TSC and ACPI timer are the clocks behind QueryPerformanceCounter. Windows picks one when it starts, and this page works out which from how long one read takes. All of it is read only.'
 
 function Info-OsCard {
     param($d)
@@ -11952,7 +12208,15 @@ function Info-OsCard {
     if ($null -ne $up) { $lines += , (Info-Line 'Running for' (Fmt-Span $up)) }
     if ($lv -and $null -ne $lv.Procs) { $lines += , (Info-Line 'Processes' (Fmt-N $lv.Procs 0)) } else { $lines += , (Info-Line 'Processes' 'Reading...' 'Dim') }
     if ($lv -and $null -ne $lv.Threads) { $lines += , (Info-Line 'Threads' (Fmt-N $lv.Threads 0)) }
-    return (Info-Card 'info:os' 'Windows' $sub $lines)
+    # the timer and the clocks (read only)
+    $clock = $d.Clock
+    $src = Info-ClockSource $clock
+    $lines += , (Info-TimerLine $lv)
+    $lines += , (Info-HpetLine $clock $src)
+    $lines += , (Info-TscLine $clock $src)
+    $lines += , (Info-AcpiLine $clock $src)
+    foreach ($bl in @(Info-BootTimerLines $clock)) { $lines += , $bl }
+    return (Info-Card 'info:os' 'Windows' $sub $lines $script:TimerNote)
 }
 
 function Info-CpuCard {
@@ -12512,7 +12776,7 @@ function Start-SysJob {
 
 function Start-SysWorker {
     if ($script:SysWorker) { return }
-    $script:SysShared = [hashtable]::Synchronized(@{ Stop = $false; Active = $false; Force = $false; Ver = 0; Static = $null; Live = $null })
+    $script:SysShared = [hashtable]::Synchronized(@{ Stop = $false; Active = $false; Force = $false; Ver = 0; Static = $null; Live = $null; Clock = $null })
     $script:SysSeen = -1
     $script:SysWorker = Start-SysJob 'loop'
 }
