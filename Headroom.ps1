@@ -8521,12 +8521,14 @@ function Rgb {
 function Ui-InitTheme {
     # Near-black navy with one light-purple accent: the window and side menu are the darkest navy (#0f0f19), the page is a little lighter,
     # cards lighter again. Purple (accent) is used for the selected tab, switches that are on, the main button and a change that is waiting.
+    # The look is flat: a card, a page of the side menu and a panel are a fill with round corners and no outline. An outline is only drawn
+    # where it says something: the selected setting and a text box that is being typed in (purple).
     $script:Th = @{
         Bg        = (Rgb 18 18 30)       # the page
         Side      = (Rgb 15 15 25)       # the window frame and the side menu
-        SideHot   = (Rgb 31 31 49)       # a side-menu box under the pointer
-        SideSel   = (Rgb 36 32 62)       # the side-menu box of the open page (with the purple outline)
-        SideBox   = (Rgb 24 24 39)       # a side-menu box at rest
+        SideHot   = (Rgb 31 31 49)       # the page of the side menu under the pointer
+        SideSel   = (Rgb 36 32 62)       # the open page of the side menu (a soft purple fill)
+        SideBox   = (Rgb 24 24 39)       # a choice in a list at rest (the preset window)
         Panel     = (Rgb 24 24 39)       # dialogs
         Card      = (Rgb 24 24 39)       # cards
         CardHot   = (Rgb 29 29 46)
@@ -8539,8 +8541,7 @@ function Ui-InitTheme {
         Border    = (Rgb 64 64 92)
         Tag       = (Rgb 34 34 53)       # the tag pills on a card (quieter than the buttons)
         TagText   = (Rgb 170 170 194)
-        Edge      = (Rgb 40 40 60)       # the quiet outline of a card
-        EdgeHot   = (Rgb 66 66 96)
+        Edge      = (Rgb 40 40 60)       # hairlines (under the app name when the menu is scrolled, the track of the progress bar)
         Text      = (Rgb 244 244 251)
         Sub       = (Rgb 200 200 216)
         Mute      = (Rgb 152 152 174)    # descriptions
@@ -8559,8 +8560,6 @@ function Ui-InitTheme {
         TintUndo  = (Rgb 36 27 43)       # a card waiting to be turned off
         TintApplySel = (Rgb 35 33 57)
         TintUndoSel  = (Rgb 42 31 50)
-        EdgeApply = (Rgb 72 60 122)
-        EdgeUndo  = (Rgb 98 62 88)
         Hover     = (Rgb 29 29 46)
         Sel       = (Rgb 33 33 52)
         Track     = (Rgb 46 46 68)       # switch, off
@@ -8574,23 +8573,20 @@ function Ui-InitTheme {
         ThumbTrack = (Rgb 27 27 42)      # the faint groove behind a scroll thumb while the pointer is on the scroll bar
         LogBg     = (Rgb 13 13 22)
         BtnText   = (Rgb 24 16 52)
-        GoodText  = (Rgb 118 214 106)       # the bright green of the Low risk badge text
-        WarnText  = (Rgb 255 170 90)        # the orange of the Medium risk badge text
-        BadText   = (Rgb 255 142 142)       # the red of the Risky badge text
-        BadFill   = (Rgb 74 40 54)    # the dark red tint behind the Risky badge
-        GoodFill  = (Rgb 28 54 46)
-        WarnFill  = (Rgb 70 48 40)
+        GoodText  = (Rgb 118 214 106)       # the green dot of Low risk
+        WarnText  = (Rgb 255 170 90)        # the orange dot of Medium risk
+        BadText   = (Rgb 255 142 142)       # the red dot of Risky
     }
 }
 
 function Ui-InitMetrics {
     $script:M = @{
-        Row = (Px 64); Gap = (Px 8); Head = (Px 46); Pad = (Px 18); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); RiskDot = (Px 10); ChoiceY = (Px 52); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
-        Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 10); BtnR = (Px 8)
+        Row = (Px 66); Gap = (Px 10); Head = (Px 46); Pad = (Px 20); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); RiskDot = (Px 10); ChoiceY = (Px 52); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
+        Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 14); BtnR = (Px 10)
         ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
-        CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 14); Wheel = (Px 168)
+        CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 18); Wheel = (Px 168)
         Side = (Px 244); Gutter = (Px 28); Details = (Px 340); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
-        NavTop = (Px 132); SearchY = (Px 80); SearchH = (Px 40); NavRow = (Px 42); NavGap = (Px 8); NavLabel = (Px 40); NavSb = (Px 12); NavWheel = (Px 80)
+        NavTop = (Px 132); SearchY = (Px 80); SearchH = (Px 40); NavRow = (Px 40); NavGap = (Px 4); NavLabel = (Px 40); NavSb = (Px 12); NavWheel = (Px 80)
     }
 }
 
@@ -8764,14 +8760,6 @@ function Ui-StrokeRound {
     $o = $width / 2.0
     $gp = Ui-RoundPath ($x + $o) ($y + $o) ($w - $width) ($h - $width) ([Math]::Max(0.0, ($r - $o)))
     try { $g.DrawPath((Ui-Pen $c $width), $gp) } finally { $gp.Dispose() }
-}
-# A box: its fill and a clean one-pixel outline all the way round (no shadow, no bevel). The caller picks the colours: the quiet outline at
-# rest, a lighter one under the pointer, purple for the selected one, the tint's own for a card with a change waiting. The settings, the
-# read-out cards of Home and the pages in the side menu are all drawn with it, so they look alike.
-function Ui-PaintBox {
-    param($g, $fill, $edge, [int]$x, [int]$y, [int]$w, [int]$h, [int]$r)
-    Ui-FillRound $g $fill $x $y $w $h $r
-    Ui-StrokeRound $g $edge 1 $x $y $w $h $r
 }
 # the width of a text in pixels (for putting one thing right after another)
 function Ui-Measure {
@@ -9089,16 +9077,16 @@ function Ui-PaintBtn {
     $r = [Math]::Min($M.BtnR, [int]($h / 2))
     Ui-Fill $g $behind 0 0 $w $h
     if ($kind -eq 'choice' -or $kind -eq 'choiceon') {
-        # a choice in a list (the preset window): the same flat box as a page of the side menu - a fill and a clean outline, the name at the left
+        # a choice in a list (the preset window): flat like a page of the side menu - a fill and no outline, the name at the left
         $csel = ($kind -eq 'choiceon')
-        if ($csel) { Ui-PaintBox $g $Th.SideSel $Th.Accent 0 0 $w $h (Px 10) }
-        elseif ($hot) { Ui-PaintBox $g $Th.SideHot $Th.EdgeHot 0 0 $w $h (Px 10) }
-        else { Ui-PaintBox $g $Th.SideBox $Th.Edge 0 0 $w $h (Px 10) }
+        if ($csel) { Ui-FillRound $g $Th.SideSel 0 0 $w $h (Px 12) }
+        elseif ($hot) { Ui-FillRound $g $Th.SideHot 0 0 $w $h (Px 12) }
+        else { Ui-FillRound $g $Th.SideBox 0 0 $w $h (Px 12) }
         $ccol = $Th.Mute
         $cfont = Ui-Font 'nav'
         if ($csel) { $ccol = $Th.Text; $cfont = Ui-Font 'navb' } elseif ($hot) { $ccol = $Th.Text }
         Ui-Text $g ([string]$b.Text) $cfont $ccol (Px 16) 0 ($w - (Px 32)) $h $TF.L
-        if ($on -and ($b.Focused -eq $true)) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h (Px 10) }
+        if ($on -and ($b.Focused -eq $true)) { Ui-StrokeRound $g $Th.Accent 1.5 0 0 $w $h (Px 12) }
         return
     }
     if ($kind -eq 'tabon') {
@@ -9156,7 +9144,6 @@ function Ui-PaintSwitch {
     if ($hot) { $back = $Th.CardHot }
     Ui-Fill $g $behind 0 0 $w $h
     Ui-FillRound $g $back 0 0 $w $h $M.BtnR
-    Ui-StrokeRound $g $Th.Edge 1 0 0 $w $h $M.BtnR
     $fore = $Th.Sub
     if ($on) { $fore = $Th.Text }
     $swW = Px 36
@@ -9206,7 +9193,7 @@ function Ui-SetEnabled {
 }
 
 # ----------------------------------------------------------- cards ----------------
-# A card is a panel with round corners and a quiet outline. Its Tag holds how it looks:  Fill, Edge, R (corner radius),
+# A card is a panel with round corners. Its Tag holds how it looks:  Fill, Edge (the outline; the same colour as the fill = none), R (corner radius),
 # Icon ('search' draws a magnifying glass at the left). The panel's own colour is the colour of what is behind it.
 function Ui-NewCard {
     param($fill, $edge, [int]$radius, [string]$icon = '')
@@ -9910,20 +9897,16 @@ function Ui-PaintRow {
     $cw = [int]$e.W
     $o = Ui-RowGeom $e
     $ch = $o.CardH                                        # the card is a little shorter than its line: that is the gap
+    # a flat card: a fill and no outline. Only the selected card has an outline (purple); the one under the pointer is a little lighter.
     $fill = $Th.Card
-    $edge = $Th.Edge
-    if ($e.Tint) {
-        $fill = $Th[$e.Tint]
-        $edge = $Th[([string]$e.Tint).Replace('Tint', 'Edge')]
-    }
+    if ($e.Tint) { $fill = $Th[$e.Tint] }
     if ($sel) {
-        $edge = $Th.Accent
         if ($e.Tint) { $fill = $Th[$e.Tint + 'Sel'] } else { $fill = $Th.CardSel }
     } elseif ($hot -and -not $e.Tint) {
         $fill = $Th.CardHot
-        $edge = $Th.EdgeHot
     }
-    Ui-PaintBox $g $fill $edge $x $y $cw $ch $M.Radius
+    Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
+    if ($sel) { Ui-StrokeRound $g $Th.Accent 1 $x $y $cw $ch $M.Radius }
     if ($e.Tint) {
         # a change waiting to be made: a short bar at the left edge (purple: the switch will go on, orange: it will go off)
         $bar = $Th.Accent
@@ -9950,19 +9933,21 @@ function Ui-PaintRow {
     }
     # a row with options has its option pill on a second line, under the text
     if ($e.Choices) { Ui-DrawChoices $g $e $textX ($y + $o.ChoiceY) ($cw - $M.Pad - $o.TextX) $M.ChoiceH }
-    # the right side: status chip, risk pill (or dot), switch
+    # the right side: status chip, the risk (a coloured dot and its name in a quiet colour; on a narrow row only the dot), switch
     if ($o.ChipX -ge 0) {
         Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH (Px 6)
         Ui-Text $g ([string]$e.ChipText) $tagFont $Th[$e.ChipKey] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH $TF.C
     }
-    $fk = $e.RiskKey + 'Fill'
     $tk = $e.RiskKey + 'Text'
-    if (-not $on) { $fk = 'Raised'; $tk = 'Dim' }
+    if (-not $on) { $tk = 'Dim' }
     if ($o.RiskDot) {
         Ui-FillOval $g $Th[$tk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH
     } else {
-        Ui-FillRound $g $Th[$fk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH (Px 6)
-        Ui-Text $g ([string]$e.Risk) $tagFont $Th[$tk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH $TF.C
+        $rd = Px 8
+        Ui-FillOval $g $Th[$tk] ($x + $o.RiskX + (Px 6)) ($y + $o.RiskY + [int](($o.RiskH - $rd) / 2)) $rd $rd
+        $rcol = $Th.Mute
+        if (-not $on) { $rcol = $Th.Dim }
+        Ui-Text $g ([string]$e.Risk) (Ui-Font 'small') $rcol ($x + $o.RiskX + (Px 6) + $rd + (Px 8)) ($y + $o.RiskY) ($o.RiskW - $rd - (Px 14)) $o.RiskH $TF.L
     }
     if (-not $e.Choices) { Ui-DrawToggle $g ($x + $o.TogX) ($y + $o.TogY) ([bool]$e.Checked) $on }
 }
@@ -10979,7 +10964,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '97'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '98'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11252,11 +11237,10 @@ function Ui-PaintNav {
         $sel = ([string]$e.Cat -eq $curCat)
         $hot = ($script:NavHot -eq $e.Key)
         $ih = $e.H - $M.NavGap
-        # every page is a box, like the cards of the list (a fill and a clean outline); the open page has the purple outline, the one
-        # under the pointer is a little lighter
-        if ($sel) { Ui-PaintBox $g $Th.SideSel $Th.Accent $ix $e.Y $iw $ih (Px 10) }
-        elseif ($hot) { Ui-PaintBox $g $Th.SideHot $Th.EdgeHot $ix $e.Y $iw $ih (Px 10) }
-        else { Ui-PaintBox $g $Th.SideBox $Th.Edge $ix $e.Y $iw $ih (Px 10) }
+        # a flat list: a page at rest is only its icon, name and count. The open page has a soft purple fill, the one under the pointer a
+        # lighter fill. Nothing has an outline.
+        if ($sel) { Ui-FillRound $g $Th.SideSel $ix $e.Y $iw $ih (Px 12) }
+        elseif ($hot) { Ui-FillRound $g $Th.SideHot $ix $e.Y $iw $ih (Px 12) }
         $col = $Th.Mute
         $icol = $Th.Dim
         $font = Ui-Font 'nav'
@@ -11270,17 +11254,15 @@ function Ui-PaintNav {
         $limit = $right
         $pw = 0
         if ($e.CountText) {
-            # the count sits in a small pill at the right edge (lit for the open page)
-            $cf = Ui-Font 'smallb'
-            $pw = (Ui-Measure $g ([string]$e.CountText) $cf) + (Px 16)
+            # the count is a plain number at the right edge (purple for the open page)
+            $cf = Ui-Font 'small'
+            $pw = (Ui-Measure $g ([string]$e.CountText) $cf) + (Px 12)
             $ph = Px 20
             $pxx = $right - $pw
             $pyy = $e.Y + [int](($ih - $ph) / 2)
-            $pfill = $Th.Tag
-            $pcol = $Th.Mute
-            if ($sel) { $pfill = $Th.AccentSoft; $pcol = $Th.Accent }
-            Ui-FillRound $g $pfill $pxx $pyy $pw $ph ([int]($ph / 2))
-            Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.C
+            $pcol = $Th.Dim
+            if ($sel) { $pcol = $Th.Accent }
+            Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.R
             $limit = $pxx - (Px 6)
         }
         Ui-Text $g (Get-TitleCase ([string]$e.Title)) $font $col $tx2 $e.Y ($limit - $tx2) $ih $TF.L
@@ -11300,7 +11282,6 @@ function Ui-PaintNav {
     Ui-Text $g 'Headroom' (Ui-Font 'brand') $Th.Text $tx ($ly - (Px 2)) ($px - $tx - (Px 6)) (Px 22) $TF.L
     Ui-Text $g 'Debloat Tool' (Ui-Font 'small') $Th.Mute $tx ($ly + (Px 18)) ($px - $tx - (Px 6)) (Px 16) $TF.L
     Ui-FillRound $g $Th.Card $px ($ly + [int](($ls - $ph) / 2)) $pw $ph ([int]($ph / 2))
-    Ui-StrokeRound $g $Th.Edge 1 $px ($ly + [int](($ls - $ph) / 2)) $pw $ph ([int]($ph / 2))
     Ui-Text $g $pillT (Ui-Font 'small') $Th.Mute $px ($ly + [int](($ls - $ph) / 2)) $pw $ph $TF.C
     if ($script:NavScroll -gt 0) { Ui-Line $g $Th.Edge 1 (Px 16) ($M.NavTop - 1) ($w - (Px 16)) ($M.NavTop - 1) }
     # the scroll bar (only when the pages do not all fit)
@@ -11705,7 +11686,7 @@ function Ui-Build {
     $btnPage.Top = (Px 24)
     $btnPage.Visible = $false
     # the search box lives in the side menu, under the app name
-    $searchBox = Ui-NewCard $Th.Card $Th.Edge $M.Radius 'search'
+    $searchBox = Ui-NewCard $Th.Card $Th.Card $M.Radius 'search'
     $searchBox.BackColor = $Th.Side
     $searchBox.Size = New-Object System.Drawing.Size(($M.Side - (Px 24)), $M.SearchH)
     $searchBox.Location = New-Object System.Drawing.Point((Px 12), $M.SearchY)
@@ -11786,7 +11767,7 @@ function Ui-Build {
     $lst.TabStop = $true
     Ui-DoubleBuffer $lst
     $gap = New-Pnl 'Right' (Px 16) $Th.Bg
-    $detCard = Ui-NewCard $Th.Card $Th.Edge $M.Radius
+    $detCard = Ui-NewCard $Th.Card $Th.Card $M.Radius
     $detCard.Dock = [System.Windows.Forms.DockStyle]::Right
     $detCard.Width = $M.Details
     $detCard.Padding = New-Object System.Windows.Forms.Padding((Px 22), (Px 20), (Px 12), (Px 16))
@@ -11808,7 +11789,7 @@ function Ui-Build {
     # --- log
     $logCard = New-Pnl 'Bottom' (Px 176) $Th.Bg
     $logCard.Padding = New-Object System.Windows.Forms.Padding($M.Gutter, 0, $M.Gutter, (Px 12))
-    $logBorder = Ui-NewCard $Th.LogBg $Th.Edge $M.Radius
+    $logBorder = Ui-NewCard $Th.LogBg $Th.LogBg $M.Radius
     $logBorder.Dock = [System.Windows.Forms.DockStyle]::Fill
     $logBorder.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 12), (Px 10), (Px 12))
     $logBox = New-Rich $Th.LogBg (Rgb 196 200 214) 'mono'
@@ -11893,7 +11874,7 @@ function Ui-Build {
     $find.Add_TextChanged({ try { if (-not $script:HoldFilter) { Ui-OnFilterChanged } } catch { Ui-Fail $_ } })
     $find.Add_KeyDown({ param($s, $e) try { if ([string]$e.KeyCode -eq 'Escape') { $s.Text = ''; $e.Handled = $true; $e.SuppressKeyPress = $true } } catch { Ui-Fail $_ } })
     $find.Add_Enter({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Accent; $script:UI.searchBox.Invalidate() } catch { } })
-    $find.Add_Leave({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Edge; $script:UI.searchBox.Invalidate() } catch { } })
+    $find.Add_Leave({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Card; $script:UI.searchBox.Invalidate() } catch { } })
     $find.Add_HandleCreated({ param($s, $e) try { Ui-Cue $s 'Find a setting' } catch { } })
     $dry.Add_CheckedChanged({ try { Ui-StyleDry; Ui-Counts } catch { Ui-Fail $_ } })
     $forceBtn.Add_Click({ try { Ui-ForceUndo } catch { Ui-Fail $_ } })
@@ -12702,7 +12683,7 @@ function Ui-PaintInfo {
     $x = [int]$e.X
     $cw = [int]$e.W
     $ch = $e.H - $M.Gap
-    Ui-PaintBox $g $Th.Card $Th.Edge $x $y $cw $ch $M.Radius
+    Ui-FillRound $g $Th.Card $x $y $cw $ch $M.Radius            # a flat card: a fill, no outline
     $ix = $x + $M.Pad
     $iw = $cw - 2 * $M.Pad
     $chipW = 0
