@@ -5230,6 +5230,8 @@ Add-Tweak -Id 'task-officetelemetry' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled
 #   Timer resolution                           NtQueryTimerResolution (it only asks what the tick is; it never sets one)
 #   HPET, TSC, ACPI timer, boot timer options  the device list (Win32_PnPEntity), "bcdedit /enum {current}" (it only lists) and how long
 #                                              one read of the performance counter takes
+#   VBS, memory integrity (HVCI)               Windows' own report, Win32_DeviceGuard (it only reports)
+#   IOMMU                                      the list of the firmware's ACPI tables (EnumSystemFirmwareTables: it only lists them)
 #
 # Everything lives in $sysEngine so the same text can run in a background worker and in the tests.
 # C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
@@ -5465,12 +5467,45 @@ public static class SysClock
 }
 '@
 
+# The signatures of the firmware's ACPI tables. It only lists them: EnumSystemFirmwareTables reads the list Windows already has and
+# changes nothing. The IOMMU is described to Windows by one of them: IVRS on AMD (AMD-Vi), DMAR on Intel (VT-d).
+$script:SysSrcFw = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class SysFw
+{
+    [DllImport("kernel32.dll")]
+    static extern uint EnumSystemFirmwareTables(uint provider, byte[] buffer, uint size);
+
+    // "APIC,FACP,IVRS,..." (four letters each), or "" when Windows does not answer
+    public static string AcpiTables()
+    {
+        const uint ACPI = 0x41435049;
+        uint need = EnumSystemFirmwareTables(ACPI, null, 0);
+        if (need == 0 || need > 65536) { return ""; }
+        byte[] buf = new byte[need];
+        uint got = EnumSystemFirmwareTables(ACPI, buf, need);
+        if (got == 0 || got > need) { return ""; }
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i + 4 <= (int)got; i += 4)
+        {
+            if (sb.Length > 0) { sb.Append(","); }
+            sb.Append(Encoding.ASCII.GetString(buf, i, 4));
+        }
+        return sb.ToString();
+    }
+}
+'@
+
 # Returns '' when the helper is ready, otherwise the reason it could not be built.
 function Sys-Ensure {
     param([string]$Which)
     $type = 'SysDisp'; $src = $script:SysSrcDisp
     if ($Which -eq 'Color') { $type = 'SysColor'; $src = $script:SysSrcColor }
     elseif ($Which -eq 'Clock') { $type = 'SysClock'; $src = $script:SysSrcClock }
+    elseif ($Which -eq 'Fw') { $type = 'SysFw'; $src = $script:SysSrcFw }
     if ($type -as [type]) { return '' }
     try {
         Add-Type -TypeDefinition $src -Language CSharp -ErrorAction Stop
@@ -5846,6 +5881,54 @@ function Get-SysClock {
     if ((Sys-Ensure 'Clock') -eq '') { try { $o.CostNs = [double][SysClock]::CounterCostNs() } catch { } }
     try { $o.Bcd = Get-SysBcd } catch { }
     try { $o.Hpet = Get-SysHpet } catch { }
+    return $o
+}
+
+# ------------------------------------------------- the protections: VBS, memory integrity, IOMMU (read only) ----
+# Nothing here switches a protection on or off. Two things are read, once:
+#   Win32_DeviceGuard       Windows' own report of virtualization-based security (root\Microsoft\Windows\DeviceGuard). The numbers are the
+#                           ones Microsoft documents: VirtualizationBasedSecurityStatus 0 = off, 1 = turned on but not running, 2 = running;
+#                           in SecurityServicesConfigured / SecurityServicesRunning 2 is memory integrity (HVCI); in AvailableSecurityProperties
+#                           3 is DMA protection.
+#   the ACPI table list     the IOMMU is described to Windows by the firmware's IVRS table (AMD-Vi) or DMAR table (Intel VT-d). Without one
+#                           of them Windows has no IOMMU to use.
+function Get-SysDeviceGuard {
+    $o = @{ Read = $false; Vbs = $null; Configured = @(); Running = @(); Available = @() }
+    $d = @(Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop)
+    if ($d.Count -lt 1 -or $null -eq $d[0]) { return $o }
+    $x = $d[0]
+    $o.Read = $true
+    try { if ($null -ne $x.VirtualizationBasedSecurityStatus) { $o.Vbs = [int]$x.VirtualizationBasedSecurityStatus } } catch { }
+    foreach ($p in @(@('Configured', 'SecurityServicesConfigured'), @('Running', 'SecurityServicesRunning'), @('Available', 'AvailableSecurityProperties'))) {
+        $v = @()
+        try { $v = @(@($x.($p[1])) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ }) } catch { }
+        $o[$p[0]] = $v
+    }
+    return $o
+}
+# The ACPI table list ("APIC,FACP,IVRS,...") -> the IOMMU: Read = the list could be had; Kind = 'AMD-Vi' (IVRS), 'VT-d' (DMAR) or '' (none)
+function Sys-IommuParse {
+    param([string]$Text)
+    $o = @{ Read = $false; Kind = '' }
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $o }
+    $names = @($t -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($names.Count -eq 0 -or @($names | Where-Object { $_ -notmatch '^[ -~]{4}$' }).Count -gt 0) { return $o }     # not a list of table names
+    $o.Read = $true
+    if ($names -contains 'IVRS') { $o.Kind = 'AMD-Vi' } elseif ($names -contains 'DMAR') { $o.Kind = 'VT-d' }
+    return $o
+}
+function Get-SysIommu {
+    if ((Sys-Ensure 'Fw') -ne '') { return @{ Read = $false; Kind = '' } }
+    $t = ''
+    try { $t = [string][SysFw]::AcpiTables() } catch { $t = '' }
+    return (Sys-IommuParse $t)
+}
+# Both, each on its own (one that cannot be read leaves the other): Dg = Get-SysDeviceGuard ($null when it could not be asked), Iommu
+function Get-SysSec {
+    $o = @{ Dg = $null; Iommu = $null }
+    try { $o.Dg = Get-SysDeviceGuard } catch { }
+    try { $o.Iommu = Get-SysIommu } catch { }
     return $o
 }
 
@@ -6543,6 +6626,8 @@ function Invoke-SysLoop {
     $SysShared.Ver = [int]$SysShared.Ver + 1
     # the clock facts come after the cards have their first data (asking for them takes a moment); the next live pass draws them
     try { $SysShared.Clock = Get-SysClock } catch { }
+    # VBS, memory integrity and the IOMMU do not change while Windows runs either: read once, after the clock
+    try { $SysShared.Sec = Get-SysSec } catch { }
     $round = 0
     $lastDisp = $null
     $lastSto = $null
@@ -9346,6 +9431,7 @@ $script:ListH = 500
 $script:SelKey = ''                                          # key of the selected entry ('' = none)
 $script:HotEntry = $null                                     # the entry under the mouse
 $script:HotZone = ''
+$script:HotLine = ''                                          # the line of a Home card under the pointer that has an explanation (its Id)
 $script:Collapsed = @{}
 $script:Filtering = $false                                   # a search or a filter button is hiding rows: show every group open
 $script:Single = $false                                      # one category page: no section titles
@@ -9664,6 +9750,7 @@ function Ui-RebuildList {
     $script:Groups = $groups
     $script:HotEntry = $null
     $script:HotZone = ''
+    $script:HotLine = ''
     Ui-FillHeads
     Ui-Layout
     # keep the selection while its line is still there
@@ -10055,7 +10142,12 @@ function Ui-Zone {
     $i = Ui-HitIndex $ly $x
     if ($i -lt 0) { return @{ Zone = ''; Entry = $null } }
     $e = $script:View[$i]
-    if ($e.Kind -eq 'info') { return @{ Zone = ''; Entry = $null } }          # a read-out: nothing to click
+    if ($e.Kind -eq 'info') {
+        # a read-out: only a line that has an explanation can be clicked (it opens the explanation)
+        $hl = Info-HitLine $e ($x - [int]$e.X) ($ly - [int]$e.Y)
+        if ($hl) { return @{ Zone = 'info'; Entry = $e; Line = [string]$hl.Id } }
+        return @{ Zone = ''; Entry = $null }
+    }
     if ($e.Kind -eq 'row') {
         $o = Ui-RowGeom $e
         $rx = $x - [int]$e.X
@@ -10100,15 +10192,18 @@ function Ui-UpdateHot {
     $new = $z.Entry
     $oldKey = ''; if ($old) { $oldKey = [string]$old.Key }
     $newKey = ''; if ($new) { $newKey = [string]$new.Key }
-    if ($z.Zone -eq $script:HotZone -and $newKey -eq $oldKey) { return }
+    $newLine = [string]$z.Line
+    $oldLine = [string]$script:HotLine
+    if ($z.Zone -eq $script:HotZone -and $newKey -eq $oldKey -and $newLine -eq $oldLine) { return }
     $oldZone = $script:HotZone
     $script:HotEntry = $new
     $script:HotZone = $z.Zone
+    $script:HotLine = $newLine
     if ($old) { Ui-InvalidateEntry $old }
-    if ($new -and $newKey -ne $oldKey) { Ui-InvalidateEntry $new }
+    if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -10176,6 +10271,7 @@ function Ui-OnMouseDown {
     elseif ($zone.StartsWith('seg')) { Ui-Select $z.Entry; Ui-PickRow $z.Entry ([int]$zone.Substring(3)) }
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
+    elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
     Ui-Flush
 }
 
@@ -10964,7 +11060,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '98'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '100'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11169,6 +11265,8 @@ $script:NavIcons = @{
     'Memory'              = @(@('r', 2, 7, 20, 9, 1.5), @('r', 5, 9.5, 3.5, 4, 0.5), @('r', 10.25, 9.5, 3.5, 4, 0.5), @('r', 15.5, 9.5, 3.5, 4, 0.5), @('p', 6, 16, 6, 19), @('p', 10, 16, 10, 19), @('p', 14, 16, 14, 19), @('p', 18, 16, 18, 19))
     'Storage'             = @(@('r', 3, 5, 18, 14, 3), @('p', 3, 14, 21, 14), @('d', 17.5, 16.5, 1))
     'Motherboard'         = @(@('r', 3, 3, 18, 18, 2), @('r', 7, 7, 6, 6, 1), @('p', 16, 6, 16, 11), @('p', 7, 16, 17, 16))
+    'Timer and clock'     = @(@('o', 4, 5, 16, 16), @('p', 12, 9, 12, 13, 15, 15), @('p', 9.5, 2.5, 14.5, 2.5), @('p', 12, 2.5, 12, 5))
+    'Security'            = @(@('c', 12, 3, 20, 6, 20, 12, 12, 21, 4, 12, 4, 6), @('d', 12, 11, 1.5), @('p', 12, 12, 12, 15.5))
     'Sensors'             = @(@('r', 9.5, 3, 5, 13, 2.5), @('o', 7.5, 13, 9, 9), @('p', 12, 8, 12, 16))
 }
 # the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
@@ -12027,9 +12125,9 @@ function Info-Reading { return (Info-Line 'Status' 'Reading your PC...' 'Dim') }
 
 # what the background reader has so far
 function Info-Data {
-    $d = @{ Static = $null; Live = $null; Clock = $null }
+    $d = @{ Static = $null; Live = $null; Clock = $null; Sec = $null }
     $s = $script:SysShared
-    if ($s) { $d.Static = $s.Static; $d.Live = $s.Live; $d.Clock = $s.Clock }
+    if ($s) { $d.Static = $s.Static; $d.Live = $s.Live; $d.Clock = $s.Clock; $d.Sec = $s.Sec }
     return $d
 }
 # a temperature as a line: green is not used, only a warning when it is hot
@@ -12166,7 +12264,76 @@ function Info-BootTimerLines {
     }
     return $out
 }
-$script:TimerNote = 'Timer resolution is how often Windows'' clock ticks right now; a program can ask for a finer tick. HPET, TSC and ACPI timer are the clocks behind QueryPerformanceCounter. Windows picks one when it starts, and this page works out which from how long one read takes. All of it is read only.'
+# ----------------------------------------------------------- VBS, memory integrity, IOMMU (read only) ----
+# What Windows reports about VBS and memory integrity, and whether the firmware gives Windows an IOMMU. $sec is what the reader found:
+# @{ Dg = @{ Read; Vbs; Configured; Running; Available }; Iommu = @{ Read; Kind } }, or $null before it has come.
+function Info-VbsLine {
+    param($sec)
+    if (-not $sec) { return (Info-Line 'VBS' 'Reading...' 'Dim') }
+    $g = $sec.Dg
+    if (-not $g -or -not $g.Read) { return (Info-Line 'VBS' 'could not be read' 'Dim') }
+    if ($null -eq $g.Vbs) { return (Info-Line 'VBS' 'not reported' 'Dim') }
+    $v = [int]$g.Vbs
+    if ($v -eq 2) { return (Info-Line 'VBS' 'Running' 'Text') }
+    if ($v -eq 1) { return (Info-Line 'VBS' 'Turned on, but not running' 'Text') }
+    if ($v -eq 0) { return (Info-Line 'VBS' 'Off' 'Text') }
+    return (Info-Line 'VBS' 'not reported' 'Dim')
+}
+function Info-HvciLine {
+    param($sec)
+    if (-not $sec) { return (Info-Line 'HVCI' 'Reading...' 'Dim') }
+    $g = $sec.Dg
+    if (-not $g -or -not $g.Read) { return (Info-Line 'HVCI' 'could not be read' 'Dim') }
+    if (@($g.Running) -contains 2) { return (Info-Line 'HVCI' 'On   (memory integrity)' 'Text') }
+    if (@($g.Configured) -contains 2) { return (Info-Line 'HVCI' 'Turned on, but not running' 'Text') }
+    return (Info-Line 'HVCI' 'Off   (memory integrity)' 'Text')
+}
+function Info-IommuLine {
+    param($sec)
+    if (-not $sec) { return (Info-Line 'IOMMU' 'Reading...' 'Dim') }
+    $m = $sec.Iommu
+    if (-not $m -or -not $m.Read) { return (Info-Line 'IOMMU' 'could not be read' 'Dim') }
+    $kind = [string]$m.Kind
+    if (-not $kind) { return (Info-Line 'IOMMU' 'Off in the BIOS, or not supported' 'Text') }
+    $dma = ($sec.Dg -and $sec.Dg.Read -and (@($sec.Dg.Available) -contains 3))
+    if ($dma) { return (Info-Line 'IOMMU' ('On   (' + $kind + ', DMA protection available)') 'Text') }
+    return (Info-Line 'IOMMU' ('On   (' + $kind + ')') 'Text')
+}
+
+# ----------------------------------------------------------- what a line means (shown when it is clicked) ----
+# A line of a Home card can carry an explanation: Id (the same for every line of a group, such as the boot options), Help (what it is) and
+# Def (what Windows has by default). A click on the line opens the explanation under it (under the last line of its group), a second click
+# closes it. Which ones are open is kept by card and Id, so it stays open while the numbers refresh.
+$script:InfoOpen = @{}
+$script:InfoHelp = @{
+    timer = @{ T = 'How often Windows'' clock ticks right now. A program (a game, a browser, a music or video app) can ask for a finer tick, and Windows ticks at the finest one asked for while that program runs. Since Windows 10 version 2004 a finer tick is only promised to the program that asked for it, and on Windows 11 a program whose window is minimized or hidden loses it. The number updates about every 2 seconds.'
+               D = '15.625 ms (64 ticks a second) while no program asks for a finer one.' }
+    hpet  = @{ T = 'The High Precision Event Timer, a timer on the motherboard. Windows can use it as the clock behind QueryPerformanceCounter, but reading it is far slower than reading the CPU''s own counter (the TSC), so a current PC uses the TSC instead. This line comes from Windows'' device list.'
+               D = 'Windows takes the HPET as the BIOS gives it and does not use it as the clock, unless the boot option useplatformclock is set.' }
+    tsc   = @{ T = 'The CPU''s own time stamp counter. On current CPUs it runs at a steady rate on every core, so Windows uses it behind QueryPerformanceCounter: one read takes some tens of nanoseconds. Windows does not say which clock it picked, so this page works it out from how long one read takes; a read that goes through a platform timer takes hundreds or thousands of nanoseconds.'
+               D = 'Windows picks the TSC by itself when the CPU''s counter can be trusted, which is the case on a current PC. Nothing has to be set.' }
+    acpi  = @{ T = 'The ACPI power management timer, an old 3.58 MHz timer on the motherboard. Windows only falls back to it, or to the HPET, when the TSC cannot be used. When it is the clock, QueryPerformanceCounter runs at exactly its speed, which is how this line can tell.'
+               D = 'Not used on a current PC: Windows uses the TSC.' }
+    boot  = @{ T = 'Options in the boot entry that change how Windows picks its clock and its tick: useplatformclock (use the HPET or the ACPI timer as the clock), useplatformtick (take the tick from a platform timer), disabledynamictick (keep ticking while idle) and tscsyncpolicy (how the TSC is synced across cores). Microsoft lists them as debugging options. Headroom only lists the boot entry; it never changes it.'
+               D = 'None of them is set: Windows decides. An option that is set shows in orange.' }
+    vbs   = @{ T = 'Virtualization-based security: Windows uses the hypervisor to keep a small part of memory apart from the rest of Windows, and runs protections such as memory integrity (HVCI) and Credential Guard there. "Turned on, but not running" means it is set to start but is not running now, for example until the next restart or because virtualization is off in the BIOS.'
+               D = 'On for a clean install of Windows 11 on a PC that meets the requirements, together with memory integrity; an upgrade does not turn it on. Since October 2026 Windows updates also turn it on for eligible PCs that are already set up, unless it was turned off.' }
+    hvci  = @{ T = 'Memory integrity (hypervisor-protected code integrity), in Windows Security under Device security > Core isolation. VBS checks every driver before it may run in the kernel, and a driver that does not pass is blocked. Microsoft has said it can lower gaming performance on some PCs. Headroom can switch it on its Security Prompts page; this line only shows what Windows reports.'
+               D = 'On for a clean install of Windows 11 on hardware that meets the requirements (Intel 8th generation or AMD Zen 2 or newer, 8 GB of memory, an SSD, compatible drivers, virtualization on in the BIOS); an upgrade does not turn it on. Since October 2026 Windows updates also turn it on for eligible PCs that are already set up, unless it was turned off.' }
+    iommu = @{ T = 'The IOMMU (AMD-Vi on AMD, VT-d on Intel) lets Windows control which memory a device may reach. Windows uses it for Kernel DMA Protection, and Riot Vanguard needs it on. The firmware tells Windows about it in an ACPI table (IVRS on AMD, DMAR on Intel), and this line looks for that table: without one Windows has no IOMMU to use, which usually means it is off in the BIOS. "DMA protection available" is what Windows reports when it can use the IOMMU to protect memory.'
+               D = 'Not a Windows setting: it is set in the BIOS (AMD: IOMMU or AMD-Vi; Intel: VT-d). When it is on, Windows turns on Kernel DMA Protection by itself on PCs that support it.' }
+}
+# Give a line its explanation (by Id) and return it
+function Info-Help {
+    param($l, [string]$Id)
+    $h = $script:InfoHelp[$Id]
+    if (-not $l -or -not $h) { return $l }
+    $l.Id = $Id
+    $l.Help = [string]$h.T
+    $l.Def = [string]$h.D
+    return $l
+}
+$script:SecNote = 'Click a line on these two cards to see what it means and what Windows has by default. All of it is read only.'
 
 function Info-OsCard {
     param($d)
@@ -12189,15 +12356,49 @@ function Info-OsCard {
     if ($null -ne $up) { $lines += , (Info-Line 'Running for' (Fmt-Span $up)) }
     if ($lv -and $null -ne $lv.Procs) { $lines += , (Info-Line 'Processes' (Fmt-N $lv.Procs 0)) } else { $lines += , (Info-Line 'Processes' 'Reading...' 'Dim') }
     if ($lv -and $null -ne $lv.Threads) { $lines += , (Info-Line 'Threads' (Fmt-N $lv.Threads 0)) }
-    # the timer and the clocks (read only)
+    return (Info-Card 'info:os' 'Windows' $sub $lines)
+}
+
+# The timer and the clocks (read only): a card of its own under the Windows card. Its name says the two things most people look for, the tick
+# in use and the clock behind QueryPerformanceCounter ("1.000 ms tick, TSC clock").
+function Info-TimerCard {
+    param($d)
+    $lv = $d.Live
     $clock = $d.Clock
     $src = Info-ClockSource $clock
-    $lines += , (Info-TimerLine $lv)
-    $lines += , (Info-HpetLine $clock $src)
-    $lines += , (Info-TscLine $clock $src)
-    $lines += , (Info-AcpiLine $clock $src)
-    foreach ($bl in @(Info-BootTimerLines $clock)) { $lines += , $bl }
-    return (Info-Card 'info:os' 'Windows' $sub $lines $script:TimerNote)
+    $lines = @()
+    $lines += , (Info-Help (Info-TimerLine $lv) 'timer')
+    $lines += , (Info-Help (Info-HpetLine $clock $src) 'hpet')
+    $lines += , (Info-Help (Info-TscLine $clock $src) 'tsc')
+    $lines += , (Info-Help (Info-AcpiLine $clock $src) 'acpi')
+    foreach ($bl in @(Info-BootTimerLines $clock)) { $lines += , (Info-Help $bl 'boot') }
+    $parts = @()
+    if ($lv -and $lv.Timer) { $parts += ((Fmt-N $lv.Timer.CurrentMs 3) + ' ms tick') }
+    $w = [string]$src.Which
+    if ($w -eq 'tsc') { $parts += 'TSC clock' } elseif ($w -eq 'maybe-tsc') { $parts += 'probably TSC clock' } elseif ($w -eq 'hpet') { $parts += 'HPET clock' }
+    elseif ($w -eq 'acpi') { $parts += 'ACPI timer clock' } elseif ($w -eq 'platform') { $parts += 'platform timer clock' }
+    return (Info-Card 'info:timer' 'Timer and clock' ($parts -join ', ') $lines)
+}
+
+# VBS, memory integrity and the IOMMU (read only): the card beside the timer card. Its name sums them up ("Memory integrity on, IOMMU on"),
+# and it carries the one note for both cards.
+function Info-SecCard {
+    param($d)
+    $sec = $d.Sec
+    $lines = @()
+    $lines += , (Info-Help (Info-VbsLine $sec) 'vbs')
+    $lines += , (Info-Help (Info-HvciLine $sec) 'hvci')
+    $lines += , (Info-Help (Info-IommuLine $sec) 'iommu')
+    $parts = @()
+    if ($sec -and $sec.Dg -and $sec.Dg.Read) {
+        $g = $sec.Dg
+        if (@($g.Running) -contains 2) { $parts += 'Memory integrity on' }
+        elseif (@($g.Configured) -contains 2) { $parts += 'Memory integrity not running' }
+        elseif ($null -ne $g.Vbs -and [int]$g.Vbs -eq 2) { $parts += 'VBS on, memory integrity off' }
+        elseif ($null -ne $g.Vbs -and [int]$g.Vbs -eq 0) { $parts += 'VBS off' }
+    }
+    if ($sec -and $sec.Iommu -and $sec.Iommu.Read) { if ([string]$sec.Iommu.Kind) { $parts += 'IOMMU on' } else { $parts += 'IOMMU off' } }
+    return (Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines $script:SecNote)
 }
 
 function Info-CpuCard {
@@ -12606,6 +12807,8 @@ function Get-PageCards {
         $d = Info-Data
         $list += , (Info-OsCard $d)
         $list += , (Info-CpuCard $d)
+        $list += , (Info-TimerCard $d)
+        $list += , (Info-SecCard $d)
         $list += , (Info-GpuCard $d)
         $list += , (Info-RamCard $d)
         $list += , (Info-BoardCard $d)
@@ -12648,7 +12851,27 @@ function Info-Prepare {
     $iw = $w - 2 * $M.Pad
     $top = Px 66                                          # the icon tile and the name beside it, then the lines
     $h = $top
-    foreach ($l in @($e.Lines)) { if ($null -ne $l.Bar) { $h += Px 32 } else { $h += Px 22 } }
+    $lines = @($e.Lines)
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $l = $lines[$i]
+        $l.Top = $h                                       # where the line starts, from the top of the card (for a click on it)
+        if ($null -ne $l.Bar) { $h += Px 32 } else { $h += Px 22 }
+        $l.HelpH = 0
+        $l.HelpLines = @()
+        $l.DefLines = @()
+        $l.Open = $false
+        if (-not $l.Id) { continue }
+        $l.Open = [bool]$script:InfoOpen.ContainsKey([string]$e.Key + '|' + [string]$l.Id)
+        # an open explanation goes under the last line of its group
+        $last = ($i -eq ($lines.Count - 1) -or [string]$lines[$i + 1].Id -ne [string]$l.Id)
+        if ($l.Open -and $last) {
+            $tw = $iw - 2 * (Px 14)
+            $l.HelpLines = @(Info-Wrap ([string]$l.Help) (Ui-Font 'cardDesc') $tw)
+            $l.DefLines = @(Info-Wrap ('Windows default: ' + [string]$l.Def) (Ui-Font 'cardDesc') $tw)
+            $l.HelpH = (Px 12) + (@($l.HelpLines).Count + @($l.DefLines).Count) * (Px 18) + (Px 6) + (Px 12)
+            $h += $l.HelpH + (Px 6)
+        }
+    }
     $e.NoteLines = @()
     if ($e.Note) {
         $e.NoteLines = @(Info-Wrap ([string]$e.Note) (Ui-Font 'cardDesc') $iw)
@@ -12666,6 +12889,8 @@ function Info-IconKey {
     $k = [string]$e.Key
     if ($k -eq 'info:os') { return 'Windows' }
     if ($k -eq 'info:cpu') { return 'Processor' }
+    if ($k -eq 'info:timer') { return 'Timer and clock' }
+    if ($k -eq 'info:sec') { return 'Security' }
     if ($k -eq 'info:gpu') { return 'Graphics card' }
     if ($k -eq 'info:ram') { return 'Memory' }
     if ($k -eq 'info:storage') { return 'Storage' }
@@ -12713,8 +12938,25 @@ function Ui-PaintInfo {
     foreach ($l in @($e.Lines)) {
         $ck = [string]$l.K
         if (-not $ck) { $ck = 'Text' }
-        Ui-Text $g (Get-TitleCase ([string]$l.L)) (Ui-Font 'small') $Th.Mute $ix $ly $lw (Px 20) $TF.L
-        Ui-Text $g ([string]$l.V) (Ui-Font 'uib') $Th[$ck] ($ix + $lw) $ly ($iw - $lw) (Px 20) $TF.L
+        $vw = $iw - $lw
+        $lcol = $Th.Mute
+        if ($l.Id) {
+            # a line with an explanation: lit under the pointer, a small arrow at its right end (down: closed, up: open)
+            $hotL = ($script:HotEntry -and [string]$script:HotEntry.Key -eq [string]$e.Key -and [string]$script:HotLine -eq [string]$l.Id)
+            if ($hotL) { Ui-FillRound $g $Th.CardHot ($ix - (Px 8)) ($ly - (Px 1)) ($iw + (Px 16)) (Px 22) (Px 6) }
+            if ($l.Open) { $lcol = $Th.Sub }
+            $vw = $vw - (Px 18)
+            if ($l.L) {
+                $acol = $Th.Dim; if ($hotL -or $l.Open) { $acol = $Th.Accent }
+                $ax = $ix + $iw - (Px 6)
+                $ay = $ly + (Px 10)
+                $d4 = Px 4; $d2 = Px 2
+                if ($l.Open) { Ui-Line $g $acol 1.6 ($ax - $d4) ($ay + $d2) $ax ($ay - $d2); Ui-Line $g $acol 1.6 $ax ($ay - $d2) ($ax + $d4) ($ay + $d2) }
+                else { Ui-Line $g $acol 1.6 ($ax - $d4) ($ay - $d2) $ax ($ay + $d2); Ui-Line $g $acol 1.6 $ax ($ay + $d2) ($ax + $d4) ($ay - $d2) }
+            }
+        }
+        Ui-Text $g (Get-TitleCase ([string]$l.L)) (Ui-Font 'small') $lcol $ix $ly $lw (Px 20) $TF.L
+        Ui-Text $g ([string]$l.V) (Ui-Font 'uib') $Th[$ck] ($ix + $lw) $ly $vw (Px 20) $TF.L
         if ($null -ne $l.Bar) {
             $by = $ly + (Px 23)
             $bh = Px 5
@@ -12729,6 +12971,16 @@ function Ui-PaintInfo {
             $ly += Px 32
         } else {
             $ly += Px 22
+        }
+        if ([int]$l.HelpH -gt 0) {
+            # the explanation: a panel in the page colour under the line, what it is, then what Windows has by default
+            $py = $ly + (Px 2)
+            Ui-FillRound $g $Th.Bg $ix $py $iw ([int]$l.HelpH) (Px 10)
+            $ty = $py + (Px 12)
+            foreach ($hl in @($l.HelpLines)) { Ui-Text $g ([string]$hl) (Ui-Font 'cardDesc') $Th.Mute ($ix + (Px 14)) $ty ($iw - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
+            $ty += Px 6
+            foreach ($dl in @($l.DefLines)) { Ui-Text $g ([string]$dl) (Ui-Font 'cardDesc') $Th.Sub ($ix + (Px 14)) $ty ($iw - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
+            $ly += [int]$l.HelpH + (Px 6)
         }
     }
     $ny = $ly + (Px 6)
@@ -12757,7 +13009,7 @@ function Start-SysJob {
 
 function Start-SysWorker {
     if ($script:SysWorker) { return }
-    $script:SysShared = [hashtable]::Synchronized(@{ Stop = $false; Active = $false; Force = $false; Ver = 0; Static = $null; Live = $null; Clock = $null })
+    $script:SysShared = [hashtable]::Synchronized(@{ Stop = $false; Active = $false; Force = $false; Ver = 0; Static = $null; Live = $null; Clock = $null; Sec = $null })
     $script:SysSeen = -1
     $script:SysWorker = Start-SysJob 'loop'
 }
@@ -12796,6 +13048,40 @@ function Ui-SysTick {
     $redo = $false
     if ([int]$sh.Ver -ne $script:SysSeen) { $script:SysSeen = [int]$sh.Ver; $redo = $true }
     if ($redo) { Ui-RefreshInfo }
+}
+
+# The line of a Home card at (rx, ry) inside the card that has an explanation, or $null (the line itself and its open explanation count)
+function Info-HitLine {
+    param($e, [int]$rx, [int]$ry)
+    $M = $script:M
+    if (-not $e -or $rx -lt ($M.Pad - (Px 8)) -or $rx -ge ([int]$e.W - $M.Pad + (Px 8))) { return $null }
+    foreach ($l in @($e.Lines)) {
+        if (-not $l.Id -or $null -eq $l.Top) { continue }
+        $t = [int]$l.Top
+        $b = $t + (Px 22)
+        if ($null -ne $l.Bar) { $b = $t + (Px 32) }
+        if ([int]$l.HelpH -gt 0) { $b += [int]$l.HelpH + (Px 6) }
+        if ($ry -ge ($t - (Px 1)) -and $ry -lt $b) { return $l }
+    }
+    return $null
+}
+# Open or close the explanation of a line, and keep it in view when it opens
+function Ui-ToggleInfoLine {
+    param($e, [string]$Id)
+    if (-not $e -or -not $Id) { return }
+    $k = [string]$e.Key + '|' + $Id
+    $opening = -not $script:InfoOpen.ContainsKey($k)
+    if ($opening) { $script:InfoOpen[$k] = $true } else { $script:InfoOpen.Remove($k) }
+    Ui-Layout
+    $script:DList = $true
+    if (-not $opening) { return }
+    $card = @($script:View | Where-Object { [string]$_.Key -eq [string]$e.Key })[0]
+    if (-not $card) { return }
+    $ln = @(@($card.Lines) | Where-Object { [string]$_.Id -eq $Id -and [int]$_.HelpH -gt 0 })[0]
+    if (-not $ln) { return }
+    $bottom = [int]$card.Y + [int]$ln.Top + (Px 22) + [int]$ln.HelpH + (Px 12)
+    $topY = [int]$card.Y + [int]$ln.Top
+    if ($bottom -gt ($script:ScrollY + $script:ListH)) { Ui-ScrollTo ([Math]::Min($topY, $bottom - $script:ListH)) }
 }
 
 # Make the cards of the page that is showing again from the newest data
