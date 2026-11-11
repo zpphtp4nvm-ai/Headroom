@@ -11060,7 +11060,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '102'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '103'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -12333,7 +12333,6 @@ function Info-Help {
     $l.Def = [string]$h.D
     return $l
 }
-$script:SecNote = 'Click a line on these two cards to see what it means and what Windows has by default. All of it is read only.'
 
 function Info-OsCard {
     param($d)
@@ -12380,8 +12379,7 @@ function Info-TimerCard {
     return (Info-Card 'info:timer' 'Timer and clock' ($parts -join ', ') $lines)
 }
 
-# VBS, memory integrity and the IOMMU (read only): the card beside the timer card. Its name sums them up ("Memory integrity on, IOMMU on"),
-# and it carries the one note for both cards.
+# VBS, memory integrity and the IOMMU (read only): the card beside the timer card. Its name sums them up ("Memory integrity on, IOMMU on").
 function Info-SecCard {
     param($d)
     $sec = $d.Sec
@@ -12398,7 +12396,7 @@ function Info-SecCard {
         elseif ($null -ne $g.Vbs -and [int]$g.Vbs -eq 0) { $parts += 'VBS off' }
     }
     if ($sec -and $sec.Iommu -and $sec.Iommu.Read) { if ([string]$sec.Iommu.Kind) { $parts += 'IOMMU on' } else { $parts += 'IOMMU off' } }
-    return (Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines $script:SecNote)
+    return (Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines)
 }
 
 function Info-CpuCard {
