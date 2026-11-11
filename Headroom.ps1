@@ -11060,7 +11060,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '100'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '102'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -12805,13 +12805,15 @@ function Get-PageCards {
     $list = @()
     if ($cat -eq $script:PageHome) {
         $d = Info-Data
+        # two to a line: Windows and the motherboard, the timer and the security cards, the processor and the graphics card side by side,
+        # then the memory and the screen
         $list += , (Info-OsCard $d)
-        $list += , (Info-CpuCard $d)
+        $list += , (Info-BoardCard $d)
         $list += , (Info-TimerCard $d)
         $list += , (Info-SecCard $d)
+        $list += , (Info-CpuCard $d)
         $list += , (Info-GpuCard $d)
         $list += , (Info-RamCard $d)
-        $list += , (Info-BoardCard $d)
         foreach ($c in @(Info-DisplayCards $d $true)) { $list += , $c }
         $list += , (Info-StorageCard $d)
         $list += , (Info-SensorCard $d)
