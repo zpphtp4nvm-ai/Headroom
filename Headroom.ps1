@@ -5908,14 +5908,16 @@ function Get-SysDeviceGuard {
     }
     return $o
 }
-# The ACPI table list ("APIC,FACP,IVRS,...") -> the IOMMU: Read = the list could be had; Kind = 'AMD-Vi' (IVRS), 'VT-d' (DMAR) or '' (none)
+# The ACPI table list ("APIC,FACP,IVRS,...") -> the IOMMU: Read = the list could be had; Kind = 'AMD-Vi' (IVRS), 'VT-d' (DMAR) or '' (none).
+# A name that is not four plain letters (some firmware has a table with an odd name) is skipped, not the whole list. The list counts as read
+# when it has the two tables every ACPI PC has (FACP and APIC); without them it is not a table list at all.
 function Sys-IommuParse {
     param([string]$Text)
     $o = @{ Read = $false; Kind = '' }
     $t = ([string]$Text).Trim()
     if (-not $t) { return $o }
-    $names = @($t -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-    if ($names.Count -eq 0 -or @($names | Where-Object { $_ -notmatch '^[ -~]{4}$' }).Count -gt 0) { return $o }     # not a list of table names
+    $names = @($t -split ',' | Where-Object { $_ -match '^[ -~]{4}$' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if (-not ($names -contains 'FACP' -and $names -contains 'APIC')) { return $o }
     $o.Read = $true
     if ($names -contains 'IVRS') { $o.Kind = 'AMD-Vi' } elseif ($names -contains 'DMAR') { $o.Kind = 'VT-d' }
     return $o
@@ -11116,7 +11118,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '104'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '105'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
