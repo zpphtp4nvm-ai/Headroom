@@ -1754,7 +1754,7 @@ function New-RestorePoint {
 # How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
 # slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
 # 3 apps and USB,  4 optional features,  5 capabilities
-$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2; PlanBalanced = 1; PlanHighPerf = 1; Khorvie = 1 }
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2; PlanBalanced = 1; PlanHighPerf = 1; Khorvie = 1; Endgame = 1 }
 function Get-ScanWeight {
     param($t)
     $w = 0
@@ -2216,15 +2216,12 @@ function Custom-PlanHighPerf-Snapshot { param($p) return $null }
 function Custom-PlanHighPerf-Apply { param($p, $mine) Plan-Reinstall $script:HighPerfTemplate 'High Performance' }
 function Custom-PlanHighPerf-Revert { param($p, $mine) Say '  (putting a power plan back is a one-time action: there is nothing to undo)' 'DarkGray' }
 
-# ------------------------------------------------- Khorvie's PowerPlan (a plan file built in) ----
-# Not one of Windows' own plans: the plan file (what "powercfg /export" writes) is kept here, compressed, and checked against its
-# SHA-256 before it is used. Switching it on imports it under its own ID when it is not there yet ("powercfg /import <file> <id>"),
+# ------------------------------------------------- built-in plan files (third-party plans) ----
+# Plans that are not Windows' own: each plan file (what "powercfg /export" writes) is kept here, compressed, and checked against its
+# SHA-256 before it is used. Switching one on imports it under its own ID when it is not there yet ("powercfg /import <file> <id>"),
 # then makes it the active plan. Switching it off goes back to the Balanced plan (the Windows default) and deletes the plan again
-# when this app imported it. It and Ultimate Performance power plan rule each other out (Add-Tweak -Rivals).
-$script:KhorvieGuid = '8070b076-188f-428d-a9d6-e1a2f99fad5d'
-$script:KhorvieName = 'Khorvie''s PowerPlan'
-$script:KhorvieSha  = '0e41edd749126d44c4f92d2c5f67e7a1abe0809a4bd69aff2a88f8f90c206b61'
-$script:KhorvieB64 = @(
+# when this app imported it. These plans and Ultimate Performance power plan rule each other out (Add-Tweak -Rivals).
+$script:PlanFileKhorvie = @(
     'H4sIAAAAAAAC/+1ba4xc112/u961N/FrbW+T9TNjJ46d2Cc57wctxIGAFyIVSyUiwAd8nrFx4qwc07iiiJWKkOFTKgSyKB+MqIThS41Uqa4agUsLmJdYJIgM',
     'SNSFVFqBFC1IgBGo5n/unZmdmZ2bvQP+BHPk2Xvn7t17f+f//P3/5/hSfC1NFEWRP39w+Le/8Cv+byby+aaiGvm8lU9OVef/2/EdP/+xdy/++Qe7fvfsF3/5',
     's60f/+vB7/mejw5cu/TG5TeK8XjoY3rbi6fHUhiP8RiP8RiP8RiP8RiP8RiP8fj/Mc658xfLk9nhv7/64MGDixdOFj/38oXzuTeQr8GlB9vbvz/7XPV9Es7v',
@@ -2269,8 +2266,84 @@ $script:KhorvieB64 = @(
     '6Levn50cZX7zDeTqfIjBCIKIVjC/AJW281AZJhUFAULqqdC98WNwfgu4esawedTX4VdOdeZxeXLTb134kH1e5f7kBvPINpn9ARntwE+IhhLPcI6iTVbKvD8q',
     'mPo+y3sD+wB/YfLMjvH/WRmP8RiP8RiP8RiP8RiP8RiP8RiP0cd/A/VnaSgAUAAA'
 ) -join ''
-function Get-KhorvieBytes {
-    $ms = New-Object IO.MemoryStream(, [Convert]::FromBase64String($script:KhorvieB64))
+$script:PlanFileEndgame = @(
+    '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'
+) -join ''
+$script:BuiltinPlans = @{
+    Khorvie = @{ Guid = '8070b076-188f-428d-a9d6-e1a2f99fad5d'; Name = 'Khorvie''s PowerPlan'; Size = 20480
+                 Sha = '0e41edd749126d44c4f92d2c5f67e7a1abe0809a4bd69aff2a88f8f90c206b61'; B64 = $script:PlanFileKhorvie }
+    Endgame = @{ Guid = '287763d5-e899-4774-bad9-cc0b30c3c391'; Name = 'Endgame Performance'; Size = 28672
+                 Sha = 'e71ed9add1da0e60b186cf03607cc2dfcadaa984ad938b1ff947c3b0cb032197'; B64 = $script:PlanFileEndgame }
+}
+function Get-BuiltinPlanBytes {
+    param([string]$Key)
+    $def = $script:BuiltinPlans[$Key]
+    $ms = New-Object IO.MemoryStream(, [Convert]::FromBase64String([string]$def.B64))
     $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Decompress)
     $out = New-Object IO.MemoryStream
     try { $gz.CopyTo($out) } finally { $gz.Dispose(); $ms.Dispose() }
@@ -2278,13 +2351,22 @@ function Get-KhorvieBytes {
     $sha = [Security.Cryptography.SHA256]::Create()
     $h = (($sha.ComputeHash($b) | ForEach-Object { $_.ToString('x2') }) -join '')
     $sha.Dispose()
-    if ($h -ne $script:KhorvieSha) { throw 'the built-in plan file did not pass its check (SHA-256), so it was not used' }
+    if ($h -ne [string]$def.Sha -or $b.Length -ne [int]$def.Size) { throw ('the built-in file of {0} did not pass its check (SHA-256), so it was not used' -f $def.Name) }
     return ,$b
+}
+# Where a plan file is written for powercfg: a local folder with a plain (ASCII) path, because powercfg /import can fail on other paths.
+# Windows' own Temp folder first (this app runs as administrator), then the user's Temp folder.
+function Get-PlanTempDir {
+    $c = @()
+    if ($env:SystemRoot) { $c += (Join-Path $env:SystemRoot 'Temp') }
+    $c += [IO.Path]::GetTempPath()
+    foreach ($d in $c) { if ($d -and $d -notmatch '[^\x20-\x7E]' -and [IO.Directory]::Exists($d)) { return $d } }
+    return [IO.Path]::GetTempPath()
 }
 # Imports a plan file under the given ID (or, where Windows does not take an ID, under a new one). Returns the ID, or '' if it failed.
 function Pwr-Import {
     param([byte[]]$Bytes, [string]$Guid)
-    $f = Join-Path ([IO.Path]::GetTempPath()) ('headroom-plan-' + [guid]::NewGuid().ToString('N') + '.pow')
+    $f = Join-Path (Get-PlanTempDir) ('headroom-plan-' + [guid]::NewGuid().ToString('N') + '.pow')
     try {
         [IO.File]::WriteAllBytes($f, $Bytes)
         [void](Pwr '/import' $f $Guid)
@@ -2298,48 +2380,52 @@ function Pwr-Import {
     }
 }
 # The ID the plan has on this PC: its own, or the one it got when this app imported it under a new one; '' when it is not there
-function Khorvie-Where {
-    param($mine)
+function Builtin-Where {
+    param([string]$Key, $mine)
+    $def = $script:BuiltinPlans[$Key]
     $plans = @(Pwr-Plans)
-    foreach ($x in $plans) { if ($x.Guid -eq $script:KhorvieGuid) { return $x.Guid } }
+    foreach ($x in $plans) { if ($x.Guid -eq [string]$def.Guid) { return $x.Guid } }
     if ($mine -and $mine.New) { foreach ($x in $plans) { if ($x.Guid -eq [string]$mine.New) { return $x.Guid } } }
     return ''
 }
-function Custom-Khorvie-Detect {
-    param($p)
+function Builtin-Detect {
+    param([string]$Key)
+    $def = $script:BuiltinPlans[$Key]
     $a = Pwr-Active
     if (-not $a.Guid) { $script:Now = 'Active power plan: could not be read'; return 'NA' }
     $snap = (Get-Store)[$script:CurTweak.Id]
-    $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom['Khorvie'] }
-    $at = Khorvie-Where $mine
+    $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom[$Key] }
+    $at = Builtin-Where $Key $mine
     $inst = 'not installed'; if ($at) { $inst = 'installed' }
-    $script:Now = ('Active power plan: {0}, wanted {1} ({2})' -f $a.Name, $script:KhorvieName, $inst)
+    $script:Now = ('Active power plan: {0}, wanted {1} ({2})' -f $a.Name, $def.Name, $inst)
     if ($at -and $a.Guid -eq $at) { return 'On' }
     return 'Off'
 }
-function Custom-Khorvie-Snapshot {
-    param($p)
-    $had = [bool](Plan-Find $script:KhorvieGuid)
+function Builtin-Snapshot {
+    param([string]$Key)
+    $had = [bool](Plan-Find ([string]$script:BuiltinPlans[$Key].Guid))
     return @{ Had = $had; New = '' }
 }
-function Custom-Khorvie-Apply {
-    param($p, $mine)
-    if ($DryRun) { Say ('  [dry] install {0} if it is not there (powercfg /import of the built-in plan file) and make it the active plan' -f $script:KhorvieName) 'DarkGray'; return }
-    $g = Khorvie-Where $mine
+function Builtin-Apply {
+    param([string]$Key, $mine)
+    $def = $script:BuiltinPlans[$Key]
+    if ($DryRun) { Say ('  [dry] install {0} if it is not there (powercfg /import of the built-in plan file) and make it the active plan' -f $def.Name) 'DarkGray'; return }
+    $g = Builtin-Where $Key $mine
     if (-not $g) {
-        $b = Get-KhorvieBytes
-        $g = Pwr-Import $b $script:KhorvieGuid
-        if (-not $g) { throw ('Windows did not import {0}, so nothing was changed' -f $script:KhorvieName) }
+        $b = Get-BuiltinPlanBytes $Key
+        $g = Pwr-Import $b ([string]$def.Guid)
+        if (-not $g) { throw ('Windows did not import {0}, so nothing was changed' -f $def.Name) }
         if ($mine) { $mine.New = $g }
-        Say ('  {0} was installed ({1})' -f $script:KhorvieName, $g) 'DarkGray'
+        Say ('  {0} was installed ({1})' -f $def.Name, $g) 'DarkGray'
     }
     [void](Pwr '/setactive' $g)
-    if ((Pwr-Active).Guid -ne $g) { throw ('{0} is installed, but Windows did not make it the active plan' -f $script:KhorvieName) }
-    Say ('  {0} is now the active plan' -f $script:KhorvieName) 'DarkGray'
+    if ((Pwr-Active).Guid -ne $g) { throw ('{0} is installed, but Windows did not make it the active plan' -f $def.Name) }
+    Say ('  {0} is now the active plan' -f $def.Name) 'DarkGray'
 }
-function Custom-Khorvie-Revert {
-    param($p, $mine)
-    if ($DryRun) { Say ('  [dry] switch back to the Balanced plan (the Windows default) and delete {0} if this app installed it' -f $script:KhorvieName) 'DarkGray'; return }
+function Builtin-Revert {
+    param([string]$Key, $mine)
+    $def = $script:BuiltinPlans[$Key]
+    if ($DryRun) { Say ('  [dry] switch back to the Balanced plan (the Windows default) and delete {0} if this app installed it' -f $def.Name) 'DarkGray'; return }
     $target = ''
     if (Plan-Find $script:BalancedTemplate) { $target = $script:BalancedTemplate }
     if (-not $target) { $target = Pwr-Restore $script:BalancedTemplate }
@@ -2351,14 +2437,22 @@ function Custom-Khorvie-Revert {
     # The plan is deleted only when this app imported it: one that was there before stays in the list
     $del = @()
     if ($mine -and $mine.New) { $del += [string]$mine.New }
-    elseif ($mine -and -not $mine.Had) { $del += $script:KhorvieGuid }
+    elseif ($mine -and -not $mine.Had) { $del += [string]$def.Guid }
     foreach ($g in $del) {
         if ($g -eq $target -or -not (Plan-Find $g)) { continue }
         [void](Pwr '/delete' $g)
-        Say ('  {0} was deleted again (this app installed it)' -f $script:KhorvieName) 'DarkGray'
+        Say ('  {0} was deleted again (this app installed it)' -f $def.Name) 'DarkGray'
     }
-    if (-not $mine) { Say ('  {0} stays in the list (this app did not install it)' -f $script:KhorvieName) 'DarkGray' }
+    if (-not $mine) { Say ('  {0} stays in the list (this app did not install it)' -f $def.Name) 'DarkGray' }
 }
+function Custom-Khorvie-Detect   { param($p) return (Builtin-Detect 'Khorvie') }
+function Custom-Khorvie-Snapshot { param($p) return (Builtin-Snapshot 'Khorvie') }
+function Custom-Khorvie-Apply    { param($p, $mine) Builtin-Apply 'Khorvie' $mine }
+function Custom-Khorvie-Revert   { param($p, $mine) Builtin-Revert 'Khorvie' $mine }
+function Custom-Endgame-Detect   { param($p) return (Builtin-Detect 'Endgame') }
+function Custom-Endgame-Snapshot { param($p) return (Builtin-Snapshot 'Endgame') }
+function Custom-Endgame-Apply    { param($p, $mine) Builtin-Apply 'Endgame' $mine }
+function Custom-Endgame-Revert   { param($p, $mine) Builtin-Revert 'Endgame' $mine }
 
 function Custom-Hibernate-Detect { param($p) return 'Skip' }
 function Custom-Hibernate-Apply {
@@ -4328,9 +4422,15 @@ Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Perform
     )
 
 Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Rivals 'ultimate' -Name 'Khorvie''s power plan' `
-    -Desc 'On: Khorvie''s PowerPlan, a third-party gaming power plan (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive, USB selective suspend and USB 3 link power management off, the display and hard disk never turned off, and wake timers off. Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the other off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Khorvie''s PowerPlan is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
+    -Desc 'On: Khorvie''s PowerPlan, a third-party gaming power plan (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive, USB selective suspend and USB 3 link power management off, the display and hard disk never turned off, and wake timers off. Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this, Endgame Performance power plan and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the others off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Khorvie''s PowerPlan is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
     -Parts @(
         pCustom 'Khorvie' 'powercfg /import of the built-in plan file (Khorvie''s PowerPlan, ID 8070b076-188f-428d-a9d6-e1a2f99fad5d) when it is not installed, then /setactive'
+    )
+
+Add-Tweak -Id 'endgame-plan' -Cat $cPower -Def 'Off' -Rivals 'ultimate', 'khorvie-plan' -Name 'Endgame Performance power plan' `
+    -Desc 'On: Endgame Performance, a third-party gaming power plan made by gavot (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive At Guaranteed, energy performance preference 0 (speed first), core parking off, USB selective suspend, USB 3 link power management and PCI Express link power management off, interrupts that Windows may move sent to logical processor 1, wake timers off, and the display and hard disk never turned off. It also switches sleep off while it is the active plan: the PC cannot sleep (shutting down and restarting work as usual). Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this, Khorvie''s power plan and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the others off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Endgame Performance is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
+    -Parts @(
+        pCustom 'Endgame' 'powercfg /import of the built-in plan file (Endgame Performance, ID 287763d5-e899-4774-bad9-cc0b30c3c391) when it is not installed, then /setactive'
     )
 
 Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
@@ -7916,7 +8016,9 @@ function Get-DetailParts {
     if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: once it is switched off it cannot be switched back on from this window.' + $nl }) }
     if ($t.Unproven) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'May have no effect: read the description above for why.' + $nl }) }
     if ($t.Reboot) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Needs a restart of the PC to take full effect.' + $nl }) }
-    foreach ($rv in @(Get-Rivals $t)) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this and "{0}" can be on: switching this on switches that one off.' -f $rv.Name) + $nl }) }
+    $rvn = @(Get-Rivals $t | ForEach-Object { '"' + [string]$_.Name + '"' })
+    if ($rvn.Count -eq 1) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this and {0} can be on: switching this on switches that one off.' -f $rvn[0]) + $nl }) }
+    elseif ($rvn.Count -gt 1) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this, {0} and {1} can be on: switching this on switches the others off.' -f ($rvn[0..($rvn.Count - 2)] -join ', '), $rvn[-1]) + $nl }) }
     if ($t.Once -and -not $t.Cleanup) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button and has nothing to undo here (a restore point is created first). It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
@@ -11439,7 +11541,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '106'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '107'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
