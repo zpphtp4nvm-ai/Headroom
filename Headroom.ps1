@@ -5232,6 +5232,8 @@ Add-Tweak -Id 'task-officetelemetry' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled
 #                                              one read of the performance counter takes
 #   VBS, memory integrity (HVCI)               Windows' own report, Win32_DeviceGuard (it only reports)
 #   IOMMU                                      the list of the firmware's ACPI tables (EnumSystemFirmwareTables: it only lists them)
+#   Mouse: pointer precision and speed         the registry (HKCU\Control Panel\Mouse), only read
+#   USB selective suspend                      "powercfg /q" for the power plan in use (it only shows the setting)
 #
 # Everything lives in $sysEngine so the same text can run in a background worker and in the tests.
 # C# note: the helper classes are compiled by Windows PowerShell 5.1 (C# 5), so no newer syntax is used in them.
@@ -5932,6 +5934,55 @@ function Get-SysSec {
     return $o
 }
 
+# --------------------------------------------------------------- the mouse (read only) ----
+# The three Windows settings that change how the pointer follows the mouse, read, never written:
+#   HKCU\Control Panel\Mouse   MouseSpeed (0 = "Enhance pointer precision" off, 1 or 2 = on), MouseSensitivity (the pointer speed, 1 to 20;
+#                              10 is the middle notch). A value that is not there is what Windows has by default (on, 10).
+#   USB selective suspend      in the power plan in use, as "powercfg /q" prints it (it only shows the setting; the other forms of powercfg,
+#                              which change plans, are never used). The two hexadecimal numbers it prints are the setting while plugged in,
+#                              then on battery: 0 = off, 1 = on.
+$script:UsbSsSub = '2a737441-1930-4402-8d77-b2bebba308a3'     # the USB settings of a power plan
+$script:UsbSsSet = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'     # USB selective suspend
+function Get-SysMouse {
+    $o = @{ Read = $false; Precision = $null; Speed = $null }
+    $k = 'Control Panel\Mouse'
+    $sp = Sys-RegGet 'HKCU' $k 'MouseSpeed'
+    $se = Sys-RegGet 'HKCU' $k 'MouseSensitivity'
+    $o.Read = $true
+    $t = ([string]$sp).Trim()
+    if ($null -eq $sp -or $t -eq '') { $o.Precision = $true }                        # not set: the Windows default, on
+    elseif ($t -match '^\d+$') { $o.Precision = ([int]$t -ne 0) }
+    $t = ([string]$se).Trim()
+    if ($null -eq $se -or $t -eq '') { $o.Speed = 10 }                               # not set: the Windows default, the middle notch
+    elseif ($t -match '^\d+$' -and [int]$t -ge 1 -and [int]$t -le 20) { $o.Speed = [int]$t }
+    return $o
+}
+# "powercfg /q SCHEME_CURRENT <USB> <selective suspend>" text -> @{ Read; Ac (0 / 1, plugged in) }. Only the 0x numbers are used, so the
+# language of Windows does not matter.
+function Sys-UsbSsParse {
+    param([string]$Text)
+    $o = @{ Read = $false; Ac = $null }
+    $t = [string]$Text
+    if (-not $t -or $t -notmatch [regex]::Escape($script:UsbSsSet)) { return $o }
+    $hx = @([regex]::Matches($t, '0x([0-9a-fA-F]{8})') | ForEach-Object { $_.Groups[1].Value })
+    if ($hx.Count -lt 2) { return $o }
+    $ac = [Convert]::ToInt32([string]$hx[$hx.Count - 2], 16)
+    if ($ac -ne 0 -and $ac -ne 1) { return $o }
+    $o.Read = $true
+    $o.Ac = $ac
+    return $o
+}
+function Get-SysUsbSuspend {
+    $o = $null
+    try {
+        $exe = "$env:SystemRoot\System32\powercfg.exe"
+        $txt = Sys-RunTool $exe ('/q SCHEME_CURRENT ' + $script:UsbSsSub + ' ' + $script:UsbSsSet) 6000
+        $o = Sys-UsbSsParse ([string]$txt)
+    } catch { }
+    if (-not $o) { $o = @{ Read = $false; Ac = $null } }
+    return $o
+}
+
 # --------------------------------------------------------------- drives ----
 # Windows' own storage service knows each drive's model, size, kind and (through the drive's SMART data) its temperature and wear, so
 # none of this needs a driver or another program. A drive or a driver that does not report a number gives $null for it.
@@ -6577,7 +6628,7 @@ function Get-SysDisplays {
 function Get-SysLive {
     param([int]$Round, $Static)
     $o = @{ At = (Get-Date); CpuUsage = $null; CpuClockMHz = $null; Procs = $null; Threads = $null; RamUsedMB = $null; RamTotalMB = $null; Uptime = $null
-            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null; Timer = $null }
+            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null; Timer = $null; Mouse = $null; UsbSs = $null }
     if ($null -eq $script:SysPc) {
         $script:SysPc = Sys-PcNew
         Start-Sleep -Milliseconds 700          # a rate counter needs two readings a little apart
@@ -6615,6 +6666,9 @@ function Get-SysLive {
     if ($Round % 5 -eq 0) { try { $o.Displays = Get-SysDisplays } catch { } }
     # the drives' temperature and wear change slowly and take a moment to ask for: every 5th round as well
     if ($Round % 5 -eq 0) { try { $o.Storage = Sys-StorageLive } catch { } }
+    # the mouse settings: every pass (three registry values); USB selective suspend runs powercfg, so every 5th round like the drives
+    try { $o.Mouse = Get-SysMouse } catch { }
+    if ($Round % 5 -eq 0) { try { $o.UsbSs = Get-SysUsbSuspend } catch { } }
     return $o
 }
 
@@ -6631,6 +6685,7 @@ function Invoke-SysLoop {
     $round = 0
     $lastDisp = $null
     $lastSto = $null
+    $lastUsb = $null
     while (-not $SysShared.Stop) {
         if ($SysShared.Force) { $SysShared.Force = $false; $round = 0 }
         if ($SysShared.Active) {
@@ -6638,6 +6693,7 @@ function Invoke-SysLoop {
                 $live = Get-SysLive $round $SysShared.Static
                 if ($live.Displays) { $lastDisp = $live.Displays } else { $live.Displays = $lastDisp }
                 if ($null -ne $live.Storage) { $lastSto = $live.Storage } else { $live.Storage = $lastSto }
+                if ($null -ne $live.UsbSs) { $lastUsb = $live.UsbSs } else { $live.UsbSs = $lastUsb }
                 $SysShared.Live = $live
                 $SysShared.Ver = [int]$SysShared.Ver + 1
             } catch { }
@@ -11060,7 +11116,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '103'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '104'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -11267,6 +11323,7 @@ $script:NavIcons = @{
     'Motherboard'         = @(@('r', 3, 3, 18, 18, 2), @('r', 7, 7, 6, 6, 1), @('p', 16, 6, 16, 11), @('p', 7, 16, 17, 16))
     'Timer and clock'     = @(@('o', 4, 5, 16, 16), @('p', 12, 9, 12, 13, 15, 15), @('p', 9.5, 2.5, 14.5, 2.5), @('p', 12, 2.5, 12, 5))
     'Security'            = @(@('c', 12, 3, 20, 6, 20, 12, 12, 21, 4, 12, 4, 6), @('d', 12, 11, 1.5), @('p', 12, 12, 12, 15.5))
+    'Mouse'               = @(@('r', 6, 2.5, 12, 19, 6), @('p', 12, 6, 12, 9.5), @('p', 6, 10.5, 18, 10.5))
     'Sensors'             = @(@('r', 9.5, 3, 5, 13, 2.5), @('o', 7.5, 13, 9, 9), @('p', 12, 8, 12, 16))
 }
 # the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
@@ -12300,6 +12357,46 @@ function Info-IommuLine {
     return (Info-Line 'IOMMU' ('On   (' + $kind + ')') 'Text')
 }
 
+# ----------------------------------------------------------- the mouse card (read only) ----
+# The three Windows settings that change how the pointer follows the mouse. A line is green when it is set the way that is best for games;
+# otherwise it is in the plain colour (each only matters where Windows moves the pointer: the desktop and games without raw input).
+function Info-MouseCard {
+    param($d)
+    $lv = $d.Live
+    $lines = @()
+    $good = 0; $read = 0
+    $m = $null; if ($lv) { $m = $lv.Mouse }
+    if (-not $lv) {
+        $lines += , (Info-Line 'Pointer precision' 'Reading...' 'Dim')
+        $lines += , (Info-Line 'Pointer speed' 'Reading...' 'Dim')
+    } else {
+        if ($m -and $m.Read -and $null -ne $m.Precision) {
+            $read++
+            if (-not $m.Precision) { $good++; $lines += , (Info-Line 'Pointer precision' 'Off   (no acceleration)' 'Good') }
+            else { $lines += , (Info-Line 'Pointer precision' 'On   (acceleration)' 'Text') }
+        } else { $lines += , (Info-Line 'Pointer precision' 'could not be read' 'Dim') }
+        if ($m -and $m.Read -and $null -ne $m.Speed) {
+            $read++
+            if ([int]$m.Speed -eq 10) { $good++; $lines += , (Info-Line 'Pointer speed' '10 of 20   (1:1)' 'Good') }
+            else { $lines += , (Info-Line 'Pointer speed' ([string][int]$m.Speed + ' of 20') 'Text') }
+        } else { $lines += , (Info-Line 'Pointer speed' 'could not be read' 'Dim') }
+    }
+    $u = $null; if ($lv) { $u = $lv.UsbSs }
+    if (-not $lv -or $null -eq $u) { $lines += , (Info-Line 'USB selective suspend' 'Reading...' 'Dim') }
+    elseif (-not $u.Read) { $lines += , (Info-Line 'USB selective suspend' 'could not be read' 'Dim') }
+    else {
+        $read++
+        if ([int]$u.Ac -eq 0) { $good++; $lines += , (Info-Line 'USB selective suspend' 'Off   (power plan in use)' 'Good') }
+        else { $lines += , (Info-Line 'USB selective suspend' 'On   (power plan in use)' 'Text') }
+    }
+    $lines[0] = Info-Help $lines[0] 'mprec'
+    $lines[1] = Info-Help $lines[1] 'mspeed'
+    $lines[2] = Info-Help $lines[2] 'usbss'
+    $sub = ''
+    if ($read -eq 3 -and $good -eq 3) { $sub = 'Set for gaming' } elseif ($read -gt 0) { $sub = ([string]$good + ' of 3 set for gaming') }
+    return (Info-Card 'info:mouse' 'Mouse' $sub $lines)
+}
+
 # ----------------------------------------------------------- what a line means (shown when it is clicked) ----
 # A line of a Home card can carry an explanation: Id (the same for every line of a group, such as the boot options), Help (what it is) and
 # Def (what Windows has by default). A click on the line opens the explanation under it (under the last line of its group), a second click
@@ -12322,6 +12419,12 @@ $script:InfoHelp = @{
                D = 'On for a clean install of Windows 11 on hardware that meets the requirements (Intel 8th generation or AMD Zen 2 or newer, 8 GB of memory, an SSD, compatible drivers, virtualization on in the BIOS); an upgrade does not turn it on. Since October 2026 Windows updates also turn it on for eligible PCs that are already set up, unless it was turned off.' }
     iommu = @{ T = 'The IOMMU (AMD-Vi on AMD, VT-d on Intel) lets Windows control which memory a device may reach. Windows uses it for Kernel DMA Protection, and Riot Vanguard needs it on. The firmware tells Windows about it in an ACPI table (IVRS on AMD, DMAR on Intel), and this line looks for that table: without one Windows has no IOMMU to use, which usually means it is off in the BIOS. "DMA protection available" is what Windows reports when it can use the IOMMU to protect memory.'
                D = 'Not a Windows setting: it is set in the BIOS (AMD: IOMMU or AMD-Vi; Intel: VT-d). When it is on, Windows turns on Kernel DMA Protection by itself on PCs that support it.' }
+    mprec = @{ T = 'Enhance pointer precision, in the mouse settings of Windows (Additional mouse settings > Pointer Options). When it is on, the pointer goes further the faster you move the mouse, so the same hand movement does not always cover the same distance. Games that read the mouse directly (raw input, as most current shooters do) are not affected; the desktop and games that use the Windows pointer are. Headroom''s Mouse acceleration setting on the Gaming page turns it off. Green: off.'
+               D = 'On.' }
+    mspeed = @{ T = 'The pointer speed, the slider in the mouse settings of Windows. 10 of 20, the middle notch, moves the pointer one pixel for each count the mouse sends; other values scale the movement up or down. Like pointer precision it only matters on the desktop and in games that use the Windows pointer: set your sensitivity in the game and the DPI in the mouse''s own software. Green: 10.'
+               D = '10 of 20, the middle notch.' }
+    usbss = @{ T = 'USB selective suspend, a setting of the power plan in use (here: while plugged in). When it is on, Windows can put a USB device that is idle into a low-power state. A mouse that is being moved is not suspended, so this mostly matters for devices that are slow to wake after a pause. Headroom''s USB power saving setting and its Ultimate Performance plan turn it off. Green: off.'
+               D = 'On, in the power plans that come with Windows.' }
 }
 # Give a line its explanation (by Id) and return it
 function Info-Help {
@@ -12624,10 +12727,10 @@ function Fmt-DriveKind {
 function Info-StorageCard {
     param($d)
     $st = $null; if ($d.Static) { $st = $d.Static.Storage }
-    if (-not $d.Static) { return (Info-Card 'info:storage' 'Storage' '' @((Info-Reading)) '' '' 'Sub' 2) }
+    if (-not $d.Static) { return (Info-Card 'info:storage' 'Storage' '' @((Info-Reading)) '' '' 'Sub' 1) }
     $drives = @($st)
     if ($null -eq $st -or $drives.Count -eq 0) {
-        return (Info-Card 'info:storage' 'Storage' '' @((Info-Line 'Drives' 'Windows did not list any here' 'Dim')) '' '' 'Sub' 2)
+        return (Info-Card 'info:storage' 'Storage' '' @((Info-Line 'Drives' 'Windows did not list any here' 'Dim')) '' '' 'Sub' 1)
     }
     $lv = $d.Live
     $nums = $null; if ($lv) { $nums = $lv.Storage }
@@ -12668,7 +12771,7 @@ function Info-StorageCard {
     elseif ($worst -eq 'Warn') { $chip = 'Check a drive'; $ck = 'Warn' }
     else { $chip = 'All drives healthy'; $ck = 'Good' }
     $sub = '{0} drive{1}' -f $drives.Count, $(if ($drives.Count -eq 1) { '' } else { 's' })
-    return (Info-Card 'info:storage' 'Storage' $sub $lines '' $chip $ck 2)
+    return (Info-Card 'info:storage' 'Storage' $sub $lines '' $chip $ck 1)
 }
 
 function Info-BoardCard {
@@ -12812,8 +12915,12 @@ function Get-PageCards {
         $list += , (Info-CpuCard $d)
         $list += , (Info-GpuCard $d)
         $list += , (Info-RamCard $d)
-        foreach ($c in @(Info-DisplayCards $d $true)) { $list += , $c }
+        # the screens; with an even number of them the last one takes the whole width, so storage and the mouse always share a line
+        $disps = @(Info-DisplayCards $d $true)
+        if ($disps.Count -ge 2 -and ($disps.Count % 2) -eq 0) { $disps[$disps.Count - 1].Span = 2 }
+        foreach ($c in $disps) { $list += , $c }
         $list += , (Info-StorageCard $d)
+        $list += , (Info-MouseCard $d)
         $list += , (Info-SensorCard $d)
     } elseif ($cat -eq $script:DisplayCat) {
         $d = Info-Data
@@ -12894,6 +13001,7 @@ function Info-IconKey {
     if ($k -eq 'info:gpu') { return 'Graphics card' }
     if ($k -eq 'info:ram') { return 'Memory' }
     if ($k -eq 'info:storage') { return 'Storage' }
+    if ($k -eq 'info:mouse') { return 'Mouse' }
     if ($k -eq 'info:board') { return 'Motherboard' }
     if ($k -eq 'info:sensors') { return 'Sensors' }
     if ($k.StartsWith('info:disp') -or $k -eq 'info:ratenote') { return 'Display' }
