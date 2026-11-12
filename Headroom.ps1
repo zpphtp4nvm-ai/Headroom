@@ -96,6 +96,7 @@ $script:InRdp  = ($env:SESSIONNAME -like 'RDP-*')
 $script:CurTweak = $null
 $script:Catalog = New-Object System.Collections.ArrayList
 $script:ById    = @{}
+$script:RivalOf = @{}     # setting id -> the ids of the settings it rules out (Add-Tweak -Rivals; both ways)
 $script:ScanMode = $false     # true while the check of the PC runs: read-only look-ups may then be remembered
 $script:NoValue = New-Object System.Object
 $script:RegRoot = @{}
@@ -1111,8 +1112,8 @@ function Add-Tweak {
     # -NotRec: a short reason why this script does not recommend switching the setting on. The card then shows "Not recommended" next
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
-          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
-          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '')
+          [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Cleanup, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
+          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string[]]$Rivals = @())
     # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
     # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
     #   Undo puts the Windows default back, so the switch is the opposite of "applied".  Without -Inv, Apply turns the feature on (Dark mode,
@@ -1122,12 +1123,18 @@ function Add-Tweak {
     # -Once: an action that is run when asked (a clean-up), not a switch. It is never "applied": it reads Off (Ready to run) every time,
     # keeps no undo record, has nothing to undo, and is never part of the Recommended preset, "Apply all" or "Turn all on".
     # Its custom part's Apply says what it did by setting $script:RunResult.
+    # -Cleanup: a run-once action that deletes files (Disk Cleanup, Temporary files): the details and the question before it runs say
+    # that what it deletes is gone for good. A run-once action without it changes something else (it puts a power plan back, for example).
+    # -Rivals: settings (defined earlier) that cannot be on together with this one, because they set the same thing (two power plans
+    # that each make themselves the active plan). It works both ways. Switching one on switches the others off first; Apply all, Tweak all
+    # and the presets never take one while another is on or lined up.
     # -Choices: instead of one on/off switch the setting offers options, shown as a selector on the card. The first entry is the
     # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
             OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Untested = [bool]$Untested; Risk = $Risk
-            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; Cleanup = [bool]$Cleanup; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
+    if ($Cleanup -and -not $Once) { throw "setting ${Id}: -Cleanup is for a run-once action" }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
     if ($Untested -and ($Preset -or $Once)) { throw "setting ${Id}: an untested setting is never part of the Recommended preset and is not a run-once action" }
     if ($NotRec -and $Unproven) { throw "setting ${Id}: an unproven setting already counts as not recommended, so it takes no reason of its own" }
@@ -1179,8 +1186,28 @@ function Add-Tweak {
     elseif ($Inv) { $t.Def = 'On' }
     else { $t.Def = 'Off' }
     if ($script:ById.ContainsKey($Id)) { throw "duplicate setting id: $Id" }
+    foreach ($rv in @($Rivals)) {
+        $o = $script:ById[[string]$rv]
+        if (-not $o) { throw "setting ${Id}: its rival '$rv' must be a setting defined before it" }
+        if ($Once -or $Inv -or $Choices.Count -gt 0 -or $o.Once -or $o.Inv -or $o.Choices) { throw "setting ${Id}: rivals are plain on/off switches (not run-once, -Inv or with options)" }
+    }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
+    foreach ($rv in @($Rivals)) {
+        foreach ($pair in @(@($Id, [string]$rv), @([string]$rv, $Id))) {
+            if (-not $script:RivalOf.ContainsKey($pair[0])) { $script:RivalOf[$pair[0]] = @() }
+            if (@($script:RivalOf[$pair[0]]) -notcontains $pair[1]) { $script:RivalOf[$pair[0]] = @($script:RivalOf[$pair[0]]) + $pair[1] }
+        }
+    }
+}
+# The settings that cannot be on together with $t (see Add-Tweak -Rivals)
+function Get-Rivals {
+    param($t)
+    $out = @()
+    if (-not $t) { return $out }
+    $ids = $script:RivalOf[[string]$t.Id]
+    foreach ($id in @($ids)) { if ($id -and $script:ById.ContainsKey([string]$id)) { $out += ,$script:ById[[string]$id] } }
+    return $out
 }
 # ---- the edition of Windows ----
 # Home / Pro / Ent (see pEd). Read once from the registry (EditionID: "Core" is Home, "Professional" is Pro).
@@ -1727,7 +1754,7 @@ function New-RestorePoint {
 # How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
 # slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
 # 3 apps and USB,  4 optional features,  5 capabilities
-$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2 }
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2; PlanBalanced = 1; PlanHighPerf = 1; Khorvie = 1 }
 function Get-ScanWeight {
     param($t)
     $w = 0
@@ -1850,8 +1877,9 @@ function Invoke-Plan {
     $mode = 'for real'; if ($DryRun) { $mode = 'DRY RUN - nothing is changed' }
     Say ("`n=== {0}: {1} change(s), {2} ===" -f (Get-Date -Format 'HH:mm:ss'), $total, $mode) 'Cyan'
     if ($script:InRdp) { Say 'You are connected through Remote Desktop: its services are switched off for the next boot but not stopped now.' 'Yellow' }
-    # a restore point is for changes that can be undone: a plan of clean-up actions only does not get one
-    $needRp = $false; foreach ($pi in $Plan) { $pt = $script:ById[[string]$pi.Id]; if ($pt -and -not $pt.Once) { $needRp = $true } }
+    # a restore point is for changes it can bring back: a plan of clean-up actions only does not get one (deleted files are not in it),
+    # while a run-once action that changes settings (making a power plan fresh) does
+    $needRp = $false; foreach ($pi in $Plan) { $pt = $script:ById[[string]$pi.Id]; if ($pt -and -not $pt.Cleanup) { $needRp = $true } }
     if (-not $DryRun -and $total -gt 0 -and $needRp) { New-RestorePoint }
     $i = 0; $good = 0; $bad = 0; $reboot = @(); $explorer = $false
     foreach ($item in $Plan) {
@@ -1891,6 +1919,17 @@ function Invoke-Plan {
         } else {
             try {
                 $script:RunResult = ''
+                if (-not $undo) {
+                    # a rival this app switched on is switched off first (its undo runs, so what it made is removed), then this one goes on
+                    foreach ($rv in @(Get-Rivals $t)) {
+                        if (-not (Get-Store).ContainsKey([string]$rv.Id)) { continue }
+                        Say ('  "{0}" is switched off first: only one of the two can be on' -f $rv.Name) 'DarkGray'
+                        Invoke-TweakRevert $rv
+                        if (-not $DryRun) { Remove-Snapshot $rv.Id }
+                        Clear-CacheFor $rv
+                    }
+                    $script:CurTweak = $t
+                }
                 if ($undo) { Invoke-TweakRevert $t } else { Invoke-TweakApply $t $choiceKey }
             } catch { $failed = $_.Exception.Message }
         }
@@ -1923,6 +1962,12 @@ function Invoke-Plan {
             Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
         }
         Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id)
+        # a rival reads differently now (it is no longer the active plan): the window gets its new state too
+        foreach ($rv in @(Get-Rivals $t)) {
+            Clear-CacheFor $rv
+            $ra = Get-TweakState $rv
+            Emit 'state' $rv.Id $ra.State $ra.Detail '' 'Gray' $i $total ([string]$ra.Choice) ([string]$ra.Read) (Get-MineText $ra.State (Get-Store) $rv.Id)
+        }
     }
     if ($explorer -and -not $DryRun) {
         Say "`nRestarting Explorer so the taskbar and theme changes show up..." 'Gray'
@@ -2100,6 +2145,219 @@ function Custom-PlansDelete-Revert {
         $g = Pwr-NewFrom $t[1]
         if ($g) { Say "  recreated the $($t[0]) plan" 'DarkGray' } else { Say "  ! could not recreate the $($t[0]) plan" 'Yellow' }
     }
+}
+
+# ------------------------------------------------- reinstall a standard plan ----
+# Puts a standard plan back with the settings Windows ships it with, under its usual ID ("powercfg /duplicatescheme <id> <id>" makes it from
+# Windows' own definition when there is no plan with that ID). A plan that is there is made fresh: a copy is made first (and made the active
+# plan while the original is replaced, if the original is the active one), the original is deleted and made again, then the copy is
+# deleted. If anything fails on the way the copy is kept, so the PC is never left without the plan.
+function Plan-Find { param([string]$Guid) foreach ($x in @(Pwr-Plans)) { if ($x.Guid -eq $Guid) { return $x } }; return $null }
+function Pwr-Restore {
+    param([string]$Guid)
+    [void](Pwr '/duplicatescheme' $Guid $Guid)
+    if (Plan-Find $Guid) { return $Guid }
+    return ''
+}
+function Plan-ReinstallDetect {
+    param([string]$Guid, [string]$Name)
+    $l = @(Pwr-Plans)
+    if ($l.Count -eq 0) { $script:Why = 'the power plans could not be listed'; $script:Now = 'Power plans: none could be listed'; return 'NA' }
+    $x = @($l | Where-Object { $_.Guid -eq $Guid })[0]
+    if ($x) {
+        $act = ''; if ($x.Active) { $act = ', the active plan' }
+        $script:Now = ('{0} plan: installed{1}. Running it makes it fresh with Windows'' own settings.' -f $Name, $act)
+    } else {
+        $script:Now = ('{0} plan: missing. Running it puts it back.' -f $Name)
+    }
+    return 'Off'
+}
+function Plan-Reinstall {
+    param([string]$Guid, [string]$Name)
+    $have = Plan-Find $Guid
+    if (-not $have) {
+        if ($DryRun) { Say ('  [dry] put the {0} plan back: powercfg /duplicatescheme {1} {1}' -f $Name, $Guid) 'DarkGray'; return }
+        if (Pwr-Restore $Guid) { Say ('  the {0} plan is back' -f $Name) 'DarkGray'; $script:RunResult = ('The {0} plan is back, with Windows'' own settings' -f $Name); return }
+        # some builds do not take the ID to make it under: then it gets a new ID, and it is still the plan with Windows' own settings
+        $g = Pwr-NewFrom $Guid
+        if ($g) { Say ('  the {0} plan is back (under a new ID, {1})' -f $Name, $g) 'DarkGray'; $script:RunResult = ('The {0} plan is back, with Windows'' own settings (under a new ID)' -f $Name); return }
+        throw ('Windows did not create the {0} plan (a PC with Modern Standby may offer only Balanced); nothing was changed' -f $Name)
+    }
+    $wasActive = ((Pwr-Active).Guid -eq $Guid)
+    if ($DryRun) { Say ('  [dry] make the {0} plan fresh: a copy first, then powercfg /delete {1} and /duplicatescheme {1} {1}, then the copy is deleted' -f $Name, $Guid) 'DarkGray'; return }
+    $copy = Pwr-NewFrom $Guid
+    if (-not $copy) { throw ('a copy of the {0} plan could not be made first, so nothing was changed' -f $Name) }
+    if ($wasActive) {
+        [void](Pwr '/setactive' $copy)
+        if ((Pwr-Active).Guid -ne $copy) { [void](Pwr '/delete' $copy); throw ('Windows did not switch to the copy of the {0} plan, so nothing was changed' -f $Name) }
+    }
+    [void](Pwr '/delete' $Guid)
+    if (Plan-Find $Guid) {
+        if ($wasActive) { [void](Pwr '/setactive' $Guid) }
+        [void](Pwr '/delete' $copy)
+        throw ('Windows did not let the {0} plan be replaced, so nothing was changed' -f $Name)
+    }
+    if (-not (Pwr-Restore $Guid)) {
+        $keep = 'it is kept in the list'; if ($wasActive) { $keep = 'it is kept, and it is the active plan' }
+        throw ('Windows did not make the {0} plan again; the copy of it ({1}) has its settings as they were, and {2}' -f $Name, $copy, $keep)
+    }
+    if ($wasActive) { [void](Pwr '/setactive' $Guid) }
+    [void](Pwr '/delete' $copy)
+    $tail = ''; if ($wasActive) { $tail = ' It is the active plan again.' }
+    Say ('  the {0} plan was made fresh' -f $Name) 'DarkGray'
+    $script:RunResult = ('The {0} plan was made fresh with Windows'' own settings.{1}' -f $Name, $tail)
+}
+function Custom-PlanBalanced-Detect { param($p) return (Plan-ReinstallDetect $script:BalancedTemplate 'Balanced') }
+function Custom-PlanBalanced-Snapshot { param($p) return $null }
+function Custom-PlanBalanced-Apply { param($p, $mine) Plan-Reinstall $script:BalancedTemplate 'Balanced' }
+function Custom-PlanBalanced-Revert { param($p, $mine) Say '  (putting a power plan back is a one-time action: there is nothing to undo)' 'DarkGray' }
+function Custom-PlanHighPerf-Detect { param($p) return (Plan-ReinstallDetect $script:HighPerfTemplate 'High Performance') }
+function Custom-PlanHighPerf-Snapshot { param($p) return $null }
+function Custom-PlanHighPerf-Apply { param($p, $mine) Plan-Reinstall $script:HighPerfTemplate 'High Performance' }
+function Custom-PlanHighPerf-Revert { param($p, $mine) Say '  (putting a power plan back is a one-time action: there is nothing to undo)' 'DarkGray' }
+
+# ------------------------------------------------- Khorvie's PowerPlan (a plan file built in) ----
+# Not one of Windows' own plans: the plan file (what "powercfg /export" writes) is kept here, compressed, and checked against its
+# SHA-256 before it is used. Switching it on imports it under its own ID when it is not there yet ("powercfg /import <file> <id>"),
+# then makes it the active plan. Switching it off goes back to the Balanced plan (the Windows default) and deletes the plan again
+# when this app imported it. It and Ultimate Performance power plan rule each other out (Add-Tweak -Rivals).
+$script:KhorvieGuid = '8070b076-188f-428d-a9d6-e1a2f99fad5d'
+$script:KhorvieName = 'Khorvie''s PowerPlan'
+$script:KhorvieSha  = '0e41edd749126d44c4f92d2c5f67e7a1abe0809a4bd69aff2a88f8f90c206b61'
+$script:KhorvieB64 = @(
+    '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'
+) -join ''
+function Get-KhorvieBytes {
+    $ms = New-Object IO.MemoryStream(, [Convert]::FromBase64String($script:KhorvieB64))
+    $gz = New-Object IO.Compression.GZipStream($ms, [IO.Compression.CompressionMode]::Decompress)
+    $out = New-Object IO.MemoryStream
+    try { $gz.CopyTo($out) } finally { $gz.Dispose(); $ms.Dispose() }
+    $b = $out.ToArray()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    $h = (($sha.ComputeHash($b) | ForEach-Object { $_.ToString('x2') }) -join '')
+    $sha.Dispose()
+    if ($h -ne $script:KhorvieSha) { throw 'the built-in plan file did not pass its check (SHA-256), so it was not used' }
+    return ,$b
+}
+# Imports a plan file under the given ID (or, where Windows does not take an ID, under a new one). Returns the ID, or '' if it failed.
+function Pwr-Import {
+    param([byte[]]$Bytes, [string]$Guid)
+    $f = Join-Path ([IO.Path]::GetTempPath()) ('headroom-plan-' + [guid]::NewGuid().ToString('N') + '.pow')
+    try {
+        [IO.File]::WriteAllBytes($f, $Bytes)
+        [void](Pwr '/import' $f $Guid)
+        if (Plan-Find $Guid) { return $Guid }
+        $o = Pwr '/import' $f
+        $g = [regex]::Match([string]$o, $script:GuidRx).Value.ToLower()
+        if ($g -and (Plan-Find $g)) { return $g }
+        return ''
+    } finally {
+        try { if ([IO.File]::Exists($f)) { [IO.File]::Delete($f) } } catch { }
+    }
+}
+# The ID the plan has on this PC: its own, or the one it got when this app imported it under a new one; '' when it is not there
+function Khorvie-Where {
+    param($mine)
+    $plans = @(Pwr-Plans)
+    foreach ($x in $plans) { if ($x.Guid -eq $script:KhorvieGuid) { return $x.Guid } }
+    if ($mine -and $mine.New) { foreach ($x in $plans) { if ($x.Guid -eq [string]$mine.New) { return $x.Guid } } }
+    return ''
+}
+function Custom-Khorvie-Detect {
+    param($p)
+    $a = Pwr-Active
+    if (-not $a.Guid) { $script:Now = 'Active power plan: could not be read'; return 'NA' }
+    $snap = (Get-Store)[$script:CurTweak.Id]
+    $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom['Khorvie'] }
+    $at = Khorvie-Where $mine
+    $inst = 'not installed'; if ($at) { $inst = 'installed' }
+    $script:Now = ('Active power plan: {0}, wanted {1} ({2})' -f $a.Name, $script:KhorvieName, $inst)
+    if ($at -and $a.Guid -eq $at) { return 'On' }
+    return 'Off'
+}
+function Custom-Khorvie-Snapshot {
+    param($p)
+    $had = [bool](Plan-Find $script:KhorvieGuid)
+    return @{ Had = $had; New = '' }
+}
+function Custom-Khorvie-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say ('  [dry] install {0} if it is not there (powercfg /import of the built-in plan file) and make it the active plan' -f $script:KhorvieName) 'DarkGray'; return }
+    $g = Khorvie-Where $mine
+    if (-not $g) {
+        $b = Get-KhorvieBytes
+        $g = Pwr-Import $b $script:KhorvieGuid
+        if (-not $g) { throw ('Windows did not import {0}, so nothing was changed' -f $script:KhorvieName) }
+        if ($mine) { $mine.New = $g }
+        Say ('  {0} was installed ({1})' -f $script:KhorvieName, $g) 'DarkGray'
+    }
+    [void](Pwr '/setactive' $g)
+    if ((Pwr-Active).Guid -ne $g) { throw ('{0} is installed, but Windows did not make it the active plan' -f $script:KhorvieName) }
+    Say ('  {0} is now the active plan' -f $script:KhorvieName) 'DarkGray'
+}
+function Custom-Khorvie-Revert {
+    param($p, $mine)
+    if ($DryRun) { Say ('  [dry] switch back to the Balanced plan (the Windows default) and delete {0} if this app installed it' -f $script:KhorvieName) 'DarkGray'; return }
+    $target = ''
+    if (Plan-Find $script:BalancedTemplate) { $target = $script:BalancedTemplate }
+    if (-not $target) { $target = Pwr-Restore $script:BalancedTemplate }
+    if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
+    if (-not $target) { throw 'could not find or create a Balanced plan, so the active plan was not changed' }
+    [void](Pwr '/setactive' $target)
+    if ((Pwr-Active).Guid -ne $target) { throw 'Windows did not switch to the Balanced plan' }
+    Say "  power plan $target (Balanced) is the active one again" 'DarkGray'
+    # The plan is deleted only when this app imported it: one that was there before stays in the list
+    $del = @()
+    if ($mine -and $mine.New) { $del += [string]$mine.New }
+    elseif ($mine -and -not $mine.Had) { $del += $script:KhorvieGuid }
+    foreach ($g in $del) {
+        if ($g -eq $target -or -not (Plan-Find $g)) { continue }
+        [void](Pwr '/delete' $g)
+        Say ('  {0} was deleted again (this app installed it)' -f $script:KhorvieName) 'DarkGray'
+    }
+    if (-not $mine) { Say ('  {0} stays in the list (this app did not install it)' -f $script:KhorvieName) 'DarkGray' }
 }
 
 function Custom-Hibernate-Detect { param($p) return 'Skip' }
@@ -4069,6 +4327,12 @@ Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Perform
         pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
     )
 
+Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Rivals 'ultimate' -Name 'Khorvie''s power plan' `
+    -Desc 'On: Khorvie''s PowerPlan, a third-party gaming power plan (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive, USB selective suspend and USB 3 link power management off, the display and hard disk never turned off, and wake timers off. Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the other off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Khorvie''s PowerPlan is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
+    -Parts @(
+        pCustom 'Khorvie' 'powercfg /import of the built-in plan file (Khorvie''s PowerPlan, ID 8070b076-188f-428d-a9d6-e1a2f99fad5d) when it is not installed, then /setactive'
+    )
+
 Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
     -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Plans that your PC maker or a driver added (the AMD chipset driver adds AMD Ryzen Balanced, for example) are deleted too. Switching it back on recreates the three standard plans only. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
     -Parts @(
@@ -4081,6 +4345,18 @@ Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast S
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power' 'HiberbootEnabled' 0 1
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled' 0 1
         pCustom 'Hibernate' 'powercfg /h off   (undo: powercfg /h on)'
+    )
+
+Add-Tweak -Id 'plan-balanced' -Cat $cPower -Once -Name 'Reinstall Balanced power plan' `
+    -Desc 'A one-time action, not a switch. Puts the Balanced power plan back with the settings Windows ships it with, under its usual ID, so Windows and other programs find it again. If the plan is missing (deleted by the Standard power plans setting or by another tool) it is added again. If it is there, it is made fresh: a copy of it is made first, the plan is deleted and created again from Windows'' own settings, and then the copy is deleted, so you are never left without the plan. Changes you made inside the plan are lost. The active plan stays the same: if Balanced was the active plan it is the active plan again afterwards, otherwise it is only added to the list (choose it under Power Options if you want to use it). If you switched Standard power plans off, switch it back on instead: it puts all three standard plans back, and otherwise the next check of the PC offers to delete the other plans again.' `
+    -Parts @(
+        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID (when the plan is there: a copy first, then /delete and the same again, then the copy is deleted)'
+    )
+
+Add-Tweak -Id 'plan-highperf' -Cat $cPower -Once -Name 'Reinstall High Performance power plan' `
+    -Desc 'A one-time action, not a switch. Puts the High Performance power plan back with the settings Windows ships it with, under its usual ID. If the plan is missing it is added again; if it is there, it is made fresh the same way as Reinstall Balanced power plan (a copy first, so you are never left without it), and changes you made inside it are lost. The active plan stays the same: if High Performance was the active plan it is the active plan again afterwards, otherwise it is only added to the list (choose it under Power Options if you want to use it). On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create High Performance; nothing is changed then. If you switched Standard power plans off, switch it back on instead, as for Balanced.' `
+    -Parts @(
+        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID (when the plan is there: a copy first, then /delete and the same again, then the copy is deleted)'
     )
 
 # (desktop-delay and power-throttle used to be here; they are on the "Placebo Tweaks - Not Recommended" page now, further down)
@@ -4580,13 +4856,13 @@ Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Depends on the PC' -Name '
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
     )
 
-Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Risk 'note' -Name 'Disk Cleanup (run once)' `
+Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Cleanup -Risk 'note' -Name 'Disk Cleanup (run once)' `
     -Desc 'A one-time action, not a switch. Runs the Disk Cleanup program that comes with Windows (cleanmgr) once, on every drive, for these items only: temporary files, temporary setup files, setup and upgrade log files, Active Setup temp folders, thumbnail cache, Windows error reports, downloaded program files, old browser cache files, Delivery Optimization files, old Check Disk files, system error memory dumps and minidumps, and Windows Update Cleanup. It never touches the Recycle Bin, your Downloads folder, the old Windows installation (Windows.old), device driver packages, the DirectX shader cache, language files or file history versions. Windows Update Cleanup removes the files of updates that were replaced by newer ones: updates that are already installed can no longer be uninstalled afterwards. A Disk Cleanup window shows the progress and it can take several minutes. It runs when you press Apply, files it deletes do not go to the Recycle Bin, and it is never part of Apply all, Tweak all or the Recommended preset.' `
     -Parts @(
         pCustom 'DiskCleanup' 'cleanmgr /sagerun for 14 items: temporary and setup files, logs, thumbnail and error report caches, Delivery Optimization, old update files, memory dumps (not the Recycle Bin, Downloads, Windows.old, drivers or shader cache)'
     )
 
-Add-Tweak -Id 'temp-files' -Cat $cStore -Once -Risk 'note' -Name 'Temporary files (clean up once)' `
+Add-Tweak -Id 'temp-files' -Cat $cStore -Once -Cleanup -Risk 'note' -Name 'Temporary files (clean up once)' `
     -Desc 'A one-time action, not a switch. Deletes what is inside your own Temp folder (the TEMP folder of your account) and inside C:\Windows\Temp, once. Anything that was changed in the last hour is left alone, and so is anything a running program is using, because Windows does not allow it to be deleted. Folders that end up empty are removed; the two Temp folders themselves stay. Shortcuts and links inside them are removed but never followed, so nothing outside the Temp folders is touched, and a TEMP folder that is not named Temp is never emptied. When it is done it says how many items were removed and how much space that freed. It runs when you press Apply, deleted files do not go to the Recycle Bin, and it is never part of Apply all, Tweak all or the Recommended preset.' `
     -Parts @(
         pCustom 'TempClean' 'delete the files in %TEMP% and C:\Windows\Temp that are older than an hour and not in use; empty sub-folders are removed'
@@ -6808,8 +7084,10 @@ function Test-CanChange {
 }
 
 # The user ticked (want = true) or unticked (false) a box. Returns '' when accepted, else why not.
+$script:RivalNote = ''      # what Try-SetWant did to a rival (Add-Tweak -Rivals) of the setting it ticked, for the status line
 function Try-SetWant {
     param([string]$id, [bool]$want)
+    $script:RivalNote = ''
     $row = $script:Rows[$id]
     if (-not $row) { return 'Unknown setting.' }
     $why = Test-CanChange $row
@@ -6826,6 +7104,21 @@ function Try-SetWant {
     $row.Force = ''
     $row.Note = ''
     $row.NoteDetail = ''
+    # only one of a setting and its rivals can be on: lining this one up to go on takes a rival's tick away, or lines it up to go off
+    if ($want -and (Get-Action $row) -eq 'Apply') {
+        foreach ($rv in @(Get-Rivals $row.T)) {
+            $rr = $script:Rows[[string]$rv.Id]
+            if (-not $rr) { continue }
+            $ra = Get-Action $rr
+            if ($ra -eq 'Apply') {
+                $rr.Want = $false; $rr.Force = ''; $rr.Note = ''; $rr.NoteDetail = ''
+                $script:RivalNote = ('"{0}" is not lined up any more: only one of it and "{1}" can be on.' -f $rv.Name, $row.T.Name)
+            } elseif ($rr.State -eq 'On' -and $ra -ne 'Undo' -and -not (Test-CanChange $rr)) {
+                $rr.Want = $false; $rr.Force = ''; $rr.Note = ''; $rr.NoteDetail = ''
+                $script:RivalNote = ('"{0}" is lined up to switch off: only one of it and "{1}" can be on.' -f $rv.Name, $row.T.Name)
+            }
+        }
+    }
     return ''
 }
 
@@ -6955,6 +7248,16 @@ $script:Personal = @{ Saved = ''; Picks = @{}; Source = '' }
 
 # Is this row in the preset? ($key: recommended | advanced | personal)
 function Test-InPreset {
+    param($row, [string]$key)
+    if (-not (Test-InPresetBase $row $key)) { return $false }
+    # a preset does not swap one setting for its rival: while the rival is on (and not part of the preset) the setting is left out
+    foreach ($rv in @(Get-Rivals $row.T)) {
+        $rr = $script:Rows[[string]$rv.Id]
+        if ($rr -and $rr.State -eq 'On' -and -not (Test-InPresetBase $rr $key)) { return $false }
+    }
+    return $true
+}
+function Test-InPresetBase {
     param($row, [string]$key)
     $id = [string]$row.T.Id
     switch ($key) {
@@ -7171,6 +7474,13 @@ function Get-ApplyAllSkip {
     if (-not $cat -and [string]$row.T.Cat -like 'Startup apps*') { return 'which programs start with Windows is your own choice' }
     if (-not $cat -and [string]$row.T.Cat -eq $script:TestingCat) { return 'they are untested ideas from other debloat scripts, so you pick them yourself on the Testing page' }
     if ($row.T.Untested) { return 'they are untested ideas from other debloat scripts, so you pick them yourself' }
+    foreach ($rv in @(Get-Rivals $row.T)) {
+        $rr = $script:Rows[[string]$rv.Id]
+        if (-not $rr) { continue }
+        $ra = Get-Action $rr
+        if ($ra -eq 'Apply') { return ('only one of it and "{0}" can be on, and "{0}" is lined up' -f $rv.Name) }
+        if ($rr.State -eq 'On' -and $ra -ne 'Undo') { return ('only one of it and "{0}" can be on, and "{0}" is on' -f $rv.Name) }
+    }
     $why = $script:ApplyAllSkip[[string]$row.T.Id]
     if ($why) { return [string]$why }
     return ''
@@ -7268,7 +7578,7 @@ function Get-Pending {
 }
 
 function Get-Counts {
-    $c = @{ Total = 0; On = 0; Off = 0; Idle = 0; RunOnce = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0 }
+    $c = @{ Total = 0; On = 0; Off = 0; Idle = 0; RunOnce = 0; Partial = 0; NA = 0; Unknown = 0; Checking = 0; Apply = 0; Undo = 0; GoOn = 0; GoOff = 0; GoRun = 0 }
     foreach ($id in @($script:Rows.Keys)) {
         $row = $script:Rows[$id]
         $c.Total++
@@ -7283,7 +7593,8 @@ function Get-Counts {
         $a = Get-Action $row
         if ($a -eq 'Apply') { $c.Apply++ }
         if ($a -eq 'Undo') { $c.Undo++ }
-        if ($a -and -not $row.T.Choices) { if (Get-SwitchGoesOn $row.T ($a -eq 'Undo')) { $c.GoOn++ } else { $c.GoOff++ } }
+        if ($a -and $row.T.Once) { $c.GoRun++ }
+        elseif ($a -and -not $row.T.Choices) { if (Get-SwitchGoesOn $row.T ($a -eq 'Undo')) { $c.GoOn++ } else { $c.GoOff++ } }
     }
     return $c
 }
@@ -7348,7 +7659,9 @@ function Get-SummaryText {
     if ($c.RunOnce -gt 0) { $s += (', {0} run-once action{1} not run' -f $c.RunOnce, $(if ($c.RunOnce -eq 1) { '' } else { 's' })) }
     if ($c.NA -gt 0) { $s += (', {0} not on this PC' -f $c.NA) }
     if ($n -gt 0) {
-        $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off.' -f $n, $c.GoOn, $c.GoOff)
+        $s += ('.  {0} change(s) waiting: {1} to turn on, {2} to turn off' -f $n, $c.GoOn, $c.GoOff)
+        if ($c.GoRun -gt 0) { $s += (', {0} to run once' -f $c.GoRun) }
+        $s += '.'
     } else {
         $s += '.  Switch settings on or off to choose changes.'
     }
@@ -7603,7 +7916,9 @@ function Get-DetailParts {
     if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: once it is switched off it cannot be switched back on from this window.' + $nl }) }
     if ($t.Unproven) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'May have no effect: read the description above for why.' + $nl }) }
     if ($t.Reboot) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Needs a restart of the PC to take full effect.' + $nl }) }
-    if ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
+    foreach ($rv in @(Get-Rivals $t)) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this and "{0}" can be on: switching this on switches that one off.' -f $rv.Name) + $nl }) }
+    if ($t.Once -and -not $t.Cleanup) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button and has nothing to undo here (a restore point is created first). It is never part of Apply all, Tweak all or any preset.' + $nl }) }
+    elseif ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
     else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (change it yourself if you want it).' + $nl }) }
     if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') {
@@ -7689,7 +8004,8 @@ function Get-ConfirmText {
     # a setting with options is listed with the option it is set to
     $goesOn = { param($x) $tt = $script:ById[$x.Id]; if ($tt.Choices) { return ($x.Action -eq 'Apply') }; return [bool](Get-SwitchGoesOn $tt ($x.Action -eq 'Undo')) }
     $on = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and (& $goesOn $_) } | ForEach-Object { Get-PlanName $_ })
-    $run = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once } | ForEach-Object { $script:ById[$_.Id].Name })
+    $run = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once -and $script:ById[$_.Id].Cleanup } | ForEach-Object { $script:ById[$_.Id].Name })
+    $runOther = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once -and -not $script:ById[$_.Id].Cleanup } | ForEach-Object { $script:ById[$_.Id].Name })
     $off = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and -not (& $goesOn $_) } | ForEach-Object { $script:ById[$_.Id].Name })
     $one = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].OneWay } | ForEach-Object { $script:ById[$_.Id].Name })
     $rb = @($Plan | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
@@ -7697,11 +8013,14 @@ function Get-ConfirmText {
     if ($Extra) { $s += $Extra + $nl }
     if ($on.Count)  { $s += ('Turn ON ({0}):' -f $on.Count) + $nl + (Format-NameList $on) + $nl }
     if ($run.Count) { $s += ('RUN once ({0}); files they delete are gone for good, they do not go to the Recycle Bin:' -f $run.Count) + $nl + (Format-NameList $run) + $nl }
+    if ($runOther.Count) { $s += ('RUN once ({0}):' -f $runOther.Count) + $nl + (Format-NameList $runOther) + $nl }
     if ($off.Count) { $s += ('Turn OFF ({0}):' -f $off.Count) + $nl + (Format-NameList $off) + $nl }
     if ($one.Count) { $s += ('These cannot be switched back on from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
     if ($rb.Count)  { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl + $nl }
     if (@($Plan | Where-Object { -not $script:ById[$_.Id].Once }).Count -gt 0) {
         $s += 'A restore point is created first. Putting a setting back later restores the Windows default.'
+    } elseif ($runOther.Count) {
+        $s += 'A restore point is created first. A one-time action has no undo here, but the restore point can bring back what it changed.'
     } else {
         $s += 'Nothing here can be undone, so no restore point is made.'
     }
@@ -10664,7 +10983,9 @@ function Ui-ToggleRow {
         $msg = Try-SetWant $id (-not [bool]$row.Want)
     }
     Ui-RefreshRow $id          # also puts the switch back if the change was refused
-    if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
+    $rnote = ''
+    if (-not $row.T.Choices) { $rnote = [string]$script:RivalNote; foreach ($rv in @(Get-Rivals $row.T)) { Ui-RefreshRow ([string]$rv.Id) } }
+    if ($msg) { Ui-Status $msg } elseif ($rnote) { Ui-Status ($rnote + '  ' + (Get-SummaryText)) } else { Ui-Status (Get-SummaryText) }
     Ui-Flush
 }
 
@@ -11118,7 +11439,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '105'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '106'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
