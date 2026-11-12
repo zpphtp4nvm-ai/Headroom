@@ -5152,7 +5152,7 @@ Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot
 $wsch = "$pol\Windows Search"
 $ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
 Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and cloud results in Start search' `
-    -Desc 'On: Start search also shows Bing results, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC.' `
+    -Desc 'On: Start search also shows Bing results, Microsoft Store suggestions, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC, and under Settings > Privacy & security > Search both "Show suggested search results" switches (Web searches and Microsoft Store) are off.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
@@ -5165,6 +5165,8 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and clo
         pReg $ssm 'IsMSACloudSearchEnabled' 0 1
         pReg $ssm 'IsAADCloudSearchEnabled' 0 1
         pReg $ssm 'IsDynamicSearchBoxEnabled' 0 1
+        pReg $ssm 'IsWebSuggestionsEnabled' 0 1
+        pReg $ssm 'IsStoreSuggestionsEnabled' 0 1
     )
 
 Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Snap suggestions and layouts flyout' `
@@ -5420,6 +5422,12 @@ Add-Tweak -Id 'apps-gamebar' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Na
     -Desc 'On: the Xbox Game Bar overlay (Win+G, the screenshot and recording widgets) and its speech-to-text overlay are installed. Off: they are removed. The Xbox app and Game Pass are not touched; "Xbox app and Xbox sign-in" takes those out. Removing Game Bar can make an "ms-gamingoverlay" pop-up appear in some games or on controller buttons; switching off "Xbox Game Bar and background recording" under Gaming and performance is the usual fix. It cannot be switched back on from here; get it back with winget install 9pfhdd62mxs1.' `
     -Parts @(
         pAppx 'Microsoft.XboxGamingOverlay', 'Microsoft.XboxGameOverlay', 'Microsoft.XboxSpeechToTextOverlay'
+    )
+
+Add-Tweak -Id 'apps-gameassist' -Cat $cApps -Inv -Def 'On' -OneWay -Name 'Microsoft Edge Game Assist' `
+    -Desc 'On: Microsoft Edge Game Assist is installed. It is the Edge browser widget for Game Bar (EdgeGameAssist.exe) and shows in Settings > Apps as "Microsoft Edge Game Assist". Off: it is removed for every user account. Edge itself and Game Bar are not touched. Edge can install it again when it updates; the next check of the PC then offers to remove it again. It cannot be switched back on from here; get it back from the Game Bar widget store.' `
+    -Parts @(
+        pAppx 'Microsoft.Edge.GameAssist'
     )
 
 Add-Tweak -Id 'apps-xbox' -Cat $cApps -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Xbox app and Xbox sign-in' `
@@ -11541,7 +11549,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '107'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '108'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
