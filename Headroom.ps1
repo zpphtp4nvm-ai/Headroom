@@ -2270,28 +2270,77 @@ function Plan-Rebuild {
         if (-not $at -or -not (Plan-Find $at)) { return '' }
     }
     [void](Pwr '/changename' $at ([string]$txt.Name) ([string]$txt.Desc))
-    # only the values that differ from the copy are set (one powercfg call each)
-    $cur = Pwr-ParseQuery (Pwr '/qh' $at) -Both
-    $n = 0; $bad = 0
     $want = @($vals)
     if (@($vals | Where-Object { $_.Set -eq '245d8541-3943-4422-b025-13a784f679b7' }).Count -eq 0) {
         $want += ,@{ Sub = $script:SubNone; Set = '245d8541-3943-4422-b025-13a784f679b7'; AC = [int64]$txt.Kind; DC = [int64]$txt.Kind }    # the plan's kind, when Windows keeps none
     }
-    foreach ($s in $want) {
+    $r = Plan-SetValues $at $want
+    $m = '  made from Windows'' own default values for it: {0} value(s) set' -f $r.Set
+    if ($r.Bad) { $m += (', {0} not accepted' -f $r.Bad) }
+    Say $m 'DarkGray'
+    return $at
+}
+# Sets values (@(@{ Sub; Set; AC; DC })) in a plan; only the ones that differ from what the plan has now (one powercfg call each).
+# @{ Set = how many were set; Bad = how many Windows did not accept }
+function Plan-SetValues {
+    param([string]$Guid, $Vals)
+    $cur = Pwr-ParseQuery (Pwr '/qh' $Guid) -Both
+    $n = 0; $bad = 0
+    foreach ($s in @($Vals)) {
         foreach ($side in @(@('AC', '/setacvalueindex', 0), @('DC', '/setdcvalueindex', 1))) {
             $v = $s[$side[0]]
             if ($null -eq $v) { continue }
             $c = $cur[[string]$s.Set]
             if ($c -and @($c).Count -gt [int]$side[2] -and [int64]@($c)[[int]$side[2]] -eq [int64]$v) { continue }
             $n++
-            $o = Pwr ([string]$side[1]) $at ([string]$s.Sub) ([string]$s.Set) ([string]$v)
+            $o = Pwr ([string]$side[1]) $Guid ([string]$s.Sub) ([string]$s.Set) ([string]$v)
             if (([string]$o).Trim()) { $bad++ }
         }
     }
-    $m = '  made from Windows'' own default values for it: {0} value(s) set' -f ($n - $bad)
-    if ($bad) { $m += (', {0} not accepted' -f $bad) }
-    Say $m 'DarkGray'
-    return $at
+    return @{ Set = ($n - $bad); Bad = $bad }
+}
+# A plan of Windows' own (Balanced, High Performance) compared with the values Windows keeps as that plan's defaults, the ones its
+# "Restore plan defaults" uses. Only reads. @{ Checked = how many of them the plan lists; Diff = @(@{ Sub; Set; AC; DC }) that differ,
+# plugged in or on battery }; Checked = 0 when Windows keeps no defaults for it or the plan cannot be read.
+function Plan-DefaultsDiff {
+    param([string]$Key, [string]$Guid, $Cur = $null)
+    $o = @{ Checked = 0; Diff = @() }
+    $def = $script:PlanDefs[$Key]
+    if (-not $def -or $def.Kind -ne 'windows') { return $o }
+    $vals = @(Plan-WindowsDefaults ([string]$def.Guid))
+    if ($vals.Count -lt 20) { return $o }
+    $cur = $Cur
+    if ($null -eq $cur) { $cur = @{}; try { $cur = Pwr-ParseQuery (Pwr '/qh' $Guid) -Both } catch { } }     # (or what the caller has read already)
+    foreach ($s in $vals) {
+        $c = $cur[[string]$s.Set]
+        if (-not $c) { continue }                       # (a setting this PC does not list for the plan)
+        $o.Checked++
+        $d = $false
+        if ($null -ne $s.AC -and @($c).Count -gt 0 -and [int64]@($c)[0] -ne [int64]$s.AC) { $d = $true }
+        if ($null -ne $s.DC -and @($c).Count -gt 1 -and [int64]@($c)[1] -ne [int64]$s.DC) { $d = $true }
+        if ($d) { $o.Diff += ,$s }
+    }
+    return $o
+}
+# Windows' own "Restore plan defaults" for one of its plans (powrprof.dll, PowerRestoreIndividualDefaultPowerScheme): the plan is replaced
+# with the copy Windows keeps for new accounts, with Windows' own name for it. 0 when Windows did it, else the error number Windows gave.
+function Pwr-RestoreDefault {
+    param([string]$Guid)
+    if ($DryRun) { return 0 }
+    try {
+        if (-not ('HrPowrProf' -as [type])) {
+            Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class HrPowrProf {
+    [DllImport("powrprof.dll")]
+    public static extern uint PowerRestoreIndividualDefaultPowerScheme(ref Guid SchemeGuid);
+}
+"@
+        }
+        $id = [Guid]$Guid
+        return [int64][HrPowrProf]::PowerRestoreIndividualDefaultPowerScheme([ref]$id)
+    } catch { return [int64]-1 }
 }
 
 # ------------------------------------------------- built-in plan files (third-party plans) ----
@@ -2582,12 +2631,21 @@ function Plan-Snapshot {
 }
 # Ultimate Performance comes with Headroom's own changes inside it: USB selective suspend, USB 3 link power management and the
 # Wi-Fi adapter's power saving off
-function Plan-UltimateExtras {
-    param([string]$Guid)
-    foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
-        [void](Pwr $mode $Guid '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' '0')
-        [void](Pwr $mode $Guid '2a737441-1930-4402-8d77-b2bebba308a3' 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' '0')
-        [void](Pwr $mode $Guid '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a' '0')
+# After Balanced or High Performance is installed: every value is checked against the defaults Windows keeps for it; one that differs
+# (a value Windows' copy did not bring) is set to Windows' default, and the log says how it came out.
+function Plan-CheckDefaults {
+    param([string]$Key, [string]$Guid)
+    $d = Plan-DefaultsDiff $Key $Guid
+    if ($d.Checked -eq 0) { Say '  (Windows keeps no default values for this plan to check it against)' 'DarkGray'; return }
+    if ($d.Diff.Count) {
+        $r = Plan-SetValues $Guid $d.Diff
+        Say ('  {0} value(s) differed from Windows'' own defaults and were set to them' -f $d.Diff.Count) 'DarkGray'
+        $d = Plan-DefaultsDiff $Key $Guid
+    }
+    if ($d.Diff.Count) {
+        Say ('  checked against Windows'' own default values: {0} of {1} still differ ({2})' -f $d.Diff.Count, $d.Checked, ((@($d.Diff | Select-Object -First 3) | ForEach-Object { [string]$_.Set }) -join ', ')) 'Yellow'
+    } else {
+        Say ('  checked against Windows'' own default values: all {0} match' -f $d.Checked) 'DarkGray'
     }
 }
 function Plan-Install {
@@ -2616,13 +2674,29 @@ function Plan-Install {
         }
     } else {
         $n0 = $Error.Count
+        $std = ($Key -eq 'PlanBalanced' -or $Key -eq 'PlanHighPerf')
         $g = Pwr-Restore ([string]$def.Guid)
+        if (-not $g -and $std) {
+            # Windows' own "Restore plan defaults" can put back the copy it keeps for new accounts
+            if ((Pwr-RestoreDefault ([string]$def.Guid)) -eq 0 -and (Plan-Find ([string]$def.Guid))) {
+                $g = [string]$def.Guid
+                Say ('  Windows put back its own {0} (the copy it keeps for new accounts)' -f (Plan-Label $def.Name)) 'DarkGray'
+            }
+        }
         if (-not $g) { $n = Pwr-NewFrom ([string]$def.Guid); if ($n -and (Plan-Find $n)) { $g = $n } }
         if (-not $g) {
             # Windows no longer finds the plan to copy (it was deleted): it is made again from Windows' own default values for it
             Say ('  Windows has no {0} left to copy; making it from Windows'' own default values for it' -f (Plan-Label $def.Name)) 'DarkGray'
             try { $g = Plan-Rebuild $Key } catch { Drop-ErrorsSince $n0; throw }      # (the refused copy above is no part of what went wrong)
+            if ($g) {
+                # then Windows' own "Restore plan defaults" on it, which also gives it Windows' own name where Windows can
+                if ((Pwr-RestoreDefault $g) -eq 0) {
+                    if (Plan-Find $g) { Say '  Windows reset it to its own defaults ("Restore plan defaults")' 'DarkGray' }
+                    else { Say '  Windows removed it when asked to reset it; making it again' 'DarkGray'; $g = Plan-Rebuild $Key }
+                }
+            }
         }
+        if ($g -and $std) { Plan-CheckDefaults $Key $g }
         Drop-ErrorsSince $n0          # (what powercfg said on the way is no failure when the plan was made after all)
     }
     if (-not $g) {
@@ -2631,7 +2705,6 @@ function Plan-Install {
         throw ('Windows did not create the {0}{1}, so nothing was changed' -f (Plan-Label $def.Name), $why)
     }
     if ($mine -and $g -ne [string]$def.Guid) { $mine.New = $g }
-    if ($Key -eq 'Ultimate') { Plan-UltimateExtras $g }
     Say ('  the {0} is installed ({1}); the active plan is unchanged' -f (Plan-Label $def.Name), $g) 'DarkGray'
 }
 # The plan that is made active when the active one is deleted
@@ -2743,12 +2816,12 @@ $script:PlanCmpRows = @(
 $script:PlanCmpRef = @{
     PlanBalanced = @{ min = 5; park = @{ T = 'On: idle cores park'; K = 'save' }; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
     PlanHighPerf = @{ min = 100; park = 100; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
-    Ultimate     = @{ min = 100; park = 100; idle = 0; usbss = 0; usb3 = 0; wifi = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
+    Ultimate     = @{ min = 100; park = 100; idle = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
     Khorvie      = @{ min = 100; park = 'unset'; boost = 2; epp = 'unset'; ramp = 2; incdec = @(100, 100); thr = 0; idle = 0; idlepd = @(100, 100); irq = 6; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 'unset'; disk = 0; disp = 0; sleep = @(-1, 1); wake = 0 }
     LowLatency   = @{ min = 'unset'; park = 'unset'; boost = 'unset'; epp = 'unset'; ramp = 'unset'; incdec = @(1, 1); thr = 0; idle = 'unset'; idlepd = @(100, 100); irq = 3; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 60000; disk = 0; disp = 0; sleep = @(-1, 'unset'); wake = 0 }
 }
 $script:PlanCmpBy = @{
-    PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft, tuned by Headroom'
+    PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft'
     Khorvie = 'Khorvie (third party)'; LowLatency = 'Amit (third party)'
 }
 # The plugged-in value of every setting in "powercfg /q(h)" output: setting ID -> number. The words around the numbers are in the language of
@@ -2859,17 +2932,36 @@ function Get-PlanCompare {
             if ($store -and $store.ContainsKey([string]$t.Id) -and $store[[string]$t.Id].Custom) { $mine = $store[[string]$t.Id].Custom[$key] }
         }
         $at = @(Plan-Where $key $mine $plans)
-        $p = [ordered]@{ Key = [string]$key; Name = [string]$def.Name; By = [string]$script:PlanCmpBy[$key]; Guid = [string]$def.Guid; Installed = ($at.Count -gt 0); Active = $false; Source = ''; Cells = @{} }
+        $p = [ordered]@{ Key = [string]$key; Name = [string]$def.Name; By = [string]$script:PlanCmpBy[$key]; Guid = [string]$def.Guid; Installed = ($at.Count -gt 0); Active = $false; Source = ''; Cells = @{}; Check = $null }
+        $std = ($key -eq 'PlanBalanced' -or $key -eq 'PlanHighPerf')
         if ($at.Count) {
             $g = [string]$at[0]
             $p.Guid = $g; $p.Active = ($g -eq $act)
-            $vals = @{}; try { $vals = Pwr-ParseQuery (Pwr '/qh' $g) } catch { }
+            $both = @{}; try { $both = Pwr-ParseQuery (Pwr '/qh' $g) -Both } catch { }
+            $vals = @{}; foreach ($k in @($both.Keys)) { $vals[$k] = @($both[$k])[0] }
             if ($vals.Count -eq 0) { $p.Source = 'unread' } else { $p.Source = 'pc' }
             foreach ($r in $script:PlanCmpRows) {
                 if ($p.Source -eq 'unread') { $p.Cells[$r.Id] = @{ T = 'Could not be read'; K = 'unset' }; continue }
                 $v = $null; if ($vals.ContainsKey([string]$r.Set)) { $v = $vals[[string]$r.Set] }
                 $v2 = $null; if ($r.Set2 -and $vals.ContainsKey([string]$r.Set2)) { $v2 = $vals[[string]$r.Set2] }
                 if ($null -eq $v -and $null -eq $v2 -and $r.Id -ne 'sleep') { $p.Cells[$r.Id] = @{ T = 'Not listed by Windows'; K = 'unset' }; continue }
+                $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
+            }
+            # Balanced and High Performance: are they as Windows ships them? (compared with the defaults Windows keeps for them)
+            if ($std -and $p.Source -eq 'pc') { $d = $null; try { $d = Plan-DefaultsDiff $key $g $both } catch { }; if ($d -and $d.Checked -gt 0) { $p.Check = @{ Checked = [int]$d.Checked; Diff = @($d.Diff).Count } } }
+            $out += ,$p
+            continue
+        }
+        # Balanced and High Performance that are not installed: the defaults Windows keeps for them on this PC, when it keeps them
+        $wd = @(); if ($std) { try { $wd = @(Plan-WindowsDefaults ([string]$def.Guid)) } catch { } }
+        if ($wd.Count -ge 20) {
+            $p.Source = 'defaults'
+            $byS = @{}; foreach ($s in $wd) { $byS[[string]$s.Set] = $s.AC }
+            foreach ($r in $script:PlanCmpRows) {
+                $v = $null; $v2 = $null
+                if ($byS.ContainsKey([string]$r.Set)) { $v = $byS[[string]$r.Set] }
+                if ($r.Set2 -and $byS.ContainsKey([string]$r.Set2)) { $v2 = $byS[[string]$r.Set2] }
+                if ($null -eq $v -and $null -eq $v2 -and $r.Id -ne 'sleep') { $p.Cells[$r.Id] = @{ T = 'Windows default'; K = 'def' }; continue }
                 $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
             }
         } else {
@@ -5029,21 +5121,21 @@ Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power sav
 # "Make active" on its card does. Switching the active plan off makes another plan active first; the last plan is never deleted.
 $planTail = ' Switching it on only installs it: "Make active" on its card makes it the plan Windows uses, and the card says which plan is active. Switching it off deletes this plan and no other; if it is the active plan, Balanced (or another installed plan) is made active first, and the last plan on the PC is never deleted.'
 Add-Tweak -Id 'plan-balanced' -Cat $cPower -Def 'On' -Plan 'PlanBalanced' -Name 'Balanced power plan' `
-    -Desc ('On: the Balanced plan is installed, under its usual ID and with the settings Windows ships it with. It is the plan Windows uses unless you choose another. Off: the Balanced plan is deleted.' + $planTail) `
+    -Desc ('On: the Balanced plan is installed, under its usual ID and with the settings Windows ships it with. It is the plan Windows uses unless you choose another. Off: the Balanced plan is deleted. Once it was deleted Windows has no copy left: Headroom asks Windows to put back its own (Restore plan defaults), or makes it under its usual ID from the values Windows keeps as its defaults. Every value is then checked against those defaults, and Compare Power Plans shows whether it still matches them.' + $planTail) `
     -Parts @(
-        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID; once it was deleted, a copy under that ID with the values Windows keeps as its defaults (to install) / powercfg /delete (to delete)'
+        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID; once it was deleted, Windows'' own Restore plan defaults (PowerRestoreIndividualDefaultPowerScheme), else a copy under that ID with the values Windows keeps as its defaults; then each value is checked against those defaults (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'plan-highperf' -Cat $cPower -Def 'On' -Plan 'PlanHighPerf' -Name 'High Performance power plan' `
-    -Desc ('On: the High Performance plan is installed, under its usual ID and with the settings Windows ships it with. Off: it is deleted. On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create it; nothing is changed then.' + $planTail) `
+    -Desc ('On: the High Performance plan is installed, under its usual ID and with the settings Windows ships it with (once it was deleted, as for Balanced: Windows'' own Restore plan defaults, or the values Windows keeps as its defaults, each one checked). Off: it is deleted. On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
-        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID; once it was deleted, a copy under that ID with the values Windows keeps as its defaults (to install) / powercfg /delete (to delete)'
+        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID; once it was deleted, Windows'' own Restore plan defaults (PowerRestoreIndividualDefaultPowerScheme), else a copy under that ID with the values Windows keeps as its defaults; then each value is checked against those defaults (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Plan 'Ultimate' -Name 'Ultimate Performance power plan' `
-    -Desc ('On: the Ultimate Performance plan is installed. It is High Performance with the small delays of fine-grained power management removed, and Headroom also turns off USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving inside it. Off: it is deleted, also a copy an older Headroom build made under another ID. On a PC with Modern Standby Windows may refuse to create it; nothing is changed then.' + $planTail) `
+    -Desc ('On: the Ultimate Performance plan is installed. It is High Performance with the small delays of fine-grained power management removed. It is installed exactly as Windows makes it, from Windows'' own hidden copy; Headroom changes nothing in it (builds before 113 also turned off USB and Wi-Fi power saving in it: switch it off and on again to get Windows'' own). Off: it is deleted, also a copy an older Headroom build made under another ID. On a PC with Modern Standby Windows may refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
-        pCustom 'Ultimate' 'powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 under the same ID, USB / Wi-Fi power saving off in it (to install) / powercfg /delete (to delete)'
+        pCustom 'Ultimate' 'powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 under the same ID, nothing changed in it (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Plan 'Khorvie' -Name 'Khorvie''s power plan' `
@@ -6917,11 +7009,42 @@ function Get-SysIommu {
     try { $t = [string][SysFw]::AcpiTables() } catch { $t = '' }
     return (Sys-IommuParse $t)
 }
-# Both, each on its own (one that cannot be read leaves the other): Dg = Get-SysDeviceGuard ($null when it could not be asked), Iommu
+# Secure Boot (read only): at every start Windows writes down what the firmware reported, under
+# HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State (UEFISecureBootEnabled: 1 = on, 0 = off). That key is only there on a PC that
+# started in UEFI mode; PEFirmwareType under HKLM\SYSTEM\CurrentControlSet\Control says how it started (1 = legacy BIOS, 2 = UEFI).
+# @{ Read; State = 'on' | 'off' | 'legacy' }
+function Get-SysSecureBoot {
+    $o = @{ Read = $false; State = '' }
+    $t = ([string](Sys-RegGet 'HKLM' 'SYSTEM\CurrentControlSet\Control\SecureBoot\State' 'UEFISecureBootEnabled')).Trim()
+    if ($t -eq '1') { $o.Read = $true; $o.State = 'on'; return $o }
+    if ($t -eq '0') { $o.Read = $true; $o.State = 'off'; return $o }
+    $fw = ([string](Sys-RegGet 'HKLM' 'SYSTEM\CurrentControlSet\Control' 'PEFirmwareType')).Trim()
+    if ($fw -eq '1') { $o.Read = $true; $o.State = 'legacy' }
+    elseif ($fw -eq '2') { $o.Read = $true; $o.State = 'off' }          # (UEFI, and Windows wrote down no state: it is not on)
+    return $o
+}
+# Each on its own (one that cannot be read leaves the others): Dg = Get-SysDeviceGuard ($null when it could not be asked), Iommu, Sb (Secure Boot)
 function Get-SysSec {
-    $o = @{ Dg = $null; Iommu = $null }
+    $o = @{ Dg = $null; Iommu = $null; Sb = $null }
     try { $o.Dg = Get-SysDeviceGuard } catch { }
     try { $o.Iommu = Get-SysIommu } catch { }
+    try { $o.Sb = Get-SysSecureBoot } catch { }
+    return $o
+}
+# Fast startup (read only): HiberbootEnabled under HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Power (0 = off; 1 or not there =
+# on, the Windows default), the policy "Require use of fast startup" (HiberbootEnabled = 1 under HKLM\SOFTWARE\Policies\Microsoft\Windows\System)
+# and hibernation, which it needs (HibernateEnabled under HKLM\SYSTEM\CurrentControlSet\Control\Power, else HibernateEnabledDefault;
+# 0 = off). It can change while Windows runs, so it is read in every live pass (three registry values).
+# @{ Read; On (what Shut down does now); Setting (the switch in Power Options); Policy; Hib }
+function Get-SysFastStartup {
+    $o = @{ Read = $true; On = $true; Setting = $true; Policy = $false; Hib = $true }
+    $p = 'SYSTEM\CurrentControlSet\Control'
+    if (([string](Sys-RegGet 'HKLM' ($p + '\Session Manager\Power') 'HiberbootEnabled')).Trim() -eq '0') { $o.Setting = $false }
+    if (([string](Sys-RegGet 'HKLM' 'SOFTWARE\Policies\Microsoft\Windows\System' 'HiberbootEnabled')).Trim() -eq '1') { $o.Policy = $true }
+    $he = ([string](Sys-RegGet 'HKLM' ($p + '\Power') 'HibernateEnabled')).Trim()
+    if (-not $he) { $he = ([string](Sys-RegGet 'HKLM' ($p + '\Power') 'HibernateEnabledDefault')).Trim() }
+    if ($he -eq '0') { $o.Hib = $false }
+    $o.On = (($o.Setting -or $o.Policy) -and $o.Hib)
     return $o
 }
 
@@ -7666,7 +7789,7 @@ function Get-SysDisplays {
 function Get-SysLive {
     param([int]$Round, $Static)
     $o = @{ At = (Get-Date); CpuUsage = $null; CpuClockMHz = $null; Procs = $null; Threads = $null; RamUsedMB = $null; RamTotalMB = $null; Uptime = $null
-            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null; Timer = $null; Mouse = $null; UsbSs = $null }
+            Gpu = $null; Sensors = $null; Hwi = $false; HwiVia = ''; HwiWhy = ''; Lhm = $false; Smi = ''; Displays = $null; Storage = $null; Timer = $null; Mouse = $null; UsbSs = $null; FastStart = $null }
     if ($null -eq $script:SysPc) {
         $script:SysPc = Sys-PcNew
         Start-Sleep -Milliseconds 700          # a rate counter needs two readings a little apart
@@ -7706,6 +7829,7 @@ function Get-SysLive {
     if ($Round % 5 -eq 0) { $sd = $null; if ($Static) { $sd = $Static.Storage }; try { $o.Storage = Sys-StorageLive $sd } catch { } }
     # the mouse settings: every pass (three registry values); USB selective suspend runs powercfg, so every 5th round like the drives
     try { $o.Mouse = Get-SysMouse } catch { }
+    try { $o.FastStart = Get-SysFastStartup } catch { }
     if ($Round % 5 -eq 0) { try { $o.UsbSs = Get-SysUsbSuspend } catch { } }
     return $o
 }
@@ -12243,7 +12367,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '112'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '114'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -13476,6 +13600,31 @@ function Info-HvciLine {
     if (@($g.Configured) -contains 2) { return (Info-Line 'HVCI' 'Turned on, but not running' 'Text') }
     return (Info-Line 'HVCI' 'Off   (memory integrity)' 'Text')
 }
+function Info-SecureBootLine {
+    param($sec)
+    if (-not $sec) { return (Info-Line 'Secure Boot' 'Reading...' 'Dim') }
+    $s = $sec.Sb
+    if (-not $s -or -not $s.Read) { return (Info-Line 'Secure Boot' 'could not be read' 'Dim') }
+    switch ([string]$s.State) {
+        'on'     { return (Info-Line 'Secure Boot' 'On' 'Good') }
+        'off'    { return (Info-Line 'Secure Boot' 'Off   (it is switched on in the BIOS)' 'Warn') }
+        'legacy' { return (Info-Line 'Secure Boot' 'Not available   (legacy BIOS boot, CSM)' 'Warn') }
+    }
+    return (Info-Line 'Secure Boot' 'could not be read' 'Dim')
+}
+# Fast startup on the Windows card: green when it is off (Shut down then starts Windows and its drivers fresh), plain when it is on
+function Info-FastStartupLine {
+    param($lv)
+    if (-not $lv -or -not $lv.FastStart) { return (Info-Line 'Fast startup' 'Reading...' 'Dim') }
+    $f = $lv.FastStart
+    if (-not $f.Read) { return (Info-Line 'Fast startup' 'could not be read' 'Dim') }
+    if ($f.On) {
+        if ($f.Policy -and -not $f.Setting) { return (Info-Line 'Fast startup' 'On   (required by a policy)' 'Text') }
+        return (Info-Line 'Fast startup' 'On' 'Text')
+    }
+    if (-not $f.Hib -and ($f.Setting -or $f.Policy)) { return (Info-Line 'Fast startup' 'Off   (hibernation is off, which it needs)' 'Good') }
+    return (Info-Line 'Fast startup' 'Off' 'Good')
+}
 function Info-IommuLine {
     param($sec)
     if (-not $sec) { return (Info-Line 'IOMMU' 'Reading...' 'Dim') }
@@ -13548,6 +13697,10 @@ $script:InfoHelp = @{
                D = 'On for a clean install of Windows 11 on a PC that meets the requirements, together with memory integrity; an upgrade does not turn it on. Since October 2026 Windows updates also turn it on for eligible PCs that are already set up, unless it was turned off.' }
     hvci  = @{ T = 'Memory integrity (hypervisor-protected code integrity), in Windows Security under Device security > Core isolation. VBS checks every driver before it may run in the kernel, and a driver that does not pass is blocked. Microsoft has said it can lower gaming performance on some PCs. Headroom can switch it on its Security Prompts page; this line only shows what Windows reports.'
                D = 'On for a clean install of Windows 11 on hardware that meets the requirements (Intel 8th generation or AMD Zen 2 or newer, 8 GB of memory, an SSD, compatible drivers, virtualization on in the BIOS); an upgrade does not turn it on. Since October 2026 Windows updates also turn it on for eligible PCs that are already set up, unless it was turned off.' }
+    sboot = @{ T = 'Secure Boot, a feature of the UEFI firmware: the PC only starts a boot loader and early drivers that are signed with keys the firmware trusts, so nothing can slip in before Windows. Some anti-cheats refuse to run without it: Riot Vanguard on Windows 11 (VAN 9003), Battlefield 6 and Call of Duty: Black Ops 7. It is switched on or off in the BIOS / UEFI setup, not in Windows, and a PC that starts in legacy BIOS mode (CSM) cannot use it. This line shows what the firmware reported to Windows at the last start (HKLM\SYSTEM\CurrentControlSet\Control\SecureBoot\State).'
+               D = 'Not a Windows setting: it is set in the BIOS. PCs sold with Windows 11 have it on; a self-built PC can have it off until it is switched on in the BIOS.' }
+    fstart = @{ T = 'Fast startup (Control Panel > Power Options > Choose what the power buttons do). When it is on, Shut down does not end Windows completely: it signs you out, saves the Windows kernel and the drivers to the hibernation file, and the next start resumes them. Restart always does a full start. With it on, drivers do not start fresh after Shut down, which is why many gaming guides turn it off, and "Running for" keeps counting across Shut down. It needs hibernation. The setting Fast Startup and hibernation on the Power page turns both off.'
+               D = 'On, as long as hibernation is on (it is on most PCs).' }
     iommu = @{ T = 'The IOMMU (AMD-Vi on AMD, VT-d on Intel) lets Windows control which memory a device may reach. Windows uses it for Kernel DMA Protection, and Riot Vanguard needs it on. The firmware tells Windows about it in an ACPI table (IVRS on AMD, DMAR on Intel), and this line looks for that table: without one Windows has no IOMMU to use, which usually means it is off in the BIOS. "DMA protection available" is what Windows reports when it can use the IOMMU to protect memory.'
                D = 'Not a Windows setting: it is set in the BIOS (AMD: IOMMU or AMD-Vi; Intel: VT-d). When it is on, Windows turns on Kernel DMA Protection by itself on PCs that support it.' }
     mprec = @{ T = 'Enhance pointer precision, in the mouse settings of Windows (Additional mouse settings > Pointer Options). When it is on, the pointer goes further the faster you move the mouse, so the same hand movement does not always cover the same distance. Games that read the mouse directly (raw input, as most current shooters do) are not affected; the desktop and games that use the Windows pointer are. Headroom''s Mouse acceleration setting on the Gaming page turns it off. Green: off.'
@@ -13587,6 +13740,7 @@ function Info-OsCard {
     $day = Fmt-Day $o.Installed
     if ($day) { $lines += , (Info-Line 'Installed' $day) }
     if ($null -ne $up) { $lines += , (Info-Line 'Running for' (Fmt-Span $up)) }
+    $lines += , (Info-Help (Info-FastStartupLine $lv) 'fstart')
     if ($lv -and $null -ne $lv.Procs) { $lines += , (Info-Line 'Processes' (Fmt-N $lv.Procs 0)) } else { $lines += , (Info-Line 'Processes' 'Reading...' 'Dim') }
     if ($lv -and $null -ne $lv.Threads) { $lines += , (Info-Line 'Threads' (Fmt-N $lv.Threads 0)) }
     return (Info-Card 'info:os' 'Windows' $sub $lines)
@@ -13613,11 +13767,13 @@ function Info-TimerCard {
     return (Info-Card 'info:timer' 'Timer and clock' ($parts -join ', ') $lines)
 }
 
-# VBS, memory integrity and the IOMMU (read only): the card beside the timer card. Its name sums them up ("Memory integrity on, IOMMU on").
+# Secure Boot, VBS, memory integrity and the IOMMU (read only): the card beside the timer card. Its name sums them up ("Memory integrity on,
+# IOMMU on, Secure Boot on").
 function Info-SecCard {
     param($d)
     $sec = $d.Sec
     $lines = @()
+    $lines += , (Info-Help (Info-SecureBootLine $sec) 'sboot')
     $lines += , (Info-Help (Info-VbsLine $sec) 'vbs')
     $lines += , (Info-Help (Info-HvciLine $sec) 'hvci')
     $lines += , (Info-Help (Info-IommuLine $sec) 'iommu')
@@ -13630,6 +13786,7 @@ function Info-SecCard {
         elseif ($null -ne $g.Vbs -and [int]$g.Vbs -eq 0) { $parts += 'VBS off' }
     }
     if ($sec -and $sec.Iommu -and $sec.Iommu.Read) { if ([string]$sec.Iommu.Kind) { $parts += 'IOMMU on' } else { $parts += 'IOMMU off' } }
+    if ($sec -and $sec.Sb -and $sec.Sb.Read) { if ([string]$sec.Sb.State -eq 'on') { $parts += 'Secure Boot on' } else { $parts += 'Secure Boot off' } }
     return (Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines)
 }
 
@@ -16227,7 +16384,7 @@ function Ui-ShowPresets {
 $script:PC = $null
 function Ui-PlanCmpGeom {
     $g = @{ Pad = (Px 24); SetW = (Px 232); ColW = (Px 178); TitleY = (Px 18); SubY = (Px 56); LegendY = (Px 104); Top = (Px 140)
-            HeadH = (Px 96); GroupH = (Px 34); RowH = (Px 54); FootH = (Px 64) }
+            HeadH = (Px 118); GroupH = (Px 34); RowH = (Px 54); FootH = (Px 64) }
     $g.TableW = $g.SetW + 5 * $g.ColW
     $n = 0; $last = ''
     foreach ($r in $script:PlanCmpRows) { if ([string]$r.Group -ne $last) { $n++; $last = [string]$r.Group } }
@@ -16242,9 +16399,19 @@ function Ui-PlanCmpSourceText {
         'pc'     { return 'Read from this PC' }
         'file'   { return 'Not installed: from its plan file' }
         'ref'    { return 'Not installed: documented values' }
+        'defaults' { return 'Not installed: Windows'' defaults' }
         'unread' { return 'Installed: Windows listed nothing' }
     }
     return ''
+}
+# Balanced and High Performance read from this PC: do they match the defaults Windows keeps for them? @{ T; C } or $null
+function Ui-PlanCmpCheckText {
+    param($p)
+    if (-not $p.Check) { return $null }
+    $n = [int]$p.Check.Diff
+    if ($n -eq 0) { return @{ T = 'Same as Windows'' defaults'; C = $script:Th.Good } }
+    $w = 'settings differ'; if ($n -eq 1) { $w = 'setting differs' }
+    return @{ T = ('{0} {1} from Windows'' defaults' -f $n, $w); C = $script:Th.Warn }
 }
 # the mark before a value: a dot, a ring (Windows default) or a small dashed square (not set)
 function Ui-PlanCmpMark {
@@ -16308,10 +16475,12 @@ function Ui-PaintPlanCmp {
         Ui-Text $g ([string]$p.By) (Ui-Font 'small') $Th.Mute $cx ($top + (Px 34)) $cw (Px 18) $TF.L
         $sc = $Th.Sub; if ($p.Source -ne 'pc') { $sc = $Th.Dim }
         Ui-Text $g (Ui-PlanCmpSourceText $p) (Ui-Font 'small') $sc $cx ($top + (Px 52)) $cw (Px 18) $TF.L
+        $ck = Ui-PlanCmpCheckText $p
+        if ($ck) { Ui-Text $g ([string]$ck.T) (Ui-Font 'small') $ck.C $cx ($top + (Px 70)) $cw (Px 18) $TF.L }
         if ($p.Active) {
             $pw = (Ui-TextWidth 'Active plan' (Ui-Font 'smallb')) + (Px 16)
-            Ui-FillRound $g $Th.GoodSoft $cx ($top + (Px 72)) $pw (Px 20) (Px 10)
-            Ui-Text $g 'Active plan' (Ui-Font 'smallb') $Th.Good $cx ($top + (Px 72)) $pw (Px 20) $TF.C
+            Ui-FillRound $g $Th.GoodSoft $cx ($top + (Px 92)) $pw (Px 20) (Px 10)
+            Ui-Text $g 'Active plan' (Ui-Font 'smallb') $Th.Good $cx ($top + (Px 92)) $pw (Px 20) $TF.C
         }
     }
     $y = $top + $G.HeadH
@@ -16351,7 +16520,7 @@ function Ui-PaintPlanCmp {
         $lx2 = $x0 + $G.SetW + $i * $G.ColW
         Ui-Line $g $Th.Edge 1 $lx2 ($top + (Px 1)) $lx2 ($top + $G.TableH - (Px 1))
     }
-    $foot = 'Windows default: the plan leaves it to Windows. Not set: the plan file does not include it, so Windows uses its own default while that plan is active. Exact numbers for any plan: powercfg /q <plan ID> in a Command Prompt.'
+    $foot = 'Windows default: the plan leaves it to Windows. Not set: the plan file does not include it, so Windows uses its own default. Balanced and High Performance are compared with the defaults Windows keeps for them (what Restore plan defaults sets). Exact numbers: powercfg /q <plan ID>.'
     Ui-Text $g $foot (Ui-Font 'small') $Th.Mute $x0 ($top + $G.TableH + (Px 14)) ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
 }
 # reads the five plans (powercfg /list and /qh only) and sizes the table
