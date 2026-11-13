@@ -2471,6 +2471,170 @@ function Custom-Hibernate-Revert {
     [void](Pwr '/h' 'on'); Say '  powercfg /h on  (hibernation back)' 'DarkGray'
 }
 
+# ------------------------------------------------- comparing the power plans (read only) ----
+# What the "Compare Power Plans" window on the Power page shows: the five plans side by side, every value the plugged-in (AC) one. A plan
+# that is installed is read from this PC with "powercfg /qh <plan>", which only reads (and also lists the settings Windows hides). A plan
+# that is not installed shows what it would bring: Khorvie's and Endgame from their built-in plan files, Windows' own plans only where their
+# behaviour is documented, and "Windows default" for the rest. Nothing here changes anything.
+$script:PlanCmpRows = @(
+    @{ Id = 'min';   Group = 'Processor'; Name = 'Minimum processor state'; Hint = 'How low the CPU may clock when idle'; Set = '893dee8e-2bef-41e0-89c6-b55d0929964c' }
+    @{ Id = 'park';  Group = 'Processor'; Name = 'Core parking'; Hint = 'Idle cores put to sleep'; Set = '0cc5b647-c1df-4637-891a-dec35c318583' }
+    @{ Id = 'boost'; Group = 'Processor'; Name = 'Boost mode'; Hint = 'How eagerly the CPU boosts'; Set = 'be337238-0d82-4146-a960-4f3749d470c7' }
+    @{ Id = 'epp';   Group = 'Processor'; Name = 'Energy performance preference'; Hint = '0 = speed first, 100 = power first'; Set = '36687f9e-e3a5-4dbf-b1dc-15eb381c6863' }
+    @{ Id = 'ramp';  Group = 'Processor'; Name = 'Ramp-up policy'; Hint = 'How fast clocks rise under load'; Set = '465e1f50-b610-473a-ab58-00d1077dc418' }
+    @{ Id = 'thr';   Group = 'Processor'; Name = 'Throttle states'; Hint = 'Clock-modulation power saving'; Set = '3b04d4fd-1cc7-4f23-ab1c-d1337819c4bb' }
+    @{ Id = 'idle';  Group = 'Processor'; Name = 'CPU idle states'; Hint = 'C-states when a core has nothing to do'; Set = '5d76a2ca-e8c0-402f-a133-2158492d58ad' }
+    @{ Id = 'irq';   Group = 'Processor'; Name = 'Interrupt steering'; Hint = 'Where device interrupts go'; Set = '2bfc24f9-5ea2-4801-8213-3dbae01aa39d' }
+    @{ Id = 'usbss'; Group = 'Devices and drives'; Name = 'USB selective suspend'; Hint = 'Idle USB devices powered down'; Set = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' }
+    @{ Id = 'usb3';  Group = 'Devices and drives'; Name = 'USB 3 link power management'; Hint = 'Low-power link states on USB 3'; Set = 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' }
+    @{ Id = 'aspm';  Group = 'Devices and drives'; Name = 'PCI Express link power'; Hint = 'ASPM on the GPU and NVMe links'; Set = 'ee12f906-d277-404b-b6da-e5fa1a576df5' }
+    @{ Id = 'wifi';  Group = 'Devices and drives'; Name = 'Wi-Fi adapter power saving'; Hint = 'Wireless power-saving mode'; Set = '12bbebe6-58d6-4636-95bb-3217ef867c1a' }
+    @{ Id = 'disk';  Group = 'Devices and drives'; Name = 'Turn off hard disk after'; Hint = 'Drive power-down'; Set = '6738e2c4-e8a5-4a42-b16a-e040e769756e' }
+    @{ Id = 'disp';  Group = 'Display, sleep and wake'; Name = 'Turn off display after'; Hint = 'Screen timeout'; Set = '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' }
+    @{ Id = 'sleep'; Group = 'Display, sleep and wake'; Name = 'Sleep'; Hint = 'When the PC goes to sleep on its own'; Set = '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Set2 = 'abfc2519-3608-4c2a-94ea-171b0ed546ab' }
+    @{ Id = 'wake';  Group = 'Display, sleep and wake'; Name = 'Wake timers'; Hint = 'Scheduled tasks waking the PC'; Set = 'bd3b718a-0680-4d9d-8ab2-e1d2b4ac806d' }
+)
+# What a plan that is not installed would bring. A number is the setting's index as powercfg shows it, 'unset' = the plan file does not
+# include it (Windows then uses its own default), a hashtable is a fixed text, and a row that is left out is Windows' default. Sleep is
+# @(timeout in seconds, "allow standby states"), -1 = not in the file. Khorvie's and Endgame come from their plan files; Windows' own plans
+# only where Microsoft documents them (High Performance and Ultimate keep the processor at its highest state with every core unparked).
+$script:PlanCmpRef = @{
+    PlanBalanced = @{ min = 5; park = @{ T = 'On: idle cores park'; K = 'save' }; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
+    PlanHighPerf = @{ min = 100; park = 100; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
+    Ultimate     = @{ min = 100; park = 100; idle = 0; usbss = 0; usb3 = 0; wifi = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
+    Khorvie      = @{ min = 100; park = 'unset'; boost = 2; epp = 'unset'; ramp = 2; thr = 0; idle = 0; irq = 6; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; disk = 0; disp = 0; sleep = @(-1, 1); wake = 0 }
+    Endgame      = @{ min = 100; park = 100; boost = 5; epp = 0; ramp = 2; thr = 0; idle = 0; irq = 6; usbss = 0; usb3 = 0; aspm = 0; wifi = 0; disk = 0; disp = 0; sleep = @(0, 0); wake = 0 }
+}
+$script:PlanCmpBy = @{
+    PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft, tuned by Headroom'
+    Khorvie = 'Khorvie (third party)'; Endgame = 'gavot (third party)'
+}
+# The plugged-in value of every setting in "powercfg /q(h)" output: setting ID -> number. The words around the numbers are in the language of
+# Windows, so the lines are told apart by their place: the plan's line, then a subgroup a little further in, then each setting further in
+# again; a setting's own "current" lines are as far in as the setting's ID line (AC first, then DC), its range lines are further in.
+function Pwr-ParseQuery {
+    param([string]$Text)
+    $o = @{}
+    $subInd = -1; $setInd = -1; $cur = ''; $vals = @()
+    foreach ($ln in ($Text -split "`r?`n")) {
+        if (-not $ln.Trim()) { continue }
+        $ind = $ln.Length - $ln.TrimStart().Length
+        $m = [regex]::Match($ln, $script:GuidRx)
+        if ($m.Success) {
+            if ($cur -and $vals.Count) { $o[$cur] = $vals[0] }
+            $cur = ''; $vals = @()
+            if ($subInd -lt 0 -or $ind -le $subInd) {
+                if ($ind -gt 0) { $subInd = $ind }                     # (the plan's own line is the one at the left edge)
+            } else {
+                $setInd = $ind; $cur = $m.Value.ToLower()
+            }
+            continue
+        }
+        if ($cur -and $ind -eq $setInd) {
+            $h = [regex]::Match($ln, ':\s*0x([0-9a-fA-F]+)\s*$')
+            if ($h.Success) { $vals += [Convert]::ToInt64($h.Groups[1].Value, 16) }
+        }
+    }
+    if ($cur -and $vals.Count) { $o[$cur] = $vals[0] }
+    return $o
+}
+function PlanCmp-Time {
+    param([int64]$s)
+    if ($s % 3600 -eq 0 -and $s -ge 3600) { return ('{0} h' -f ($s / 3600)) }
+    if ($s % 60 -eq 0) { return ('{0} min' -f ($s / 60)) }
+    return ('{0} s' -f $s)
+}
+# One cell: @{ T = the text; K = speed | save | block | none | def (Windows' default) | unset (not in the plan, or not listed) }
+function PlanCmp-Cell {
+    param([string]$Id, $v, $v2 = $null)
+    if ($v -is [hashtable]) { return $v }
+    if ($Id -eq 'sleep') {
+        if ($null -ne $v2 -and [string]$v2 -ne 'unset' -and [int64]$v2 -eq 0) { return @{ T = 'Blocked (sleep states off)'; K = 'block' } }
+        if ($null -eq $v -or [string]$v -eq 'unset' -or [int64]$v -lt 0) { return @{ T = 'Allowed'; K = 'def' } }
+        if ([int64]$v -eq 0) { return @{ T = 'Never on its own'; K = 'none' } }
+        return @{ T = ('After ' + (PlanCmp-Time ([int64]$v))); K = 'save' }
+    }
+    if ([string]$v -eq 'unset') { return @{ T = 'Not set'; K = 'unset' } }
+    if ($null -eq $v) { return @{ T = 'Windows default'; K = 'def' } }
+    $n = [int64]$v
+    switch ($Id) {
+        'min'   { if ($n -ge 100) { return @{ T = '100%'; K = 'speed' } }; return @{ T = ('{0}%' -f $n); K = 'save' } }
+        'park'  { if ($n -ge 100) { return @{ T = 'Off: all cores unparked'; K = 'speed' } }; return @{ T = ('On: {0}% of cores stay unparked' -f $n); K = 'save' } }
+        'boost' {
+            $nm = @('Disabled', 'Enabled', 'Aggressive', 'Efficient Enabled', 'Efficient Aggressive', 'Aggressive At Guaranteed', 'Efficient Aggressive At Guaranteed')
+            $t = ('Mode {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }
+            $k = 'none'; if ($n -eq 2 -or $n -eq 5) { $k = 'speed' } elseif ($n -eq 0) { $k = 'save' }
+            return @{ T = $t; K = $k }
+        }
+        'epp'   { if ($n -eq 0) { return @{ T = '0 (speed first)'; K = 'speed' } }; $k = 'none'; if ($n -ge 50) { $k = 'save' }; return @{ T = [string]$n; K = $k } }
+        'ramp'  {
+            $nm = @('Ideal', 'Single step', 'Rocket (straight to the top)', 'Ideal Aggressive')
+            $t = ('Policy {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }
+            $k = 'none'; if ($n -eq 2) { $k = 'speed' }
+            return @{ T = $t; K = $k }
+        }
+        'thr'   { if ($n -eq 0) { return @{ T = 'Off'; K = 'speed' } }; if ($n -eq 1) { return @{ T = 'On'; K = 'save' } }; return @{ T = 'Automatic'; K = 'none' } }
+        'idle'  { if ($n -eq 0) { return @{ T = 'Allowed'; K = 'none' } }; return @{ T = 'Off: cores never idle'; K = 'speed' } }
+        'irq'   {
+            $nm = @('Default', 'Any processor', 'Any unparked processor, with delay', 'Any unparked processor', 'Lock interrupt routing', 'Processor 0', 'Processor 1')
+            if ($n -eq 0) { return @{ T = 'Default'; K = 'none' } }
+            $t = ('Mode {0}' -f $n); if ($n -gt 0 -and $n -lt $nm.Count) { $t = ('Mode {0}: {1}' -f $n, $nm[$n].ToLower()) }
+            return @{ T = $t; K = 'none' }
+        }
+        'usbss' { if ($n -eq 0) { return @{ T = 'Off'; K = 'speed' } }; return @{ T = 'On'; K = 'save' } }
+        'usb3'  { $nm = @('Off', 'Minimum power savings', 'Moderate power savings', 'Maximum power savings'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
+        'aspm'  { $nm = @('Off', 'Moderate power savings', 'Maximum power savings'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
+        'wifi'  { $nm = @('Maximum performance', 'Low power saving', 'Medium power saving', 'Maximum power saving'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
+        'disk'  { if ($n -eq 0) { return @{ T = 'Never'; K = 'speed' } }; return @{ T = (PlanCmp-Time $n); K = 'save' } }
+        'disp'  { if ($n -eq 0) { return @{ T = 'Never'; K = 'speed' } }; return @{ T = (PlanCmp-Time $n); K = 'none' } }
+        'wake'  { if ($n -eq 0) { return @{ T = 'Off'; K = 'speed' } }; if ($n -eq 2) { return @{ T = 'Important ones only'; K = 'none' } }; return @{ T = 'On'; K = 'none' } }
+    }
+    return @{ T = [string]$n; K = 'none' }
+}
+# The five plans: Key, Name, By, Guid, Installed, Active, Source (pc = read from this PC, file = from its built-in plan file, ref = documented
+# values, unread = installed but Windows listed none of its settings) and Cells (row id -> cell). Only reads: powercfg /list and /qh.
+function Get-PlanCompare {
+    $plans = @(Pwr-Plans)
+    $act = ''; foreach ($x in $plans) { if ($x.Active) { $act = [string]$x.Guid } }
+    $store = $null; try { $store = Get-Store } catch { }
+    $out = @()
+    foreach ($key in @($script:PlanDefs.Keys)) {
+        $def = $script:PlanDefs[$key]
+        $mine = $null
+        foreach ($t in @($script:Catalog | Where-Object { [string]$_.Plan -eq $key })) {
+            if ($store -and $store.ContainsKey([string]$t.Id) -and $store[[string]$t.Id].Custom) { $mine = $store[[string]$t.Id].Custom[$key] }
+        }
+        $at = @(Plan-Where $key $mine $plans)
+        $p = [ordered]@{ Key = [string]$key; Name = [string]$def.Name; By = [string]$script:PlanCmpBy[$key]; Guid = [string]$def.Guid; Installed = ($at.Count -gt 0); Active = $false; Source = ''; Cells = @{} }
+        if ($at.Count) {
+            $g = [string]$at[0]
+            $p.Guid = $g; $p.Active = ($g -eq $act)
+            $vals = @{}; try { $vals = Pwr-ParseQuery (Pwr '/qh' $g) } catch { }
+            if ($vals.Count -eq 0) { $p.Source = 'unread' } else { $p.Source = 'pc' }
+            foreach ($r in $script:PlanCmpRows) {
+                if ($p.Source -eq 'unread') { $p.Cells[$r.Id] = @{ T = 'Could not be read'; K = 'unset' }; continue }
+                $v = $null; if ($vals.ContainsKey([string]$r.Set)) { $v = $vals[[string]$r.Set] }
+                $v2 = $null; if ($r.Set2 -and $vals.ContainsKey([string]$r.Set2)) { $v2 = $vals[[string]$r.Set2] }
+                if ($null -eq $v -and $r.Id -ne 'sleep') { $p.Cells[$r.Id] = @{ T = 'Not listed by Windows'; K = 'unset' }; continue }
+                $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
+            }
+        } else {
+            $p.Source = 'ref'; if ($def.Kind -eq 'file') { $p.Source = 'file' }
+            $ref = $script:PlanCmpRef[$key]
+            foreach ($r in $script:PlanCmpRows) {
+                $v = $null; $v2 = $null
+                if ($ref -and $ref.ContainsKey([string]$r.Id)) {
+                    $x = $ref[[string]$r.Id]
+                    if ($r.Id -eq 'sleep' -and $x -is [array]) { $v = $x[0]; $v2 = $x[1] } else { $v = $x }
+                }
+                $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
+            }
+        }
+        $out += ,$p
+    }
+    return $out
+}
+
 # -------------------------------------------------------- USB devices --------
 function Usb-Devices {
     if (-not $script:Cache.ContainsKey('usb')) {
@@ -4213,6 +4377,7 @@ $cVpn    = $cRemote           # the one VPN setting lives on the Remote access p
 $cShare  = 'Network sharing and discovery'
 $cNic    = 'Network adapters and USB power'
 $cPower  = 'Power plan and startup'
+$script:PowerCat = $cPower             # the window puts "Compare Power Plans" on this page
 $cGame   = 'Gaming and performance'
 $script:DisplayCat = 'Display'          # the window puts its live display cards on this page
 $cDisplay = $script:DisplayCat
@@ -11697,7 +11862,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '109'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '110'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -12205,12 +12370,16 @@ function Ui-UpdatePage {
     $hh = [int]$script:M.HeaderH
     if ($isInfo) { $hh = [int]$script:M.HeaderInfoH }
     if ($ui.header -and [int]$ui.header.Height -ne $hh) { $ui.header.Height = $hh }
-    # the button that belongs to the page (Display settings / Start HWiNFO), left of the search box
+    # the button that belongs to the page (Display settings / Start HWiNFO / Compare Power Plans), left of the search box
     $pb = $ui.pageBtn
     if ($pb) {
         $pt = Ui-PageButtonText $page
         $want = [bool]($pt -ne '')
-        if ($want -and [string]$pb.Text -ne $pt) { $pb.Text = $pt }
+        if ($want -and [string]$pb.Text -ne $pt) {
+            $pb.Text = $pt
+            $bw = [Math]::Max((Px 140), ((Ui-TextWidth $pt (Ui-Font 'btn')) + (Px 36)))     # (as wide as its text needs)
+            if ([int]$pb.Width -ne $bw) { $pb.Width = $bw }
+        }
         if ([bool]$pb.Visible -ne $want) { $pb.Visible = $want }
         Ui-PlacePageBtn
     }
@@ -12418,7 +12587,7 @@ function Ui-Build {
     $btnApplyAll = New-Btn 'Apply all' 128 'accent' 'Applies every setting on this page: each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on). You are asked to confirm first.' 34
     $btnApplyAll.Top = (Px 141)            # in the same row as "Tweak all" and "Reset all": the three page actions sit together
     $btnApplyAll.Visible = $false
-    $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), or open Windows display settings (Display).' 32
+    $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), open Windows display settings (Display), or compare the five power plans side by side (Power; it only reads).' 32
     $btnPage.Top = (Px 24)
     $btnPage.Visible = $false
     # the search box lives in the side menu, under the app name
@@ -13794,6 +13963,7 @@ function Ui-PageButtonText {
     param([string]$page)
     if ($page -eq $script:DisplayCat) { return 'Display settings' }
     if ($page -eq $script:PageHome) { return 'Start HWiNFO' }
+    if ($page -eq $script:PowerCat) { return 'Compare Power Plans' }
     return ''
 }
 function Ui-DoPageButton {
@@ -13802,7 +13972,8 @@ function Ui-DoPageButton {
         try { Start-Process -FilePath 'ms-settings:display-advanced' } catch { Ui-Status ('Could not open Settings: ' + $_.Exception.Message) }
         return
     }
-    if ($page -eq $script:PageHome) { Ui-StartHwinfo }
+    if ($page -eq $script:PageHome) { Ui-StartHwinfo; return }
+    if ($page -eq $script:PowerCat) { Ui-ShowPlanCmp }      # (it only reads the power plans)
 }
 
 # ----------------------------------------------------------- start HWiNFO ----
@@ -15650,6 +15821,225 @@ function Ui-ShowPresets {
     # the Custom tab of the list shows the saved configuration: it may have changed in the window
     if ($changed -and [string]$script:Mode -eq 'Personal') { Ui-OnFilterChanged }
     if ($res) { Ui-DoPreset $res }
+}
+
+# ----------------------------------------------------------- Compare Power Plans ----
+# The window behind "Compare Power Plans" on the Power page: the five power plans side by side (Get-PlanCompare). It only reads: a plan
+# that is installed is read from this PC with "powercfg /qh", the others show what they would bring. One painted table that scrolls, and
+# Close. The colour of the dot before a value says what it does: purple = set for speed, orange = saves power, red = blocks something,
+# a ring = Windows' own default, a dashed square = not set by the plan (Windows uses its default) or not listed by Windows.
+$script:PC = $null
+function Ui-PlanCmpGeom {
+    $g = @{ Pad = (Px 24); SetW = (Px 232); ColW = (Px 178); TitleY = (Px 18); SubY = (Px 56); LegendY = (Px 104); Top = (Px 140)
+            HeadH = (Px 96); GroupH = (Px 34); RowH = (Px 54); FootH = (Px 64) }
+    $g.TableW = $g.SetW + 5 * $g.ColW
+    $n = 0; $last = ''
+    foreach ($r in $script:PlanCmpRows) { if ([string]$r.Group -ne $last) { $n++; $last = [string]$r.Group } }
+    $g.TableH = $g.HeadH + $n * $g.GroupH + @($script:PlanCmpRows).Count * $g.RowH
+    $g.W = $g.Pad * 2 + $g.TableW
+    $g.H = $g.Top + $g.TableH + $g.FootH
+    return $g
+}
+function Ui-PlanCmpSourceText {
+    param($p)
+    switch ([string]$p.Source) {
+        'pc'     { return 'Read from this PC' }
+        'file'   { return 'Not installed: from its plan file' }
+        'ref'    { return 'Not installed: documented values' }
+        'unread' { return 'Installed: Windows listed nothing' }
+    }
+    return ''
+}
+# the mark before a value: a dot, a ring (Windows default) or a small dashed square (not set)
+function Ui-PlanCmpMark {
+    param($g, [string]$kind, [int]$x, [int]$cy)
+    $Th = $script:Th
+    $d = Px 9
+    $y = $cy - [int]($d / 2)
+    switch ($kind) {
+        'speed' { Ui-FillOval $g $Th.Accent $x $y $d $d }
+        'save'  { Ui-FillOval $g $Th.Warn $x $y $d $d }
+        'block' { Ui-FillOval $g $Th.Bad $x $y $d $d }
+        'none'  { Ui-FillOval $g $Th.Sub $x $y $d $d }
+        'def'   { Ui-StrokeOval $g $Th.Mute 1.5 $x $y $d $d }
+        default { Ui-StrokeRound $g $Th.Dim 1.2 $x $y $d $d (Px 2) }
+    }
+}
+function Ui-PlanCmpTextColor {
+    param([string]$kind)
+    if ($kind -eq 'def') { return $script:Th.Mute }
+    if ($kind -eq 'unset') { return $script:Th.Dim }
+    return $script:Th.Text
+}
+function Ui-PaintPlanCmp {
+    param($g)
+    $Th = $script:Th
+    $TF = $script:TF
+    $pc = $script:PC
+    if (-not $pc) { return }
+    $G = Ui-PlanCmpGeom
+    $x0 = $G.Pad
+    Ui-Fill $g $Th.Bg 0 0 $G.W $G.H
+    Ui-Text $g 'Compare Power Plans' (Ui-Font 'detTitle') $Th.Text $x0 $G.TitleY $G.TableW (Px 32) $TF.L
+    $sub = 'The five plans on the Power page side by side, with the values used when the PC is plugged in. A plan that is installed is read from this PC (powercfg /qh, which only reads); a plan that is not installed shows what it would bring. Nothing here changes anything.'
+    Ui-Text $g $sub (Ui-Font 'body') $Th.Sub $x0 $G.SubY ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
+    # the legend
+    $lx = $x0; $ly = $G.LegendY + (Px 10)
+    foreach ($it in @(@('speed', 'Set for speed'), @('save', 'Saves power'), @('block', 'Blocks something'), @('def', 'Windows default'), @('unset', 'Not set by the plan'))) {
+        Ui-PlanCmpMark $g ([string]$it[0]) $lx $ly
+        $tw = Ui-TextWidth ([string]$it[1]) (Ui-Font 'small')
+        Ui-Text $g ([string]$it[1]) (Ui-Font 'small') $Th.Sub ($lx + (Px 15)) ($ly - (Px 10)) ($tw + (Px 6)) (Px 20) $TF.L
+        $lx += (Px 15) + $tw + (Px 22)
+    }
+    if ($pc.Error) {
+        Ui-Text $g ('The power plans could not be read: ' + [string]$pc.Error) (Ui-Font 'body') $Th.Bad $x0 $G.Top $G.TableW (Px 40) $TF.W
+        return
+    }
+    $plans = @($pc.Plans)
+    $top = $G.Top
+    Ui-FillRound $g $Th.Card $x0 $top $G.TableW $G.TableH $script:M.Radius
+    # the column of the active plan is tinted from top to bottom
+    for ($i = 0; $i -lt $plans.Count; $i++) {
+        if ($plans[$i].Active) { Ui-Fill $g $Th.TintApply ($x0 + $G.SetW + $i * $G.ColW) ($top + (Px 1)) $G.ColW ($G.TableH - (Px 2)) }
+    }
+    # the head: the name, who made it, where the values come from, and "Active plan"
+    Ui-Text $g 'SETTING' (Ui-Font 'cap') $Th.Mute ($x0 + (Px 16)) ($top + $G.HeadH - (Px 30)) ($G.SetW - (Px 24)) (Px 20) $TF.L
+    for ($i = 0; $i -lt $plans.Count; $i++) {
+        $p = $plans[$i]
+        $cx = $x0 + $G.SetW + $i * $G.ColW + (Px 14)
+        $cw = $G.ColW - (Px 24)
+        Ui-Text $g ([string]$p.Name) (Ui-Font 'rowName') $Th.Text $cx ($top + (Px 12)) $cw (Px 22) $TF.L
+        Ui-Text $g ([string]$p.By) (Ui-Font 'small') $Th.Mute $cx ($top + (Px 34)) $cw (Px 18) $TF.L
+        $sc = $Th.Sub; if ($p.Source -ne 'pc') { $sc = $Th.Dim }
+        Ui-Text $g (Ui-PlanCmpSourceText $p) (Ui-Font 'small') $sc $cx ($top + (Px 52)) $cw (Px 18) $TF.L
+        if ($p.Active) {
+            $pw = (Ui-TextWidth 'Active plan' (Ui-Font 'smallb')) + (Px 16)
+            Ui-FillRound $g $Th.GoodSoft $cx ($top + (Px 72)) $pw (Px 20) (Px 10)
+            Ui-Text $g 'Active plan' (Ui-Font 'smallb') $Th.Good $cx ($top + (Px 72)) $pw (Px 20) $TF.C
+        }
+    }
+    $y = $top + $G.HeadH
+    Ui-Line $g $Th.Edge 1 $x0 $y ($x0 + $G.TableW) $y
+    $last = ''
+    $fv = Ui-Font 'row'
+    $vw = $G.ColW - (Px 44)
+    foreach ($r in $script:PlanCmpRows) {
+        if ([string]$r.Group -ne $last) {
+            $last = [string]$r.Group
+            Ui-Fill $g $Th.Hover ($x0 + (Px 1)) $y ($G.TableW - (Px 2)) $G.GroupH
+            Ui-Text $g $last.ToUpper() (Ui-Font 'cap') $Th.Sub ($x0 + (Px 16)) $y ($G.TableW - (Px 32)) $G.GroupH $TF.L
+            $y += $G.GroupH
+        }
+        Ui-Text $g ([string]$r.Name) (Ui-Font 'uib') $Th.Text ($x0 + (Px 16)) ($y + (Px 9)) ($G.SetW - (Px 28)) (Px 20) $TF.L
+        if ($r.Hint) { Ui-Text $g ([string]$r.Hint) (Ui-Font 'small') $Th.Mute ($x0 + (Px 16)) ($y + (Px 29)) ($G.SetW - (Px 28)) (Px 18) $TF.L }
+        for ($i = 0; $i -lt $plans.Count; $i++) {
+            $c = $plans[$i].Cells[[string]$r.Id]
+            if (-not $c) { continue }
+            $cx = $x0 + $G.SetW + $i * $G.ColW + (Px 14)
+            $t = [string]$c.T
+            $col = Ui-PlanCmpTextColor ([string]$c.K)
+            if ((Ui-TextWidth $t $fv) -le $vw) {
+                Ui-PlanCmpMark $g ([string]$c.K) $cx ($y + [int]($G.RowH / 2))
+                Ui-Text $g $t $fv $col ($cx + (Px 16)) $y $vw $G.RowH $TF.L
+            } else {
+                # two lines, from the top, the mark level with the first
+                Ui-PlanCmpMark $g ([string]$c.K) $cx ($y + (Px 17))
+                Ui-Text $g $t $fv $col ($cx + (Px 16)) ($y + (Px 8)) $vw ($G.RowH - (Px 10)) $TF.W
+            }
+        }
+        $y += $G.RowH
+        Ui-Line $g $Th.Edge 1 ($x0 + (Px 12)) $y ($x0 + $G.TableW - (Px 12)) $y
+    }
+    # the column lines
+    for ($i = 0; $i -le $plans.Count - 1; $i++) {
+        $lx2 = $x0 + $G.SetW + $i * $G.ColW
+        Ui-Line $g $Th.Edge 1 $lx2 ($top + (Px 1)) $lx2 ($top + $G.TableH - (Px 1))
+    }
+    $foot = 'Windows default: the plan leaves it to Windows. Not set: the plan file does not include it, so Windows uses its own default while that plan is active. Exact numbers for any plan: powercfg /q <plan ID> in a Command Prompt.'
+    Ui-Text $g $foot (Ui-Font 'small') $Th.Mute $x0 ($top + $G.TableH + (Px 14)) ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
+}
+# reads the five plans (powercfg /list and /qh only) and sizes the table
+function Ui-PlanCmpRead {
+    $pc = $script:PC
+    if (-not $pc) { return }
+    $pc.Error = ''
+    try { $pc.Plans = @(Get-PlanCompare) } catch { $pc.Plans = @(); $pc.Error = $_.Exception.Message }
+    $pc.When = (Get-Date).ToString('HH:mm')
+    $G = Ui-PlanCmpGeom
+    $pc.Table.Size = New-Object System.Drawing.Size($G.W, $G.H)
+    $n = @($pc.Plans | Where-Object { $_.Installed }).Count
+    if ($pc.Error) { $pc.Status.Text = 'The power plans could not be read.' }
+    else { $pc.Status.Text = ('Read at {0}: {1} of the 5 plans are installed on this PC. Nothing was changed.' -f $pc.When, $n) }
+    $pc.Table.Invalidate()
+}
+function Ui-BuildPlanCmpWindow {
+    $Th = $script:Th
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Compare Power Plans'
+    $f.Font = (Ui-Font 'ui')
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $f.MaximizeBox = $true
+    $f.MinimizeBox = $false
+    $f.ShowInTaskbar = $false
+    $f.BackColor = $Th.Bg
+    $G = Ui-PlanCmpGeom
+    $wa = Ui-WorkArea
+    $w = [Math]::Min(($G.W + (Px 24)), ([int]$wa.Width - (Px 40)))
+    $h = [Math]::Min(($G.H + (Px 64)), ([int]$wa.Height - (Px 90)))
+    $f.ClientSize = New-Object System.Drawing.Size($w, $h)
+    $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 640), $w), [Math]::Min((Px 420), $h))
+    $bar = New-Pnl 'Bottom' (Px 64) $Th.Bg
+    $close = New-Btn 'Close' 100 'secondary' 'Close this window. Nothing was changed.' 36
+    $close.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $close.Location = New-Object System.Drawing.Point((Px 24), (Px 14))
+    $status = New-Object System.Windows.Forms.Label
+    $status.AutoSize = $false
+    $status.Font = (Ui-Font 'small')
+    $status.ForeColor = $Th.Mute
+    $status.BackColor = $Th.Bg
+    $status.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $status.Location = New-Object System.Drawing.Point((Px 140), (Px 14))
+    $status.Size = New-Object System.Drawing.Size([Math]::Max((Px 200), ($w - (Px 164))), (Px 36))
+    $status.Text = 'Reading the power plans...'
+    $bar.Controls.Add($close)
+    $bar.Controls.Add($status)
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $scroll.AutoScroll = $true
+    $scroll.BackColor = $Th.Bg
+    $tbl = New-Object System.Windows.Forms.Control
+    $tbl.BackColor = $Th.Bg
+    $tbl.Location = New-Object System.Drawing.Point(0, 0)
+    $tbl.Size = New-Object System.Drawing.Size($G.W, $G.H)
+    Ui-DoubleBuffer $tbl
+    $tbl.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintPlanCmp $e.Graphics } catch { Ui-Fail $_ } })
+    $scroll.Controls.Add($tbl)
+    $f.Controls.Add($scroll)
+    $f.Controls.Add($bar)
+    $f.CancelButton = $close
+    $f.ActiveControl = $close
+    $script:PC = @{ Form = $f; Table = $tbl; Scroll = $scroll; Status = $status; Close = $close; Plans = @(); When = ''; Error = '' }
+    $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+    $scroll.Add_HandleCreated({ param($s, $e) try { Ui-DarkScroll $s } catch { } })
+    $f.Add_Load({ param($s, $e) try { Ui-PlanCmpRead } catch { Ui-Fail $_ } })
+    return $f
+}
+# The "Compare Power Plans" button on the Power page
+function Ui-ShowPlanCmp {
+    $f = Ui-BuildPlanCmpWindow
+    if (-not $f) { return }
+    $old = $null
+    try {
+        try { $old = [System.Windows.Forms.Cursor]::Current; [System.Windows.Forms.Cursor]::Current = [System.Windows.Forms.Cursors]::WaitCursor } catch { }
+        $owner = $script:UI.form
+        if ($owner) { [void]$f.ShowDialog($owner) } else { [void]$f.ShowDialog() }
+    } finally {
+        try { if ($old) { [System.Windows.Forms.Cursor]::Current = $old } } catch { }
+        try { $f.Dispose() } catch { }
+        $script:PC = $null
+    }
 }
 
 # =============================================================================
