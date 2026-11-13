@@ -1931,7 +1931,7 @@ function New-RestorePoint {
 # How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
 # slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
 # 3 apps and USB,  4 optional features,  5 capabilities
-$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlanBalanced = 1; PlanHighPerf = 1; Ultimate = 1; Khorvie = 1; LowLatency = 1 }
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlanBalanced = 1; PlanHighPerf = 1; Ultimate = 1; UltimateMod = 1; Khorvie = 1; LowLatency = 1 }
 function Get-ScanWeight {
     param($t)
     $w = 0
@@ -2639,10 +2639,21 @@ function Plan-BuildFromFile {
 # one off deletes that plan and no other: when it is the active plan another one is made active first (Balanced, else High
 # Performance, else Ultimate Performance, else the first other plan), and the last plan on the PC is never deleted. "Make active" on a
 # card (Invoke-Plan action 'Activate') makes that plan the active one.
+# Ultimate Plan Modified: Windows' own Ultimate Performance plan with the three changes Headroom made inside Ultimate Performance up to build
+# 112, under an ID of its own, so that Windows' Ultimate Performance can stay as Windows ships it next to it. Each change is set for plugged
+# in (AC) and on battery (DC).
+$script:UltimateModGuid = '96159c62-1115-4153-83ea-271a2032c250'
+$script:UltimateModChanges = @(
+    @{ Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Set = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; AC = 0; DC = 0; What = 'USB selective suspend off' }
+    @{ Sub = '2a737441-1930-4402-8d77-b2bebba308a3'; Set = 'd4e98f31-5ffe-4ce1-be31-1b38b384c009'; AC = 0; DC = 0; What = 'USB 3 link power management off' }
+    @{ Sub = '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1'; Set = '12bbebe6-58d6-4636-95bb-3217ef867c1a'; AC = 0; DC = 0; What = 'Wi-Fi adapter power saving at Maximum performance' }
+)
 $script:PlanDefs = [ordered]@{
     PlanBalanced = @{ Guid = $script:BalancedTemplate; Name = 'Balanced'; Kind = 'windows'; NameRx = '' }
     PlanHighPerf = @{ Guid = $script:HighPerfTemplate; Name = 'High Performance'; Kind = 'windows'; NameRx = '' }
     Ultimate     = @{ Guid = $script:UltimateTemplate; Name = 'Ultimate Performance'; Kind = 'windows'; NameRx = '^Ultimate Performance$' }
+    UltimateMod  = @{ Guid = $script:UltimateModGuid; Name = 'Ultimate Plan Modified'; Kind = 'mod'; NameRx = ''; From = $script:UltimateTemplate
+                      Desc = 'Ultimate Performance with USB selective suspend, USB 3 link power management and Wi-Fi power saving off (made by Headroom).'; Changes = $script:UltimateModChanges }
     Khorvie      = @{ Guid = [string]$script:BuiltinPlans.Khorvie.Guid; Name = [string]$script:BuiltinPlans.Khorvie.Name; Kind = 'file'; NameRx = '' }
     LowLatency   = @{ Guid = [string]$script:BuiltinPlans.LowLatency.Guid; Name = [string]$script:BuiltinPlans.LowLatency.Name; Kind = 'file'; NameRx = '' }
 }
@@ -2668,7 +2679,7 @@ function Plan-Mine {
     return $null
 }
 # "Balanced plan", but "Low Latency Power Plan" and "Khorvie's PowerPlan" as they are (no "plan plan")
-function Plan-Label { param([string]$Name) if ($Name -match '(?i)plan$') { return $Name }; return ($Name + ' plan') }
+function Plan-Label { param([string]$Name) if ($Name -match '(?i)plan$' -or $Name -match '(?i)\bplan\b') { return $Name }; return ($Name + ' plan') }
 function Plan-Detect {
     param([string]$Key)
     $def = $script:PlanDefs[$Key]
@@ -2691,8 +2702,6 @@ function Plan-Snapshot {
     param([string]$Key)
     return @{ Had = (@(Plan-Where $Key $null).Count -gt 0); New = '' }
 }
-# Ultimate Performance comes with Headroom's own changes inside it: USB selective suspend, USB 3 link power management and the
-# Wi-Fi adapter's power saving off
 # After Balanced or High Performance is installed: every value is checked against the defaults Windows keeps for it; one that differs
 # (a value Windows' copy did not bring) is set to Windows' default, and the log says how it came out.
 function Plan-CheckDefaults {
@@ -2734,6 +2743,22 @@ function Plan-Install {
             Drop-ErrorsSince $n0
             Say ('  named "{0}" (its file calls it "{1}")' -f $bp.Name, $bp.FileName) 'DarkGray'
         }
+    } elseif ($def.Kind -eq 'mod') {
+        # a copy of Windows' Ultimate Performance under this plan's own ID (a new ID where Windows does not take it), named, and changed
+        $n0 = $Error.Count
+        $src = [string]$def.From
+        $from = 'Windows'' own hidden Ultimate Performance plan'
+        if (Plan-Find $src) { $from = 'the Ultimate Performance plan on this PC' }
+        [void](Pwr '/duplicatescheme' $src ([string]$def.Guid))
+        if (Plan-Find ([string]$def.Guid)) { $g = [string]$def.Guid }
+        else { $n = Pwr-NewFrom $src; if ($n -and (Plan-Find $n)) { $g = $n } }
+        if ($g) {
+            [void](Pwr '/changename' $g ([string]$def.Name) ([string]$def.Desc))
+            $r = Plan-SetValues $g @($def.Changes)
+            Say ('  made from {0}, named "{1}", with these changes inside it (plugged in and on battery): {2}' -f $from, $def.Name, ((@($def.Changes) | ForEach-Object { [string]$_.What }) -join ', ')) 'DarkGray'
+            if ($r.Bad) { Say ('  ! Windows did not accept {0} of these values; the plan keeps Ultimate Performance''s own value for them' -f $r.Bad) 'Yellow' }
+        }
+        Drop-ErrorsSince $n0
     } else {
         $n0 = $Error.Count
         $std = ($Key -eq 'PlanBalanced' -or $Key -eq 'PlanHighPerf')
@@ -2762,7 +2787,7 @@ function Plan-Install {
         Drop-ErrorsSince $n0          # (what powercfg said on the way is no failure when the plan was made after all)
     }
     if (-not $g) {
-        $why = ''; if ($Key -ne 'PlanBalanced' -and $def.Kind -eq 'windows') { $why = ' (a PC with Modern Standby may offer only Balanced)' }
+        $why = ''; if ($Key -ne 'PlanBalanced' -and ($def.Kind -eq 'windows' -or $def.Kind -eq 'mod')) { $why = ' (a PC with Modern Standby may offer only Balanced)' }
         if ($def.Kind -eq 'file') { throw ('Windows did not import {0} and did not make a copy of High Performance or Balanced for it either, so nothing was changed' -f $def.Name) }
         throw ('Windows did not create the {0}{1}, so nothing was changed' -f (Plan-Label $def.Name), $why)
     }
@@ -2830,7 +2855,7 @@ function Plan-Reinstall {
     if ($std -and @(Plan-WindowsDefaults ([string]$def.Guid)).Count -lt 20) {
         throw ('Windows did not restore it and keeps no default values for the {0} on this PC to make it again from, so it was left as it is' -f (Plan-Label $def.Name))
     }
-    if ($Key -eq 'Ultimate') {
+    if ($Key -eq 'Ultimate' -or $def.Kind -eq 'mod') {
         $probe = Pwr-NewFrom $script:UltimateTemplate
         if (-not $probe -or -not (Plan-Find $probe)) { Drop-ErrorsSince $n0; throw 'Windows would not make the Ultimate Performance plan again on this PC, so it was left as it is' }
         [void](Pwr '/delete' $probe)
@@ -2885,6 +2910,10 @@ function Custom-Ultimate-Detect       { param($p) return (Plan-Detect 'Ultimate'
 function Custom-Ultimate-Snapshot     { param($p) return (Plan-Snapshot 'Ultimate') }
 function Custom-Ultimate-Apply        { param($p, $mine) Plan-Install 'Ultimate' $mine }
 function Custom-Ultimate-Revert       { param($p, $mine) Plan-Remove 'Ultimate' $mine }
+function Custom-UltimateMod-Detect    { param($p) return (Plan-Detect 'UltimateMod') }
+function Custom-UltimateMod-Snapshot  { param($p) return (Plan-Snapshot 'UltimateMod') }
+function Custom-UltimateMod-Apply     { param($p, $mine) Plan-Install 'UltimateMod' $mine }
+function Custom-UltimateMod-Revert    { param($p, $mine) Plan-Remove 'UltimateMod' $mine }
 function Custom-Khorvie-Detect        { param($p) return (Plan-Detect 'Khorvie') }
 function Custom-Khorvie-Snapshot      { param($p) return (Plan-Snapshot 'Khorvie') }
 function Custom-Khorvie-Apply         { param($p, $mine) Plan-Install 'Khorvie' $mine }
@@ -2907,7 +2936,7 @@ function Custom-Hibernate-Revert {
 }
 
 # ------------------------------------------------- comparing the power plans (read only) ----
-# What the "Compare Power Plans" window on the Power page shows: the five plans side by side, every value the plugged-in (AC) one. A plan
+# What the "Compare Power Plans" window on the Power page shows: the six plans side by side, every value the plugged-in (AC) one. A plan
 # that is installed is read from this PC with "powercfg /qh <plan>", which only reads (and also lists the settings Windows hides). A plan
 # that is not installed shows what it would bring: Khorvie's and the Low Latency Power Plan from their built-in plan files, Windows' own plans only where their
 # behaviour is documented, and "Windows default" for the rest. Nothing here changes anything.
@@ -2940,11 +2969,12 @@ $script:PlanCmpRef = @{
     PlanBalanced = @{ min = 5; park = @{ T = 'On: idle cores park'; K = 'save' }; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
     PlanHighPerf = @{ min = 100; park = 100; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
     Ultimate     = @{ min = 100; park = 100; idle = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
+    UltimateMod  = @{ min = 100; park = 100; idle = 0; usbss = 0; usb3 = 0; wifi = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
     Khorvie      = @{ min = 100; park = 'unset'; boost = 2; epp = 'unset'; ramp = 2; incdec = @(100, 100); thr = 0; idle = 0; idlepd = @(100, 100); irq = 6; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 'unset'; disk = 0; disp = 0; sleep = @(-1, 1); wake = 0 }
     LowLatency   = @{ min = 'unset'; park = 'unset'; boost = 'unset'; epp = 'unset'; ramp = 'unset'; incdec = @(1, 1); thr = 0; idle = 'unset'; idlepd = @(100, 100); irq = 3; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 60000; disk = 0; disp = 0; sleep = @(-1, 'unset'); wake = 0 }
 }
 $script:PlanCmpBy = @{
-    PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft'
+    PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft'; UltimateMod = 'Microsoft + Headroom'
     Khorvie = 'Khorvie (third party)'; LowLatency = 'Amit (third party)'
 }
 # The plugged-in value of every setting in "powercfg /q(h)" output: setting ID -> number. The words around the numbers are in the language of
@@ -3041,7 +3071,7 @@ function PlanCmp-Cell {
     }
     return @{ T = [string]$n; K = 'none' }
 }
-# The five plans: Key, Name, By, Guid, Installed, Active, Source (pc = read from this PC, file = from its built-in plan file, ref = documented
+# The six plans: Key, Name, By, Guid, Installed, Active, Source (pc = read from this PC, file = from its built-in plan file, ref = documented
 # values, unread = installed but Windows listed none of its settings) and Cells (row id -> cell). Only reads: powercfg /list and /qh.
 function Get-PlanCompare {
     $plans = @(Pwr-Plans)
@@ -5257,7 +5287,7 @@ Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power sav
     )
 
 # --------------------------------------------------------------- Power --------
-# The five power plan switches (-Plan): On = the plan is installed, Off = it is deleted. Switching one on does not change the active plan;
+# The six power plan switches (-Plan): On = the plan is installed, Off = it is deleted. Switching one on does not change the active plan;
 # "Make active" on its card does. Switching the active plan off makes another plan active first; the last plan is never deleted.
 $planTail = ' Switching it on only installs it: "Make active" on its card makes it the plan Windows uses, and the card says which plan is active. Switching it off deletes this plan and no other; if it is the active plan, Balanced (or another installed plan) is made active first, and the last plan on the PC is never deleted. "Reinstall" on the card of an installed plan makes it again the way Headroom installs it (anything changed inside it is gone); the active plan stays the active plan.'
 Add-Tweak -Id 'plan-balanced' -Cat $cPower -Def 'On' -Plan 'PlanBalanced' -Name 'Balanced power plan' `
@@ -5276,6 +5306,12 @@ Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Plan 'Ultimate' -Name 'Ultimat
     -Desc ('On: the Ultimate Performance plan is installed. It is High Performance with the small delays of fine-grained power management removed. It is installed exactly as Windows makes it, from Windows'' own hidden copy; Headroom changes nothing in it (builds before 113 also turned off USB and Wi-Fi power saving in it: switch it off and on again to get Windows'' own). Off: it is deleted, also a copy an older Headroom build made under another ID. On a PC with Modern Standby Windows may refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
         pCustom 'Ultimate' 'powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 under the same ID, nothing changed in it (to install) / powercfg /delete (to delete)'
+    )
+
+Add-Tweak -Id 'ultimate-mod' -Cat $cPower -Def 'Off' -Plan 'UltimateMod' -Name 'Ultimate Plan Modified' `
+    -Desc ('On: Ultimate Plan Modified is installed: Windows'' own Ultimate Performance plan with three changes inside it, the way Headroom installed Ultimate Performance up to build 112. USB selective suspend is off, USB 3 link power management is off and the Wi-Fi adapter''s power saving is at Maximum performance, plugged in and on battery. It has an ID of its own, so Windows'' Ultimate Performance can stay installed next to it as Windows ships it. Off: it is deleted. On a PC with Modern Standby Windows may refuse to make Ultimate Performance; nothing is changed then.' + $planTail) `
+    -Parts @(
+        pCustom 'UltimateMod' 'powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 96159c62-1115-4153-83ea-271a2032c250, named "Ultimate Plan Modified", then /setacvalueindex and /setdcvalueindex 0 for USB selective suspend, USB 3 link power management and Wi-Fi power saving (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Plan 'Khorvie' -Name 'Khorvie''s power plan' `
@@ -12342,6 +12378,7 @@ function Ui-Reinstall {
         $how = 'from its built-in plan file'
         $k = [string]$row.T.Plan
         if ($k -eq 'PlanBalanced' -or $k -eq 'PlanHighPerf' -or $k -eq 'Ultimate') { $how = 'as Windows ships it' }
+        elseif ($k -eq 'UltimateMod') { $how = 'from Windows'' Ultimate Performance with its three changes' }
         $askText = ('Reinstall "{0}"?{1}It is made again {2}. Any setting you changed inside it goes back.' -f $row.T.Name, "`r`n", $how)
         if (Test-PlanActive $row) { $askText += ' It stays the active plan.' }
         if (-not (Ui-Ask $askText 'Reinstall power plan' $false)) { return }
@@ -12553,7 +12590,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '116'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '117'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -13278,7 +13315,7 @@ function Ui-Build {
     $btnApplyAll = New-Btn 'Apply all' 128 'accent' 'Applies every setting on this page: each switch moves to the position this app sets (diagnostic data off, dark mode on, and so on). You are asked to confirm first.' 34
     $btnApplyAll.Top = (Px 141)            # in the same row as "Tweak all" and "Reset all": the three page actions sit together
     $btnApplyAll.Visible = $false
-    $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), open Windows display settings (Display), or compare the five power plans side by side (Power; it only reads).' 32
+    $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), open Windows display settings (Display), or compare the six power plans side by side (Power; it only reads).' 32
     $btnPage.Top = (Px 24)
     $btnPage.Visible = $false
     # the search box lives in the side menu, under the app name
@@ -16563,7 +16600,7 @@ function Ui-ShowPresets {
 }
 
 # ----------------------------------------------------------- Compare Power Plans ----
-# The window behind "Compare Power Plans" on the Power page: the five power plans side by side (Get-PlanCompare). It only reads: a plan
+# The window behind "Compare Power Plans" on the Power page: the six power plans side by side (Get-PlanCompare). It only reads: a plan
 # that is installed is read from this PC with "powercfg /qh", the others show what they would bring. One painted table that scrolls, and
 # Close. The colour of the dot before a value says what it does: purple = set for speed, orange = saves power, red = blocks something,
 # a ring = Windows' own default, a dashed square = not set by the plan (Windows uses its default) or not listed by Windows.
@@ -16571,7 +16608,7 @@ $script:PC = $null
 function Ui-PlanCmpGeom {
     $g = @{ Pad = (Px 24); SetW = (Px 232); ColW = (Px 178); TitleY = (Px 18); SubY = (Px 56); LegendY = (Px 104); Top = (Px 140)
             HeadH = (Px 118); GroupH = (Px 34); RowH = (Px 54); FootH = (Px 64) }
-    $g.TableW = $g.SetW + 5 * $g.ColW
+    $g.TableW = $g.SetW + @($script:PlanDefs.Keys).Count * $g.ColW
     $n = 0; $last = ''
     foreach ($r in $script:PlanCmpRows) { if ([string]$r.Group -ne $last) { $n++; $last = [string]$r.Group } }
     $g.TableH = $g.HeadH + $n * $g.GroupH + @($script:PlanCmpRows).Count * $g.RowH
@@ -16584,7 +16621,7 @@ function Ui-PlanCmpSourceText {
     switch ([string]$p.Source) {
         'pc'     { return 'Read from this PC' }
         'file'   { return 'Not installed: from its plan file' }
-        'ref'    { return 'Not installed: documented values' }
+        'ref'    { return 'Not installed: known values' }
         'defaults' { return 'Not installed: Windows'' defaults' }
         'unread' { return 'Installed: Windows listed nothing' }
     }
@@ -16630,7 +16667,7 @@ function Ui-PaintPlanCmp {
     $x0 = $G.Pad
     Ui-Fill $g $Th.Bg 0 0 $G.W $G.H
     Ui-Text $g 'Compare Power Plans' (Ui-Font 'detTitle') $Th.Text $x0 $G.TitleY $G.TableW (Px 32) $TF.L
-    $sub = 'The five plans on the Power page side by side, with the values used when the PC is plugged in. A plan that is installed is read from this PC (powercfg /qh, which only reads); a plan that is not installed shows what it would bring. Nothing here changes anything.'
+    $sub = 'The six plans on the Power page side by side, with the values used when the PC is plugged in. A plan that is installed is read from this PC (powercfg /qh, which only reads); a plan that is not installed shows what it would bring. Nothing here changes anything.'
     Ui-Text $g $sub (Ui-Font 'body') $Th.Sub $x0 $G.SubY ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
     # the legend
     $lx = $x0; $ly = $G.LegendY + (Px 10)
@@ -16709,7 +16746,7 @@ function Ui-PaintPlanCmp {
     $foot = 'Windows default: the plan leaves it to Windows. Not set: the plan file does not include it, so Windows uses its own default. Balanced and High Performance are compared with the defaults Windows keeps for them (what Restore plan defaults sets). Exact numbers: powercfg /q <plan ID>.'
     Ui-Text $g $foot (Ui-Font 'small') $Th.Mute $x0 ($top + $G.TableH + (Px 14)) ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
 }
-# reads the five plans (powercfg /list and /qh only) and sizes the table
+# reads the six plans (powercfg /list and /qh only) and sizes the table
 function Ui-PlanCmpRead {
     $pc = $script:PC
     if (-not $pc) { return }
@@ -16720,7 +16757,7 @@ function Ui-PlanCmpRead {
     $pc.Table.Size = New-Object System.Drawing.Size($G.W, $G.H)
     $n = @($pc.Plans | Where-Object { $_.Installed }).Count
     if ($pc.Error) { $pc.Status.Text = 'The power plans could not be read.' }
-    else { $pc.Status.Text = ('Read at {0}: {1} of the 5 plans are installed on this PC. Nothing was changed.' -f $pc.When, $n) }
+    else { $pc.Status.Text = ('Read at {0}: {1} of the {2} plans are installed on this PC. Nothing was changed.' -f $pc.When, $n, @($script:PlanDefs.Keys).Count) }
     $pc.Table.Invalidate()
 }
 function Ui-BuildPlanCmpWindow {
