@@ -96,7 +96,6 @@ $script:InRdp  = ($env:SESSIONNAME -like 'RDP-*')
 $script:CurTweak = $null
 $script:Catalog = New-Object System.Collections.ArrayList
 $script:ById    = @{}
-$script:RivalOf = @{}     # setting id -> the ids of the settings it rules out (Add-Tweak -Rivals; both ways)
 $script:ScanMode = $false     # true while the check of the PC runs: read-only look-ups may then be remembered
 $script:NoValue = New-Object System.Object
 $script:RegRoot = @{}
@@ -239,6 +238,12 @@ function Drop-Error {
             if ([object]::ReferenceEquals($Error[$i].Exception, $rec.Exception) -or $Error[$i].Exception.Message -eq $rec.Exception.Message) { $Error.RemoveAt($i); return }
         }
     } catch { }
+}
+# Takes every error added to $Error since it held $n0 out again: they were expected, and the caller reports what matters itself
+# ($Error is newest first)
+function Drop-ErrorsSince {
+    param([int]$n0)
+    try { while ($Error.Count -gt $n0) { $Error.RemoveAt(0) } } catch { }
 }
 # -Soft: a switch that newer Windows 11 builds protect (programs get "Attempted to perform an unauthorized operation").
 # A refusal is then only noted, not reported as a failure.
@@ -383,13 +388,14 @@ Get-WindowsCapability -Online -ErrorAction Ignore | ForEach-Object { [pscustomob
     appx = @'
 Get-AppxPackage -AllUsers -ErrorAction Ignore | ForEach-Object {
     # L: is the app installed for at least one user? A package that is only "Staged" (what stays behind when the app was uninstalled
-    # from Start or Settings: the copy kept for new accounts) is not. When Windows does not say, it counts as installed.
+    # from Start or Settings: the copy kept for new accounts) is not, and neither is one whose removal is pending (it was in use: Windows
+    # finishes removing it at the next restart). When Windows does not say, it counts as installed.
     $live = $true
     try {
         $ui = @($_.PackageUserInformation)
         if ($ui.Count -gt 0) {
             $live = $false
-            foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged') { $live = $true } }
+            foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal') { $live = $true } }
         }
     } catch { $live = $true }
     [pscustomobject]@{ N = [string]$_.Name; F = [string]$_.PackageFullName; R = [bool]$_.NonRemovable; L = $live }
@@ -414,7 +420,7 @@ foreach ($n in $nics) {
         [pscustomobject]@{ K = 'adv'; A = [string]$n.Name; N = [string]$a.DisplayName; V = [string]$a.DisplayValue; W = [string]$a.RegistryKeyword; R = [string](@($a.RegistryValue)[0]); L = $valid }
     }
     $r = Get-NetAdapterPowerManagement -Name $n.Name -ErrorAction Ignore
-    if ($r) { [pscustomobject]@{ K = 'npm'; A = [string]$n.Name; S = [string]$r.SelectiveSuspend; D = [string]$r.DeviceSleepOnDisconnect } }
+    if ($r) { [pscustomobject]@{ K = 'npm'; A = [string]$n.Name; S = [string]$r.SelectiveSuspend; D = [string]$r.DeviceSleepOnDisconnect; T = [string]$r.AllowComputerToTurnOffDevice } }
 }
 '@
     usb = @'
@@ -875,7 +881,7 @@ function Appx-IsLive {
     try {
         $ui = @($p.PackageUserInformation)
         if ($ui.Count -eq 0) { return $true }
-        foreach ($u in $ui) { if (([string]$u.InstallState + ' ' + [string]$u) -notmatch 'Staged') { return $true } }
+        foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal') { return $true } }
         return $false
     } catch { return $true }
 }
@@ -897,6 +903,79 @@ function Appx-Data {
         $script:Cache['appx'] = @{ Pkgs = $pk; Prov = $pv }
     }
     return $script:Cache['appx']
+}
+# Removes one installed package from every account. "Remove-AppxPackage -AllUsers" is the usual way, but Windows refuses it for some
+# apps (one that another program installed for a single account, such as Edge Game Assist, can have no all-users entry under its own
+# name). Then the name of the bundle it came in is tried, then the current account, then each other account it is installed for.
+# The app's own running processes are closed first. Returns '' when it is installed for nobody any more, else what Windows said.
+function Appx-RemoveOne {
+    param([string]$Full, [string]$Name)
+    # a try that Windows refuses is expected (the next one may work), so its error is not left in $Error for the run to list: what
+    # Windows said is returned when no try removed the app
+    $n0 = $Error.Count
+    $errs = @()
+    Appx-StopApp $Full $Name
+    $tries = @(@{ Pkg = $Full; All = $true; User = '' })
+    foreach ($b in @(Appx-BundleNames $Name)) { if ($b -and $b -ne $Full) { $tries += ,@{ Pkg = $b; All = $true; User = '' } } }
+    $tries += ,@{ Pkg = $Full; All = $false; User = '' }
+    $me = ''; try { $me = [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { }
+    foreach ($sid in @(Appx-UserSids $Full)) { if ($sid -and $sid -ne $me) { $tries += ,@{ Pkg = $Full; All = $false; User = $sid } } }
+    foreach ($t in $tries) {
+        try {
+            if ($t.All) { Remove-AppxPackage -Package $t.Pkg -AllUsers -ErrorAction Stop }
+            elseif ($t.User) { Remove-AppxPackage -Package $t.Pkg -User $t.User -ErrorAction Stop }
+            else { Remove-AppxPackage -Package $t.Pkg -ErrorAction Stop }
+        } catch {
+            $msg = ([string]$_.Exception.Message -split "`r?`n")[0].Trim()
+            if ($msg -and $errs -notcontains $msg) { $errs += $msg }
+        }
+        if (-not (Appx-LiveFull $Full $Name)) { Drop-ErrorsSince $n0; return '' }
+    }
+    Drop-ErrorsSince $n0
+    if ($errs.Count -eq 0) { return 'Windows reported no error, but it is still installed' }
+    return (($errs | Select-Object -First 2) -join ' / ')
+}
+# Is this exact package's removal waiting for a restart? (it was in use: Windows shows it as "Installed(pending removal)")
+function Appx-PendingFull {
+    param([string]$Full, [string]$Name)
+    foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Ignore)) {
+        if ([string]$x.PackageFullName -ne $Full) { continue }
+        try { foreach ($u in @($x.PackageUserInformation)) { if (([string]$u.InstallState + ' ' + [string]$u) -match 'pending\s*removal') { return $true } } } catch { }
+    }
+    return $false
+}
+# Is this exact package still installed for an account? (only the copy kept for new accounts, or one whose removal waits for a restart,
+# counts as removed, as in the check)
+function Appx-LiveFull {
+    param([string]$Full, [string]$Name)
+    foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Ignore)) {
+        if ([string]$x.PackageFullName -eq $Full -and (Appx-IsLive $x)) { return $true }
+    }
+    return $false
+}
+# The full names of the bundles an app was installed from (the name Windows sometimes wants for removing it)
+function Appx-BundleNames {
+    param([string]$Name)
+    $o = @()
+    foreach ($x in @(Get-AppxPackage -AllUsers -PackageTypeFilter Bundle -Name $Name -ErrorAction Ignore)) { $o += [string]$x.PackageFullName }
+    return $o
+}
+# Closes the app's own processes (those started from its install folder), so a running app does not hold up its removal
+function Appx-StopApp {
+    param([string]$Full, [string]$Name)
+    $loc = ''
+    foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Ignore | Where-Object { $_.PackageFullName -eq $Full })) { if ($x.InstallLocation) { $loc = [string]$x.InstallLocation } }
+    if (-not $loc) { return }
+    $root = $loc.TrimEnd('\') + '\'
+    $n0 = $Error.Count                   # (a process whose path Windows does not show, or that is already gone, is no problem)
+    foreach ($pr in @(Get-Process -ErrorAction Ignore)) {
+        $path = ''; try { $path = [string]$pr.Path } catch { }
+        if ($path -and $path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
+            Say ('  closing {0} (it belongs to the app)' -f $pr.ProcessName) 'DarkGray'
+            try { Stop-Process -Id $pr.Id -Force -ErrorAction Stop } catch { }
+        }
+    }
+    Drop-ErrorsSince $n0
 }
 function Appx-Matches {
     param([string[]]$patterns)
@@ -1113,7 +1192,7 @@ function Add-Tweak {
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
           [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Cleanup, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
-          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string[]]$Rivals = @())
+          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string]$Plan = '')
     # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
     # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
     #   Undo puts the Windows default back, so the switch is the opposite of "applied".  Without -Inv, Apply turns the feature on (Dark mode,
@@ -1125,9 +1204,8 @@ function Add-Tweak {
     # Its custom part's Apply says what it did by setting $script:RunResult.
     # -Cleanup: a run-once action that deletes files (Disk Cleanup, Temporary files): the details and the question before it runs say
     # that what it deletes is gone for good. A run-once action without it changes something else (it puts a power plan back, for example).
-    # -Rivals: settings (defined earlier) that cannot be on together with this one, because they set the same thing (two power plans
-    # that each make themselves the active plan). It works both ways. Switching one on switches the others off first; Apply all, Tweak all
-    # and the presets never take one while another is on or lined up.
+    # -Plan: the setting is a power plan switch (the key of its plan in $script:PlanDefs, which is also the name of its custom part).
+    # On = the plan is installed; Off = it is not. Its card shows whether it is the active plan and offers "Make active".
     # -Choices: instead of one on/off switch the setting offers options, shown as a selector on the card. The first entry is the
     # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
@@ -1186,28 +1264,13 @@ function Add-Tweak {
     elseif ($Inv) { $t.Def = 'On' }
     else { $t.Def = 'Off' }
     if ($script:ById.ContainsKey($Id)) { throw "duplicate setting id: $Id" }
-    foreach ($rv in @($Rivals)) {
-        $o = $script:ById[[string]$rv]
-        if (-not $o) { throw "setting ${Id}: its rival '$rv' must be a setting defined before it" }
-        if ($Once -or $Inv -or $Choices.Count -gt 0 -or $o.Once -or $o.Inv -or $o.Choices) { throw "setting ${Id}: rivals are plain on/off switches (not run-once, -Inv or with options)" }
+    if ($Plan) {
+        if ($Once -or $Inv -or $Choices.Count -gt 0) { throw "setting ${Id}: a power plan switch is a plain switch (not run-once, -Inv or with options)" }
+        if (@($t.Parts).Count -ne 1 -or [string]@($t.Parts)[0].T -ne 'custom' -or [string]@($t.Parts)[0].Name -ne $Plan) { throw "setting ${Id}: a power plan switch has one custom part named after its plan" }
     }
+    $t.Plan = $Plan
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
-    foreach ($rv in @($Rivals)) {
-        foreach ($pair in @(@($Id, [string]$rv), @([string]$rv, $Id))) {
-            if (-not $script:RivalOf.ContainsKey($pair[0])) { $script:RivalOf[$pair[0]] = @() }
-            if (@($script:RivalOf[$pair[0]]) -notcontains $pair[1]) { $script:RivalOf[$pair[0]] = @($script:RivalOf[$pair[0]]) + $pair[1] }
-        }
-    }
-}
-# The settings that cannot be on together with $t (see Add-Tweak -Rivals)
-function Get-Rivals {
-    param($t)
-    $out = @()
-    if (-not $t) { return $out }
-    $ids = $script:RivalOf[[string]$t.Id]
-    foreach ($id in @($ids)) { if ($id -and $script:ById.ContainsKey([string]$id)) { $out += ,$script:ById[[string]$id] } }
-    return $out
 }
 # ---- the edition of Windows ----
 # Home / Pro / Ent (see pEd). Read once from the registry (EditionID: "Core" is Home, "Professional" is Pro).
@@ -1441,6 +1504,16 @@ function Get-TweakState {
     param($t)
     $script:CurTweak = $t
     if ($t.Choices) { return (Get-ChoiceState $t) }
+    if (-not $t.Plan) { return (Get-PartsState $t) }
+    # a power plan switch: Choice says whether it is the active plan ('active') or not ('')
+    $script:PlanActive = $false
+    $r = Get-PartsState $t
+    $r.Choice = ''
+    if ($script:PlanActive -and $r.State -eq 'On') { $r.Choice = 'active' }
+    return $r
+}
+function Get-PartsState {
+    param($t)
     $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
     $reads = New-Object System.Collections.ArrayList
     foreach ($p in (Expand-Parts $t)) {
@@ -1550,14 +1623,20 @@ function Apply-Part {
         }
         'appx' {
             $m = Appx-Matches $p.Patterns
-            foreach ($k in $m.Pkgs.Keys) {
+            $fails = @()
+            foreach ($k in @($m.Pkgs.Keys)) {
                 Say "  removing app $($m.Pkgs[$k])" 'Gray'
-                if (-not $DryRun) { Remove-AppxPackage -Package $k -AllUsers -ErrorAction SilentlyContinue }
+                if ($DryRun) { continue }
+                $why = Appx-RemoveOne $k ([string]$m.Pkgs[$k])
+                if ($why) { $fails += ('{0}: {1}' -f $m.Pkgs[$k], $why); Say "  ! $($m.Pkgs[$k]) was not removed: $why" 'Yellow' }
+                elseif (Appx-PendingFull $k ([string]$m.Pkgs[$k])) { Say '  Windows finishes removing it at the next restart (it is in use)' 'DarkGray' }
             }
             foreach ($k in $m.Prov.Keys) {
                 if (-not $DryRun) { Remove-AppxProvisionedPackage -Online -PackageName $k -ErrorAction SilentlyContinue | Out-Null }
             }
             if ($DryRun -and ($m.Pkgs.Count + $m.Prov.Count) -eq 0) { Say '  (no matching apps installed)' 'DarkGray' }
+            $script:Cache.Remove('appx')
+            if ($fails.Count) { throw ('Windows did not remove ' + ($fails -join '; ')) }
         }
         'custom' {
             $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom[$p.Name] }
@@ -1754,7 +1833,7 @@ function New-RestorePoint {
 # How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
 # slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
 # 3 apps and USB,  4 optional features,  5 capabilities
-$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlansDelete = 2; PlanBalanced = 1; PlanHighPerf = 1; Khorvie = 1; Endgame = 1 }
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlanBalanced = 1; PlanHighPerf = 1; Ultimate = 1; Khorvie = 1; Endgame = 1 }
 function Get-ScanWeight {
     param($t)
     $w = 0
@@ -1878,8 +1957,8 @@ function Invoke-Plan {
     Say ("`n=== {0}: {1} change(s), {2} ===" -f (Get-Date -Format 'HH:mm:ss'), $total, $mode) 'Cyan'
     if ($script:InRdp) { Say 'You are connected through Remote Desktop: its services are switched off for the next boot but not stopped now.' 'Yellow' }
     # a restore point is for changes it can bring back: a plan of clean-up actions only does not get one (deleted files are not in it),
-    # while a run-once action that changes settings (making a power plan fresh) does
-    $needRp = $false; foreach ($pi in $Plan) { $pt = $script:ById[[string]$pi.Id]; if ($pt -and -not $pt.Cleanup) { $needRp = $true } }
+    # and neither does making a power plan the active one (another click switches back)
+    $needRp = $false; foreach ($pi in $Plan) { $pt = $script:ById[[string]$pi.Id]; if ($pt -and -not $pt.Cleanup -and [string]$pi.Action -ne 'Activate') { $needRp = $true } }
     if (-not $DryRun -and $total -gt 0 -and $needRp) { New-RestorePoint }
     $i = 0; $good = 0; $bad = 0; $reboot = @(); $explorer = $false
     foreach ($item in $Plan) {
@@ -1887,9 +1966,12 @@ function Invoke-Plan {
         $t = $script:ById[[string]$item.Id]
         if (-not $t) { Say "  unknown setting '$($item.Id)'" 'Red'; $bad++; continue }
         $undo = ($item.Action -eq 'Undo')
+        $activate = ($item.Action -eq 'Activate')
         # the verb says what the SWITCH does: an -Inv setting that is applied turns its feature off, and undone turns it back on
         $verb = 'Turning on'; if (-not (Get-SwitchGoesOn $t $undo)) { $verb = 'Turning off' }
         if ($t.Once) { $verb = 'Running' }
+        if ($t.Plan) { if ($undo) { $verb = 'Deleting' } else { $verb = 'Installing' } }
+        if ($activate) { $verb = 'Making active' }
         $failed = $null
         # a setting with options: the one to set (the plan item names it; none named = the first that changes something)
         $choiceKey = ''
@@ -1906,6 +1988,15 @@ function Invoke-Plan {
         $Error.Clear()
         if ($failed) {
             # nothing to do: the failure is reported below
+        } elseif ($activate) {
+            if (-not $t.Plan) { $failed = 'only a power plan can be made the active plan' }
+            else {
+                try {
+                    $script:RunResult = ''
+                    $s0 = (Get-Store)[[string]$t.Id]; $mine = $null; if ($s0 -and $s0.Custom) { $mine = $s0.Custom[[string]$t.Plan] }
+                    Plan-Activate ([string]$t.Plan) $mine
+                } catch { $failed = $_.Exception.Message }
+            }
         } elseif ($undo -and $t.Once) {
             $failed = 'it is a one-time action: there is nothing to undo'
         } elseif ($t.Once -and (Get-TweakState $t).State -eq 'NA') {
@@ -1919,17 +2010,6 @@ function Invoke-Plan {
         } else {
             try {
                 $script:RunResult = ''
-                if (-not $undo) {
-                    # a rival this app switched on is switched off first (its undo runs, so what it made is removed), then this one goes on
-                    foreach ($rv in @(Get-Rivals $t)) {
-                        if (-not (Get-Store).ContainsKey([string]$rv.Id)) { continue }
-                        Say ('  "{0}" is switched off first: only one of the two can be on' -f $rv.Name) 'DarkGray'
-                        Invoke-TweakRevert $rv
-                        if (-not $DryRun) { Remove-Snapshot $rv.Id }
-                        Clear-CacheFor $rv
-                    }
-                    $script:CurTweak = $t
-                }
                 if ($undo) { Invoke-TweakRevert $t } else { Invoke-TweakApply $t $choiceKey }
             } catch { $failed = $_.Exception.Message }
         }
@@ -1944,8 +2024,9 @@ function Invoke-Plan {
         } elseif ($DryRun) {
             Emit 'item' $t.Id 'dry' 'Preview only' '' 'Gray' $i $total
             $good++
-        } elseif ($t.Once) {
-            # a run-once action reads "ready to run" before and after: it succeeded when nothing went wrong, and says what it did
+        } elseif ($t.Once -or $activate) {
+            # a run-once action reads "ready to run" before and after (and making a plan active leaves the switch as it was): it
+            # succeeded when nothing went wrong, and says what it did
             $res = [string]$script:RunResult
             if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
             $good++
@@ -1962,11 +2043,13 @@ function Invoke-Plan {
             Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
         }
         Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id)
-        # a rival reads differently now (it is no longer the active plan): the window gets its new state too
-        foreach ($rv in @(Get-Rivals $t)) {
-            Clear-CacheFor $rv
-            $ra = Get-TweakState $rv
-            Emit 'state' $rv.Id $ra.State $ra.Detail '' 'Gray' $i $total ([string]$ra.Choice) ([string]$ra.Read) (Get-MineText $ra.State (Get-Store) $rv.Id)
+        # a power plan was installed, deleted or made active: which plan is active may have changed, so every plan switch is read again
+        if ($t.Plan) {
+            foreach ($o in @($script:Catalog | Where-Object { $_.Plan -and $_.Id -ne $t.Id })) {
+                Clear-CacheFor $o
+                $oa = Get-TweakState $o
+                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id)
+            }
         }
     }
     if ($explorer -and -not $DryRun) {
@@ -2053,105 +2136,8 @@ function Pwr-NewFrom {
     return [regex]::Match($out, $script:GuidRx).Value.ToLower()
 }
 
-function Custom-Ultimate-Detect {
-    param($p)
-    $a = Pwr-Active
-    if (-not $a.Guid) { $script:Now = 'Active power plan: could not be read'; return 'NA' }
-    $script:Now = ('Active power plan: {0}, wanted Ultimate Performance' -f $a.Name)
-    if ($a.Name -match 'Ultimate') { return 'On' }
-    $snap = (Get-Store)[$script:CurTweak.Id]
-    if ($snap -and $snap.Custom -and $snap.Custom['Ultimate'] -and $snap.Custom['Ultimate'].New -and ($snap.Custom['Ultimate'].New -eq $a.Guid)) { $script:Now += ' (the plan this app made)'; return 'On' }
-    return 'Off'
-}
-function Custom-Ultimate-Snapshot {
-    param($p)
-    $a = Pwr-Active
-    return @{ Orig = $a.Guid; New = '' }
-}
-function Custom-Ultimate-Apply {
-    param($p, $mine)
-    if ($DryRun) { Say '  [dry] create the Ultimate Performance plan, turn USB / Wi-Fi power saving off inside it, make it active' 'DarkGray'; return }
-    $new = ''
-    if ($mine -and $mine.New) { foreach ($x in @(Pwr-Plans)) { if ($x.Guid -eq $mine.New) { $new = $mine.New } } }
-    if (-not $new) {
-        $new = Pwr-NewFrom $script:UltimateTemplate
-        if (-not $new) {
-            # Some systems (e.g. Modern Standby) hide Ultimate Performance; fall back to High Performance
-            Say '  Ultimate Performance is not available on this PC; using High Performance instead.' 'Yellow'
-            $new = Pwr-NewFrom $script:HighPerfTemplate
-        }
-    }
-    if (-not $new) { Say '  ! could not create a power plan - nothing changed' 'Red'; return }
-    foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
-        # USB selective suspend = Disabled, USB 3 link power management = Off, wireless adapter = Maximum Performance
-        [void](Pwr $mode $new '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' '0')
-        [void](Pwr $mode $new '2a737441-1930-4402-8d77-b2bebba308a3' 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' '0')
-        [void](Pwr $mode $new '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a' '0')
-    }
-    [void](Pwr '/setactive' $new)
-    if ($mine) { $mine.New = $new }
-    Say "  power plan $new is now the active one" 'DarkGray'
-}
-function Custom-Ultimate-Revert {
-    param($p, $mine)
-    if ($DryRun) { Say '  [dry] switch back to the Balanced plan (the Windows default) and delete the plan this app made' 'DarkGray'; return }
-    $plans = @(Pwr-Plans)
-    # the Windows default is the Balanced plan, not the plan that was active before this app changed it
-    $target = ''
-    foreach ($x in $plans) { if ($x.Guid -eq $script:BalancedTemplate) { $target = $x.Guid } }
-    if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
-    if ($target) {
-        [void](Pwr '/setactive' $target); Say "  power plan $target is the active one again" 'DarkGray'
-        # The plan this app made is not kept: once another plan is the active one it is deleted, so the list of plans is as it was.
-        # (Only that plan, and only when the switch worked; Windows refuses to delete the active plan anyway.)
-        if ($mine -and $mine.New -and [string]$mine.New -ne $target -and (Pwr-Active).Guid -eq $target) {
-            foreach ($x in $plans) {
-                if ($x.Guid -eq [string]$mine.New) { [void](Pwr '/delete' $x.Guid); Say "  the power plan this app made ($($x.Name)) was deleted" 'DarkGray' }
-            }
-        }
-    }
-    else { Say '  ! could not find or create a Balanced plan' 'Red' }
-}
-
-function Custom-PlansDelete-Detect {
-    param($p)
-    if (Battery-Present) { $script:Why = 'battery detected - the other plans are kept for when you unplug'; $script:Now = 'Battery: found, so the other power plans are left alone'; return 'NA' }
-    $n = @(Pwr-Plans).Count
-    if ($n -eq 0) { $script:Now = 'Power plans: none could be listed'; return 'NA' }
-    $script:Now = ('Power plans: {0} on this PC, wanted only the active one' -f $n)
-    if ($n -le 1) { return 'On' }
-    return 'Off'
-}
-function Custom-PlansDelete-Snapshot {
-    param($p)
-    $l = @(); foreach ($x in @(Pwr-Plans)) { $l += "$($x.Guid) $($x.Name)" }
-    return @{ Plans = $l }
-}
-function Custom-PlansDelete-Apply {
-    param($p, $mine)
-    $a = Pwr-Active
-    foreach ($x in @(Pwr-Plans)) {
-        if ($x.Guid -eq $a.Guid) { continue }
-        if ($DryRun) { Say "  [dry] delete power plan $($x.Name)" 'DarkGray' }
-        else { [void](Pwr '/delete' $x.Guid); Say "  deleted power plan $($x.Name)" 'DarkGray' }
-    }
-}
-function Custom-PlansDelete-Revert {
-    param($p, $mine)
-    $have = @(); foreach ($x in @(Pwr-Plans)) { $have += $x.Guid; $have += $x.Name }
-    foreach ($t in @(@('Balanced', $script:BalancedTemplate), @('High performance', $script:HighPerfTemplate), @('Power saver', $script:SaverTemplate))) {
-        if ($have -contains $t[1] -or $have -contains $t[0]) { continue }
-        if ($DryRun) { Say "  [dry] recreate the $($t[0]) plan" 'DarkGray'; continue }
-        $g = Pwr-NewFrom $t[1]
-        if ($g) { Say "  recreated the $($t[0]) plan" 'DarkGray' } else { Say "  ! could not recreate the $($t[0]) plan" 'Yellow' }
-    }
-}
-
-# ------------------------------------------------- reinstall a standard plan ----
-# Puts a standard plan back with the settings Windows ships it with, under its usual ID ("powercfg /duplicatescheme <id> <id>" makes it from
-# Windows' own definition when there is no plan with that ID). A plan that is there is made fresh: a copy is made first (and made the active
-# plan while the original is replaced, if the original is the active one), the original is deleted and made again, then the copy is
-# deleted. If anything fails on the way the copy is kept, so the PC is never left without the plan.
+# Plan-Find: the plan with this ID, or $null.  Pwr-Restore: makes a standard plan from Windows' own definition under its usual ID
+# ("powercfg /duplicatescheme <id> <id>" when no plan has that ID); returns the ID, or '' when Windows did not make it.
 function Plan-Find { param([string]$Guid) foreach ($x in @(Pwr-Plans)) { if ($x.Guid -eq $Guid) { return $x } }; return $null }
 function Pwr-Restore {
     param([string]$Guid)
@@ -2159,68 +2145,10 @@ function Pwr-Restore {
     if (Plan-Find $Guid) { return $Guid }
     return ''
 }
-function Plan-ReinstallDetect {
-    param([string]$Guid, [string]$Name)
-    $l = @(Pwr-Plans)
-    if ($l.Count -eq 0) { $script:Why = 'the power plans could not be listed'; $script:Now = 'Power plans: none could be listed'; return 'NA' }
-    $x = @($l | Where-Object { $_.Guid -eq $Guid })[0]
-    if ($x) {
-        $act = ''; if ($x.Active) { $act = ', the active plan' }
-        $script:Now = ('{0} plan: installed{1}. Running it makes it fresh with Windows'' own settings.' -f $Name, $act)
-    } else {
-        $script:Now = ('{0} plan: missing. Running it puts it back.' -f $Name)
-    }
-    return 'Off'
-}
-function Plan-Reinstall {
-    param([string]$Guid, [string]$Name)
-    $have = Plan-Find $Guid
-    if (-not $have) {
-        if ($DryRun) { Say ('  [dry] put the {0} plan back: powercfg /duplicatescheme {1} {1}' -f $Name, $Guid) 'DarkGray'; return }
-        if (Pwr-Restore $Guid) { Say ('  the {0} plan is back' -f $Name) 'DarkGray'; $script:RunResult = ('The {0} plan is back, with Windows'' own settings' -f $Name); return }
-        # some builds do not take the ID to make it under: then it gets a new ID, and it is still the plan with Windows' own settings
-        $g = Pwr-NewFrom $Guid
-        if ($g) { Say ('  the {0} plan is back (under a new ID, {1})' -f $Name, $g) 'DarkGray'; $script:RunResult = ('The {0} plan is back, with Windows'' own settings (under a new ID)' -f $Name); return }
-        throw ('Windows did not create the {0} plan (a PC with Modern Standby may offer only Balanced); nothing was changed' -f $Name)
-    }
-    $wasActive = ((Pwr-Active).Guid -eq $Guid)
-    if ($DryRun) { Say ('  [dry] make the {0} plan fresh: a copy first, then powercfg /delete {1} and /duplicatescheme {1} {1}, then the copy is deleted' -f $Name, $Guid) 'DarkGray'; return }
-    $copy = Pwr-NewFrom $Guid
-    if (-not $copy) { throw ('a copy of the {0} plan could not be made first, so nothing was changed' -f $Name) }
-    if ($wasActive) {
-        [void](Pwr '/setactive' $copy)
-        if ((Pwr-Active).Guid -ne $copy) { [void](Pwr '/delete' $copy); throw ('Windows did not switch to the copy of the {0} plan, so nothing was changed' -f $Name) }
-    }
-    [void](Pwr '/delete' $Guid)
-    if (Plan-Find $Guid) {
-        if ($wasActive) { [void](Pwr '/setactive' $Guid) }
-        [void](Pwr '/delete' $copy)
-        throw ('Windows did not let the {0} plan be replaced, so nothing was changed' -f $Name)
-    }
-    if (-not (Pwr-Restore $Guid)) {
-        $keep = 'it is kept in the list'; if ($wasActive) { $keep = 'it is kept, and it is the active plan' }
-        throw ('Windows did not make the {0} plan again; the copy of it ({1}) has its settings as they were, and {2}' -f $Name, $copy, $keep)
-    }
-    if ($wasActive) { [void](Pwr '/setactive' $Guid) }
-    [void](Pwr '/delete' $copy)
-    $tail = ''; if ($wasActive) { $tail = ' It is the active plan again.' }
-    Say ('  the {0} plan was made fresh' -f $Name) 'DarkGray'
-    $script:RunResult = ('The {0} plan was made fresh with Windows'' own settings.{1}' -f $Name, $tail)
-}
-function Custom-PlanBalanced-Detect { param($p) return (Plan-ReinstallDetect $script:BalancedTemplate 'Balanced') }
-function Custom-PlanBalanced-Snapshot { param($p) return $null }
-function Custom-PlanBalanced-Apply { param($p, $mine) Plan-Reinstall $script:BalancedTemplate 'Balanced' }
-function Custom-PlanBalanced-Revert { param($p, $mine) Say '  (putting a power plan back is a one-time action: there is nothing to undo)' 'DarkGray' }
-function Custom-PlanHighPerf-Detect { param($p) return (Plan-ReinstallDetect $script:HighPerfTemplate 'High Performance') }
-function Custom-PlanHighPerf-Snapshot { param($p) return $null }
-function Custom-PlanHighPerf-Apply { param($p, $mine) Plan-Reinstall $script:HighPerfTemplate 'High Performance' }
-function Custom-PlanHighPerf-Revert { param($p, $mine) Say '  (putting a power plan back is a one-time action: there is nothing to undo)' 'DarkGray' }
 
 # ------------------------------------------------- built-in plan files (third-party plans) ----
 # Plans that are not Windows' own: each plan file (what "powercfg /export" writes) is kept here, compressed, and checked against its
-# SHA-256 before it is used. Switching one on imports it under its own ID when it is not there yet ("powercfg /import <file> <id>"),
-# then makes it the active plan. Switching it off goes back to the Balanced plan (the Windows default) and deletes the plan again
-# when this app imported it. These plans and Ultimate Performance power plan rule each other out (Add-Tweak -Rivals).
+# SHA-256 and size before it is used ("powercfg /import <file> <id>", see the power plan switches below).
 $script:PlanFileKhorvie = @(
     'H4sIAAAAAAAC/+1ba4xc112/u961N/FrbW+T9TNjJ46d2Cc57wctxIGAFyIVSyUiwAd8nrFx4qwc07iiiJWKkOFTKgSyKB+MqIThS41Uqa4agUsLmJdYJIgM',
     'SNSFVFqBFC1IgBGo5n/unZmdmZ2bvQP+BHPk2Xvn7t17f+f//P3/5/hSfC1NFEWRP39w+Le/8Cv+byby+aaiGvm8lU9OVef/2/EdP/+xdy/++Qe7fvfsF3/5',
@@ -2379,80 +2307,157 @@ function Pwr-Import {
         try { if ([IO.File]::Exists($f)) { [IO.File]::Delete($f) } } catch { }
     }
 }
-# The ID the plan has on this PC: its own, or the one it got when this app imported it under a new one; '' when it is not there
-function Builtin-Where {
-    param([string]$Key, $mine)
-    $def = $script:BuiltinPlans[$Key]
-    $plans = @(Pwr-Plans)
-    foreach ($x in $plans) { if ($x.Guid -eq [string]$def.Guid) { return $x.Guid } }
-    if ($mine -and $mine.New) { foreach ($x in $plans) { if ($x.Guid -eq [string]$mine.New) { return $x.Guid } } }
-    return ''
+# ------------------------------------------------- the power plan switches ----
+# Each switch is one plan: On = the plan is installed, Off = it is not. Switching one on installs it (Windows' own plans are made from
+# Windows' definition under their usual ID; the built-in plan files are imported) and does not change which plan is active. Switching
+# one off deletes that plan and no other: when it is the active plan another one is made active first (Balanced, else High
+# Performance, else Ultimate Performance, else the first other plan), and the last plan on the PC is never deleted. "Make active" on a
+# card (Invoke-Plan action 'Activate') makes that plan the active one.
+$script:PlanDefs = [ordered]@{
+    PlanBalanced = @{ Guid = $script:BalancedTemplate; Name = 'Balanced'; Kind = 'windows'; NameRx = '' }
+    PlanHighPerf = @{ Guid = $script:HighPerfTemplate; Name = 'High Performance'; Kind = 'windows'; NameRx = '' }
+    Ultimate     = @{ Guid = $script:UltimateTemplate; Name = 'Ultimate Performance'; Kind = 'windows'; NameRx = '^Ultimate Performance$' }
+    Khorvie      = @{ Guid = [string]$script:BuiltinPlans.Khorvie.Guid; Name = [string]$script:BuiltinPlans.Khorvie.Name; Kind = 'file'; NameRx = '' }
+    Endgame      = @{ Guid = [string]$script:BuiltinPlans.Endgame.Guid; Name = [string]$script:BuiltinPlans.Endgame.Name; Kind = 'file'; NameRx = '' }
 }
-function Builtin-Detect {
+$script:PlanActive = $false      # set by a plan's check: the plan is the active one
+# The IDs this plan has on the PC: its usual ID first, then the one it got when this app made it under a new ID (an older build made
+# Ultimate Performance that way), then (for Ultimate Performance only) a plan with its English name.
+function Plan-Where {
+    param([string]$Key, $mine, $plans = $null)
+    $def = $script:PlanDefs[$Key]
+    if ($null -eq $plans) { $plans = @(Pwr-Plans) }
+    $own = @(); $more = @()
+    foreach ($x in @($plans)) {
+        if ($x.Guid -eq [string]$def.Guid) { $own += [string]$x.Guid }
+        elseif ($mine -and $mine.New -and $x.Guid -eq [string]$mine.New) { $more += [string]$x.Guid }
+        elseif ($def.NameRx -and [string]$x.Name -match $def.NameRx) { $more += [string]$x.Guid }
+    }
+    return @($own + $more)
+}
+function Plan-Mine {
     param([string]$Key)
-    $def = $script:BuiltinPlans[$Key]
-    $a = Pwr-Active
-    if (-not $a.Guid) { $script:Now = 'Active power plan: could not be read'; return 'NA' }
     $snap = (Get-Store)[$script:CurTweak.Id]
-    $mine = $null; if ($snap -and $snap.Custom) { $mine = $snap.Custom[$Key] }
-    $at = Builtin-Where $Key $mine
-    $inst = 'not installed'; if ($at) { $inst = 'installed' }
-    $script:Now = ('Active power plan: {0}, wanted {1} ({2})' -f $a.Name, $def.Name, $inst)
-    if ($at -and $a.Guid -eq $at) { return 'On' }
-    return 'Off'
+    if ($snap -and $snap.Custom) { return $snap.Custom[$Key] }
+    return $null
 }
-function Builtin-Snapshot {
+function Plan-Detect {
     param([string]$Key)
-    $had = [bool](Plan-Find ([string]$script:BuiltinPlans[$Key].Guid))
-    return @{ Had = $had; New = '' }
+    $def = $script:PlanDefs[$Key]
+    $script:PlanActive = $false
+    $plans = @(Pwr-Plans)
+    if ($plans.Count -eq 0) { $script:Why = 'the power plans could not be listed'; $script:Now = 'Power plans: none could be listed'; return 'NA' }
+    $at = @(Plan-Where $Key (Plan-Mine $Key) $plans)
+    $act = @($plans | Where-Object { $_.Active })[0]
+    $an = 'not known'; if ($act) { $an = [string]$act.Name }
+    if ($at.Count -eq 0) { $script:Now = ('{0} plan: not installed (the active plan is {1})' -f $def.Name, $an); return 'Off' }
+    if ($act -and $at -contains [string]$act.Guid) {
+        $script:PlanActive = $true
+        $script:Now = ('{0} plan: installed, and it is the active plan' -f $def.Name)
+    } else {
+        $script:Now = ('{0} plan: installed (the active plan is {1})' -f $def.Name, $an)
+    }
+    return 'On'
 }
-function Builtin-Apply {
+function Plan-Snapshot {
+    param([string]$Key)
+    return @{ Had = (@(Plan-Where $Key $null).Count -gt 0); New = '' }
+}
+# Ultimate Performance comes with Headroom's own changes inside it: USB selective suspend, USB 3 link power management and the
+# Wi-Fi adapter's power saving off
+function Plan-UltimateExtras {
+    param([string]$Guid)
+    foreach ($mode in '/setacvalueindex', '/setdcvalueindex') {
+        [void](Pwr $mode $Guid '2a737441-1930-4402-8d77-b2bebba308a3' '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' '0')
+        [void](Pwr $mode $Guid '2a737441-1930-4402-8d77-b2bebba308a3' 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' '0')
+        [void](Pwr $mode $Guid '19cbb8fa-5279-450e-9fac-8a3d5fedd0c1' '12bbebe6-58d6-4636-95bb-3217ef867c1a' '0')
+    }
+}
+function Plan-Install {
     param([string]$Key, $mine)
-    $def = $script:BuiltinPlans[$Key]
-    if ($DryRun) { Say ('  [dry] install {0} if it is not there (powercfg /import of the built-in plan file) and make it the active plan' -f $def.Name) 'DarkGray'; return }
-    $g = Builtin-Where $Key $mine
+    $def = $script:PlanDefs[$Key]
+    $at = @(Plan-Where $Key $mine)
+    if ($at.Count) { Say ('  {0} is already installed' -f $def.Name) 'DarkGray'; return }
+    if ($DryRun) { Say ('  [dry] install the {0} plan (the active plan stays the same)' -f $def.Name) 'DarkGray'; return }
+    $g = ''
+    if ($def.Kind -eq 'file') {
+        $g = Pwr-Import (Get-BuiltinPlanBytes $Key) ([string]$def.Guid)
+    } else {
+        $g = Pwr-Restore ([string]$def.Guid)
+        if (-not $g) { $n = Pwr-NewFrom ([string]$def.Guid); if ($n -and (Plan-Find $n)) { $g = $n } }
+    }
     if (-not $g) {
-        $b = Get-BuiltinPlanBytes $Key
-        $g = Pwr-Import $b ([string]$def.Guid)
-        if (-not $g) { throw ('Windows did not import {0}, so nothing was changed' -f $def.Name) }
-        if ($mine) { $mine.New = $g }
-        Say ('  {0} was installed ({1})' -f $def.Name, $g) 'DarkGray'
+        $why = ''; if ($Key -ne 'PlanBalanced' -and $def.Kind -eq 'windows') { $why = ' (a PC with Modern Standby may offer only Balanced)' }
+        if ($def.Kind -eq 'file') { throw ('Windows did not import {0}, so nothing was changed' -f $def.Name) }
+        throw ('Windows did not create the {0} plan{1}, so nothing was changed' -f $def.Name, $why)
     }
-    [void](Pwr '/setactive' $g)
-    if ((Pwr-Active).Guid -ne $g) { throw ('{0} is installed, but Windows did not make it the active plan' -f $def.Name) }
-    Say ('  {0} is now the active plan' -f $def.Name) 'DarkGray'
+    if ($mine -and $g -ne [string]$def.Guid) { $mine.New = $g }
+    if ($Key -eq 'Ultimate') { Plan-UltimateExtras $g }
+    Say ('  the {0} plan is installed ({1}); the active plan is unchanged' -f $def.Name, $g) 'DarkGray'
 }
-function Builtin-Revert {
+# The plan that is made active when the active one is deleted
+function Plan-Fallback {
+    param($rest)
+    foreach ($g in $script:BalancedTemplate, $script:HighPerfTemplate, $script:UltimateTemplate) { foreach ($x in @($rest)) { if ($x.Guid -eq $g) { return $x } } }
+    return @($rest)[0]
+}
+function Plan-Remove {
     param([string]$Key, $mine)
-    $def = $script:BuiltinPlans[$Key]
-    if ($DryRun) { Say ('  [dry] switch back to the Balanced plan (the Windows default) and delete {0} if this app installed it' -f $def.Name) 'DarkGray'; return }
-    $target = ''
-    if (Plan-Find $script:BalancedTemplate) { $target = $script:BalancedTemplate }
-    if (-not $target) { $target = Pwr-Restore $script:BalancedTemplate }
-    if (-not $target) { $target = Pwr-NewFrom $script:BalancedTemplate }
-    if (-not $target) { throw 'could not find or create a Balanced plan, so the active plan was not changed' }
-    [void](Pwr '/setactive' $target)
-    if ((Pwr-Active).Guid -ne $target) { throw 'Windows did not switch to the Balanced plan' }
-    Say "  power plan $target (Balanced) is the active one again" 'DarkGray'
-    # The plan is deleted only when this app imported it: one that was there before stays in the list
-    $del = @()
-    if ($mine -and $mine.New) { $del += [string]$mine.New }
-    elseif ($mine -and -not $mine.Had) { $del += [string]$def.Guid }
-    foreach ($g in $del) {
-        if ($g -eq $target -or -not (Plan-Find $g)) { continue }
-        [void](Pwr '/delete' $g)
-        Say ('  {0} was deleted again (this app installed it)' -f $def.Name) 'DarkGray'
+    $def = $script:PlanDefs[$Key]
+    $plans = @(Pwr-Plans)
+    $at = @(Plan-Where $Key $mine $plans)
+    if ($at.Count -eq 0) { Say ('  the {0} plan is not installed: nothing to delete' -f $def.Name) 'DarkGray'; return }
+    $rest = @($plans | Where-Object { $at -notcontains [string]$_.Guid })
+    if ($rest.Count -eq 0) { throw ('{0} is the only power plan on this PC and one plan must stay, so it was not deleted' -f $def.Name) }
+    $act = Pwr-Active
+    $to = $null; if ($at -contains [string]$act.Guid) { $to = Plan-Fallback $rest }
+    if ($DryRun) {
+        if ($to) { Say ('  [dry] make {0} the active plan, then delete the {1} plan' -f $to.Name, $def.Name) 'DarkGray' }
+        else { Say ('  [dry] delete the {0} plan' -f $def.Name) 'DarkGray' }
+        return
     }
-    if (-not $mine) { Say ('  {0} stays in the list (this app did not install it)' -f $def.Name) 'DarkGray' }
+    if ($to) {
+        [void](Pwr '/setactive' ([string]$to.Guid))
+        if ((Pwr-Active).Guid -ne [string]$to.Guid) { throw ('{0} is the active plan and Windows did not switch to {1} first, so it was not deleted' -f $def.Name, $to.Name) }
+        Say ('  {0} is the active plan now' -f $to.Name) 'DarkGray'
+    }
+    foreach ($g in $at) { [void](Pwr '/delete' $g) }
+    if (@(Plan-Where $Key $mine).Count) { throw ('Windows did not delete the {0} plan' -f $def.Name) }
+    Say ('  the {0} plan was deleted' -f $def.Name) 'DarkGray'
 }
-function Custom-Khorvie-Detect   { param($p) return (Builtin-Detect 'Khorvie') }
-function Custom-Khorvie-Snapshot { param($p) return (Builtin-Snapshot 'Khorvie') }
-function Custom-Khorvie-Apply    { param($p, $mine) Builtin-Apply 'Khorvie' $mine }
-function Custom-Khorvie-Revert   { param($p, $mine) Builtin-Revert 'Khorvie' $mine }
-function Custom-Endgame-Detect   { param($p) return (Builtin-Detect 'Endgame') }
-function Custom-Endgame-Snapshot { param($p) return (Builtin-Snapshot 'Endgame') }
-function Custom-Endgame-Apply    { param($p, $mine) Builtin-Apply 'Endgame' $mine }
-function Custom-Endgame-Revert   { param($p, $mine) Builtin-Revert 'Endgame' $mine }
+function Plan-Activate {
+    param([string]$Key, $mine)
+    $def = $script:PlanDefs[$Key]
+    $at = @(Plan-Where $Key $mine)
+    if ($at.Count -eq 0) { throw ('the {0} plan is not installed: switch it on first' -f $def.Name) }
+    $g = [string]$at[0]
+    if ((Pwr-Active).Guid -eq $g) { $script:RunResult = ('{0} is already the active plan' -f $def.Name); return }
+    if ($DryRun) { Say ('  [dry] make {0} the active plan' -f $def.Name) 'DarkGray'; return }
+    [void](Pwr '/setactive' $g)
+    if ((Pwr-Active).Guid -ne $g) { throw ('Windows did not make {0} the active plan' -f $def.Name) }
+    Say ('  {0} is now the active plan' -f $def.Name) 'DarkGray'
+    $script:RunResult = ('{0} is now the active plan' -f $def.Name)
+}
+function Custom-PlanBalanced-Detect   { param($p) return (Plan-Detect 'PlanBalanced') }
+function Custom-PlanBalanced-Snapshot { param($p) return (Plan-Snapshot 'PlanBalanced') }
+function Custom-PlanBalanced-Apply    { param($p, $mine) Plan-Install 'PlanBalanced' $mine }
+function Custom-PlanBalanced-Revert   { param($p, $mine) Plan-Remove 'PlanBalanced' $mine }
+function Custom-PlanHighPerf-Detect   { param($p) return (Plan-Detect 'PlanHighPerf') }
+function Custom-PlanHighPerf-Snapshot { param($p) return (Plan-Snapshot 'PlanHighPerf') }
+function Custom-PlanHighPerf-Apply    { param($p, $mine) Plan-Install 'PlanHighPerf' $mine }
+function Custom-PlanHighPerf-Revert   { param($p, $mine) Plan-Remove 'PlanHighPerf' $mine }
+function Custom-Ultimate-Detect       { param($p) return (Plan-Detect 'Ultimate') }
+function Custom-Ultimate-Snapshot     { param($p) return (Plan-Snapshot 'Ultimate') }
+function Custom-Ultimate-Apply        { param($p, $mine) Plan-Install 'Ultimate' $mine }
+function Custom-Ultimate-Revert       { param($p, $mine) Plan-Remove 'Ultimate' $mine }
+function Custom-Khorvie-Detect        { param($p) return (Plan-Detect 'Khorvie') }
+function Custom-Khorvie-Snapshot      { param($p) return (Plan-Snapshot 'Khorvie') }
+function Custom-Khorvie-Apply         { param($p, $mine) Plan-Install 'Khorvie' $mine }
+function Custom-Khorvie-Revert        { param($p, $mine) Plan-Remove 'Khorvie' $mine }
+function Custom-Endgame-Detect        { param($p) return (Plan-Detect 'Endgame') }
+function Custom-Endgame-Snapshot      { param($p) return (Plan-Snapshot 'Endgame') }
+function Custom-Endgame-Apply         { param($p, $mine) Plan-Install 'Endgame' $mine }
+function Custom-Endgame-Revert        { param($p, $mine) Plan-Remove 'Endgame' $mine }
 
 function Custom-Hibernate-Detect { param($p) return 'Skip' }
 function Custom-Hibernate-Apply {
@@ -2578,7 +2583,7 @@ function Net-Pre {
                         if (-not $adv.ContainsKey($an)) { $adv[$an] = @() }
                         $adv[$an] += ,@{ DisplayName = [string]$x.N; DisplayValue = [string]$x.V; Keyword = [string]$x.W; RegValue = [string]$x.R; Valid = @($x.L) }
                     }
-                    'npm' { $npm[[string]$x.A] = @{ SelectiveSuspend = [string]$x.S; DeviceSleepOnDisconnect = [string]$x.D } }
+                    'npm' { $npm[[string]$x.A] = @{ SelectiveSuspend = [string]$x.S; DeviceSleepOnDisconnect = [string]$x.D; TurnOff = [string]$x.T } }
                 }
             }
             $r = @{ Nic = $nic; Pm = $pm; Adv = $adv; Npm = $npm }
@@ -2611,7 +2616,20 @@ function Nic-PmRead {
     if ($script:ScanMode) { $x = Net-Pre; if ($x -and $x.Npm.ContainsKey($name)) { return $x.Npm[$name] } }
     $r = Get-NetAdapterPowerManagement -Name $name -ErrorAction Ignore
     if (-not $r) { return $null }
-    return @{ SelectiveSuspend = [string]$r.SelectiveSuspend; DeviceSleepOnDisconnect = [string]$r.DeviceSleepOnDisconnect }
+    return @{ SelectiveSuspend = [string]$r.SelectiveSuspend; DeviceSleepOnDisconnect = [string]$r.DeviceSleepOnDisconnect; TurnOff = [string]$r.AllowComputerToTurnOffDevice }
+}
+# "Allow the computer to turn off this device to save power" through Windows' own network adapter settings (what Device Manager's box
+# shows on Windows 11): the adapter's power settings are read, that one is changed, and they are written back. Unless $restart, the adapter
+# is not restarted (the change then counts from the next restart). Returns '' or what Windows said.
+function Nic-TurnOffWrite {
+    param([string]$name, [string]$value, [bool]$restart)
+    if ($DryRun) { return '' }
+    try {
+        $r = Get-NetAdapterPowerManagement -Name $name -ErrorAction Stop
+        $r.AllowComputerToTurnOffDevice = $value
+        if ($restart) { $r | Set-NetAdapterPowerManagement -ErrorAction Stop } else { $r | Set-NetAdapterPowerManagement -NoRestart -ErrorAction Stop }
+        return ''
+    } catch { Drop-Error $_; return ([string]$_.Exception.Message -split "`r?`n")[0].Trim() }     # (the caller says it, once)
 }
 function Nic-PmWrite {
     param([string]$name, [string]$setting, [string]$value)
@@ -2647,22 +2665,30 @@ function Nic-AdvReset {
 $script:NicPowerRx = 'Energy.?Efficient|Green Ethernet|Power Sav|\bEEE\b|Ultra Low Power|Gigabit Lite|Reduce Speed|Auto Disable|Link Speed Battery'
 $script:OffValueRx = '^(Disabled|Off|Maximum Performance|No|Never)$'
 
-# 1) the "Allow the computer to turn off this device to save power" box
+# 1) "Allow the computer to turn off this device to save power"
+# Windows 11 keeps this box in the adapter's own power settings (Get/Set-NetAdapterPowerManagement, AllowComputerToTurnOffDevice:
+# Enabled, Disabled or Unsupported). That is what is read and changed. An adapter for which Windows does not report it falls back to
+# the older ways: the PnPCapabilities value Microsoft documents (KB 2740020) and the Device Manager switch behind the box (WMI).
+function Nic-TurnOffState {
+    # 'off' = the box is unticked, 'on' = it is ticked, '' = this adapter has no such box
+    param($n, $pm)
+    $r = Nic-PmRead $n.Name
+    $tf = ''; if ($r) { $tf = [string]$r.TurnOff }
+    if ($tf -eq 'Disabled') { return 'off' }
+    if ($tf -eq 'Enabled') { return 'on' }
+    $ck = Nic-ClassKey $n.Guid
+    if ($ck) { $c = Reg-Read $ck 'PnPCapabilities'; if ($c.Exists -and (([int]$c.Value -band 0x10) -ne 0)) { return 'off' } }
+    foreach ($i in @($pm)) { if ($i.Id -eq $n.PnpId) { if ($i.Enable) { return 'on' } else { return 'off' } } }
+    return ''
+}
 function Custom-NicTurnOff-Detect {
     param($p)
     $pm = @(Pm-List)
     $on = 0; $off = 0
     foreach ($n in @(Nic-List)) {
-        $ok = $true
-        $ck = Nic-ClassKey $n.Guid
-        if ($ck) {
-            $c = Reg-Read $ck 'PnPCapabilities'
-            if (-not ($c.Exists -and (([int]$c.Value -band 0x10) -ne 0))) { $ok = $false }
-        }
-        foreach ($i in $pm) { if ($i.Id -eq $n.PnpId -and $i.Enable) { $ok = $false } }
-        if ($ok) { $on++ } else { $off++ }
+        switch (Nic-TurnOffState $n $pm) { 'off' { $on++ } 'on' { $off++ } }
     }
-    if ($on + $off -eq 0) { $script:Why = 'no physical network adapters found'; $script:Now = 'Network adapters: no physical adapter found'; return 'NA' }
+    if ($on + $off -eq 0) { $script:Why = 'no network adapter has this power box'; $script:Now = 'Network adapters: none has an "allow the computer to turn off this device" box'; return 'NA' }
     $script:Now = ('Network adapters: {0} of {1} have "allow the computer to turn off this device" switched off, wanted all' -f $on, ($on + $off))
     return (Count-State $on $off)
 }
@@ -2671,7 +2697,8 @@ function Custom-NicTurnOff-Snapshot {
     $nic = @{}
     $pm = @(Pm-List)
     foreach ($n in @(Nic-List)) {
-        $e = @{ ClassKey = ''; PnPExists = $false; PnPValue = 0; Enable = $null }
+        $e = @{ ClassKey = ''; PnPExists = $false; PnPValue = 0; Enable = $null; TurnOff = '' }
+        $r = Nic-PmRead $n.Name; if ($r) { $e.TurnOff = [string]$r.TurnOff }
         $ck = Nic-ClassKey $n.Guid
         if ($ck) { $e.ClassKey = $ck; $c = Reg-Read $ck 'PnPCapabilities'; $e.PnPExists = $c.Exists; if ($c.Exists) { $e.PnPValue = [int]$c.Value } }
         foreach ($i in $pm) { if ($i.Id -eq $n.PnpId) { $e.Enable = $i.Enable } }
@@ -2681,19 +2708,30 @@ function Custom-NicTurnOff-Snapshot {
 }
 function Custom-NicTurnOff-Apply {
     param($p, $mine)
+    $pm = @(Pm-List)
     foreach ($n in @(Nic-List)) {
         Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        $r = Nic-PmRead $n.Name
+        $tf = ''; if ($r) { $tf = [string]$r.TurnOff }
+        if ($tf -eq 'Disabled') { Say '    already off' 'DarkGray'; continue }
         if ($DryRun) { Say '    [dry] power-saving box off' 'DarkGray'; continue }
+        if ($tf -eq 'Enabled') {
+            # the adapter restarts for a moment so the change counts at once (not over Remote Desktop: then it counts from the next restart)
+            $err = Nic-TurnOffWrite $n.Name 'Disabled' (-not $script:InRdp)
+            if ($err) { Say "    ! Windows did not change it: $err" 'Yellow' } else { Say '    "Allow the computer to turn off this device" is now off' 'DarkGray' }
+            continue
+        }
+        if ((Nic-TurnOffState $n $pm) -eq '') { Say '    this adapter has no such box' 'DarkGray'; continue }
+        # an adapter whose box Windows does not report: the older ways. PnPCapabilities 24 (0x18) is the value Microsoft documents for the
+        # box cleared; it is OR-ed in, so a wake setting you chose (0x100) is kept.
         Pm-Set $n.PnpId $false
-        # PnPCapabilities 24 (0x18) is the value Microsoft documents (KB 2740020) for "Allow the computer to turn off this device" cleared;
-        # 280 (0x118) is the same with the wake options greyed. It is OR-ed in, so a wake setting you chose (0x100) is kept.
         $ck = Nic-ClassKey $n.Guid
         if ($ck) {
             $c = Reg-Read $ck 'PnPCapabilities'
             $cur = 0; if ($c.Exists) { $cur = [int]$c.Value }
             [void](Reg-Write $ck 'PnPCapabilities' ($cur -bor 0x18) 'DWord' -Quiet)
         }
-        Say '    "Allow the computer to turn off this device" is now off' 'DarkGray'
+        Say '    "Allow the computer to turn off this device" is now off (it counts from the next restart)' 'DarkGray'
     }
 }
 function Custom-NicTurnOff-Revert {
@@ -2701,13 +2739,20 @@ function Custom-NicTurnOff-Revert {
     foreach ($n in @(Nic-List)) {
         Say "  $($n.Name) ($($n.Desc))" 'Gray'
         if ($DryRun) { Say '    [dry] power-saving box back to the Windows default (on)' 'DarkGray'; continue }
+        $r = Nic-PmRead $n.Name
+        $tf = ''; if ($r) { $tf = [string]$r.TurnOff }
+        if ($tf -eq 'Disabled') {
+            $err = Nic-TurnOffWrite $n.Name 'Enabled' (-not $script:InRdp)
+            if ($err) { Say "    ! Windows did not change it: $err" 'Yellow' }
+        }
         $ck = Nic-ClassKey $n.Guid
         if ($ck) {
-            # only the two "turn off this device" bits are cleared, so a wake setting you chose (0x100) is kept; with none left the value is deleted (the Windows default)
+            # the two "turn off this device" bits that this app (or an older build) may have set are cleared, so a wake setting you chose
+            # (0x100) is kept; with none left the value is deleted (the Windows default)
             $c = Reg-Read $ck 'PnPCapabilities'
             if ($c.Exists) {
                 $v = [int]$c.Value -band (-bnot 0x18)
-                if ($v -eq 0) { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) } else { [void](Reg-Write $ck 'PnPCapabilities' $v 'DWord' -Quiet) }
+                if ($v -ne [int]$c.Value) { if ($v -eq 0) { [void](Reg-Remove $ck 'PnPCapabilities' -Quiet) } else { [void](Reg-Write $ck 'PnPCapabilities' $v 'DWord' -Quiet) } }
             }
         }
         Pm-Set $n.PnpId $true
@@ -3494,10 +3539,18 @@ function Custom-AcmApps-Revert {
 
 # ------------------------------- Windows AI core package -----
 # MicrosoftWindows.Client.CoreAI is part of Windows and is marked "not removable". Windows allows removing such a package once it is
-# marked end of life for the user: a key named after the package under ...\Appx\AppxAllUserStore\EndOfLife\<user SID>. The package is
-# then removed for every user and from the list of apps new accounts get.
+# marked end of life: a key named after the package under ...\Appx\AppxAllUserStore\EndOfLife\<account SID>. The removal goes the way
+# the other removal tools do it:
+#   1. the package's family is marked deprovisioned (AppxAllUserStore\Deprovisioned\<family>, the key Windows itself writes when a
+#      provisioned app is removed), so Windows does not install it again for new accounts or with an update
+#   2. Windows' own "not removable" mark is taken off (Set-NonRemovableAppsPolicy -NonRemovable 0, on the Windows versions that have it)
+#   3. it is marked end of life for SYSTEM (S-1-5-18), every account that has an app store entry, and every account it is installed for
+#   4. it is removed for all users, else for each account it is installed for (Appx-RemoveOne), and its provisioned copy is removed
+#   5. the end-of-life marks are taken out again: left in place they can stop Windows Update from installing updates
+# Then it is checked: when it is still installed for any account the setting fails with what Windows said.
 $script:AiCorePat = 'MicrosoftWindows.Client.CoreAI*'
-$script:EolRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife'
+$script:AppxStore = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore'
+$script:EolRoot = $script:AppxStore + '\EndOfLife'
 function Ai-CoreFind {
     $d = Appx-Data
     $pk = @{}; $pv = @{}; $lv = @{}
@@ -3505,13 +3558,22 @@ function Ai-CoreFind {
     foreach ($p in $d.Prov) { if ([string]$p.Name -like $script:AiCorePat) { $pv[[string]$p.Pkg] = [string]$p.Name } }
     return @{ Pkgs = $pk; Prov = $pv; Live = $lv }
 }
+# The package family of a full package name (Name_Version_Arch_Resource_Publisher -> Name_Publisher)
+function Appx-FamilyOf {
+    param([string]$Full)
+    $s = $Full -split '_'
+    if ($s.Count -lt 3) { return $Full }
+    return ($s[0] + '_' + $s[-1])
+}
 # The accounts a package is installed for (the current account is always in the list)
 function Appx-UserSids {
     param([string]$Full)
     $sids = @()
+    $n0 = $Error.Count
     try { $sids += [string][System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value } catch { }
     try {
-        foreach ($x in @(Get-AppxPackage -AllUsers -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $Full })) {
+        $nm = ($Full -split '_')[0]
+        foreach ($x in @(Get-AppxPackage -AllUsers -Name $nm -ErrorAction Stop | Where-Object { $_.PackageFullName -eq $Full })) {
             foreach ($u in @($x.PackageUserInformation)) {
                 $s = ''
                 try { $s = [string]$u.UserSecurityId.Sid } catch { }
@@ -3519,13 +3581,48 @@ function Appx-UserSids {
             }
         }
     } catch { }
+    Drop-ErrorsSince $n0
     return @($sids | Where-Object { $_ })
+}
+# The accounts that have an entry in Windows' app store (AppxAllUserStore\S-1-5-21-...)
+function Appx-StoreSids {
+    $o = @()
+    foreach ($k in @(Reg-SubKeys $script:AppxStore)) { $leaf = ([string]$k -split '\\')[-1]; if ($leaf -like 'S-1-5-21-*' -and $o -notcontains $leaf) { $o += $leaf } }
+    return $o
+}
+# Every account the end-of-life mark is written for: SYSTEM, the accounts with an app store entry, the accounts it is installed for
+function Ai-CoreSids {
+    param([string]$Full)
+    $o = @('S-1-5-18')
+    foreach ($s in @(@(Appx-StoreSids) + @(Appx-UserSids $Full))) { if ($s -and $o -notcontains $s) { $o += [string]$s } }
+    return $o
 }
 function Appx-EolMark {
     param([string]$Sid, [string]$Full)
+    if ($DryRun) { return '' }
+    try { New-Item -Path ($script:EolRoot + '\' + $Sid + '\' + $Full) -Force -ErrorAction Stop | Out-Null; return '' }
+    catch { Drop-Error $_; return ('it could not be marked as end of life for {0}: {1}' -f $Sid, $_.Exception.Message) }
+}
+function Appx-EolClear {
+    param([string]$Sid, [string]$Full)
     if ($DryRun) { return }
-    try { New-Item -Path ($script:EolRoot + '\' + $Sid + '\' + $Full) -Force -ErrorAction Stop | Out-Null }
-    catch { Say "  ! could not mark the package as end of life for $Sid : $($_.Exception.Message)" 'Yellow' }
+    $k = $script:EolRoot + '\' + $Sid + '\' + $Full
+    $n0 = $Error.Count
+    if (Test-Path -LiteralPath $k) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
+    Drop-ErrorsSince $n0
+}
+function Appx-DeprovMark {
+    param([string]$Family)
+    if ($DryRun) { return '' }
+    try { New-Item -Path ($script:AppxStore + '\Deprovisioned\' + $Family) -Force -ErrorAction Stop | Out-Null; return '' }
+    catch { Drop-Error $_; return ('it could not be marked as deprovisioned: ' + $_.Exception.Message) }
+}
+function Appx-NonRemovableOff {
+    param([string]$Family)
+    if ($DryRun) { return '' }
+    if (-not (Get-Command Set-NonRemovableAppsPolicy -ErrorAction Ignore)) { return '' }       # (older Windows 11 versions do not have it)
+    try { Set-NonRemovableAppsPolicy -Online -PackageFamilyName $Family -NonRemovable 0 -ErrorAction Stop | Out-Null; return '' }
+    catch { Drop-Error $_; return ('Windows kept its "not removable" mark: ' + $_.Exception.Message) }
 }
 function Custom-AiCore-Detect {
     param($p)
@@ -3544,20 +3641,34 @@ function Custom-AiCore-Apply {
     param($p, $mine)
     $m = Ai-CoreFind
     if ($m.Pkgs.Count -eq 0 -and $m.Prov.Count -eq 0) { Say '  (the Windows AI core package is not on this PC)' 'DarkGray'; return }
+    $fails = @()
     foreach ($full in @($m.Pkgs.Keys)) {
-        Say "  removing app $($m.Pkgs[$full])" 'Gray'
+        $name = [string]$m.Pkgs[$full]
+        Say "  removing app $name" 'Gray'
         if ($DryRun) { continue }
-        foreach ($sid in @(Appx-UserSids $full)) { Appx-EolMark $sid $full }
-        try { Remove-AppxPackage -Package $full -AllUsers -ErrorAction Stop }
-        catch {
-            try { Remove-AppxPackage -Package $full -ErrorAction Stop }
-            catch { Say "  ! $($m.Pkgs[$full]) could not be removed: $($_.Exception.Message)" 'Yellow' }
+        $notes = @()
+        $fam = Appx-FamilyOf $full
+        $r = Appx-DeprovMark $fam; if ($r) { $notes += $r }
+        $r = Appx-NonRemovableOff $fam; if ($r) { $notes += $r }
+        $sids = @(Ai-CoreSids $full)
+        foreach ($sid in $sids) { $r = Appx-EolMark $sid $full; if ($r) { $notes += $r } }
+        Say ('  marked as end of life for {0} account(s); removing it...' -f $sids.Count) 'DarkGray'
+        $why = Appx-RemoveOne $full $name
+        foreach ($sid in $sids) { Appx-EolClear $sid $full }
+        Say '  the end-of-life marks are taken out again (left in place they can stop Windows Update)' 'DarkGray'
+        if ($why) {
+            if ($notes.Count) { $why += ' (' + (($notes | Select-Object -First 2) -join '; ') + ')' }
+            $fails += ('{0}: {1}' -f $name, $why)
+            Say "  ! $name was not removed: $why" 'Yellow'
+        } elseif (Appx-PendingFull $full $name) {
+            Say '  Windows finishes removing it at the next restart (it is in use)' 'DarkGray'
         }
     }
     foreach ($k in @($m.Prov.Keys)) {
         if (-not $DryRun) { Remove-AppxProvisionedPackage -Online -PackageName $k -ErrorAction SilentlyContinue | Out-Null }
     }
     $script:Cache.Remove('appx')
+    if ($fails.Count) { throw ('Windows did not remove ' + ($fails -join '; ')) }
 }
 function Custom-AiCore-Revert { param($p, $mine) Say '  (the removed AI package cannot be put back from here)' 'Yellow' }
 
@@ -4391,7 +4502,7 @@ Add-Tweak -Id 'smb1' -Cat $cShare -Inv -Def 'Off' -Preset -Reboot -Name 'SMB1 pr
 
 # ----------------------------------------------------- Adapters and USB -------
 Add-Tweak -Id 'nic-turnoff' -Cat $cNic -Inv -Def 'On' -Reboot -Name 'Windows turning off network adapters' `
-    -Desc 'On: Windows may turn off a network adapter to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked. Off: the "turn off this device to save power" box is unticked on every physical network adapter. Wake-on-LAN settings you chose are kept.' `
+    -Desc 'On: Windows may turn off a network adapter to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked. Off: the "turn off this device to save power" box is unticked on every physical network adapter, through Windows'' own adapter settings (what Device Manager shows); each adapter restarts for a moment, so the connection drops for a few seconds. Wake-on-LAN settings you chose are kept.' `
     -Parts @(
         pCustom 'NicTurnOff' 'Device Manager > network adapter > Power Management > "Allow the computer to turn off this device": off, on every physical adapter'
     )
@@ -4415,28 +4526,37 @@ Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power sav
     )
 
 # --------------------------------------------------------------- Power --------
-Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Preset -Name 'Ultimate Performance power plan' `
-    -Desc 'On: the Ultimate Performance plan is created and made the active plan. High Performance is used if your PC hides it, and inside the plan USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving are turned off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses (not necessarily the plan you used before), and the plan this app made is deleted.' `
+# The five power plan switches (-Plan): On = the plan is installed, Off = it is deleted. Switching one on does not change the active plan;
+# "Make active" on its card does. Switching the active plan off makes another plan active first; the last plan is never deleted.
+$planTail = ' Switching it on only installs it: "Make active" on its card makes it the plan Windows uses, and the card says which plan is active. Switching it off deletes this plan and no other; if it is the active plan, Balanced (or another installed plan) is made active first, and the last plan on the PC is never deleted.'
+Add-Tweak -Id 'plan-balanced' -Cat $cPower -Def 'On' -Plan 'PlanBalanced' -Name 'Balanced power plan' `
+    -Desc ('On: the Balanced plan is installed, under its usual ID and with the settings Windows ships it with. It is the plan Windows uses unless you choose another. Off: the Balanced plan is deleted.' + $planTail) `
     -Parts @(
-        pCustom 'Ultimate' 'powercfg: duplicate the Ultimate Performance scheme, USB / wireless power saving off in it, set it active'
+        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID (to install) / powercfg /delete (to delete)'
     )
 
-Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Rivals 'ultimate' -Name 'Khorvie''s power plan' `
-    -Desc 'On: Khorvie''s PowerPlan, a third-party gaming power plan (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive, USB selective suspend and USB 3 link power management off, the display and hard disk never turned off, and wake timers off. Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this, Endgame Performance power plan and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the others off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Khorvie''s PowerPlan is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
+Add-Tweak -Id 'plan-highperf' -Cat $cPower -Def 'On' -Plan 'PlanHighPerf' -Name 'High Performance power plan' `
+    -Desc ('On: the High Performance plan is installed, under its usual ID and with the settings Windows ships it with. Off: it is deleted. On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
-        pCustom 'Khorvie' 'powercfg /import of the built-in plan file (Khorvie''s PowerPlan, ID 8070b076-188f-428d-a9d6-e1a2f99fad5d) when it is not installed, then /setactive'
+        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID (to install) / powercfg /delete (to delete)'
     )
 
-Add-Tweak -Id 'endgame-plan' -Cat $cPower -Def 'Off' -Rivals 'ultimate', 'khorvie-plan' -Name 'Endgame Performance power plan' `
-    -Desc 'On: Endgame Performance, a third-party gaming power plan made by gavot (not one of Windows'' own), is installed if it is not there yet and made the active plan. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive At Guaranteed, energy performance preference 0 (speed first), core parking off, USB selective suspend, USB 3 link power management and PCI Express link power management off, interrupts that Windows may move sent to logical processor 1, wake timers off, and the display and hard disk never turned off. It also switches sleep off while it is the active plan: the PC cannot sleep (shutting down and restarting work as usual). Keeping the processor at its highest state means more power use and heat when the PC is idle. Only one of this, Khorvie''s power plan and Ultimate Performance power plan can be on, since each makes itself the active plan: switching one on switches the others off. Off: your PC goes back to the Balanced plan, which is what Windows normally uses, and Endgame Performance is deleted again if Headroom installed it (one you installed yourself stays in the list).' `
+Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Plan 'Ultimate' -Name 'Ultimate Performance power plan' `
+    -Desc ('On: the Ultimate Performance plan is installed. It is High Performance with the small delays of fine-grained power management removed, and Headroom also turns off USB selective suspend, USB 3 link power management and Wi-Fi adapter power saving inside it. Off: it is deleted, also a copy an older Headroom build made under another ID. On a PC with Modern Standby Windows may refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
-        pCustom 'Endgame' 'powercfg /import of the built-in plan file (Endgame Performance, ID 287763d5-e899-4774-bad9-cc0b30c3c391) when it is not installed, then /setactive'
+        pCustom 'Ultimate' 'powercfg /duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 under the same ID, USB / Wi-Fi power saving off in it (to install) / powercfg /delete (to delete)'
     )
 
-Add-Tweak -Id 'plans-delete' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Standard power plans' -NotRec 'No speed gain, and you can no longer switch to Balanced.' `
-    -Desc 'On: Windows keeps its power plans, so you can switch between Balanced, High Performance and Power Saver. Off: only the active power plan is kept. Plans that your PC maker or a driver added (the AMD chipset driver adds AMD Ryzen Balanced, for example) are deleted too. Switching it back on recreates the three standard plans only. Not offered on laptops (a battery was detected), so you keep Balanced for when you unplug.' `
+Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Plan 'Khorvie' -Name 'Khorvie''s power plan' `
+    -Desc ('On: Khorvie''s PowerPlan, a third-party gaming power plan (not one of Windows'' own), is installed. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive, USB selective suspend and USB 3 link power management off, interrupts that Windows may move sent to logical processor 1, wake timers off, and the display and hard disk never turned off. Keeping the processor at its highest state means more power use and heat when the PC is idle. Off: it is deleted.' + $planTail) `
     -Parts @(
-        pCustom 'PlansDelete' 'powercfg /delete for every plan except the active one'
+        pCustom 'Khorvie' 'powercfg /import of the built-in plan file (Khorvie''s PowerPlan, ID 8070b076-188f-428d-a9d6-e1a2f99fad5d) (to install) / powercfg /delete (to delete)'
+    )
+
+Add-Tweak -Id 'endgame-plan' -Cat $cPower -Def 'Off' -Plan 'Endgame' -Name 'Endgame Performance power plan' `
+    -Desc ('On: Endgame Performance, a third-party gaming power plan made by gavot (not one of Windows'' own), is installed. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive At Guaranteed, energy performance preference 0 (speed first), core parking off, USB selective suspend, USB 3 link power management and PCI Express link power management off, interrupts that Windows may move sent to logical processor 1, wake timers off, and the display and hard disk never turned off. While it is the active plan sleep is off: the PC cannot sleep (shutting down and restarting work as usual). Keeping the processor at its highest state means more power use and heat when the PC is idle. Off: it is deleted.' + $planTail) `
+    -Parts @(
+        pCustom 'Endgame' 'powercfg /import of the built-in plan file (Endgame Performance, ID 287763d5-e899-4774-bad9-cc0b30c3c391) (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast Startup and hibernation' `
@@ -4446,20 +4566,6 @@ Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast S
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' 'HibernateEnabled' 0 1
         pCustom 'Hibernate' 'powercfg /h off   (undo: powercfg /h on)'
     )
-
-Add-Tweak -Id 'plan-balanced' -Cat $cPower -Once -Name 'Reinstall Balanced power plan' `
-    -Desc 'A one-time action, not a switch. Puts the Balanced power plan back with the settings Windows ships it with, under its usual ID, so Windows and other programs find it again. If the plan is missing (deleted by the Standard power plans setting or by another tool) it is added again. If it is there, it is made fresh: a copy of it is made first, the plan is deleted and created again from Windows'' own settings, and then the copy is deleted, so you are never left without the plan. Changes you made inside the plan are lost. The active plan stays the same: if Balanced was the active plan it is the active plan again afterwards, otherwise it is only added to the list (choose it under Power Options if you want to use it). If you switched Standard power plans off, switch it back on instead: it puts all three standard plans back, and otherwise the next check of the PC offers to delete the other plans again.' `
-    -Parts @(
-        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID (when the plan is there: a copy first, then /delete and the same again, then the copy is deleted)'
-    )
-
-Add-Tweak -Id 'plan-highperf' -Cat $cPower -Once -Name 'Reinstall High Performance power plan' `
-    -Desc 'A one-time action, not a switch. Puts the High Performance power plan back with the settings Windows ships it with, under its usual ID. If the plan is missing it is added again; if it is there, it is made fresh the same way as Reinstall Balanced power plan (a copy first, so you are never left without it), and changes you made inside it are lost. The active plan stays the same: if High Performance was the active plan it is the active plan again afterwards, otherwise it is only added to the list (choose it under Power Options if you want to use it). On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create High Performance; nothing is changed then. If you switched Standard power plans off, switch it back on instead, as for Balanced.' `
-    -Parts @(
-        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID (when the plan is there: a copy first, then /delete and the same again, then the copy is deleted)'
-    )
-
-# (desktop-delay and power-throttle used to be here; they are on the "Placebo Tweaks - Not Recommended" page now, further down)
 
 # ------------------------------------------------------- Startup apps ---------
 # One switch per program on Task Manager's Startup apps list (built from this PC, so it can differ each run).
@@ -5234,9 +5340,9 @@ Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activatio
     )
 
 Add-Tweak -Id 'ai-core' -Cat $cAi -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Windows AI core package' `
-    -Desc 'On: MicrosoftWindows.Client.CoreAI is installed; it is the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Off: the package is removed. Windows treats it as part of the system, so this app first marks it as end of life for your account, which is the way Windows allows such a package to be removed, and then removes it for all users and from the list of apps new accounts get. On a PC that does not have it, the setting reads as off and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
+    -Desc 'On: MicrosoftWindows.Client.CoreAI is installed; it is the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Off: the package is removed. Windows treats it as part of the system, so this app first marks it as deprovisioned (so Windows does not install it again for new accounts or with an update), takes off Windows'' own "not removable" mark where Windows has that command, and marks it as end of life for SYSTEM and every account, which is the way Windows allows such a package to be removed. Then it is removed for all users (or account by account when Windows refuses that), and from the list of apps new accounts get, and the end-of-life marks are taken out again, because left in place they can stop Windows Update from installing updates. If Windows still keeps it for an account, the setting says Failed with what Windows said. If it is in use, Windows finishes removing it at the next restart. On a PC that does not have it, the setting reads as off and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
     -Parts @(
-        pCustom 'AiCore' 'marks MicrosoftWindows.Client.CoreAI as end of life for your account (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\EndOfLife), removes it for all users and from the apps new accounts get    (cannot be undone from here)'
+        pCustom 'AiCore' 'marks MicrosoftWindows.Client.CoreAI deprovisioned (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned), turns its "not removable" policy off (Set-NonRemovableAppsPolicy), marks it end of life for SYSTEM and every account (AppxAllUserStore\EndOfLife), removes it for all users and from the apps new accounts get, then takes the end-of-life marks out again    (cannot be undone from here)'
     )
 
 Add-Tweak -Id 'ai-page' -Cat $cAi -Inv -Def 'On' -Preset -Name 'AI components page in Settings' `
@@ -7192,10 +7298,8 @@ function Test-CanChange {
 }
 
 # The user ticked (want = true) or unticked (false) a box. Returns '' when accepted, else why not.
-$script:RivalNote = ''      # what Try-SetWant did to a rival (Add-Tweak -Rivals) of the setting it ticked, for the status line
 function Try-SetWant {
     param([string]$id, [bool]$want)
-    $script:RivalNote = ''
     $row = $script:Rows[$id]
     if (-not $row) { return 'Unknown setting.' }
     $why = Test-CanChange $row
@@ -7212,21 +7316,6 @@ function Try-SetWant {
     $row.Force = ''
     $row.Note = ''
     $row.NoteDetail = ''
-    # only one of a setting and its rivals can be on: lining this one up to go on takes a rival's tick away, or lines it up to go off
-    if ($want -and (Get-Action $row) -eq 'Apply') {
-        foreach ($rv in @(Get-Rivals $row.T)) {
-            $rr = $script:Rows[[string]$rv.Id]
-            if (-not $rr) { continue }
-            $ra = Get-Action $rr
-            if ($ra -eq 'Apply') {
-                $rr.Want = $false; $rr.Force = ''; $rr.Note = ''; $rr.NoteDetail = ''
-                $script:RivalNote = ('"{0}" is not lined up any more: only one of it and "{1}" can be on.' -f $rv.Name, $row.T.Name)
-            } elseif ($rr.State -eq 'On' -and $ra -ne 'Undo' -and -not (Test-CanChange $rr)) {
-                $rr.Want = $false; $rr.Force = ''; $rr.Note = ''; $rr.NoteDetail = ''
-                $script:RivalNote = ('"{0}" is lined up to switch off: only one of it and "{1}" can be on.' -f $rv.Name, $row.T.Name)
-            }
-        }
-    }
     return ''
 }
 
@@ -7325,8 +7414,8 @@ $script:AdvancedExtra = @(
     'rdp', 'remote-assist', 'quickassist', 'winrm', 'remote-mgmt', 'vpn',
     # Network adapters and USB power: the one Recommended leaves out
     'nic-turnoff',
-    # Power plan and startup: the two Recommended leaves out
-    'plans-delete', 'hibernate',
+    # Power plan and startup: Fast Startup and hibernation (the power plan switches are in no preset)
+    'hibernate',
     # Gaming and performance (all but WPBT; Recommended has the rest)
     'wu-drivers',
     # Security prompts (all but BitLocker and automatic device encryption)
@@ -7356,16 +7445,6 @@ $script:Personal = @{ Saved = ''; Picks = @{}; Source = '' }
 
 # Is this row in the preset? ($key: recommended | advanced | personal)
 function Test-InPreset {
-    param($row, [string]$key)
-    if (-not (Test-InPresetBase $row $key)) { return $false }
-    # a preset does not swap one setting for its rival: while the rival is on (and not part of the preset) the setting is left out
-    foreach ($rv in @(Get-Rivals $row.T)) {
-        $rr = $script:Rows[[string]$rv.Id]
-        if ($rr -and $rr.State -eq 'On' -and -not (Test-InPresetBase $rr $key)) { return $false }
-    }
-    return $true
-}
-function Test-InPresetBase {
     param($row, [string]$key)
     $id = [string]$row.T.Id
     switch ($key) {
@@ -7582,13 +7661,6 @@ function Get-ApplyAllSkip {
     if (-not $cat -and [string]$row.T.Cat -like 'Startup apps*') { return 'which programs start with Windows is your own choice' }
     if (-not $cat -and [string]$row.T.Cat -eq $script:TestingCat) { return 'they are untested ideas from other debloat scripts, so you pick them yourself on the Testing page' }
     if ($row.T.Untested) { return 'they are untested ideas from other debloat scripts, so you pick them yourself' }
-    foreach ($rv in @(Get-Rivals $row.T)) {
-        $rr = $script:Rows[[string]$rv.Id]
-        if (-not $rr) { continue }
-        $ra = Get-Action $rr
-        if ($ra -eq 'Apply') { return ('only one of it and "{0}" can be on, and "{0}" is lined up' -f $rv.Name) }
-        if ($rr.State -eq 'On' -and $ra -ne 'Undo') { return ('only one of it and "{0}" can be on, and "{0}" is on' -f $rv.Name) }
-    }
     $why = $script:ApplyAllSkip[[string]$row.T.Id]
     if ($why) { return [string]$why }
     return ''
@@ -7708,11 +7780,22 @@ function Get-Counts {
 }
 
 # ---------------------------------------------------------------- the texts ----
+# A power plan switch whose plan is the active one (Get-TweakState puts 'active' in Choice)
+function Test-PlanActive {
+    param($row)
+    return [bool]($row -and $row.T -and $row.T.Plan -and [string]$row.State -eq 'On' -and [string]$row.Choice -eq 'active')
+}
 function Get-StateText {
     # What the setting is now, in the words of the switch: "On" / "Off". 'Already on' / 'Already off' = it was like this before this
-    # app did anything (no undo record), so there is nothing of ours to take back.
+    # app did anything (no undo record), so there is nothing of ours to take back. A power plan switch says Installed / Not installed.
     param($row)
     $t = $row.T
+    if ($t -and $t.Plan) {
+        switch ([string]$row.State) {
+            'On'  { if (Test-PlanActive $row) { return 'Installed, active plan' } else { return 'Installed' } }
+            'Off' { return 'Not installed' }
+        }
+    }
     $once = ($row.Once -or ($t -and $t.Once))
     switch ([string]$row.State) {
         'Checking' { return 'Checking...' }
@@ -7746,6 +7829,7 @@ function Get-NextText {
     $a = Get-Action $row
     if ($row.T.Choices -and $a) { return ('Set to ' + (Get-ChoiceLabel $row.T ([string]$row.Pick))) }
     if ($a -eq 'Apply' -and $row.T.Once) { return 'Run now' }
+    if ($a -and $row.T.Plan) { if ($a -eq 'Apply') { return 'Install' } else { return 'Delete' } }
     if ($a) { if (Get-SwitchGoesOn $row.T ($a -eq 'Undo')) { return 'Turn on' } else { return 'Turn off' } }
     return ''
 }
@@ -7990,7 +8074,9 @@ function Get-DetailParts {
     elseif ([string]$row.State -eq 'Partial' -or [string]$row.State -eq 'Unknown') { $c = 'warn' }
     [void]$p.Add(@{ S = 'title'; C = ''; T = (Get-TitleCase ([string]$t.Name)) + $nl })
     [void]$p.Add(@{ S = 'sub'; C = ''; T = (Get-CatTitle ([string]$t.Cat)) + $nl + $nl })
-    [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + [string]$row.Detail + $nl })
+    $nowT = [string]$row.Detail
+    if ($t.Plan -and ([string]$row.State -eq 'On' -or [string]$row.State -eq 'Off')) { $nowT = Get-StateText $row }     # a power plan: installed / not installed
+    [void]$p.Add(@{ S = 'now'; C = $c; T = 'Now: ' + $nowT + $nl })
     # the switch, in words: where it is now and what Windows has out of the box
     if (-not $t.Once) {
         if ($t.Choices) {
@@ -8007,6 +8093,12 @@ function Get-DetailParts {
     if ($t.Choices -and $a) {
         [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be set to "' + (Get-ChoiceLabel $t ([string]$row.Pick)) + '" when you press the button' + $(if ($a -eq 'Undo') { ' (the Windows default is put back)' } else { '' }) + $nl) })
     } elseif ($a -eq 'Apply' -and $t.Once) { [void]$p.Add(@{ S = 'wait'; C = ''; T = 'Waiting: will run once when you press the button' + $nl }) }
+    elseif ($a -and $t.Plan) {
+        if ($a -eq 'Apply') { $wt = 'Waiting: will be installed when you press the button (the active plan stays the same)' }
+        elseif (Test-PlanActive $row) { $wt = 'Waiting: will be deleted when you press the button; it is the active plan, so another plan is made active first' }
+        else { $wt = 'Waiting: will be deleted when you press the button' }
+        [void]$p.Add(@{ S = 'wait'; C = ''; T = $wt + $nl })
+    }
     elseif ($a) {
         $dir = 'OFF'; if (Get-SwitchGoesOn $t ($a -eq 'Undo')) { $dir = 'ON' }
         $tail = ''
@@ -8024,9 +8116,12 @@ function Get-DetailParts {
     if ($t.OneWay) { [void]$p.Add(@{ S = 'warn'; C = ''; T = 'One-way: once it is switched off it cannot be switched back on from this window.' + $nl }) }
     if ($t.Unproven) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'May have no effect: read the description above for why.' + $nl }) }
     if ($t.Reboot) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Needs a restart of the PC to take full effect.' + $nl }) }
-    $rvn = @(Get-Rivals $t | ForEach-Object { '"' + [string]$_.Name + '"' })
-    if ($rvn.Count -eq 1) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this and {0} can be on: switching this on switches that one off.' -f $rvn[0]) + $nl }) }
-    elseif ($rvn.Count -gt 1) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Only one of this, {0} and {1} can be on: switching this on switches the others off.' -f ($rvn[0..($rvn.Count - 2)] -join ', '), $rvn[-1]) + $nl }) }
+    if ($t.Plan) {
+        $pa = 'Not the active plan: "Make active" on its card switches to it.'
+        if ([string]$row.State -ne 'On') { $pa = 'Not installed: switch it on (and apply) to install it; then "Make active" on its card switches to it.' }
+        elseif (Test-PlanActive $row) { $pa = 'This is the active plan: the one Windows uses now.' }
+        [void]$p.Add(@{ S = 'note'; C = ''; T = $pa + $nl })
+    }
     if ($t.Once -and -not $t.Cleanup) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button and has nothing to undo here (a restore point is created first). It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
@@ -8113,10 +8208,12 @@ function Get-ConfirmText {
     # "ON" / "OFF" are the positions the SWITCH goes to (a setting that turns its feature off when applied goes OFF when applied);
     # a setting with options is listed with the option it is set to
     $goesOn = { param($x) $tt = $script:ById[$x.Id]; if ($tt.Choices) { return ($x.Action -eq 'Apply') }; return [bool](Get-SwitchGoesOn $tt ($x.Action -eq 'Undo')) }
-    $on = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and (& $goesOn $_) } | ForEach-Object { Get-PlanName $_ })
+    $on = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and -not $script:ById[$_.Id].Plan -and (& $goesOn $_) } | ForEach-Object { Get-PlanName $_ })
+    $pInst = @($Plan | Where-Object { $script:ById[$_.Id].Plan -and $_.Action -eq 'Apply' } | ForEach-Object { $script:ById[$_.Id].Name })
+    $pDel = @($Plan | Where-Object { $script:ById[$_.Id].Plan -and $_.Action -eq 'Undo' } | ForEach-Object { $script:ById[$_.Id].Name })
     $run = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once -and $script:ById[$_.Id].Cleanup } | ForEach-Object { $script:ById[$_.Id].Name })
     $runOther = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].Once -and -not $script:ById[$_.Id].Cleanup } | ForEach-Object { $script:ById[$_.Id].Name })
-    $off = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and -not (& $goesOn $_) } | ForEach-Object { $script:ById[$_.Id].Name })
+    $off = @($Plan | Where-Object { -not $script:ById[$_.Id].Once -and -not $script:ById[$_.Id].Plan -and -not (& $goesOn $_) } | ForEach-Object { $script:ById[$_.Id].Name })
     $one = @($Plan | Where-Object { $_.Action -eq 'Apply' -and $script:ById[$_.Id].OneWay } | ForEach-Object { $script:ById[$_.Id].Name })
     $rb = @($Plan | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
     $s = ('Make {0} change(s) on this PC?' -f $Plan.Count) + $nl + $nl
@@ -8125,6 +8222,8 @@ function Get-ConfirmText {
     if ($run.Count) { $s += ('RUN once ({0}); files they delete are gone for good, they do not go to the Recycle Bin:' -f $run.Count) + $nl + (Format-NameList $run) + $nl }
     if ($runOther.Count) { $s += ('RUN once ({0}):' -f $runOther.Count) + $nl + (Format-NameList $runOther) + $nl }
     if ($off.Count) { $s += ('Turn OFF ({0}):' -f $off.Count) + $nl + (Format-NameList $off) + $nl }
+    if ($pInst.Count) { $s += ('INSTALL ({0}); the active plan stays the same:' -f $pInst.Count) + $nl + (Format-NameList $pInst) + $nl }
+    if ($pDel.Count) { $s += ('DELETE ({0}); if one is the active plan, another plan is made active first:' -f $pDel.Count) + $nl + (Format-NameList $pDel) + $nl }
     if ($one.Count) { $s += ('These cannot be switched back on from here ({0}):' -f $one.Count) + $nl + (Format-NameList $one 20) + $nl }
     if ($rb.Count)  { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl + $nl }
     if (@($Plan | Where-Object { -not $script:ById[$_.Id].Once }).Count -gt 0) {
@@ -8416,16 +8515,16 @@ Add-GQ -Id 'uninstall' -Group 'Before you start' -Gate '' `
     -Help 'Some settings do not just switch a feature off, they remove something for good: built-in apps, OneDrive, Quick Assist and the Windows AI package. Headroom cannot put those back (most apps can be installed again from the Microsoft Store). Yes allows them. No or Not sure skips every setting that removes something, and the questions about the built-in apps are not asked. Settings that only switch features off are still applied, and each of those can be undone from this app.'
 Add-GQ -Id 'advanced' -Group 'Before you start' `
     -Q 'Do you also want to be asked the advanced questions?' `
-    -Help 'The everyday questions are about how you use this PC. The advanced ones are about settings that lower protection or can get in the way of other things: Windows security prompts (UAC), drive encryption, Windows Update and drivers, the file indexer, troubleshooters, power plans, firmware programs, the Microsoft Store and similar. They are what the old Advanced Debloat was made of, and each one is marked in the lists. Yes asks them. No or Not sure skips all of them and applies nothing from them.'
+    -Help 'The everyday questions are about how you use this PC. The advanced ones are about settings that lower protection or can get in the way of other things: Windows security prompts (UAC), drive encryption, Windows Update and drivers, the file indexer, troubleshooters, firmware programs, the Microsoft Store and similar. They are what the old Advanced Debloat was made of, and each one is marked in the lists. Yes asks them. No or Not sure skips all of them and applies nothing from them.'
 Add-GQ -Id 'laptop' -Group 'Your PC' `
     -Q 'Is this a laptop or a tablet that often runs on battery?' `
-    -Help 'Laptops need power saving to make the battery last. A desktop does not, and power saving there can cause stutter, dropped network connections and USB devices that go to sleep. Answer No (a desktop) and power saving is switched off for network adapters and USB devices, and the Health and Optimized Experiences and sensor services are switched off. Yes keeps all of that as Windows has it, and keeps the Ultimate Performance plan and Fast Startup and hibernation off the list too.' `
+    -Help 'Laptops need power saving to make the battery last. A desktop does not, and power saving there can cause stutter, dropped network connections and USB devices that go to sleep. Answer No (a desktop) and power saving is switched off for network adapters and USB devices, and the Health and Optimized Experiences and sensor services are switched off. Yes keeps all of that as Windows has it, and keeps Fast Startup and hibernation off the list too.' `
     -No @('nic-turnoff', 'nic-eee', 'nic-suspend', 'usb-power', 'svc-whe', 'svc-sensormon', 'svc-sensordata') `
-    -Keep @('nic-turnoff', 'nic-eee', 'nic-suspend', 'usb-power', 'svc-whe', 'svc-sensormon', 'svc-sensordata', 'ultimate', 'hibernate', 'plans-delete')
+    -Keep @('nic-turnoff', 'nic-eee', 'nic-suspend', 'usb-power', 'svc-whe', 'svc-sensormon', 'svc-sensordata', 'hibernate')
 Add-GQ -Id 'gaming' -Group 'Your PC' `
     -Q 'Do you play games on this PC?' `
-    -Help 'Yes tunes Windows for games: Game Mode, hardware-accelerated GPU scheduling (HAGS), optimizations for windowed games, the Ultimate Performance power plan, and Windows Security scans that only run while the PC is idle. No skips all of that and the questions that only matter for games.' `
-    -Yes @('game-mode', 'hags', 'windowed-opt', 'ultimate', 'defender-idle')
+    -Help 'Yes tunes Windows for games: Game Mode, hardware-accelerated GPU scheduling (HAGS), optimizations for windowed games, and Windows Security scans that only run while the PC is idle. No skips all of that and the questions that only matter for games. (Power plans are not part of this: install them and choose the active one on the Power plan and startup page.)' `
+    -Yes @('game-mode', 'hags', 'windowed-opt', 'defender-idle')
 Add-GQ -Id 'shooters' -Group 'Your PC' -Gate 'gaming' `
     -Q 'Do you play shooters or other games where precise aiming matters?' `
     -Help 'Mouse acceleration moves the pointer farther when you move the mouse faster, which works against muscle memory in aim-heavy games. Yes turns it off, so the pointer moves 1:1 with your hand. Most people notice little on the desktop, but some like acceleration for work.' `
@@ -8657,10 +8756,6 @@ Add-GQ -Id 'bgapps' -Group 'Advanced' -Gate 'advanced+' `
     -Q 'Do you use Microsoft Store apps that need to update or notify you in the background?' `
     -Help 'No stops Store apps from running and fetching data while you are not using them. Normal desktop programs such as Steam, Discord and browsers are not affected. Store apps such as Mail, Weather or a Store game may then only update when you open them.' `
     -No @('bgapps')
-Add-GQ -Id 'powerplans' -Group 'Advanced' -Gate 'advanced+' `
-    -Q 'Do you switch between Windows power plans, or use a plan from your PC maker?' `
-    -Help 'No deletes every power plan except the one in use (Balanced, High Performance, Power Saver). Switching the setting off again recreates the three standard plans. It is not offered on laptops, where you keep Balanced for when you unplug.' `
-    -No @('plans-delete')
 Add-GQ -Id 'automaint' -Group 'Advanced' -Gate 'advanced+' `
     -Q 'Do you want Windows to run automatic maintenance while the PC is idle?' `
     -Help 'Automatic Maintenance runs Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up in the background. No stops those tasks from starting on their own, and the WinSAT benchmark task with them. You can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update.' `
@@ -10032,6 +10127,10 @@ function Ui-FillEntry {
     if ($st -ne 'NA' -and $st -ne 'Checking') { $e.Checked = (Get-SwitchOn $row.T ([bool]$row.Want)) }
     if ($row.T.Choices) { $e.Pick = [string]$row.Pick; $e.Now = [string](Get-RealPick $row) }
     $e.State = $st
+    # a power plan switch: the card says which plan is active, and an installed plan that is not active offers "Make active"
+    $e.Plan = [bool]$row.T.Plan
+    $e.PlanActive = (Test-PlanActive $row)
+    $e.CanActivate = ($e.Plan -and $st -eq 'On' -and -not $e.PlanActive)
     $e.Action = $a
     $e.Enabled = ($st -ne 'NA' -and $st -ne 'Checking')
     $e.StateText = Get-StateText $row
@@ -10066,9 +10165,10 @@ function Ui-FillEntry {
         if ($goOn) { $ct = 'Will turn on'; $ck = 'Accent' } else { $ct = 'Will turn off'; $ck = 'Warn' }
         if ($row.T.Choices) { if ($a -eq 'Apply') { $ct = 'Will change' } else { $ct = 'Will reset' } }
         if ($row.T.Once) { $ct = 'Will run' }
+        if ($row.T.Plan) { if ($a -eq 'Apply') { $ct = 'Will install' } else { $ct = 'Will delete' } }
     }
     elseif ($st -eq 'Partial') { $ct = 'Partly changed'; $ck = 'Warn' }
-    elseif ($st -eq 'On' -and $row.Mine -eq 'no') {
+    elseif ($st -eq 'On' -and $row.Mine -eq 'no' -and -not $row.T.Plan) {
         if ($row.T.Choices) { $ct = 'Already set'; $ck = 'Good' }
         elseif (Get-SwitchOn $row.T $true) { $ct = 'Already on'; $ck = 'Good' }
         else { $ct = 'Already off'; $ck = 'Good' }
@@ -10430,7 +10530,10 @@ function Ui-RowGeom {
     $o.Pills = @()
     $o.Hidden = 0
     $o.NotRec = $null
+    $o.MakeAct = $null
     $items = @()
+    if ($e.PlanActive) { $items += , @('active', 'Active plan') }
+    elseif ($e.CanActivate) { $items += , @('makeact', 'Make active') }
     if ($e.NotRec) { $items += , @('notrec', [string]$script:NotRecText) }
     foreach ($t in @(Ui-RowTags $e)) { $items += , @('tag', [string]$t) }
     $room = $true
@@ -10440,6 +10543,7 @@ function Ui-RowGeom {
             $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $px; Y = $py; W = $pw; H = $ph }
             $o.Pills += , $p
             if ($p.Kind -eq 'notrec') { $o.NotRec = $p }
+            if ($p.Kind -eq 'makeact') { $o.MakeAct = $p }
             $px += $pw + (Px 6)
         } else {
             $room = $false
@@ -10500,6 +10604,18 @@ function Ui-PaintRow {
             if (-not $on) { $nc = $Th.Dim }
             Ui-StrokeRound $g $nc 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
             Ui-Text $g $p.Text $tagFont $nc ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
+        } elseif ($p.Kind -eq 'active') {
+            Ui-FillRound $g $Th[(Ui-SoftKey 'Good')] ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
+            Ui-Text $g $p.Text $tagFont $Th.Good ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
+        } elseif ($p.Kind -eq 'makeact') {
+            # a small button: it makes this plan the active one
+            $busy = [bool]($script:Scanning -or $script:Applying)
+            $bf = $Th.Raised
+            if (-not $busy -and $hot -and $script:HotZone -eq 'makeact') { $bf = $Th.RaisedHot }
+            Ui-FillRound $g $bf ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
+            Ui-StrokeRound $g $Th.Border 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
+            $bc = $Th.Text; if ($busy -or -not $on) { $bc = $Th.Dim }
+            Ui-Text $g $p.Text $tagFont $bc ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
         } else {
             Ui-FillRound $g $Th.Tag ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
             Ui-Text $g $p.Text $tagFont $Th.TagText ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
@@ -10619,7 +10735,7 @@ function Ui-OnPaint {
 }
 
 # ----------------------------------------------------------- the mouse ----------------
-# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | row | head | ''
+# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | row | head | ''
 function Ui-Zone {
     param([int]$x, [int]$y)
     $M = $script:M
@@ -10653,6 +10769,9 @@ function Ui-Zone {
                 return @{ Zone = ('seg' + $k); Entry = $e }
             }
         }
+        # "Make active" on an installed power plan that is not the active one
+        $ma = $o.MakeAct
+        if ($ma -and $ry -ge $ma.Y -and $ry -lt ($ma.Y + $ma.H) -and $rx -ge $ma.X -and $rx -lt ($ma.X + $ma.W)) { return @{ Zone = 'makeact'; Entry = $e } }
         # the "Not recommended" mark after the title
         $nrr = Ui-NotRecRect $e
         if ($nrr -and $ry -ge $nrr.Y -and $ry -lt ($nrr.Y + $nrr.H) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
@@ -10690,7 +10809,7 @@ function Ui-UpdateHot {
     if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'makeact') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -10756,6 +10875,7 @@ function Ui-OnMouseDown {
     if ($zone -eq 'sb') { Ui-ScrollbarDown $y; return }
     if ($zone -eq 'toggle') { Ui-Select $z.Entry; Ui-ToggleRow $z.Entry }
     elseif ($zone.StartsWith('seg')) { Ui-Select $z.Entry; Ui-PickRow $z.Entry ([int]$zone.Substring(3)) }
+    elseif ($zone -eq 'makeact') { Ui-Select $z.Entry; Ui-MakeActive $z.Entry }
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
     elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
@@ -11093,9 +11213,7 @@ function Ui-ToggleRow {
         $msg = Try-SetWant $id (-not [bool]$row.Want)
     }
     Ui-RefreshRow $id          # also puts the switch back if the change was refused
-    $rnote = ''
-    if (-not $row.T.Choices) { $rnote = [string]$script:RivalNote; foreach ($rv in @(Get-Rivals $row.T)) { Ui-RefreshRow ([string]$rv.Id) } }
-    if ($msg) { Ui-Status $msg } elseif ($rnote) { Ui-Status ($rnote + '  ' + (Get-SummaryText)) } else { Ui-Status (Get-SummaryText) }
+    if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
     Ui-Flush
 }
 
@@ -11360,6 +11478,36 @@ function Ui-DoApply {
     Ui-Flush
 }
 
+# "Make active" on a power plan's card: that plan becomes the one Windows uses. It runs at once (no question: another click switches
+# back), through the background worker like any change; "Preview only" only shows what would happen.
+function Ui-MakeActive {
+    param($e)
+    if (-not $e) { return }
+    $row = $script:Rows[[string]$e.Id]
+    if (-not $row -or -not $row.T.Plan) { return }
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    if ([string]$row.State -ne 'On') { Ui-Status ('"{0}" is not installed: switch it on and apply first.' -f $row.T.Name); return }
+    if (Test-PlanActive $row) { Ui-Status ('"{0}" is already the active plan.' -f $row.T.Name); return }
+    $dry = [bool]$script:UI.dry.Checked
+    $row.Note = 'Working...'; $row.NoteDetail = ''
+    $script:Applying = $true
+    Ui-ShowLog $true
+    Ui-RefreshAll
+    Ui-Progress 0 1
+    if ($dry) { Ui-Status 'Preview running - nothing is changed...' } else { Ui-Status ('Making "{0}" the active plan...' -f $row.T.Name) }
+    try {
+        Start-EngineJob 'apply' @(@{ Id = [string]$row.T.Id; Action = 'Activate' }) $dry
+    } catch {
+        $script:Applying = $false
+        $row.Note = ''
+        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red'
+        Ui-RefreshAll
+        Ui-Status 'Could not start - see the log.'
+    }
+    Ui-Flush
+}
+
 function Ui-DoStop {
     if (-not $script:Applying -or -not $script:Job) { return }
     $script:Job.Stopping = $true
@@ -11549,7 +11697,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '108'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '109'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -14440,7 +14588,6 @@ $script:RecommendedSummary = @(
         'Old name lookups (LLMNR, mDNS, NetBIOS), SMB1 and connection sharing off',
         'Power saving off on network adapters and on all USB devices') }
     @{ H = 'Performance for games'; L = @(
-        'Ultimate Performance power plan, set as the active plan',
         'Game Mode, HAGS and Optimizations for windowed games on',
         'Game Bar and mouse acceleration off',
         'Windows Security scans only while the PC is idle',
@@ -14477,9 +14624,9 @@ $script:AdvancedSummary = @(
     @{ H = 'Remote access and VPN'; L = @(
         'Remote Desktop, Remote Assistance, PowerShell remoting, remote management off',
         'Windows built-in VPN services off; Quick Assist removed') }
-    @{ H = 'Network adapters, power plan and startup'; L = @(
+    @{ H = 'Network adapters and startup'; L = @(
         'Windows powering down network adapters off',
-        'All other power plans deleted; Fast Startup and hibernation off') }
+        'Fast Startup and hibernation off') }
     @{ H = 'Gaming and performance'; L = @(
         'Windows Update does not replace drivers (WPBT stays on)') }
     @{ H = 'Security prompts (lowers protection)'; L = @(
