@@ -314,8 +314,30 @@ function Reg-KeyAdd {
         return $false
     }
 }
+# A key that may be deleted as a whole: at least three levels below the hive (HKLM:\SOFTWARE\Classes\ms-gamebar), and never one of the
+# keys that hold whole parts of Windows (a mistake in a path must not take, say, every CLSID or every service with it). A second lock:
+# the settings only name keys of their own.
+$script:RegKeyKeep = @('software\classes\clsid', 'software\classes\interface', 'software\classes\typelib', 'software\classes\appid',
+    'software\classes\applications', 'software\classes\systemfileassociations', 'software\classes\directory', 'software\classes\folder',
+    'software\classes\*', 'software\classes\drive', 'software\classes\local settings', 'software\microsoft\windows',
+    'software\microsoft\windows nt', 'software\policies\microsoft', 'software\wow6432node\microsoft', 'software\wow6432node\classes',
+    'system\currentcontrolset\services', 'system\currentcontrolset\control', 'system\currentcontrolset\enum', 'system\currentcontrolset\hardware profiles')
+function Reg-KeyIsDeep {
+    param([string]$Path)
+    $p = ([string]$Path).Trim()
+    $m = [regex]::Match($p, '^(?i)(HKLM:|HKCU:|Registry::HKEY_[A-Z_]+)\\(.+)$')
+    if (-not $m.Success) { return $false }
+    $parts = @($m.Groups[2].Value.Split('\') | ForEach-Object { $_.Trim() })
+    if (@($parts | Where-Object { -not $_ }).Count -gt 0) { return $false }          # (an empty level: a name that was missing)
+    $root = $m.Groups[1].Value.ToUpperInvariant()
+    if ($root -eq 'REGISTRY::HKEY_USERS') { if ($parts.Count -lt 4) { return $false }; $parts = @($parts | Select-Object -Skip 1) }
+    if ($parts.Count -lt 3) { return $false }
+    if ($parts.Count -eq 3 -and $script:RegKeyKeep -contains (($parts -join '\').ToLowerInvariant())) { return $false }
+    return $true
+}
 function Reg-KeyRemove {
     param([string]$Path)
+    if (-not (Reg-KeyIsDeep $Path)) { Say "  ! $Path was not deleted: it is too near the top of the registry to be a key of this app's own" 'Yellow'; return $false }
     if (-not (Reg-KeyExists $Path)) { return $true }
     if ($DryRun) { Say "  [dry] delete registry key $Path" 'DarkGray'; return $true }
     try {
@@ -606,7 +628,8 @@ function Svc-Decode {
         'Automatic'        { return @{ Start = 2; Delayed = 0 } }
         'AutomaticDelayed' { return @{ Start = 2; Delayed = 1 } }
         'Manual'           { return @{ Start = 3; Delayed = 0 } }
-        default            { return @{ Start = 4; Delayed = 0 } }
+        'Disabled'         { return @{ Start = 4; Delayed = 0 } }
+        default            { throw ('unknown service start type "{0}"' -f $s) }      # (a typo must never disable a service)
     }
 }
 function Svc-Label {
@@ -1011,6 +1034,25 @@ function Appx-BundleNames {
     foreach ($x in @(Get-AppxPackage -AllUsers -PackageTypeFilter Bundle -Name $Name -ErrorAction Ignore)) { $o += [string]$x.PackageFullName }
     return $o
 }
+# Windows' own processes, which are never closed (closing some of them stops Windows at once)
+$script:CoreProcs = @('system', 'idle', 'smss', 'csrss', 'wininit', 'winlogon', 'services', 'lsass', 'lsaiso', 'svchost', 'dwm', 'explorer',
+    'fontdrvhost', 'sihost', 'ctfmon', 'runtimebroker', 'searchhost', 'startmenuexperiencehost', 'shellexperiencehost', 'textinputhost',
+    'memory compression', 'registry', 'secure system', 'audiodg', 'conhost', 'taskhostw', 'spoolsv')
+# Is this an app's install folder of its own? (at least three folders deep, and not Windows', System32, SysWOW64, Program Files or a
+# drive root: an app whose install folder Windows reports as one of those has no processes of its own to close)
+function Appx-OwnFolder {
+    param([string]$Root)
+    $r = ([string]$Root).TrimEnd('\')
+    if (@($r.Split('\') | Where-Object { $_ }).Count -lt 3) { return $false }
+    $deny = @()
+    foreach ($b in @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData)) {
+        if ($b) { $deny += ([string]$b).TrimEnd('\') }
+    }
+    if ($env:SystemRoot) { $deny += (([string]$env:SystemRoot).TrimEnd('\') + '\System32'); $deny += (([string]$env:SystemRoot).TrimEnd('\') + '\SysWOW64'); $deny += (([string]$env:SystemRoot).TrimEnd('\') + '\SystemApps') }
+    if ($env:ProgramFiles) { $deny += (([string]$env:ProgramFiles).TrimEnd('\') + '\WindowsApps') }
+    foreach ($d in $deny) { if ($r -ieq $d) { return $false } }
+    return $true
+}
 # Closes the app's own processes (those started from its install folder), so a running app does not hold up its removal
 function Appx-StopApp {
     param([string]$Full, [string]$Name)
@@ -1018,8 +1060,10 @@ function Appx-StopApp {
     foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Ignore | Where-Object { $_.PackageFullName -eq $Full })) { if ($x.InstallLocation) { $loc = [string]$x.InstallLocation } }
     if (-not $loc) { return }
     $root = $loc.TrimEnd('\') + '\'
+    if (-not (Appx-OwnFolder $root)) { return }
     $n0 = $Error.Count                   # (a process whose path Windows does not show, or that is already gone, is no problem)
     foreach ($pr in @(Get-Process -ErrorAction Ignore)) {
+        if ($script:CoreProcs -contains ([string]$pr.ProcessName).ToLowerInvariant()) { continue }
         $path = ''; try { $path = [string]$pr.Path } catch { }
         if ($path -and $path.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
             Say ('  closing {0} (it belongs to the app)' -f $pr.ProcessName) 'DarkGray'
@@ -2114,8 +2158,15 @@ function Invoke-Plan {
         }
     }
     if ($explorer -and -not $DryRun) {
-        Say "`nRestarting Explorer so the taskbar and theme changes show up..." 'Gray'
-        Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        # Windows starts Explorer again by itself (AutoRestartShell = 1, its default). Where that is switched off, Explorer is not closed: the
+        # desktop and the taskbar would stay gone until the next sign-in.
+        $ars = Reg-Read 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' 'AutoRestartShell'
+        if ($ars.Exists -and ([string]$ars.Value).Trim() -eq '0') {
+            Say "`nExplorer is not restarted here (Windows is set not to start it again by itself): sign out and in to see the taskbar and theme changes." 'Yellow'
+        } else {
+            Say "`nRestarting Explorer so the taskbar and theme changes show up..." 'Gray'
+            Stop-Process -Name explorer -Force -ErrorAction SilentlyContinue
+        }
     }
     $tail = "{0} done, {1} need attention." -f $good, $bad
     if ($DryRun) { $tail = "Preview finished - nothing was changed. ($total setting(s) checked)" }
@@ -2157,12 +2208,16 @@ function Custom-OneDrive-Apply {
     $setup = $null
     foreach ($f in @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")) { if (-not $setup -and (Fs-Exists $f)) { $setup = $f } }
     if ($setup) { Start-Process $setup -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
-    # Leftovers
-    Remove-Item "$env:LOCALAPPDATA\Microsoft\OneDrive" -Recurse -Force -ErrorAction Ignore
-    Remove-Item "$env:ProgramData\Microsoft OneDrive" -Recurse -Force -ErrorAction Ignore
-    Remove-Item "$env:SystemDrive\OneDriveTemp" -Recurse -Force -ErrorAction Ignore
-    $od = "$env:USERPROFILE\OneDrive"
-    if (Fs-Exists $od) {
+    # Leftovers: OneDrive's own folders only. A folder variable that is not set is skipped (never read as the root of the drive), and
+    # the paths are taken as written (a [ or ] in a user name is not read as a wildcard that could match another folder).
+    foreach ($d in @(@([string]$env:LOCALAPPDATA, 'Microsoft\OneDrive'), @([string]$env:ProgramData, 'Microsoft OneDrive'), @([string]$env:SystemDrive, 'OneDriveTemp'))) {
+        $base = ([string]$d[0]).Trim().TrimEnd('\')
+        if ($base.Length -lt 2) { continue }
+        $path = $base + '\' + [string]$d[1]
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Ignore }
+    }
+    $od = ''; if (([string]$env:USERPROFILE).Trim().Length -ge 3) { $od = ([string]$env:USERPROFILE).Trim().TrimEnd('\') + '\OneDrive' }
+    if ($od -and (Fs-Exists $od)) {
         if (-not (Get-ChildItem -LiteralPath $od -Force -ErrorAction SilentlyContinue | Select-Object -First 1)) { Remove-Item -LiteralPath $od -Force -ErrorAction SilentlyContinue }
         else { Say "  NOTE: $od still has files in it - left alone. Move them out and delete it yourself." 'Yellow' }
     }
@@ -2786,7 +2841,15 @@ function Plan-Reinstall {
     }
     Drop-ErrorsSince $n0
     Plan-Remove $Key $mine
-    try { Invoke-TweakApply $t } catch { throw ('the old {0} was deleted, but making it again failed: {1}. Switch it on to try once more' -f (Plan-Label $def.Name), $_.Exception.Message) }
+    $made = $false; $err = ''; $through = $false
+    try {
+        foreach ($k in 1, 2) { try { Invoke-TweakApply $t; $made = $true; break } catch { if (-not $err) { $err = $_.Exception.Message } } }
+        $through = $true
+    } finally {
+        # stopped half-way (the old plan deleted, the new one not made yet): one more try, so the PC is not left without it
+        if (-not $through) { try { if (@(Plan-Where $Key $null).Count -eq 0) { Invoke-TweakApply $t } } catch { } }
+    }
+    if (-not $made) { throw ('the old {0} was deleted, but making it again failed: {1}. Switch it on to try once more' -f (Plan-Label $def.Name), $err) }
     $s1 = (Get-Store)[[string]$t.Id]; $mine1 = $null; if ($s1 -and $s1.Custom) { $mine1 = $s1.Custom[$Key] }
     $new = @(Plan-Where $Key $mine1)
     if ($new.Count -eq 0) { throw ('the old {0} was deleted, and Windows did not make it again. Switch it on to try once more' -f (Plan-Label $def.Name)) }
@@ -3128,9 +3191,17 @@ function Custom-UsbPower-Revert {
         $key = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($i.Id)\Device Parameters"
         $s = $null; if ($mine -and $mine.Dev) { $s = $mine.Dev[$i.Id] }
         if ($DryRun) { Say ("  [dry] {0} : power saving back on" -f $ids[$i.Id]) 'DarkGray'; continue }
-        # the Windows default: "allow the computer to turn off this device" on, and no value of ours left in the device's settings
-        Pm-Set $i.Id $true
-        if (Fs-Exists $key) { foreach ($rn in $script:UsbRegNames) { [void](Reg-Remove $key $rn -Quiet) } }
+        # what the device had before this app first changed it: its driver can ship its own values (some USB devices need selective suspend
+        # off, for example), and those are written back as they were. A device without a record gets the Windows default: "allow the
+        # computer to turn off this device" on, and no value of ours left in the device's settings.
+        $en = $true; if ($s -and $null -ne $s.Enable) { $en = [bool]$s.Enable }
+        Pm-Set $i.Id $en
+        if (Fs-Exists $key) {
+            foreach ($rn in $script:UsbRegNames) {
+                $o = $null; if ($s -and $s.Reg) { $o = $s.Reg[$rn] }
+                if ($o -and $o.Exists -and $null -ne $o.Value) { [void](Reg-Write $key $rn ([int64]$o.Value) 'DWord' -Quiet) } else { [void](Reg-Remove $key $rn -Quiet) }
+            }
+        }
         Say ("  {0} : power saving back to the Windows default" -f $ids[$i.Id]) 'DarkGray'
     }
 }
@@ -4210,15 +4281,19 @@ function Ai-CoreSids {
     foreach ($s in @(@(Appx-StoreSids) + @(Appx-UserSids $Full))) { if ($s -and $o -notcontains $s) { $o += [string]$s } }
     return $o
 }
+# (a mark is only written or taken out for one account and one exact package name: never for a whole account or every package)
+function Appx-EolOk { param([string]$Sid, [string]$Full) return ($Sid -match '^S-1-[0-9-]+$' -and $Full -match '^[A-Za-z0-9][A-Za-z0-9._-]*_[A-Za-z0-9._~-]+$' -and $Full -notmatch '[\\*?]') }
 function Appx-EolMark {
     param([string]$Sid, [string]$Full)
     if ($DryRun) { return '' }
+    if (-not (Appx-EolOk $Sid $Full)) { return ('it could not be marked as end of life for {0}: not a package name or an account' -f $Sid) }
     try { New-Item -Path ($script:EolRoot + '\' + $Sid + '\' + $Full) -Force -ErrorAction Stop | Out-Null; return '' }
     catch { Drop-Error $_; return ('it could not be marked as end of life for {0}: {1}' -f $Sid, $_.Exception.Message) }
 }
 function Appx-EolClear {
     param([string]$Sid, [string]$Full)
     if ($DryRun) { return }
+    if (-not (Appx-EolOk $Sid $Full)) { return }
     $k = $script:EolRoot + '\' + $Sid + '\' + $Full
     $n0 = $Error.Count
     if (Test-Path -LiteralPath $k) { Remove-Item -LiteralPath $k -Recurse -Force -ErrorAction SilentlyContinue }
@@ -4265,34 +4340,39 @@ function Custom-AiCore-Apply {
         $r = Appx-DeprovMark $fam; if ($r) { $notes += $r }
         $r = Appx-NonRemovableOff $fam; if ($r) { $notes += $r }
         $sids = @(Ai-CoreSids $full)
-        foreach ($sid in $sids) { $r = Appx-EolMark $sid $full; if ($r) { $notes += $r } }
-        Say ('  marked as end of life for {0} account(s); removing it...' -f $sids.Count) 'DarkGray'
-        $why = Appx-RemoveOne $full $name
-        if (-not $why) {
-            # checked the way the check of the PC does it, a moment later: Windows can still have it for an account (or put it back);
-            # then once more for each account it still lists, while the end-of-life marks are still in place
-            Start-Sleep -Milliseconds $script:AiCoreSettleMs
-            $left = @(Appx-UserStates $full $name)
-            if ($left.Count) {
-                Say ('  Windows still lists it for: {0}; removing it for those accounts too' -f ($left -join '; ')) 'DarkGray'
-                $n0 = $Error.Count
-                foreach ($st in $left) {
-                    $sid = [regex]::Match([string]$st, 'S-1-[0-9-]+').Value
-                    if (-not $sid) { continue }
-                    if ($sids -notcontains $sid) { [void](Appx-EolMark $sid $full); $sids += $sid }
-                    try { Remove-AppxPackage -Package $full -User $sid -ErrorAction Stop } catch { $notes += (([string]$_.Exception.Message -split "`r?`n")[0]) }
-                }
-                Drop-ErrorsSince $n0
+        $why = ''
+        try {
+            foreach ($sid in $sids) { $r = Appx-EolMark $sid $full; if ($r) { $notes += $r } }
+            Say ('  marked as end of life for {0} account(s); removing it...' -f $sids.Count) 'DarkGray'
+            $why = Appx-RemoveOne $full $name
+            if (-not $why) {
+                # checked the way the check of the PC does it, a moment later: Windows can still have it for an account (or put it back);
+                # then once more for each account it still lists, while the end-of-life marks are still in place
                 Start-Sleep -Milliseconds $script:AiCoreSettleMs
                 $left = @(Appx-UserStates $full $name)
-                if ($left.Count) { $why = ('Windows still has it for ' + ($left -join '; ')) }
+                if ($left.Count) {
+                    Say ('  Windows still lists it for: {0}; removing it for those accounts too' -f ($left -join '; ')) 'DarkGray'
+                    $n0 = $Error.Count
+                    foreach ($st in $left) {
+                        $sid = [regex]::Match([string]$st, 'S-1-[0-9-]+').Value
+                        if (-not $sid) { continue }
+                        if ($sids -notcontains $sid) { [void](Appx-EolMark $sid $full); $sids += $sid }
+                        try { Remove-AppxPackage -Package $full -User $sid -ErrorAction Stop } catch { $notes += (([string]$_.Exception.Message -split "`r?`n")[0]) }
+                    }
+                    Drop-ErrorsSince $n0
+                    Start-Sleep -Milliseconds $script:AiCoreSettleMs
+                    $left = @(Appx-UserStates $full $name)
+                    if ($left.Count) { $why = ('Windows still has it for ' + ($left -join '; ')) }
+                }
+            } else {
+                # name the accounts Windows still has it for, so the reason is plain
+                $left = @(Appx-UserStates $full $name)
+                if ($left.Count) { $why += (' (still installed for ' + ($left -join '; ') + ')') }
             }
-        } else {
-            # name the accounts Windows still has it for, so the reason is plain
-            $left = @(Appx-UserStates $full $name)
-            if ($left.Count) { $why += (' (still installed for ' + ($left -join '; ') + ')') }
+        } finally {
+            # the marks always come out again, also when something fails on the way or the run is stopped
+            foreach ($sid in $sids) { Appx-EolClear $sid $full }
         }
-        foreach ($sid in $sids) { Appx-EolClear $sid $full }
         Say '  the end-of-life marks are taken out again (left in place they can stop Windows Update)' 'DarkGray'
         if ($why) {
             if ($notes.Count) { $why += ' (' + (($notes | Select-Object -First 2) -join '; ') + ')' }
@@ -5171,7 +5251,7 @@ Add-Tweak -Id 'nic-suspend' -Cat $cNic -Inv -Def 'On' -Preset -Reboot -Name 'Net
     )
 
 Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power saving' `
-    -Desc 'On: Windows may turn off USB devices to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked and selective suspend is on. Off: the "turn off this device" box is unticked for every USB device and selective suspend is off. Devices plugged in later start with Windows'' defaults, so press Apply again after adding new ones.' `
+    -Desc 'On: Windows may turn off USB devices to save power (the Windows default). The box "Allow the computer to turn off this device to save power" is ticked and selective suspend is on. Off: the "turn off this device" box is unticked for every USB device and selective suspend is off. Devices plugged in later start with Windows'' defaults, so press Apply again after adding new ones. Switching it back on gives each device what it had before this app first changed it (its driver can ship its own values, and some USB devices need selective suspend off).' `
     -Parts @(
         pCustom 'UsbPower' 'Every USB device: "Allow the computer to turn off this device" off, and selective suspend off in its driver settings'
     )
@@ -12473,7 +12553,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '115'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '116'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
