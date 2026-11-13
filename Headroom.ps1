@@ -390,15 +390,21 @@ Get-AppxPackage -AllUsers -ErrorAction Ignore | ForEach-Object {
     # L: is the app installed for at least one user? A package that is only "Staged" (what stays behind when the app was uninstalled
     # from Start or Settings: the copy kept for new accounts) is not, and neither is one whose removal is pending (it was in use: Windows
     # finishes removing it at the next restart). When Windows does not say, it counts as installed.
-    $live = $true
+    $live = $true; $sys = $false
     try {
         $ui = @($_.PackageUserInformation)
         if ($ui.Count -gt 0) {
+            # (a copy that only Windows' own system account, S-1-5-18, has is installed for no one who signs in: S)
             $live = $false
-            foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal') { $live = $true } }
+            foreach ($u in $ui) {
+                $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -match 'Staged' -or $s -match 'pending\s*removal') { continue }
+                $sid = ''; try { $sid = [string]$u.UserSecurityId.Sid } catch { }
+                if ($sid -notmatch '^S-1-') { $sid = [regex]::Match([string]$u, 'S-1-[0-9-]+').Value }
+                if ($sid -eq 'S-1-5-18') { $sys = $true } else { $live = $true }
+            }
         }
     } catch { $live = $true }
-    [pscustomobject]@{ N = [string]$_.Name; F = [string]$_.PackageFullName; R = [bool]$_.NonRemovable; L = $live }
+    [pscustomobject]@{ N = [string]$_.Name; F = [string]$_.PackageFullName; R = [bool]$_.NonRemovable; L = $live; S = $sys }
 }
 '@
     tasks = @'
@@ -529,7 +535,7 @@ function Pre-Wait {
 # Which background answers a setting's check asks for (so the check can leave it until they have arrived).
 # Settings that use a slow question without saying so in their parts are listed here; the tests compare this list with
 # what the checks really ask for.
-$script:CustomNeeds = @{ UsbPower = @('usb', 'net'); NicTurnOff = @('net'); NicEee = @('net'); NicSuspend = @('net'); AiCore = @('appx', 'prov') }
+$script:CustomNeeds = @{ UsbPower = @('usb', 'net'); NicTurnOff = @('net'); NicEee = @('net'); NicSuspend = @('net'); AiCore = @('appx', 'prov'); Hypervisor = @('feat') }
 $script:NeedsMemo = @{}
 function Get-TweakNeeds {
     param($t)
@@ -874,25 +880,44 @@ function Appx-Allowed {
     if (-not (Test-Protected $name)) { return $true }
     return ($pat -notmatch '[*?]' -and $pat -ieq $name)
 }
+# The account of one entry of PackageUserInformation ("S-1-5-21-... [PC\name]: Installed"): its SID, '' when Windows does not name it
+function Appx-UiSid {
+    param($u)
+    $s = ''
+    try { $s = [string]$u.UserSecurityId.Sid } catch { }
+    if ($s -notmatch '^S-1-') { try { $s = [string]$u.UserSecurityId } catch { $s = '' } }
+    if ($s -notmatch '^S-1-') { $s = [regex]::Match([string]$u, 'S-1-[0-9-]+').Value }
+    return $s
+}
 # Is a package (from Get-AppxPackage -AllUsers) installed for at least one user? "Staged" for every user = only the copy kept for new
-# accounts is left. Anything unclear counts as installed.
+# accounts is left. A copy that only Windows' own system account (S-1-5-18) has is installed for no one who signs in either: Windows
+# keeps such a copy of some built-in packages for itself and puts it back when it is removed, so it counts as removed. Anything unclear
+# counts as installed.
 function Appx-IsLive {
     param($p)
     try {
         $ui = @($p.PackageUserInformation)
         if ($ui.Count -eq 0) { return $true }
-        foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal') { return $true } }
+        foreach ($u in $ui) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal' -and (Appx-UiSid $u) -ne 'S-1-5-18') { return $true } }
         return $false
     } catch { return $true }
+}
+# Does Windows' own system account (S-1-5-18) still have this package installed? (what the check of the PC does not count)
+function Appx-IsSysKept {
+    param($p)
+    try {
+        foreach ($u in @($p.PackageUserInformation)) { $s = ([string]$u.InstallState + ' ' + [string]$u); if ($s -notmatch 'Staged' -and $s -notmatch 'pending\s*removal' -and (Appx-UiSid $u) -eq 'S-1-5-18') { return $true } }
+    } catch { }
+    return $false
 }
 function Appx-Data {
     if (-not $script:Cache.ContainsKey('appx')) {
         $pk = @(); $pv = @()
         $preA = Pre-Wait 'appx'
         if ($null -ne $preA) {
-            foreach ($p in $preA) { $pk += ,@{ Name = [string]$p.N; Full = [string]$p.F; NonRemovable = [bool]$p.R; Live = ($null -eq $p.L -or [bool]$p.L) } }
+            foreach ($p in $preA) { $pk += ,@{ Name = [string]$p.N; Full = [string]$p.F; NonRemovable = [bool]$p.R; Live = ($null -eq $p.L -or [bool]$p.L); Sys = [bool]$p.S } }
         } else {
-            foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction Ignore)) { $pk += ,@{ Name = [string]$p.Name; Full = [string]$p.PackageFullName; NonRemovable = [bool]$p.NonRemovable; Live = (Appx-IsLive $p) } }
+            foreach ($p in @(Get-AppxPackage -AllUsers -ErrorAction Ignore)) { $pk += ,@{ Name = [string]$p.Name; Full = [string]$p.PackageFullName; NonRemovable = [bool]$p.NonRemovable; Live = (Appx-IsLive $p); Sys = (Appx-IsSysKept $p) } }
         }
         $preP = Pre-Wait 'prov'
         if ($null -ne $preP) {
@@ -957,7 +982,7 @@ function Appx-LiveFull {
     return $false
 }
 # The accounts an app is still installed for, as Windows lists them ("S-1-5-21-... [PC\name]: Installed"); a copy that is only kept for
-# new accounts, or whose removal waits for a restart, is left out. @() when it is installed for nobody.
+# new accounts, or whose removal waits for a restart, is left out, and so is Windows' own system account. @() when it is installed for nobody.
 function Appx-UserStates {
     param([string]$Full, [string]$Name)
     $o = @()
@@ -970,6 +995,7 @@ function Appx-UserStates {
             foreach ($u in $ui) {
                 $s = ([string]$u.InstallState + ' ' + [string]$u)
                 if ($s -match 'Staged' -or $s -match 'pending\s*removal') { continue }
+                if ((Appx-UiSid $u) -eq 'S-1-5-18') { continue }          # (Windows' own system account: see Appx-IsLive)
                 $t = ([string]$u).Trim(); if (-not $t) { $t = [string]$u.InstallState }
                 if ($o -notcontains $t) { $o += $t }
             }
@@ -1005,14 +1031,14 @@ function Appx-StopApp {
 function Appx-Matches {
     param([string[]]$patterns)
     $d = Appx-Data
-    $pk = @{}; $pv = @{}; $lv = @{}
+    $pk = @{}; $pv = @{}; $lv = @{}; $sy = @{}
     foreach ($pat in $patterns) {
         foreach ($p in $d.Pkgs) {
-            if ($p.Name -like $pat -and -not $p.NonRemovable -and (Appx-Allowed $p.Name $pat)) { $pk[$p.Full] = $p.Name; $lv[$p.Full] = ($null -eq $p.Live -or [bool]$p.Live) }
+            if ($p.Name -like $pat -and -not $p.NonRemovable -and (Appx-Allowed $p.Name $pat)) { $pk[$p.Full] = $p.Name; $lv[$p.Full] = ($null -eq $p.Live -or [bool]$p.Live); $sy[$p.Full] = [bool]$p.Sys }
         }
         foreach ($p in $d.Prov) { if ($p.Name -like $pat -and (Appx-Allowed $p.Name $pat)) { $pv[$p.Pkg] = $p.Name } }
     }
-    return @{ Pkgs = $pk; Prov = $pv; Live = $lv }
+    return @{ Pkgs = $pk; Prov = $pv; Live = $lv; Sys = $sy }
 }
 
 # -------------------------------------------------------- small helpers ------
@@ -1046,10 +1072,12 @@ function Startup-Dirs {
     try { $c = [string][Environment]::GetFolderPath('CommonStartup') } catch { }
     return @{ User = $u; Common = $c }
 }
-# bcdedit (the boot configuration). $null when the boot store cannot be read.
+# bcdedit (the boot configuration). $null when the boot store cannot be read or the change is refused; then $script:BcdSaid has what
+# bcdedit said.
 function Bcd {
-    try { $o = & bcdedit @args 2>&1 } catch { return $null }
-    if ($LASTEXITCODE -ne 0) { return $null }
+    $script:BcdSaid = ''
+    try { $o = & bcdedit @args 2>&1 } catch { $script:BcdSaid = (([string]$_.Exception.Message -split "`r?`n")[0]).Trim(); return $null }
+    if ($LASTEXITCODE -ne 0) { $script:BcdSaid = (@($o | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) -join ' '); return $null }
     return (($o | Out-String).TrimEnd())
 }
 # Windows Security (Defender) scan preferences. $null when it is not there / not usable.
@@ -1440,9 +1468,10 @@ function Get-PartState {
             $m = Appx-Matches $p.Patterns
             # Removed = installed for nobody. What stays behind after an uninstall from Start or Settings (the copy kept for new accounts) is not an
             # installed app: it is mentioned in the reading, and the setting counts as done.
-            $inst = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } }
-            $left = ($m.Pkgs.Count - $inst) + $m.Prov.Count
+            $inst = 0; $sysk = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } elseif ($m.Sys -and $m.Sys[$k]) { $sysk++ } }
+            $left = ($m.Pkgs.Count - $inst - $sysk) + $m.Prov.Count
             $script:Now = ('Apps {0}: {1} installed' -f ((@($p.Patterns) | ForEach-Object { [string]$_ }) -join ', '), $inst)
+            if ($sysk -gt 0) { $script:Now += (', {0} kept only for Windows'' own system account (S-1-5-18, not for anyone who signs in)' -f $sysk) }
             if ($left -gt 0) { $script:Now += (', {0} only kept for new accounts (not installed for anyone)' -f $left) }
             $script:Now += ', wanted none installed'
             if ($inst -gt 0) { return 'Off' }
@@ -2174,14 +2203,25 @@ function Pwr-Restore {
 # HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\<subgroup>\<setting>\DefaultPowerSchemeValues\<plan ID> (ACSettingIndex,
 # DCSettingIndex); a setting that belongs to no subgroup sits directly under PowerSettings. Only reads. @(@{ Sub; Set; AC; DC }).
 $script:PowerSettingsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings'
+# A registry number as the unsigned 32-bit index powercfg uses: a DWORD of 0xFFFFFFFF reads as -1 in PowerShell and is 4294967295 here
+# (the literal 0xffffffff is itself -1 in PowerShell, so the mask is written out). $null when it is no number.
+function Pwr-U32 {
+    param($v)
+    if ($null -eq $v) { return $null }
+    if ($v -is [byte[]]) { if ($v.Length -ge 4) { return [int64][BitConverter]::ToUInt32($v, 0) }; return $null }
+    $n = [int64]0
+    if (-not [int64]::TryParse([string]$v, [ref]$n)) { return $null }
+    return ($n -band [int64]4294967295)
+}
 function Plan-DefaultsAt {
     param([string]$Key, [string]$Guid)
     $p = $Key + '\DefaultPowerSchemeValues\' + $Guid
     $ac = Reg-Read $p 'ACSettingIndex'; $dc = Reg-Read $p 'DCSettingIndex'
     if (-not $ac.Exists -and -not $dc.Exists) { return $null }
     $o = @{ AC = $null; DC = $null }
-    if ($ac.Exists) { $o.AC = [int64][uint32]([int64]$ac.Value -band 0xffffffff) }
-    if ($dc.Exists) { $o.DC = [int64][uint32]([int64]$dc.Value -band 0xffffffff) }
+    if ($ac.Exists) { $o.AC = Pwr-U32 $ac.Value }
+    if ($dc.Exists) { $o.DC = Pwr-U32 $dc.Value }
+    if ($null -eq $o.AC -and $null -eq $o.DC) { return $null }
     return $o
 }
 function Plan-WindowsDefaults {
@@ -2405,7 +2445,7 @@ function Pow-Subs {
 function Pow-Values {
     param([byte[]]$B, $K)
     $out = @{}
-    if ($K.NVal -eq 0 -or $K.ValList -eq 0xffffffff) { return $out }
+    if ($K.NVal -eq 0 -or $K.ValList -eq [uint32]::MaxValue) { return $out }
     $c = Pow-Cell $B $K.ValList
     for ($i = 0; $i -lt $K.NVal; $i++) {
         $v = Pow-Cell $B ([int64][BitConverter]::ToUInt32($B, $c.At + $i * 4)); $o = $v.At
@@ -2432,7 +2472,7 @@ function Pow-Read {
     $rv = Pow-Values $Bytes $root
     $str = { param($x) if (-not $x) { return '' }; return ([Text.Encoding]::Unicode.GetString([byte[]]$x.Data)).TrimEnd([char]0) }
     $out = @{ Guid = ([string]$root.Name).ToLower(); Name = (& $str $rv['FriendlyName']); Desc = (& $str $rv['Description']); Settings = @() }
-    if ($root.NSub -eq 0 -or $root.SubList -eq 0xffffffff) { return $out }
+    if ($root.NSub -eq 0 -or $root.SubList -eq [uint32]::MaxValue) { return $out }
     foreach ($o1 in @(Pow-Subs $Bytes $root.SubList)) {
         $k1 = Pow-Key $Bytes $o1
         $v1 = Pow-Values $Bytes $k1
@@ -2440,7 +2480,7 @@ function Pow-Read {
             $out.Settings += ,@{ Sub = $script:SubNone; Set = ([string]$k1.Name).ToLower(); AC = (Pow-Num $v1['ACSettingIndex']); DC = (Pow-Num $v1['DCSettingIndex']) }
             continue
         }
-        if ($k1.NSub -eq 0 -or $k1.SubList -eq 0xffffffff) { continue }
+        if ($k1.NSub -eq 0 -or $k1.SubList -eq [uint32]::MaxValue) { continue }
         foreach ($o2 in @(Pow-Subs $Bytes $k1.SubList)) {
             $k2 = Pow-Key $Bytes $o2
             $v2 = Pow-Values $Bytes $k2
@@ -2581,7 +2621,7 @@ function Plan-Install {
         if (-not $g) {
             # Windows no longer finds the plan to copy (it was deleted): it is made again from Windows' own default values for it
             Say ('  Windows has no {0} left to copy; making it from Windows'' own default values for it' -f (Plan-Label $def.Name)) 'DarkGray'
-            $g = Plan-Rebuild $Key
+            try { $g = Plan-Rebuild $Key } catch { Drop-ErrorsSince $n0; throw }      # (the refused copy above is no part of what went wrong)
         }
         Drop-ErrorsSince $n0          # (what powercfg said on the way is no failure when the plan was made after all)
     }
@@ -3440,13 +3480,40 @@ function Hv-Type {
     if ($m.Success) { return $m.Groups[1].Value.ToLower() }
     return ''
 }
+function Hv-Shown { param($t) if ($null -eq $t) { return 'could not be read' }; if (-not $t) { return 'not set (Windows decides)' }; return [string]$t }
+# What on this PC uses the Windows hypervisor (it does not start while the hypervisor is off; turning it on, or its installer or an
+# update to it, can set the boot setting back to Auto): Windows features and virtualization-based security. Only reads. @() when none.
+function Hv-Users {
+    $o = @()
+    foreach ($f in @(@('Microsoft-Hyper-V-All', 'Hyper-V'), @('VirtualMachinePlatform', 'Virtual Machine Platform (WSL 2, Android apps)'), @('HypervisorPlatform', 'Windows Hypervisor Platform (Android emulators)'), @('Containers-DisposableClientVM', 'Windows Sandbox'))) {
+        $st = ''; try { $st = [string](Feat-State ([string]$f[0])) } catch { }
+        if ($st -eq 'Enabled') { $o += [string]$f[1] }
+    }
+    $dg = 'HKLM:\SYSTEM\CurrentControlSet\Control\DeviceGuard'
+    $hv = Reg-Read "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled'
+    $vb = Reg-Read $dg 'EnableVirtualizationBasedSecurity'
+    if ($hv.Exists -and [string]$hv.Value -eq '1') { $o += 'Memory integrity (Core isolation)' }
+    elseif ($vb.Exists -and [string]$vb.Value -eq '1') { $o += 'Virtualization-based security' }
+    $cg = Reg-Read 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags'
+    if ($cg.Exists -and ([string]$cg.Value -eq '1' -or [string]$cg.Value -eq '2')) { $o += 'Credential Guard' }
+    return $o
+}
+# Is the hypervisor running right now? $true / $false, $null when Windows does not say
+function Hv-Running {
+    $n0 = $Error.Count
+    $r = $null
+    try { $c = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop; if ($null -ne $c.HypervisorPresent) { $r = [bool]$c.HypervisorPresent } } catch { }
+    Drop-ErrorsSince $n0
+    return $r
+}
 function Custom-Hypervisor-Detect {
     param($p)
     $t = Hv-Type
     if ($null -eq $t) { $script:Why = 'the boot settings cannot be read on this PC'; $script:Now = 'Boot setting hypervisorlaunchtype: could not be read'; return 'NA' }
-    $shown = $t; if (-not $shown) { $shown = 'not set (Windows decides)' }
-    $script:Now = ('Boot setting hypervisorlaunchtype: {0}, wanted off' -f $shown)
+    $script:Now = ('Boot setting hypervisorlaunchtype: {0}, wanted off' -f (Hv-Shown $t))
     if ($t -eq 'off') { return 'On' }
+    $u = @(); try { $u = @(Hv-Users) } catch { }
+    if ($u.Count) { $script:Now += ('. Uses the hypervisor on this PC (and can set it back to Auto): ' + ($u -join ', ')) }
     return 'Off'
 }
 function Custom-Hypervisor-Snapshot {
@@ -3457,8 +3524,23 @@ function Custom-Hypervisor-Snapshot {
 function Custom-Hypervisor-Apply {
     param($p, $mine)
     if ($DryRun) { Say '  [dry] bcdedit /set hypervisorlaunchtype off' 'DarkGray'; return }
-    if (Test-UsesVirtualization) { Say '  NOTE: WSL2, Hyper-V, Windows Sandbox or Virtual Machine Platform is turned on here. They will not start while this is switched on.' 'Yellow' }
+    # what the boot entry had and whether the hypervisor runs now (when it keeps coming back, these lines show what set it back)
+    $was = Hv-Type
+    $run = Hv-Running
+    $m = '  the boot entry had: hypervisorlaunchtype {0}' -f (Hv-Shown $was)
+    if ($null -ne $run) { if ($run) { $m += '; the hypervisor is running now' } else { $m += '; the hypervisor is not running now' } }
+    Say $m 'DarkGray'
+    $u = @(); try { $u = @(Hv-Users) } catch { }
+    if ($u.Count) {
+        Say ('  NOTE: uses the hypervisor on this PC: ' + ($u -join ', ') + '. It does not start while this is switched on, and turning it on, or its installer or an update to it, can set the boot setting back to Auto.') 'Yellow'
+    }
     [void](Bcd '/set' 'hypervisorlaunchtype' 'off')
+    $said = [string]$script:BcdSaid
+    $now = Hv-Type
+    if ($now -ne 'off') {
+        if (-not $said) { $said = ('the boot entry still has ' + (Hv-Shown $now)) }
+        throw ('bcdedit did not turn the hypervisor off: ' + $said)
+    }
     Say '  bcdedit /set hypervisorlaunchtype off   (takes effect after a restart)' 'DarkGray'
 }
 function Custom-Hypervisor-Revert {
@@ -3932,10 +4014,10 @@ $script:AppxStore = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAl
 $script:EolRoot = $script:AppxStore + '\EndOfLife'
 function Ai-CoreFind {
     $d = Appx-Data
-    $pk = @{}; $pv = @{}; $lv = @{}
-    foreach ($p in $d.Pkgs) { if ([string]$p.Name -like $script:AiCorePat) { $pk[[string]$p.Full] = [string]$p.Name; $lv[[string]$p.Full] = ($null -eq $p.Live -or [bool]$p.Live) } }
+    $pk = @{}; $pv = @{}; $lv = @{}; $sy = @{}
+    foreach ($p in $d.Pkgs) { if ([string]$p.Name -like $script:AiCorePat) { $pk[[string]$p.Full] = [string]$p.Name; $lv[[string]$p.Full] = ($null -eq $p.Live -or [bool]$p.Live); $sy[[string]$p.Full] = [bool]$p.Sys } }
     foreach ($p in $d.Prov) { if ([string]$p.Name -like $script:AiCorePat) { $pv[[string]$p.Pkg] = [string]$p.Name } }
-    return @{ Pkgs = $pk; Prov = $pv; Live = $lv }
+    return @{ Pkgs = $pk; Prov = $pv; Live = $lv; Sys = $sy }
 }
 # The package family of a full package name (Name_Version_Arch_Resource_Publisher -> Name_Publisher)
 function Appx-FamilyOf {
@@ -4007,9 +4089,10 @@ function Custom-AiCore-Detect {
     param($p)
     $m = Ai-CoreFind
     # removed = installed for nobody: the copy that is only kept for new accounts does not count as installed
-    $inst = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } }
-    $left = ($m.Pkgs.Count - $inst) + $m.Prov.Count
+    $inst = 0; $sysk = 0; foreach ($k in @($m.Pkgs.Keys)) { if ($m.Live[$k]) { $inst++ } elseif ($m.Sys[$k]) { $sysk++ } }
+    $left = ($m.Pkgs.Count - $inst - $sysk) + $m.Prov.Count
     $script:Now = ('Windows AI core package: {0} installed' -f $inst)
+    if ($sysk -gt 0) { $script:Now += (', {0} kept only for Windows'' own system account (S-1-5-18, not for anyone who signs in)' -f $sysk) }
     if ($left -gt 0) { $script:Now += (', {0} only kept for new accounts (not installed for anyone)' -f $left) }
     $script:Now += ', wanted none installed'
     if ($inst -gt 0) { return 'Off' }
@@ -4079,6 +4162,9 @@ function Custom-AiCore-Apply {
         if ($still.Count) {
             $what = @($still | ForEach-Object { $st = @(Appx-UserStates ([string]$_) ([string]$m2.Pkgs[$_])); if ($st.Count) { ('{0} ({1})' -f $_, ($st -join '; ')) } else { [string]$_ } })
             throw ('Windows still lists the AI core package as installed: ' + ($what -join '; '))
+        }
+        if (@($m2.Pkgs.Keys | Where-Object { $m2.Sys[$_] }).Count) {
+            Say '  Windows keeps a copy for its own system account (S-1-5-18), as it does for some built-in packages; it is removed for every account that signs in, which is what counts' 'DarkGray'
         }
     }
 }
@@ -5225,7 +5311,7 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'secu
 
 Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on deletes the boot setting, so Windows decides again.' `
+    -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on deletes the boot setting, so Windows decides again. Turning on one of those features or memory integrity, or its installer or an update to it, can set the boot setting back to Auto; the check then offers this again, and the log names what on the PC uses the hypervisor.' `
     -Parts @(
         pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: bcdedit /deletevalue hypervisorlaunchtype)'
     )
@@ -5753,7 +5839,7 @@ Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activatio
     )
 
 Add-Tweak -Id 'ai-core' -Cat $cAi -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Windows AI core package' `
-    -Desc 'On: MicrosoftWindows.Client.CoreAI is installed; it is the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Off: the package is removed. Windows treats it as part of the system, so this app first marks it as deprovisioned (so Windows does not install it again for new accounts or with an update), takes off Windows'' own "not removable" mark where Windows has that command, and marks it as end of life for SYSTEM and every account, which is the way Windows allows such a package to be removed. Then it is removed for all users (or account by account when Windows refuses that), and from the list of apps new accounts get, and the end-of-life marks are taken out again, because left in place they can stop Windows Update from installing updates. If Windows still keeps it for an account, the setting says Failed with what Windows said. If it is in use, Windows finishes removing it at the next restart. On a PC that does not have it, the setting reads as off and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
+    -Desc 'On: MicrosoftWindows.Client.CoreAI is installed; it is the Windows package that Windows'' AI features run on (Click to Do and Recall, for example). Off: the package is removed. Windows treats it as part of the system, so this app first marks it as deprovisioned (so Windows does not install it again for new accounts or with an update), takes off Windows'' own "not removable" mark where Windows has that command, and marks it as end of life for SYSTEM and every account, which is the way Windows allows such a package to be removed. Then it is removed for all users (or account by account when Windows refuses that), and from the list of apps new accounts get, and the end-of-life marks are taken out again, because left in place they can stop Windows Update from installing updates. Windows keeps a copy for its own system account (S-1-5-18) and puts that copy back when it is removed; that copy is installed for no one who signs in, so it does not count. If Windows still keeps it for an account that signs in, the setting says Failed with what Windows said. If it is in use, Windows finishes removing it at the next restart. On a PC that does not have it, the setting reads as off and nothing happens. It cannot be put back from here, and a Windows feature update can bring it back. The other settings on this page are policies and keep working whether or not the package is there.' `
     -Parts @(
         pCustom 'AiCore' 'marks MicrosoftWindows.Client.CoreAI deprovisioned (HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore\Deprovisioned), turns its "not removable" policy off (Set-NonRemovableAppsPolicy), marks it end of life for SYSTEM and every account (AppxAllUserStore\EndOfLife), removes it for all users and from the apps new accounts get, then takes the end-of-life marks out again    (cannot be undone from here)'
     )
@@ -12157,7 +12243,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '111'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '112'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
