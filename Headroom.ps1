@@ -2021,11 +2021,13 @@ function Invoke-Plan {
         if (-not $t) { Say "  unknown setting '$($item.Id)'" 'Red'; $bad++; continue }
         $undo = ($item.Action -eq 'Undo')
         $activate = ($item.Action -eq 'Activate')
+        $reinstall = ($item.Action -eq 'Reinstall')
         # the verb says what the SWITCH does: an -Inv setting that is applied turns its feature off, and undone turns it back on
         $verb = 'Turning on'; if (-not (Get-SwitchGoesOn $t $undo)) { $verb = 'Turning off' }
         if ($t.Once) { $verb = 'Running' }
         if ($t.Plan) { if ($undo) { $verb = 'Deleting' } else { $verb = 'Installing' } }
         if ($activate) { $verb = 'Making active' }
+        if ($reinstall) { $verb = 'Reinstalling' }
         $failed = $null
         # a setting with options: the one to set (the plan item names it; none named = the first that changes something)
         $choiceKey = ''
@@ -2050,6 +2052,11 @@ function Invoke-Plan {
                     $s0 = (Get-Store)[[string]$t.Id]; $mine = $null; if ($s0 -and $s0.Custom) { $mine = $s0.Custom[[string]$t.Plan] }
                     Plan-Activate ([string]$t.Plan) $mine
                 } catch { $failed = $_.Exception.Message }
+            }
+        } elseif ($reinstall) {
+            if (-not $t.Plan) { $failed = 'only a power plan can be reinstalled' }
+            else {
+                try { $script:RunResult = ''; Plan-Reinstall $t } catch { $failed = $_.Exception.Message }
             }
         } elseif ($undo -and $t.Once) {
             $failed = 'it is a one-time action: there is nothing to undo'
@@ -2078,7 +2085,7 @@ function Invoke-Plan {
         } elseif ($DryRun) {
             Emit 'item' $t.Id 'dry' 'Preview only' '' 'Gray' $i $total
             $good++
-        } elseif ($t.Once -or $activate) {
+        } elseif ($t.Once -or $activate -or $reinstall) {
             # a run-once action reads "ready to run" before and after (and making a plan active leaves the switch as it was): it
             # succeeded when nothing went wrong, and says what it did
             $res = [string]$script:RunResult
@@ -2736,6 +2743,59 @@ function Plan-Remove {
     foreach ($g in $at) { [void](Pwr '/delete' $g) }
     if (@(Plan-Where $Key $mine).Count) { throw ('Windows did not delete the {0}' -f (Plan-Label $def.Name)) }
     Say ('  the {0} was deleted' -f (Plan-Label $def.Name)) 'DarkGray'
+}
+# "Reinstall" on the card of an installed plan: the plan is made again the way Headroom installs it (Windows' own plans as Windows ships
+# them, the others from their built-in plan files), so whatever was changed inside it is gone. Balanced and High Performance: Windows' own
+# "Restore plan defaults" is asked first, which keeps the plan where it is. Otherwise the plan is deleted and installed again, and only after
+# Headroom has made sure it can be made again (Windows keeps defaults for Balanced and High Performance; Windows makes Ultimate Performance,
+# tried under a spare ID that is deleted again; the plan file is intact). The active plan is the active plan again afterwards.
+function Plan-Reinstall {
+    param($t)
+    $Key = [string]$t.Plan
+    $def = $script:PlanDefs[$Key]
+    $s0 = (Get-Store)[[string]$t.Id]; $mine = $null; if ($s0 -and $s0.Custom) { $mine = $s0.Custom[$Key] }
+    $plans = @(Pwr-Plans)
+    $at = @(Plan-Where $Key $mine $plans)
+    if ($at.Count -eq 0) { throw ('the {0} is not installed: switch it on first' -f (Plan-Label $def.Name)) }
+    $act = [string](Pwr-Active).Guid
+    $wasActive = ($at -contains $act)
+    $std = ($Key -eq 'PlanBalanced' -or $Key -eq 'PlanHighPerf')
+    if ($DryRun) { Say ('  [dry] make the {0} again the way Headroom installs it (it stays the active plan if it is)' -f (Plan-Label $def.Name)) 'DarkGray'; return }
+    $n0 = $Error.Count
+    if ($std -and $at.Count -eq 1 -and [string]$at[0] -eq [string]$def.Guid) {
+        if ((Pwr-RestoreDefault ([string]$def.Guid)) -eq 0 -and (Plan-Find ([string]$def.Guid))) {
+            Say ('  Windows restored the {0} to its own defaults ("Restore plan defaults"); the plan stayed where it is' -f (Plan-Label $def.Name)) 'DarkGray'
+            Plan-CheckDefaults $Key ([string]$def.Guid)
+            Drop-ErrorsSince $n0
+            $script:RunResult = ('{0} was reset to Windows'' own defaults' -f $def.Name)
+            return
+        }
+    }
+    # before anything is deleted: can it be made again?
+    if ($std -and @(Plan-WindowsDefaults ([string]$def.Guid)).Count -lt 20) {
+        throw ('Windows did not restore it and keeps no default values for the {0} on this PC to make it again from, so it was left as it is' -f (Plan-Label $def.Name))
+    }
+    if ($Key -eq 'Ultimate') {
+        $probe = Pwr-NewFrom $script:UltimateTemplate
+        if (-not $probe -or -not (Plan-Find $probe)) { Drop-ErrorsSince $n0; throw 'Windows would not make the Ultimate Performance plan again on this PC, so it was left as it is' }
+        [void](Pwr '/delete' $probe)
+    }
+    if ($def.Kind -eq 'file') { [void](Get-BuiltinPlanBytes $Key) }        # (throws when the built-in plan file is not intact)
+    if (@($plans | Where-Object { $at -notcontains [string]$_.Guid }).Count -eq 0) {
+        throw ('{0} is the only power plan on this PC, so it cannot be taken off to be made again' -f $def.Name)
+    }
+    Drop-ErrorsSince $n0
+    Plan-Remove $Key $mine
+    try { Invoke-TweakApply $t } catch { throw ('the old {0} was deleted, but making it again failed: {1}. Switch it on to try once more' -f (Plan-Label $def.Name), $_.Exception.Message) }
+    $s1 = (Get-Store)[[string]$t.Id]; $mine1 = $null; if ($s1 -and $s1.Custom) { $mine1 = $s1.Custom[$Key] }
+    $new = @(Plan-Where $Key $mine1)
+    if ($new.Count -eq 0) { throw ('the old {0} was deleted, and Windows did not make it again. Switch it on to try once more' -f (Plan-Label $def.Name)) }
+    $script:RunResult = ('{0} was reinstalled' -f $def.Name)
+    if ($wasActive) {
+        [void](Pwr '/setactive' ([string]$new[0]))
+        if ((Pwr-Active).Guid -eq [string]$new[0]) { Say ('  {0} is the active plan again' -f $def.Name) 'DarkGray'; $script:RunResult += ' and is the active plan again' }
+        else { Say ('  ! Windows did not make {0} the active plan again: "Make active" on its card does' -f $def.Name) 'Yellow'; $script:RunResult += ' (it is not the active plan now)' }
+    }
 }
 function Plan-Activate {
     param([string]$Key, $mine)
@@ -5119,7 +5179,7 @@ Add-Tweak -Id 'usb-power' -Cat $cNic -Inv -Def 'On' -Preset -Name 'USB power sav
 # --------------------------------------------------------------- Power --------
 # The five power plan switches (-Plan): On = the plan is installed, Off = it is deleted. Switching one on does not change the active plan;
 # "Make active" on its card does. Switching the active plan off makes another plan active first; the last plan is never deleted.
-$planTail = ' Switching it on only installs it: "Make active" on its card makes it the plan Windows uses, and the card says which plan is active. Switching it off deletes this plan and no other; if it is the active plan, Balanced (or another installed plan) is made active first, and the last plan on the PC is never deleted.'
+$planTail = ' Switching it on only installs it: "Make active" on its card makes it the plan Windows uses, and the card says which plan is active. Switching it off deletes this plan and no other; if it is the active plan, Balanced (or another installed plan) is made active first, and the last plan on the PC is never deleted. "Reinstall" on the card of an installed plan makes it again the way Headroom installs it (anything changed inside it is gone); the active plan stays the active plan.'
 Add-Tweak -Id 'plan-balanced' -Cat $cPower -Def 'On' -Plan 'PlanBalanced' -Name 'Balanced power plan' `
     -Desc ('On: the Balanced plan is installed, under its usual ID and with the settings Windows ships it with. It is the plan Windows uses unless you choose another. Off: the Balanced plan is deleted. Once it was deleted Windows has no copy left: Headroom asks Windows to put back its own (Restore plan defaults), or makes it under its usual ID from the values Windows keeps as its defaults. Every value is then checked against those defaults, and Compare Power Plans shows whether it still matches them.' + $planTail) `
     -Parts @(
@@ -8790,6 +8850,7 @@ function Get-DetailParts {
         $pa = 'Not the active plan: "Make active" on its card switches to it.'
         if ([string]$row.State -ne 'On') { $pa = 'Not installed: switch it on (and apply) to install it; then "Make active" on its card switches to it.' }
         elseif (Test-PlanActive $row) { $pa = 'This is the active plan: the one Windows uses now.' }
+        if ([string]$row.State -eq 'On') { $pa += ' "Reinstall" on its card makes it again the way Headroom installs it.' }
         [void]$p.Add(@{ S = 'note'; C = ''; T = $pa + $nl })
     }
     if ($t.Once -and -not $t.Cleanup) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button and has nothing to undo here (a restore point is created first). It is never part of Apply all, Tweak all or any preset.' + $nl }) }
@@ -10801,6 +10862,7 @@ function Ui-FillEntry {
     $e.Plan = [bool]$row.T.Plan
     $e.PlanActive = (Test-PlanActive $row)
     $e.CanActivate = ($e.Plan -and $st -eq 'On' -and -not $e.PlanActive)
+    $e.CanReinstall = ($e.Plan -and $st -eq 'On')                       # "Reinstall": made again the way Headroom installs it
     $e.Action = $a
     $e.Enabled = ($st -ne 'NA' -and $st -ne 'Checking')
     $e.StateText = Get-StateText $row
@@ -11201,9 +11263,11 @@ function Ui-RowGeom {
     $o.Hidden = 0
     $o.NotRec = $null
     $o.MakeAct = $null
+    $o.Reinst = $null
     $items = @()
     if ($e.PlanActive) { $items += , @('active', 'Active plan') }
     elseif ($e.CanActivate) { $items += , @('makeact', 'Make active') }
+    if ($e.CanReinstall) { $items += , @('reinst', 'Reinstall') }
     if ($e.NotRec) { $items += , @('notrec', [string]$script:NotRecText) }
     foreach ($t in @(Ui-RowTags $e)) { $items += , @('tag', [string]$t) }
     $room = $true
@@ -11214,6 +11278,7 @@ function Ui-RowGeom {
             $o.Pills += , $p
             if ($p.Kind -eq 'notrec') { $o.NotRec = $p }
             if ($p.Kind -eq 'makeact') { $o.MakeAct = $p }
+            if ($p.Kind -eq 'reinst') { $o.Reinst = $p }
             $px += $pw + (Px 6)
         } else {
             $room = $false
@@ -11277,11 +11342,11 @@ function Ui-PaintRow {
         } elseif ($p.Kind -eq 'active') {
             Ui-FillRound $g $Th[(Ui-SoftKey 'Good')] ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
             Ui-Text $g $p.Text $tagFont $Th.Good ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
-        } elseif ($p.Kind -eq 'makeact') {
-            # a small button: it makes this plan the active one
+        } elseif ($p.Kind -eq 'makeact' -or $p.Kind -eq 'reinst') {
+            # a small button: it makes this plan the active one, or makes it again
             $busy = [bool]($script:Scanning -or $script:Applying)
             $bf = $Th.Raised
-            if (-not $busy -and $hot -and $script:HotZone -eq 'makeact') { $bf = $Th.RaisedHot }
+            if (-not $busy -and $hot -and $script:HotZone -eq [string]$p.Kind) { $bf = $Th.RaisedHot }
             Ui-FillRound $g $bf ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
             Ui-StrokeRound $g $Th.Border 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
             $bc = $Th.Text; if ($busy -or -not $on) { $bc = $Th.Dim }
@@ -11405,7 +11470,7 @@ function Ui-OnPaint {
 }
 
 # ----------------------------------------------------------- the mouse ----------------
-# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | row | head | ''
+# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | reinst | row | head | ''
 function Ui-Zone {
     param([int]$x, [int]$y)
     $M = $script:M
@@ -11442,6 +11507,9 @@ function Ui-Zone {
         # "Make active" on an installed power plan that is not the active one
         $ma = $o.MakeAct
         if ($ma -and $ry -ge $ma.Y -and $ry -lt ($ma.Y + $ma.H) -and $rx -ge $ma.X -and $rx -lt ($ma.X + $ma.W)) { return @{ Zone = 'makeact'; Entry = $e } }
+        # "Reinstall" on an installed power plan
+        $rb = $o.Reinst
+        if ($rb -and $ry -ge $rb.Y -and $ry -lt ($rb.Y + $rb.H) -and $rx -ge $rb.X -and $rx -lt ($rb.X + $rb.W)) { return @{ Zone = 'reinst'; Entry = $e } }
         # the "Not recommended" mark after the title
         $nrr = Ui-NotRecRect $e
         if ($nrr -and $ry -ge $nrr.Y -and $ry -lt ($nrr.Y + $nrr.H) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
@@ -11479,7 +11547,7 @@ function Ui-UpdateHot {
     if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'makeact') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -11546,6 +11614,7 @@ function Ui-OnMouseDown {
     if ($zone -eq 'toggle') { Ui-Select $z.Entry; Ui-ToggleRow $z.Entry }
     elseif ($zone.StartsWith('seg')) { Ui-Select $z.Entry; Ui-PickRow $z.Entry ([int]$zone.Substring(3)) }
     elseif ($zone -eq 'makeact') { Ui-Select $z.Entry; Ui-MakeActive $z.Entry }
+    elseif ($zone -eq 'reinst') { Ui-Select $z.Entry; Ui-Reinstall $z.Entry }
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
     elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
@@ -12178,6 +12247,43 @@ function Ui-MakeActive {
     Ui-Flush
 }
 
+# "Reinstall" on an installed power plan's card: the plan is made again the way Headroom installs it. It asks first (whatever was changed
+# inside the plan is gone), then runs through the background worker like any change, with a restore point; "Preview only" only shows it.
+function Ui-Reinstall {
+    param($e)
+    if (-not $e) { return }
+    $row = $script:Rows[[string]$e.Id]
+    if (-not $row -or -not $row.T.Plan) { return }
+    $b = Get-BusyReason
+    if ($b) { Ui-Status $b; return }
+    if ([string]$row.State -ne 'On') { Ui-Status ('"{0}" is not installed: switch it on and apply first.' -f $row.T.Name); return }
+    $dry = [bool]$script:UI.dry.Checked
+    if (-not $dry) {
+        $how = 'from its built-in plan file'
+        $k = [string]$row.T.Plan
+        if ($k -eq 'PlanBalanced' -or $k -eq 'PlanHighPerf' -or $k -eq 'Ultimate') { $how = 'as Windows ships it' }
+        $askText = ('Reinstall "{0}"?{1}It is made again {2}. Any setting you changed inside it goes back.' -f $row.T.Name, "`r`n", $how)
+        if (Test-PlanActive $row) { $askText += ' It stays the active plan.' }
+        if (-not (Ui-Ask $askText 'Reinstall power plan' $false)) { return }
+    }
+    $row.Note = 'Working...'; $row.NoteDetail = ''
+    $script:Applying = $true
+    Ui-ShowLog $true
+    Ui-RefreshAll
+    Ui-Progress 0 1
+    if ($dry) { Ui-Status 'Preview running - nothing is changed...' } else { Ui-Status ('Reinstalling "{0}"...' -f $row.T.Name) }
+    try {
+        Start-EngineJob 'apply' @(@{ Id = [string]$row.T.Id; Action = 'Reinstall' }) $dry
+    } catch {
+        $script:Applying = $false
+        $row.Note = ''
+        Ui-Note ('Could not start the background worker: ' + $_.Exception.Message) 'Red'
+        Ui-RefreshAll
+        Ui-Status 'Could not start - see the log.'
+    }
+    Ui-Flush
+}
+
 function Ui-DoStop {
     if (-not $script:Applying -or -not $script:Job) { return }
     $script:Job.Stopping = $true
@@ -12367,7 +12473,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '114'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '115'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
