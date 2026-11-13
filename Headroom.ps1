@@ -948,10 +948,35 @@ function Appx-PendingFull {
 # counts as removed, as in the check)
 function Appx-LiveFull {
     param([string]$Full, [string]$Name)
-    foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Ignore)) {
+    # a query Windows does not answer is no proof that the app is gone: it then counts as still installed
+    $n0 = $Error.Count
+    try { $all = @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Stop) } catch { Drop-ErrorsSince $n0; return $true }
+    foreach ($x in $all) {
         if ([string]$x.PackageFullName -eq $Full -and (Appx-IsLive $x)) { return $true }
     }
     return $false
+}
+# The accounts an app is still installed for, as Windows lists them ("S-1-5-21-... [PC\name]: Installed"); a copy that is only kept for
+# new accounts, or whose removal waits for a restart, is left out. @() when it is installed for nobody.
+function Appx-UserStates {
+    param([string]$Full, [string]$Name)
+    $o = @()
+    $n0 = $Error.Count
+    try {
+        foreach ($x in @(Get-AppxPackage -AllUsers -Name $Name -ErrorAction Stop)) {
+            if ([string]$x.PackageFullName -ne $Full) { continue }
+            $ui = @($x.PackageUserInformation)
+            if ($ui.Count -eq 0) { $o += 'an account Windows does not name: Installed'; continue }
+            foreach ($u in $ui) {
+                $s = ([string]$u.InstallState + ' ' + [string]$u)
+                if ($s -match 'Staged' -or $s -match 'pending\s*removal') { continue }
+                $t = ([string]$u).Trim(); if (-not $t) { $t = [string]$u.InstallState }
+                if ($o -notcontains $t) { $o += $t }
+            }
+        }
+    } catch { $o += ('Windows did not say: ' + (([string]$_.Exception.Message -split "`r?`n")[0])) }
+    Drop-ErrorsSince $n0
+    return $o
 }
 # The full names of the bundles an app was installed from (the name Windows sometimes wants for removing it)
 function Appx-BundleNames {
@@ -1833,7 +1858,7 @@ function New-RestorePoint {
 # How long a setting's check is likely to take, so the quick ones are shown first and the ones that wait for a
 # slow Windows question come last:  0 registry / services,  1 other custom checks,  2 firewall / tasks / adapters,
 # 3 apps and USB,  4 optional features,  5 capabilities
-$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlanBalanced = 1; PlanHighPerf = 1; Ultimate = 1; Khorvie = 1; Endgame = 1 }
+$script:ScanHeavyCustom = @{ UsbPower = 3; NicTurnOff = 2; NicEee = 2; NicSuspend = 2; PlanBalanced = 1; PlanHighPerf = 1; Ultimate = 1; Khorvie = 1; LowLatency = 1 }
 function Get-ScanWeight {
     param($t)
     $w = 0
@@ -2145,6 +2170,89 @@ function Pwr-Restore {
     if (Plan-Find $Guid) { return $Guid }
     return ''
 }
+# Windows' own default values of one of its standard plans, the ones its "restore plan defaults" uses:
+# HKLM\SYSTEM\CurrentControlSet\Control\Power\PowerSettings\<subgroup>\<setting>\DefaultPowerSchemeValues\<plan ID> (ACSettingIndex,
+# DCSettingIndex); a setting that belongs to no subgroup sits directly under PowerSettings. Only reads. @(@{ Sub; Set; AC; DC }).
+$script:PowerSettingsKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Power\PowerSettings'
+function Plan-DefaultsAt {
+    param([string]$Key, [string]$Guid)
+    $p = $Key + '\DefaultPowerSchemeValues\' + $Guid
+    $ac = Reg-Read $p 'ACSettingIndex'; $dc = Reg-Read $p 'DCSettingIndex'
+    if (-not $ac.Exists -and -not $dc.Exists) { return $null }
+    $o = @{ AC = $null; DC = $null }
+    if ($ac.Exists) { $o.AC = [int64][uint32]([int64]$ac.Value -band 0xffffffff) }
+    if ($dc.Exists) { $o.DC = [int64][uint32]([int64]$dc.Value -band 0xffffffff) }
+    return $o
+}
+function Plan-WindowsDefaults {
+    param([string]$Guid)
+    $out = @()
+    $root = $script:PowerSettingsKey
+    foreach ($k1 in @(Reg-SubKeys $root)) {
+        $n1 = ([string]$k1 -split '\\')[-1]
+        if ($n1 -notmatch ('^' + $script:GuidRx + '$')) { continue }
+        $p1 = $root + '\' + $n1
+        $d = Plan-DefaultsAt $p1 $Guid
+        if ($d) { $out += ,@{ Sub = $script:SubNone; Set = $n1.ToLower(); AC = $d.AC; DC = $d.DC }; continue }
+        foreach ($k2 in @(Reg-SubKeys $p1)) {
+            $n2 = ([string]$k2 -split '\\')[-1]
+            if ($n2 -notmatch ('^' + $script:GuidRx + '$')) { continue }
+            $d = Plan-DefaultsAt ($p1 + '\' + $n2) $Guid
+            if ($d) { $out += ,@{ Sub = $n1.ToLower(); Set = $n2.ToLower(); AC = $d.AC; DC = $d.DC } }
+        }
+    }
+    return $out
+}
+# Puts a standard plan back that Windows will not copy any more (after "powercfg /delete" Windows no longer finds Balanced or High
+# Performance to copy: "The power scheme, subgroup or setting specified does not exist"). A copy of a plan that is there is made under
+# the plan's usual ID (or a new one when Windows does not take that ID), it gets the plan's name, kind and description, and every value
+# Windows keeps as that plan's default is set. Returns the ID, or '' when Windows keeps no default values for the plan on this PC (then
+# nothing is left behind).
+$script:PlanStdText = @{
+    PlanBalanced = @{ Name = 'Balanced'; Desc = 'Automatically balances performance with energy consumption on capable hardware.'; Kind = 2 }
+    PlanHighPerf = @{ Name = 'High performance'; Desc = 'Favors performance, but may use more energy.'; Kind = 1 }
+    Ultimate     = @{ Name = 'Ultimate Performance'; Desc = 'Provides ultimate performance on higher end PCs.'; Kind = 1 }
+}
+function Plan-Rebuild {
+    param([string]$Key)
+    $def = $script:PlanDefs[$Key]
+    $g = [string]$def.Guid
+    $txt = $script:PlanStdText[$Key]
+    $vals = @(Plan-WindowsDefaults $g)
+    if ($vals.Count -lt 20 -or -not $txt) { return '' }
+    $plans = @(Pwr-Plans)
+    if ($plans.Count -eq 0) { return '' }
+    $base = @($plans | Where-Object { $_.Active })[0]; if (-not $base) { $base = $plans[0] }
+    [void](Pwr '/duplicatescheme' ([string]$base.Guid) $g)
+    $at = $g
+    if (-not (Plan-Find $g)) {
+        $at = Pwr-NewFrom ([string]$base.Guid)
+        if (-not $at -or -not (Plan-Find $at)) { return '' }
+    }
+    [void](Pwr '/changename' $at ([string]$txt.Name) ([string]$txt.Desc))
+    # only the values that differ from the copy are set (one powercfg call each)
+    $cur = Pwr-ParseQuery (Pwr '/qh' $at) -Both
+    $n = 0; $bad = 0
+    $want = @($vals)
+    if (@($vals | Where-Object { $_.Set -eq '245d8541-3943-4422-b025-13a784f679b7' }).Count -eq 0) {
+        $want += ,@{ Sub = $script:SubNone; Set = '245d8541-3943-4422-b025-13a784f679b7'; AC = [int64]$txt.Kind; DC = [int64]$txt.Kind }    # the plan's kind, when Windows keeps none
+    }
+    foreach ($s in $want) {
+        foreach ($side in @(@('AC', '/setacvalueindex', 0), @('DC', '/setdcvalueindex', 1))) {
+            $v = $s[$side[0]]
+            if ($null -eq $v) { continue }
+            $c = $cur[[string]$s.Set]
+            if ($c -and @($c).Count -gt [int]$side[2] -and [int64]@($c)[[int]$side[2]] -eq [int64]$v) { continue }
+            $n++
+            $o = Pwr ([string]$side[1]) $at ([string]$s.Sub) ([string]$s.Set) ([string]$v)
+            if (([string]$o).Trim()) { $bad++ }
+        }
+    }
+    $m = '  made from Windows'' own default values for it: {0} value(s) set' -f ($n - $bad)
+    if ($bad) { $m += (', {0} not accepted' -f $bad) }
+    Say $m 'DarkGray'
+    return $at
+}
 
 # ------------------------------------------------- built-in plan files (third-party plans) ----
 # Plans that are not Windows' own: each plan file (what "powercfg /export" writes) is kept here, compressed, and checked against its
@@ -2194,79 +2302,37 @@ $script:PlanFileKhorvie = @(
     '6Levn50cZX7zDeTqfIjBCIKIVjC/AJW281AZJhUFAULqqdC98WNwfgu4esawedTX4VdOdeZxeXLTb134kH1e5f7kBvPINpn9ARntwE+IhhLPcI6iTVbKvD8q',
     'mPo+y3sD+wB/YfLMjvH/WRmP8RiP8RiP8RiP8RiP8RiP8RiP0cd/A/VnaSgAUAAA'
 ) -join ''
-$script:PlanFileEndgame = @(
-    'H4sIAAAAAAAC/+1cW4yd11X+fUsmd+fWTJwmOXaaZHLZ8b5faC524jiTi5OBQLEqoN7X2CR2Ro4bXPXFqEKyhJAslaoWD8gUHiwhVeGl8gOCASHVRUiMEBc3',
-    'QGsQVBY8YHhhqBBm7X/P8Zxz5v/n/KfNW89WTuY/57+tb+211/rW3mv7eHwnbaqqKn8e+f3//bV//P7Hm/Lxlqq0fNzLB4fK8Y/bvvtzH/7OX77+H3f+1sH/',
-    'unzy3//pq6Pf8zUfj/x2/OiJo9W0feLtqT/44zemWpi2aZu2aZu2aZu2aZu2aZu2afvJaIfdkWP1wfbm86evXbt27N2nq9NfeI3+3vc+rqcA4Kdr966e3/5q',
-    '+b4Zjme2VNXZ1fPzq+dn4eNWjz8DH6qVkiwIFLUxiCvFkbPBIO+xY9gzzwypVl/ywbvlefnj4fMv9XzE1tN/AX8vrT7zHvhsri5UM6tvux++bdpcf9mW5y12',
-    '5uMdWYrq1LrfG67vtVxf/w5ve6G6o9pUJkK23ZX/v+OeWg1Dv8F19XPXX3dq9bd6emXw/PD9gA/wf/juLbXuljZljBk7qvbFD/zxI4snjrx/rNpbkWoWrvvZ',
-    '6nAVq151tHq/+qA6AUfvV4vw9wj8Yqv34HuCX47D30W47vjqt3zuGOg1Vs/AmQPwLdRPcdWX4P/vwPcP4boTcDb3YFx9cvMT8u/53R/AOx28MdZ3HYej/CwP',
-    '596vfw31lR6uexqOvgjHAZ5xYvXMfvjr4K4vwm/H6ztpheHDr+vj1moOjpc39/Whq/3Hj8Rj4b0vvWmPRgL6uQjXvQxShRrB0Vq2hUaZq/qoV32ufv5VuO8s',
-    '6Pn85kG771Xbv/Lec9/762L32Q5mVvtn/uZi5/3xMGr3gy3bPcaExsgVMpgTxJ0IyDilkGAiOasd4ZxWq3K8lzZVh26pKoZN6Mux8/01OWa3rD372mrLYp/c',
-    'ujb++uc/DZ+tg3I4GqQJCllqQQ5uPDJSY5QM8QoLSrzEfTlmt1XVnm3lnqL/2/OzTlWrz9xUPVjtfenteOLEkWPvvHosxJM3Vs3X6bhv6LptN+Xnz8HJha3D',
-    '+u6Cc7YDTqmYjtRz8DNWIG45RY5IiyLmOCpplJCxj3PmBsB4Q8G5At8v3Vq14Lh2bRgvXNt4XVUN40V8EnzVtvH4NI4Muioi5wwHfEHDUcQIB0aMiMlLydb8',
-    'SJFv+ca+fOKWYRz3zTXjkHz4Oi2ar+uN4H1wov7s3Tgeb4CYAbAC8iQlxCmPyATPwIKJi0ozhglux7txv61dN9pvjxzI9rEMtrFyw+R2un2mAy7JjCAaDFPI',
-    'gDjjAmmbwFhNYjQ5Kgk2o7g2Ve39mOU9D3jOg38K1slsz6fuaNPLx5uG8ZbxcBns78qN7X6wDe+VLnhBJsxkdnwpIp6cR5qKiMDzBAyOiXIhR/EOjqthvCeO',
-    'NF/XjOssyLc0MzmupZs64HLeRMo0kiECrzGRIUN9QNpTxw2Xjiva3o+j9tmG/+dH7PPtGtdilu+myXEtdxh3yRthEwfTBLcJcQuMVDNhEVgrYQRQgyPK156r',
-    '49ZMdW5L8aOntxYffHhb8VUHbyhjGN9YbL43s2qfM0V3yzeVd7Xx1K793Ba3+2tXZ7ZMGLeDCs5GCi4n+1lMLfBVHRGVSqmoudY+DMbtk7dVFaHO5XGn72yW',
-    'Z/nm5v6Yu3V8f2RO4KNxyMUE8hBikDGUIKsFSY7QhBNvt7PReP1gy3Wj/nxHje8ScJLq1o350SiufGJ7h3gG1mWkCw4RjMHYVJDAUCBNSCrQYC2AE6Sv5/Pg',
-    'z5bhQ0VItVyg5+qu8r2O3w+22UscwS/G2sv8LZPZCzHeOZ1ggFAFfkBAhDbJgpOzYPwphoA9adNfdVuzXey5fbz+ss1FFyUSGlTHJZPICOcQo0TFpKXyxDaN',
-    'oy2r42ic/9my6qea/OpVkHv29mG7mPt6M2/ec+9k+gSX6kGBGmFrwS5IzP4HLN8oFymnXid6na+eBqV8BB/PZGru//95YRin/7dsL71es9wLtzfb8+UOfjPb',
-    'oiXcIBEC8GwF/eGEdZmOMuWE00Srdr+2teoWD7ZU+zpdZ0ee92iVcS/1VvP/7ePy//F6yXb6UQf/RU2SHuIG0jJYxLUXMD7ga6JOKkcS58FO8t584uAt49+r',
-    'nOeWJoOCTh5YozTIYQXjg0WntLDWW9zeH/HMiP7+vBs/mUx/Sx30Z7j1MlCDFPPAn4iVSGOTEAx45iwlwDNiO47f/e6wfLTqxud7E+GYubsDjqA0ESC9gqwY',
-    '+JKKSENDAn7EImHKJJ+kP/L4Pwcx4Bz4F+uSz/a951PdeUO+fzvEkct3TW73lzvgzTJRAdGaSawR98AjDI8WEUUcjkFwaV073g9G7OpnbNd+y7jOgHwX7p4c',
-    '14V7xuNygTmV8xecZxF4MOCfraMokgDE1wI9lKEdV68jn1+smvrrMMh35p7JcV28qwOf5+CluNcoCA/+ggWGnGYRJS8IJcI7zMMg751Z5SO97cXHnd1efM6h',
-    'O8uYnbur2Pzs3cUWrt5ddHfxnvKuyXjvYyP6eKw17jb5y0sd8EMeFrTgBDHDc5ZNISXFVCDCrNI8SWWcauKZhSdIsrfFf7z1R8Py9d/Zu39CXmAVU5D8I2IY',
-    '2B0Qc6SDUshRoEHOMgxxdtAuBt97+FMt9n5fB56qBbNSE0QVGAcHtgo8NYHRU0xYNAqGAevzkYOzoJTZcs+gnmjHvI9u0N+1/YO8Z+4btv8uOA92wMl1lE6B',
-    'fxY4CeAvmiIrAoe0PdNbrCKlso9zHvpu8f6CM/vds7Rr/u5b/NitrfGnC749sx3wGe0x5xZBv7nMlyGFEmDkwoNVxcCjVLpv3++lrdXlTxV8F+8rujk/W55x',
-    '9v48fqNpzqNG8w3bkm/tGsEbwyR4D+3o4s+i0QlQipTnXXwkkEHCV+KYhv+4x+vnmdb64+aq27xnGMHxYYmrIJ/eMWynv/xXw35gddq9Wvz0hH4gSkwIuADB',
-    'BFmNPxFzRAU1UjobsOCD+fnVnVUVI6Fd84O2eeC2eYfB/lrc0TJP9sD4/so5DI4OgBhgRdwqDLhiRFiD9/XUU85Ye3+N2hPkaDkvhni49EB7P7TJe7FD/hkE',
-    'pgm4HCLBK8TzTK0VIqCEuZNJeOiGem7nSt0Pm6v5BwrGlQfKvV35dLf59o83tdlZP6+/+OBkdsYhhaaJaaSsgbzFAcXRLmnEIEq6SEyIPLbp9dKnm+Pwcpd8',
-    'KfNGDnmLiJZCvoQJhBrC4L3ORkysZWZo/mnhwXLPoJ5uGOC9bflJ23i89PCEekpGkagNitFBvs6FQFaHiEwUpl56YVy16al6qNn+Fh7ukN9J8MrJMhSCAb4W',
-    'gao5IevwZahhWlJ9fZ5gBey890C5Z1BPW1rjcq9qvm7U7nbVz69A3rmH28dZE876xB0d8ghgGFIKBmxHAk5sNTIER2RJEtyBH1dxaJydfKjgPPRwubeO1/Cg',
-    'Rfhg6W2d//fa8/9B3Juv4/7pkXF5c6sdNeFc6YCTJ2shsYAsicbMP2ieP4F4RYGYCgNjMRCzkf8blu+bb4/zB1d2TGbnAsYeDzAQObUp82OT5zHyPCwl2lOp',
-    'Y5mX6r/3V7/5lW/8w/fLe8/ON9u5fq3DPB8LGCICR0lxiOMKGIzVAsi5dCFqCHfMaiVI3c+X4HnV6+WezMtOvtlsj1d6zfJcfWi8PDmWJoMlChTYNwdvD6KE',
-    'vJyVLLFCyZDEoB4WxdEh/T/cn2c1E+qfC8YgoQZv6EAPmnJkpM8zbU5ipzgOGLeNv8O7mvGef6QD/4cxEyAyIwksEfodMl9tqEI+Kgd6iI6JdfnuQ612Ocyj',
-    'Pt/qV1bzCZDv1CPDfkX/YDyuqx38J/ZeOMkBCAkp82EFuGD4heiZ8IxosZbX6EeBcz5adJHtauaZYbyhFe/Hm7rxqWvXJsGHP9Nlftxi6ziMm0iBTyVrkGM5',
-    'QgHoxLmR2G6w7nj+P4dx/PpKN7+zq+P82q6J+nPhsQ68IYQgLPgJYRWMCqYgBIMOUHDYaa+0VmzdeuSNHe10yxg7hXS1mntscjvd83iH9S8ptUomoshyXUdw',
-    'CTmgnIgIGHqaeKnX1z1s2qAfaz8Jsl56ojy7Xi/fXXXutzq/gbEw+/jkeGfnPhG8vHsc7FqvUvrxImC6+iPgutoFV55A45AlEJ/zhUQZso54BCGVKU2MB4rd',
-    'juvICC5ZtdUnNeVB50C+i3PDuG754XhcVQf75Di5mAASjZCK8kCB/4LzRNgnyBQUd9av8zOn7+7mZ+64juvv/nkY1/1/knGdBBs+Bx/uDG22fzWiDzoR/otP',
-    'dsAvnM8TKyhoQM1ZhDxJYgHpAI5eRiOdWMfbwsA8196Rea6265rmw06CfOeenLxfzz3VAZcUESg2BnZDcF7PA97lhEYYB4KVCp4T3c6XR/PYXst1CyO4VM3j',
-    'FkC+k09Njuvk0x1wga0EBUCEBQrFNTAqy/NkAxFBaQv0bj3Pdq24Nrf016h/OfHtuv4P5Ft4ehjX1/ZXrzz3N2Ps8IkOuAJ1mAAxVkFAnmS0Qxo4OWK5xIoZ',
-    'aqkX7Xa48TikY8ZhhSD+ofXjcO35f/b14ed//zdz3Flh3fs3n9jTgfdAL0rACoRce5zrVxL4I8YQJUJz6HoBOUO7n72tdT2zi/2tPNOhTpMYpwQ4CIyZg7xd',
-    'QyqTp515CNR4hrFRZFQ+f12+t0fk+0LLdc3x7TzIt/zMsP397W1Hx+p9e4c4ID01BoIc0okD39QE4rb3MvsLyJQgabRYtvOUjee91sbf3pHrfqHFnsVoPWq9',
-    '/r9CVtf/8fj1/3F6yf19FndZh4cMXmsG7DuvqwVlwNWYhDRTHIard1H563U+wMOWd08uxyLpIEeiSfhkUSLY5/wRJAIPj6JhNmqROASq9nFxYkTvseU6M6L3',
-    '/TWuHsg3TybHtYA61AUbFmLMBWpAQ3K9DFig8XnyRARswCYl96O4tm3g9/ryfWPn+HGx0GHdxXMBrJVB3m4sjHdhIM+M1CHjjc/5GY7SZQyD8vXe7Mv31i8N',
-    'yxeeq/PPz1a1PZ99YUI7YZ+IPkO7Pr/c2P+HoB/n2eR+53SX/nfWcqstIhyk5DzPkEQIfoS74AIxSjDV7nfYiF2bifR5hXeo+2BOOwkJDJYG/GIAym9yBQiW',
-    'nEeDsdfr50/aedSuNjvePKz3xVL/C/It8cnH3ZLoUpfDvPZOIplMnhSkCtmgFfgTy1KMHuuwLo49e11eNILr5ZbrRv0JLvW/WT7xI/hr2QVXYFaSPIuf92tZ',
-    'D0d5vEYedJLApqRK7faER3B9d3Pzdd8b6a+v/UY9Tw3yLcphXOP80Oj8YdUyf+gwEA6j8i4cDH5IMzjS3iAJ1FBiCemaS5O8t7Z/1aFexkasXa4fCCIiLrUG',
-    'O5EwXFle0RNSCu7a7f8Hfzqszxs2N9v/7sa89yzIt6Qm02dt/7oDLi8w0wnyXgYuMs+nIZPngRmzziZhmIi+nW/v3nCeIozhcYtZPj2M64n/vvZaf769zZ+u',
-    '7O6AKzKmcl0/DkBNOeES2QyOJyAsJkCq5GuNXvi/vN7ycHV5V5kXvfBImVM9+5ky93j60TInd+ixMqez8Hj5OzdX5kKqJ8rcQfVkyaEvPVlyzo+eKnnE6adL',
-    'TnMGFU6PnynceWZ34Zo9XLjVeVy4zSlSYtcyLX9PsRIberz44BVefNayKGP8vCxjoqeKja6o0qfLuuigR0vsPvNT8DfFgCHmhhTIDDinuMplP4k2Cd9Yoh34',
-    'BshqWcAo7/kCviFz/1EK/8Na+gBdmNbVRa/xjdF4Y1LTOkZr/vPZDuvmoEMciELgDjIfCgFppSyCsAEpUCDC63XztPdcHw8//Pth+S5tar5u/fx6za9BvuXP',
-    'Duu9C67lZzusC4FNUAw8D0fGYbQkAp5WBhQdweANGGSiut0fjPLrX2m5joz4g/drf5AD5vln23H1yha7cn7vZOtOeW3NGZFQUirzK8mR9oIBfyEQCTkMeWPa',
-    '3nv52Zb1i+c7rF8oay01DmmX6/Hypj9rU0RMJGCgcEji9f2My/C8lefLPc15ye4fa1748nNVNfP8sH6/9duf+8I4nMvPdZgX9th5TAny2gI/jBh4lFEMSQeE',
-    '1nlHnbqOcwn4fm9PwVnX+77VtX728Y51JLsn6scLHfpRau5ZlAZZnvJ6KQH7UYKjAExdGSuyGbWPi9veHZbv8zub+RR3I/s2Xa0v0NWVPUWWmcH9/3u6rf+v',
-    'Pf87TwzL8Z0nJtHTlRc65DHRc5eXPKSWef7EU+SiEjnuYs5d1NpusH/i9pH+fudbbeNgGMftnfs7n7jYIf7YEMGz51ktg4E/y3q/FjcoQRAnwWZrr/neUl2v',
-    'sa06+Fyx5z3Pl7HQe6HYzPyeopPte8sz2+KmenXYz/W3/p3aN5mf05lcGCJRxJjn2Tid/bdEwUYtk8YS0rc2P3dxb8t610td6jK9IwT6Xci86c4mh0xguc4q',
-    'caUVjZS4/vi/AM+7/FK555OuH6vXv16E97zYrt82nBde7OAHsMcqRYiPQkAcET6BXWAGNEBGRinBdO3fAzgPfbe8r+CcWb33k92fzvkk+M516MdcD00UFihB',
-    'tAT7Ad6sAxO5QoQ6EigOMa3V126p9rxY8M29VPDN7CvP2LgOfuP+XfNXBA3j/cOn2sZLv+5tef9k48UII/N2bcgiBWQHJNc/+rxfQHkYxtimUPK6pveu7GvW',
-    '8/z+DrwAK6UZV5BAKnhvzPNTzgXIuxx4Fwuugpu+HV2B521/pdzTbd45hRZ9mlG/WdfVvQw63N8+XtpwXnm5Ay/gXjljYJTYvE/eMQ/25BUCnwTpjNI+ln2v',
-    '/bq3xZcLzoP7y73N+xmPHNtoXW7tutHx8kyrv+3Xk83NT2Y/XknmePTAl7P9OAl+z8WAqMsTEhHi3XB96eB79SvNej0932EePHoCnNYhiXM9k8jzEckJMGMC',
-    'fjcoFQwerC/96JVyT7e6ycnqRjTIe2h+43jWH59Lr02m3xA1wyZXGQiZ83ibkIUMMJdVUJ/rxGnZdzhX47y33jOf/82WvFc77wHXt5Y9ynmPbt7jm/cW5b2p',
-    'F+8te2VybX7ek5JrqHNNeq75zTXDudYz18TO90pNY661y7WDObfKNWyZW+ScIvvaHHPzGMm+JPdptolcK5hln3sdciqq5Ok34K9i9jBw3QSm3zWvbptPGe6v',
-    'vS37T5r768qr4E9ea++vtjrHSzs7rFt64RwDomTzZkfwaxR4AHYwHqigCidlNRkc74d2ljrH+dfKvc3x4tsjeF9tiStodB3+Or6tv9g83mffmMwec19GIjFS',
-    '3sF4Z3lJgQI+xYAZ+siMKfsWmt6bbaFxvf+NDnyUSEnzBj0Y3cDrIqSu+Z8fQlQy4HuRYi3U4Hg/93q5p3kcf3ndfvrm614c0aeonz8H8i68MWw/o/rt89fZ',
-    'tybUL4wRzHVALtFcX0QAscrLTqBl0LzWhqS2955+o8VuD3TgdUxFm1fZHRD7nN+JvL7lkSU5fgGhF1wO6re3kP0JSW37/Daqh6nG1MOcBnk/OtCu3yac+cSV',
-    'DuNTE81c3goRTa6H0cFCHgtpLeE2yuAz97N9nGcB49JC0c3M6r3NdU3r98NNIvfFDvl3Yl5gqgLyAZIbnjcPWpuDLQ5Oc251wniQl1YHitxXDhS5z71ZntHk',
-    'V29u3df6r2P9x8kDk9l39v3JYYKiFrmeFePsPxKC9DgSCnmlDHK0Br/13/9bGL/+Pyh3jj2N+9De7MBXwdalAIIReK7LsTwhbW1ExDrtUjAaxx+5LqIaqIsY',
-    'ne+cvWP6bz1O27RN27RN27RN27RN27RN27RN209u+39xMFSPAHAAAA=='
+$script:PlanFileLowLatency = @(
+    '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'
 ) -join ''
 $script:BuiltinPlans = @{
     Khorvie = @{ Guid = '8070b076-188f-428d-a9d6-e1a2f99fad5d'; Name = 'Khorvie''s PowerPlan'; Size = 20480
                  Sha = '0e41edd749126d44c4f92d2c5f67e7a1abe0809a4bd69aff2a88f8f90c206b61'; B64 = $script:PlanFileKhorvie }
-    Endgame = @{ Guid = '287763d5-e899-4774-bad9-cc0b30c3c391'; Name = 'Endgame Performance'; Size = 28672
-                 Sha = 'e71ed9add1da0e60b186cf03607cc2dfcadaa984ad938b1ff947c3b0cb032197'; B64 = $script:PlanFileEndgame }
+    # amit's low latency powerplan (idle enabled, v3); Headroom gives it the name "Low Latency Power Plan" (powercfg /changename)
+    LowLatency = @{ Guid = '95c05c40-e7bb-47bb-8baf-f152b0e1ffcc'; Name = 'Low Latency Power Plan'; FileName = 'amit''s low latency powerplan'; Size = 12288
+                 Desc = 'Eliminates power saving within Windows (amit''s low latency powerplan, idle enabled, v3).'
+                 Sha = 'ed98a09f99e0b46355b6f0044b61fb742ecb4da56be2f1e383a306caa7cf891b'; B64 = $script:PlanFileLowLatency }
 }
 function Get-BuiltinPlanBytes {
     param([string]$Key)
@@ -2292,20 +2358,129 @@ function Get-PlanTempDir {
     return [IO.Path]::GetTempPath()
 }
 # Imports a plan file under the given ID (or, where Windows does not take an ID, under a new one). Returns the ID, or '' if it failed.
+$script:PwrImportSaid = ''      # what powercfg said when it refused the last import (for the log)
 function Pwr-Import {
     param([byte[]]$Bytes, [string]$Guid)
+    $script:PwrImportSaid = ''
     $f = Join-Path (Get-PlanTempDir) ('headroom-plan-' + [guid]::NewGuid().ToString('N') + '.pow')
     try {
         [IO.File]::WriteAllBytes($f, $Bytes)
-        [void](Pwr '/import' $f $Guid)
+        $o1 = Pwr '/import' $f $Guid
         if (Plan-Find $Guid) { return $Guid }
         $o = Pwr '/import' $f
         $g = [regex]::Match([string]$o, $script:GuidRx).Value.ToLower()
         if ($g -and (Plan-Find $g)) { return $g }
+        $script:PwrImportSaid = ((([string]$o1).Trim()) -split "`r?`n")[0]
         return ''
     } finally {
         try { if ([IO.File]::Exists($f)) { [IO.File]::Delete($f) } } catch { }
     }
+}
+
+# What a plan file holds. A .pow file is a small registry hive: the plan's key (named after its ID, with FriendlyName and Description),
+# under it one key per subgroup with one key per setting (ACSettingIndex / DCSettingIndex), and settings that belong to no subgroup
+# directly under the plan. Returns @{ Guid; Name; Desc; Settings = @(@{ Sub; Set; AC; DC }) }; AC or DC is $null when the file has none.
+$script:SubNone = 'fea3413e-7e05-4911-9a71-700331f1c294'
+function Pow-Cell { param([byte[]]$B, [int64]$Off) $o = 4096 + $Off; return @{ At = [int]($o + 4); Len = [int]([Math]::Abs([BitConverter]::ToInt32($B, [int]$o)) - 4) } }
+function Pow-Key {
+    param([byte[]]$B, [int64]$Off)
+    $c = Pow-Cell $B $Off; $o = $c.At
+    if ([Text.Encoding]::ASCII.GetString($B, $o, 2) -ne 'nk') { throw 'the plan file is damaged' }
+    $flags = [BitConverter]::ToUInt16($B, $o + 2)
+    $nlen = [BitConverter]::ToUInt16($B, $o + 0x48)
+    $name = if ($flags -band 0x20) { [Text.Encoding]::GetEncoding(28591).GetString($B, $o + 0x4c, $nlen) } else { [Text.Encoding]::Unicode.GetString($B, $o + 0x4c, $nlen) }
+    return @{ Name = $name; NSub = [BitConverter]::ToUInt32($B, $o + 0x14); SubList = [BitConverter]::ToUInt32($B, $o + 0x1c); NVal = [BitConverter]::ToUInt32($B, $o + 0x24); ValList = [BitConverter]::ToUInt32($B, $o + 0x28) }
+}
+function Pow-Subs {
+    param([byte[]]$B, [int64]$List)
+    $c = Pow-Cell $B $List; $o = $c.At
+    $sig = [Text.Encoding]::ASCII.GetString($B, $o, 2); $n = [BitConverter]::ToUInt16($B, $o + 2)
+    $out = @()
+    if ($sig -eq 'lf' -or $sig -eq 'lh') { for ($i = 0; $i -lt $n; $i++) { $out += [int64][BitConverter]::ToUInt32($B, $o + 4 + $i * 8) } }
+    elseif ($sig -eq 'li') { for ($i = 0; $i -lt $n; $i++) { $out += [int64][BitConverter]::ToUInt32($B, $o + 4 + $i * 4) } }
+    elseif ($sig -eq 'ri') { for ($i = 0; $i -lt $n; $i++) { $out += @(Pow-Subs $B ([int64][BitConverter]::ToUInt32($B, $o + 4 + $i * 4))) } }
+    else { throw 'the plan file is damaged' }
+    return $out
+}
+function Pow-Values {
+    param([byte[]]$B, $K)
+    $out = @{}
+    if ($K.NVal -eq 0 -or $K.ValList -eq 0xffffffff) { return $out }
+    $c = Pow-Cell $B $K.ValList
+    for ($i = 0; $i -lt $K.NVal; $i++) {
+        $v = Pow-Cell $B ([int64][BitConverter]::ToUInt32($B, $c.At + $i * 4)); $o = $v.At
+        if ([Text.Encoding]::ASCII.GetString($B, $o, 2) -ne 'vk') { throw 'the plan file is damaged' }
+        $nlen = [BitConverter]::ToUInt16($B, $o + 2); $dlen = [BitConverter]::ToUInt32($B, $o + 4); $doff = [BitConverter]::ToUInt32($B, $o + 8)
+        $typ = [BitConverter]::ToUInt32($B, $o + 12); $vfl = [BitConverter]::ToUInt16($B, $o + 16)
+        $name = if ($nlen -eq 0) { '' } elseif ($vfl -band 1) { [Text.Encoding]::GetEncoding(28591).GetString($B, $o + 0x14, $nlen) } else { [Text.Encoding]::Unicode.GetString($B, $o + 0x14, $nlen) }
+        $inline = ($dlen -band 0x80000000) -ne 0; $len = [int]($dlen -band 0x7fffffff)
+        if ($inline) { $data = [BitConverter]::GetBytes([uint32]$doff)[0..([Math]::Max(0, $len - 1))] } else { $d = Pow-Cell $B ([int64]$doff); $data = $B[$d.At..($d.At + [Math]::Max(0, $len - 1))] }
+        if ($len -eq 0) { $data = @() }
+        $out[$name] = @{ Type = [int]$typ; Data = [byte[]]$data }
+    }
+    return $out
+}
+function Pow-Num {
+    param($v)
+    if (-not $v -or @($v.Data).Count -lt 4) { return $null }
+    return [int64][BitConverter]::ToUInt32([byte[]]$v.Data, 0)          # a DWORD, or a 4-byte binary value (the way some plan files keep an index)
+}
+function Pow-Read {
+    param([byte[]]$Bytes)
+    if ($Bytes.Length -lt 4100 -or [Text.Encoding]::ASCII.GetString($Bytes, 0, 4) -ne 'regf') { throw 'not a plan file' }
+    $root = Pow-Key $Bytes ([int64][BitConverter]::ToUInt32($Bytes, 0x24))
+    $rv = Pow-Values $Bytes $root
+    $str = { param($x) if (-not $x) { return '' }; return ([Text.Encoding]::Unicode.GetString([byte[]]$x.Data)).TrimEnd([char]0) }
+    $out = @{ Guid = ([string]$root.Name).ToLower(); Name = (& $str $rv['FriendlyName']); Desc = (& $str $rv['Description']); Settings = @() }
+    if ($root.NSub -eq 0 -or $root.SubList -eq 0xffffffff) { return $out }
+    foreach ($o1 in @(Pow-Subs $Bytes $root.SubList)) {
+        $k1 = Pow-Key $Bytes $o1
+        $v1 = Pow-Values $Bytes $k1
+        if ($v1.ContainsKey('ACSettingIndex') -or $v1.ContainsKey('DCSettingIndex')) {
+            $out.Settings += ,@{ Sub = $script:SubNone; Set = ([string]$k1.Name).ToLower(); AC = (Pow-Num $v1['ACSettingIndex']); DC = (Pow-Num $v1['DCSettingIndex']) }
+            continue
+        }
+        if ($k1.NSub -eq 0 -or $k1.SubList -eq 0xffffffff) { continue }
+        foreach ($o2 in @(Pow-Subs $Bytes $k1.SubList)) {
+            $k2 = Pow-Key $Bytes $o2
+            $v2 = Pow-Values $Bytes $k2
+            if (-not ($v2.ContainsKey('ACSettingIndex') -or $v2.ContainsKey('DCSettingIndex'))) { continue }
+            $out.Settings += ,@{ Sub = ([string]$k1.Name).ToLower(); Set = ([string]$k2.Name).ToLower(); AC = (Pow-Num $v2['ACSettingIndex']); DC = (Pow-Num $v2['DCSettingIndex']) }
+        }
+    }
+    return $out
+}
+# When Windows refuses to import a plan file as a whole (one value it does not accept on this PC is enough, for example "The value
+# specified is malformed, or is not within the range of the target power setting"), the plan is made the other way: a copy of High
+# Performance (the kind of plan both built-in plans are; Balanced when this PC has no High Performance) under the plan's own ID, with
+# the plan's name, and then every value of the file set one by one. A value Windows does not accept keeps the High Performance one,
+# and the log says how many that were. Returns the plan's ID, or '' when no copy could be made.
+$script:PlanBuildRefused = @()
+function Plan-BuildFromFile {
+    param([byte[]]$Bytes, [string]$Guid)
+    $script:PlanBuildRefused = @()
+    $pow = Pow-Read $Bytes
+    $made = $false
+    foreach ($tpl in @($script:HighPerfTemplate, $script:BalancedTemplate)) {
+        [void](Pwr '/duplicatescheme' $tpl $Guid)
+        if (Plan-Find $Guid) { $made = $true; break }
+    }
+    if (-not $made) { return '' }
+    [void](Pwr '/changename' $Guid ([string]$pow.Name) ([string]$pow.Desc))
+    $n = 0; $bad = @()
+    foreach ($s in @($pow.Settings)) {
+        foreach ($side in @(@('AC', '/setacvalueindex'), @('DC', '/setdcvalueindex'))) {
+            $v = $s[$side[0]]
+            if ($null -eq $v) { continue }
+            $n++
+            $o = Pwr ([string]$side[1]) $Guid ([string]$s.Sub) ([string]$s.Set) ([string]$v)
+            if (([string]$o).Trim()) { $bad += ('{0} {1}={2}' -f $s.Set, $side[0], $v) }
+        }
+    }
+    $script:PlanBuildRefused = $bad
+    Say ('  {0} of its {1} values set' -f ($n - $bad.Count), $n) 'DarkGray'
+    if ($bad.Count) { Say ('  Windows did not accept {0} value(s), which keep the High Performance setting: {1}' -f $bad.Count, ($bad -join ', ')) 'DarkGray' }
+    return $Guid
 }
 # ------------------------------------------------- the power plan switches ----
 # Each switch is one plan: On = the plan is installed, Off = it is not. Switching one on installs it (Windows' own plans are made from
@@ -2318,7 +2493,7 @@ $script:PlanDefs = [ordered]@{
     PlanHighPerf = @{ Guid = $script:HighPerfTemplate; Name = 'High Performance'; Kind = 'windows'; NameRx = '' }
     Ultimate     = @{ Guid = $script:UltimateTemplate; Name = 'Ultimate Performance'; Kind = 'windows'; NameRx = '^Ultimate Performance$' }
     Khorvie      = @{ Guid = [string]$script:BuiltinPlans.Khorvie.Guid; Name = [string]$script:BuiltinPlans.Khorvie.Name; Kind = 'file'; NameRx = '' }
-    Endgame      = @{ Guid = [string]$script:BuiltinPlans.Endgame.Guid; Name = [string]$script:BuiltinPlans.Endgame.Name; Kind = 'file'; NameRx = '' }
+    LowLatency   = @{ Guid = [string]$script:BuiltinPlans.LowLatency.Guid; Name = [string]$script:BuiltinPlans.LowLatency.Name; Kind = 'file'; NameRx = '' }
 }
 $script:PlanActive = $false      # set by a plan's check: the plan is the active one
 # The IDs this plan has on the PC: its usual ID first, then the one it got when this app made it under a new ID (an older build made
@@ -2341,6 +2516,8 @@ function Plan-Mine {
     if ($snap -and $snap.Custom) { return $snap.Custom[$Key] }
     return $null
 }
+# "Balanced plan", but "Low Latency Power Plan" and "Khorvie's PowerPlan" as they are (no "plan plan")
+function Plan-Label { param([string]$Name) if ($Name -match '(?i)plan$') { return $Name }; return ($Name + ' plan') }
 function Plan-Detect {
     param([string]$Key)
     $def = $script:PlanDefs[$Key]
@@ -2350,12 +2527,12 @@ function Plan-Detect {
     $at = @(Plan-Where $Key (Plan-Mine $Key) $plans)
     $act = @($plans | Where-Object { $_.Active })[0]
     $an = 'not known'; if ($act) { $an = [string]$act.Name }
-    if ($at.Count -eq 0) { $script:Now = ('{0} plan: not installed (the active plan is {1})' -f $def.Name, $an); return 'Off' }
+    if ($at.Count -eq 0) { $script:Now = ('{0}: not installed (the active plan is {1})' -f (Plan-Label $def.Name), $an); return 'Off' }
     if ($act -and $at -contains [string]$act.Guid) {
         $script:PlanActive = $true
-        $script:Now = ('{0} plan: installed, and it is the active plan' -f $def.Name)
+        $script:Now = ('{0}: installed, and it is the active plan' -f (Plan-Label $def.Name))
     } else {
-        $script:Now = ('{0} plan: installed (the active plan is {1})' -f $def.Name, $an)
+        $script:Now = ('{0}: installed (the active plan is {1})' -f (Plan-Label $def.Name), $an)
     }
     return 'On'
 }
@@ -2378,22 +2555,44 @@ function Plan-Install {
     $def = $script:PlanDefs[$Key]
     $at = @(Plan-Where $Key $mine)
     if ($at.Count) { Say ('  {0} is already installed' -f $def.Name) 'DarkGray'; return }
-    if ($DryRun) { Say ('  [dry] install the {0} plan (the active plan stays the same)' -f $def.Name) 'DarkGray'; return }
+    if ($DryRun) { Say ('  [dry] install the {0} (the active plan stays the same)' -f (Plan-Label $def.Name)) 'DarkGray'; return }
     $g = ''
     if ($def.Kind -eq 'file') {
-        $g = Pwr-Import (Get-BuiltinPlanBytes $Key) ([string]$def.Guid)
+        $bytes = Get-BuiltinPlanBytes $Key
+        $n0 = $Error.Count
+        $g = Pwr-Import $bytes ([string]$def.Guid)
+        if (-not $g) {
+            $said = [string]$script:PwrImportSaid; if (-not $said) { $said = 'no reason given' }
+            Say ('  Windows did not import the plan file as a whole ({0}); making it from High Performance and setting its values one by one' -f $said) 'DarkGray'
+            $g = Plan-BuildFromFile $bytes ([string]$def.Guid)
+        }
+        Drop-ErrorsSince $n0          # (what powercfg said on the way is in the log lines above; only a plan that could not be made at all is a failure)
+        $bp = $script:BuiltinPlans[$Key]
+        if ($g -and $bp.FileName) {
+            # the name Headroom gives this plan instead of the one in its file
+            [void](Pwr '/changename' $g ([string]$bp.Name) ([string]$bp.Desc))
+            Drop-ErrorsSince $n0
+            Say ('  named "{0}" (its file calls it "{1}")' -f $bp.Name, $bp.FileName) 'DarkGray'
+        }
     } else {
+        $n0 = $Error.Count
         $g = Pwr-Restore ([string]$def.Guid)
         if (-not $g) { $n = Pwr-NewFrom ([string]$def.Guid); if ($n -and (Plan-Find $n)) { $g = $n } }
+        if (-not $g) {
+            # Windows no longer finds the plan to copy (it was deleted): it is made again from Windows' own default values for it
+            Say ('  Windows has no {0} left to copy; making it from Windows'' own default values for it' -f (Plan-Label $def.Name)) 'DarkGray'
+            $g = Plan-Rebuild $Key
+        }
+        Drop-ErrorsSince $n0          # (what powercfg said on the way is no failure when the plan was made after all)
     }
     if (-not $g) {
         $why = ''; if ($Key -ne 'PlanBalanced' -and $def.Kind -eq 'windows') { $why = ' (a PC with Modern Standby may offer only Balanced)' }
-        if ($def.Kind -eq 'file') { throw ('Windows did not import {0}, so nothing was changed' -f $def.Name) }
-        throw ('Windows did not create the {0} plan{1}, so nothing was changed' -f $def.Name, $why)
+        if ($def.Kind -eq 'file') { throw ('Windows did not import {0} and did not make a copy of High Performance or Balanced for it either, so nothing was changed' -f $def.Name) }
+        throw ('Windows did not create the {0}{1}, so nothing was changed' -f (Plan-Label $def.Name), $why)
     }
     if ($mine -and $g -ne [string]$def.Guid) { $mine.New = $g }
     if ($Key -eq 'Ultimate') { Plan-UltimateExtras $g }
-    Say ('  the {0} plan is installed ({1}); the active plan is unchanged' -f $def.Name, $g) 'DarkGray'
+    Say ('  the {0} is installed ({1}); the active plan is unchanged' -f (Plan-Label $def.Name), $g) 'DarkGray'
 }
 # The plan that is made active when the active one is deleted
 function Plan-Fallback {
@@ -2406,14 +2605,14 @@ function Plan-Remove {
     $def = $script:PlanDefs[$Key]
     $plans = @(Pwr-Plans)
     $at = @(Plan-Where $Key $mine $plans)
-    if ($at.Count -eq 0) { Say ('  the {0} plan is not installed: nothing to delete' -f $def.Name) 'DarkGray'; return }
+    if ($at.Count -eq 0) { Say ('  the {0} is not installed: nothing to delete' -f (Plan-Label $def.Name)) 'DarkGray'; return }
     $rest = @($plans | Where-Object { $at -notcontains [string]$_.Guid })
     if ($rest.Count -eq 0) { throw ('{0} is the only power plan on this PC and one plan must stay, so it was not deleted' -f $def.Name) }
     $act = Pwr-Active
     $to = $null; if ($at -contains [string]$act.Guid) { $to = Plan-Fallback $rest }
     if ($DryRun) {
-        if ($to) { Say ('  [dry] make {0} the active plan, then delete the {1} plan' -f $to.Name, $def.Name) 'DarkGray' }
-        else { Say ('  [dry] delete the {0} plan' -f $def.Name) 'DarkGray' }
+        if ($to) { Say ('  [dry] make {0} the active plan, then delete the {1}' -f $to.Name, (Plan-Label $def.Name)) 'DarkGray' }
+        else { Say ('  [dry] delete the {0}' -f (Plan-Label $def.Name)) 'DarkGray' }
         return
     }
     if ($to) {
@@ -2422,14 +2621,14 @@ function Plan-Remove {
         Say ('  {0} is the active plan now' -f $to.Name) 'DarkGray'
     }
     foreach ($g in $at) { [void](Pwr '/delete' $g) }
-    if (@(Plan-Where $Key $mine).Count) { throw ('Windows did not delete the {0} plan' -f $def.Name) }
-    Say ('  the {0} plan was deleted' -f $def.Name) 'DarkGray'
+    if (@(Plan-Where $Key $mine).Count) { throw ('Windows did not delete the {0}' -f (Plan-Label $def.Name)) }
+    Say ('  the {0} was deleted' -f (Plan-Label $def.Name)) 'DarkGray'
 }
 function Plan-Activate {
     param([string]$Key, $mine)
     $def = $script:PlanDefs[$Key]
     $at = @(Plan-Where $Key $mine)
-    if ($at.Count -eq 0) { throw ('the {0} plan is not installed: switch it on first' -f $def.Name) }
+    if ($at.Count -eq 0) { throw ('the {0} is not installed: switch it on first' -f (Plan-Label $def.Name)) }
     $g = [string]$at[0]
     if ((Pwr-Active).Guid -eq $g) { $script:RunResult = ('{0} is already the active plan' -f $def.Name); return }
     if ($DryRun) { Say ('  [dry] make {0} the active plan' -f $def.Name) 'DarkGray'; return }
@@ -2454,10 +2653,10 @@ function Custom-Khorvie-Detect        { param($p) return (Plan-Detect 'Khorvie')
 function Custom-Khorvie-Snapshot      { param($p) return (Plan-Snapshot 'Khorvie') }
 function Custom-Khorvie-Apply         { param($p, $mine) Plan-Install 'Khorvie' $mine }
 function Custom-Khorvie-Revert        { param($p, $mine) Plan-Remove 'Khorvie' $mine }
-function Custom-Endgame-Detect        { param($p) return (Plan-Detect 'Endgame') }
-function Custom-Endgame-Snapshot      { param($p) return (Plan-Snapshot 'Endgame') }
-function Custom-Endgame-Apply         { param($p, $mine) Plan-Install 'Endgame' $mine }
-function Custom-Endgame-Revert        { param($p, $mine) Plan-Remove 'Endgame' $mine }
+function Custom-LowLatency-Detect     { param($p) return (Plan-Detect 'LowLatency') }
+function Custom-LowLatency-Snapshot   { param($p) return (Plan-Snapshot 'LowLatency') }
+function Custom-LowLatency-Apply      { param($p, $mine) Plan-Install 'LowLatency' $mine }
+function Custom-LowLatency-Revert     { param($p, $mine) Plan-Remove 'LowLatency' $mine }
 
 function Custom-Hibernate-Detect { param($p) return 'Skip' }
 function Custom-Hibernate-Apply {
@@ -2474,7 +2673,7 @@ function Custom-Hibernate-Revert {
 # ------------------------------------------------- comparing the power plans (read only) ----
 # What the "Compare Power Plans" window on the Power page shows: the five plans side by side, every value the plugged-in (AC) one. A plan
 # that is installed is read from this PC with "powercfg /qh <plan>", which only reads (and also lists the settings Windows hides). A plan
-# that is not installed shows what it would bring: Khorvie's and Endgame from their built-in plan files, Windows' own plans only where their
+# that is not installed shows what it would bring: Khorvie's and the Low Latency Power Plan from their built-in plan files, Windows' own plans only where their
 # behaviour is documented, and "Windows default" for the rest. Nothing here changes anything.
 $script:PlanCmpRows = @(
     @{ Id = 'min';   Group = 'Processor'; Name = 'Minimum processor state'; Hint = 'How low the CPU may clock when idle'; Set = '893dee8e-2bef-41e0-89c6-b55d0929964c' }
@@ -2482,13 +2681,16 @@ $script:PlanCmpRows = @(
     @{ Id = 'boost'; Group = 'Processor'; Name = 'Boost mode'; Hint = 'How eagerly the CPU boosts'; Set = 'be337238-0d82-4146-a960-4f3749d470c7' }
     @{ Id = 'epp';   Group = 'Processor'; Name = 'Energy performance preference'; Hint = '0 = speed first, 100 = power first'; Set = '36687f9e-e3a5-4dbf-b1dc-15eb381c6863' }
     @{ Id = 'ramp';  Group = 'Processor'; Name = 'Ramp-up policy'; Hint = 'How fast clocks rise under load'; Set = '465e1f50-b610-473a-ab58-00d1077dc418' }
+    @{ Id = 'incdec'; Group = 'Processor'; Name = 'Clock-change thresholds'; Hint = 'Core load that raises / lowers clocks'; Set = '06cadf0e-64ed-448a-8927-ce7bf90eb35d'; Set2 = '12a0ab44-fe28-4fa9-b3bd-4b64f44960a6' }
     @{ Id = 'thr';   Group = 'Processor'; Name = 'Throttle states'; Hint = 'Clock-modulation power saving'; Set = '3b04d4fd-1cc7-4f23-ab1c-d1337819c4bb' }
     @{ Id = 'idle';  Group = 'Processor'; Name = 'CPU idle states'; Hint = 'C-states when a core has nothing to do'; Set = '5d76a2ca-e8c0-402f-a133-2158492d58ad' }
+    @{ Id = 'idlepd'; Group = 'Processor'; Name = 'Idle promote / demote'; Hint = 'Thresholds for deeper / lighter C-states'; Set = '7b224883-b3cc-4d79-819f-8374152cbe7c'; Set2 = '4b92d758-5a24-4851-a470-815d78aee119' }
     @{ Id = 'irq';   Group = 'Processor'; Name = 'Interrupt steering'; Hint = 'Where device interrupts go'; Set = '2bfc24f9-5ea2-4801-8213-3dbae01aa39d' }
     @{ Id = 'usbss'; Group = 'Devices and drives'; Name = 'USB selective suspend'; Hint = 'Idle USB devices powered down'; Set = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226' }
     @{ Id = 'usb3';  Group = 'Devices and drives'; Name = 'USB 3 link power management'; Hint = 'Low-power link states on USB 3'; Set = 'd4e98f31-5ffe-4ce1-be31-1b38b384c009' }
     @{ Id = 'aspm';  Group = 'Devices and drives'; Name = 'PCI Express link power'; Hint = 'ASPM on the GPU and NVMe links'; Set = 'ee12f906-d277-404b-b6da-e5fa1a576df5' }
     @{ Id = 'wifi';  Group = 'Devices and drives'; Name = 'Wi-Fi adapter power saving'; Hint = 'Wireless power-saving mode'; Set = '12bbebe6-58d6-4636-95bb-3217ef867c1a' }
+    @{ Id = 'nvme';  Group = 'Devices and drives'; Name = 'NVMe idle timeout'; Hint = 'Idle time before low-power states'; Set = 'd639518a-e56d-4345-8af2-b9f32fb26109' }
     @{ Id = 'disk';  Group = 'Devices and drives'; Name = 'Turn off hard disk after'; Hint = 'Drive power-down'; Set = '6738e2c4-e8a5-4a42-b16a-e040e769756e' }
     @{ Id = 'disp';  Group = 'Display, sleep and wake'; Name = 'Turn off display after'; Hint = 'Screen timeout'; Set = '3c0bc021-c8a8-4e07-a973-6b14cbcb2b7e' }
     @{ Id = 'sleep'; Group = 'Display, sleep and wake'; Name = 'Sleep'; Hint = 'When the PC goes to sleep on its own'; Set = '29f6c1db-86da-48c5-9fdb-f2b67b1f44da'; Set2 = 'abfc2519-3608-4c2a-94ea-171b0ed546ab' }
@@ -2496,24 +2698,24 @@ $script:PlanCmpRows = @(
 )
 # What a plan that is not installed would bring. A number is the setting's index as powercfg shows it, 'unset' = the plan file does not
 # include it (Windows then uses its own default), a hashtable is a fixed text, and a row that is left out is Windows' default. Sleep is
-# @(timeout in seconds, "allow standby states"), -1 = not in the file. Khorvie's and Endgame come from their plan files; Windows' own plans
+# @(timeout in seconds, "allow standby states"), -1 / 'unset' = not in the file. Khorvie's and Low Latency come from their plan files; Windows' own plans
 # only where Microsoft documents them (High Performance and Ultimate keep the processor at its highest state with every core unparked).
 $script:PlanCmpRef = @{
     PlanBalanced = @{ min = 5; park = @{ T = 'On: idle cores park'; K = 'save' }; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
     PlanHighPerf = @{ min = 100; park = 100; idle = 0; usbss = 1; disk = 1200; sleep = @{ T = 'Allowed'; K = 'def' } }
     Ultimate     = @{ min = 100; park = 100; idle = 0; usbss = 0; usb3 = 0; wifi = 0; disk = 0; sleep = @{ T = 'Allowed'; K = 'def' } }
-    Khorvie      = @{ min = 100; park = 'unset'; boost = 2; epp = 'unset'; ramp = 2; thr = 0; idle = 0; irq = 6; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; disk = 0; disp = 0; sleep = @(-1, 1); wake = 0 }
-    Endgame      = @{ min = 100; park = 100; boost = 5; epp = 0; ramp = 2; thr = 0; idle = 0; irq = 6; usbss = 0; usb3 = 0; aspm = 0; wifi = 0; disk = 0; disp = 0; sleep = @(0, 0); wake = 0 }
+    Khorvie      = @{ min = 100; park = 'unset'; boost = 2; epp = 'unset'; ramp = 2; incdec = @(100, 100); thr = 0; idle = 0; idlepd = @(100, 100); irq = 6; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 'unset'; disk = 0; disp = 0; sleep = @(-1, 1); wake = 0 }
+    LowLatency   = @{ min = 'unset'; park = 'unset'; boost = 'unset'; epp = 'unset'; ramp = 'unset'; incdec = @(1, 1); thr = 0; idle = 'unset'; idlepd = @(100, 100); irq = 3; usbss = 0; usb3 = 0; aspm = 'unset'; wifi = 'unset'; nvme = 60000; disk = 0; disp = 0; sleep = @(-1, 'unset'); wake = 0 }
 }
 $script:PlanCmpBy = @{
     PlanBalanced = 'Microsoft'; PlanHighPerf = 'Microsoft'; Ultimate = 'Microsoft, tuned by Headroom'
-    Khorvie = 'Khorvie (third party)'; Endgame = 'gavot (third party)'
+    Khorvie = 'Khorvie (third party)'; LowLatency = 'Amit (third party)'
 }
 # The plugged-in value of every setting in "powercfg /q(h)" output: setting ID -> number. The words around the numbers are in the language of
 # Windows, so the lines are told apart by their place: the plan's line, then a subgroup a little further in, then each setting further in
 # again; a setting's own "current" lines are as far in as the setting's ID line (AC first, then DC), its range lines are further in.
 function Pwr-ParseQuery {
-    param([string]$Text)
+    param([string]$Text, [switch]$Both)
     $o = @{}
     $subInd = -1; $setInd = -1; $cur = ''; $vals = @()
     foreach ($ln in ($Text -split "`r?`n")) {
@@ -2521,7 +2723,7 @@ function Pwr-ParseQuery {
         $ind = $ln.Length - $ln.TrimStart().Length
         $m = [regex]::Match($ln, $script:GuidRx)
         if ($m.Success) {
-            if ($cur -and $vals.Count) { $o[$cur] = $vals[0] }
+            if ($cur -and $vals.Count) { if ($Both) { $o[$cur] = $vals } else { $o[$cur] = $vals[0] } }
             $cur = ''; $vals = @()
             if ($subInd -lt 0 -or $ind -le $subInd) {
                 if ($ind -gt 0) { $subInd = $ind }                     # (the plan's own line is the one at the left edge)
@@ -2535,7 +2737,7 @@ function Pwr-ParseQuery {
             if ($h.Success) { $vals += [Convert]::ToInt64($h.Groups[1].Value, 16) }
         }
     }
-    if ($cur -and $vals.Count) { $o[$cur] = $vals[0] }
+    if ($cur -and $vals.Count) { if ($Both) { $o[$cur] = $vals } else { $o[$cur] = $vals[0] } }
     return $o
 }
 function PlanCmp-Time {
@@ -2553,6 +2755,17 @@ function PlanCmp-Cell {
         if ($null -eq $v -or [string]$v -eq 'unset' -or [int64]$v -lt 0) { return @{ T = 'Allowed'; K = 'def' } }
         if ([int64]$v -eq 0) { return @{ T = 'Never on its own'; K = 'none' } }
         return @{ T = ('After ' + (PlanCmp-Time ([int64]$v))); K = 'save' }
+    }
+    if ($Id -eq 'incdec' -or $Id -eq 'idlepd') {
+        $u1 = ($null -eq $v -or [string]$v -eq 'unset'); $u2 = ($null -eq $v2 -or [string]$v2 -eq 'unset')
+        if ($u1 -and $u2) { if ([string]$v -eq 'unset' -or [string]$v2 -eq 'unset') { return @{ T = 'Not set'; K = 'unset' } }; return @{ T = 'Windows default'; K = 'def' } }
+        $a = '-'; if (-not $u1) { $a = ('{0}%' -f [int64]$v) }
+        $b = '-'; if (-not $u2) { $b = ('{0}%' -f [int64]$v2) }
+        if ($Id -eq 'incdec') {
+            $k = 'none'; if (-not $u1 -and [int64]$v -le 10) { $k = 'speed' }
+            return @{ T = ('Up above {0}, down below {1}' -f $a, $b); K = $k }
+        }
+        return @{ T = ('Promote {0}, demote {1}' -f $a, $b); K = 'none' }
     }
     if ([string]$v -eq 'unset') { return @{ T = 'Not set'; K = 'unset' } }
     if ($null -eq $v) { return @{ T = 'Windows default'; K = 'def' } }
@@ -2585,6 +2798,7 @@ function PlanCmp-Cell {
         'usb3'  { $nm = @('Off', 'Minimum power savings', 'Moderate power savings', 'Maximum power savings'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
         'aspm'  { $nm = @('Off', 'Moderate power savings', 'Maximum power savings'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
         'wifi'  { $nm = @('Maximum performance', 'Low power saving', 'Medium power saving', 'Maximum power saving'); $t = ('Level {0}' -f $n); if ($n -ge 0 -and $n -lt $nm.Count) { $t = $nm[$n] }; if ($n -eq 0) { return @{ T = $t; K = 'speed' } }; return @{ T = $t; K = 'save' } }
+        'nvme'  { if ($n -ge 1000 -and $n % 1000 -eq 0) { return @{ T = ('{0} s' -f ($n / 1000)); K = 'none' } }; return @{ T = ('{0} ms' -f $n); K = 'none' } }
         'disk'  { if ($n -eq 0) { return @{ T = 'Never'; K = 'speed' } }; return @{ T = (PlanCmp-Time $n); K = 'save' } }
         'disp'  { if ($n -eq 0) { return @{ T = 'Never'; K = 'speed' } }; return @{ T = (PlanCmp-Time $n); K = 'none' } }
         'wake'  { if ($n -eq 0) { return @{ T = 'Off'; K = 'speed' } }; if ($n -eq 2) { return @{ T = 'Important ones only'; K = 'none' } }; return @{ T = 'On'; K = 'none' } }
@@ -2615,7 +2829,7 @@ function Get-PlanCompare {
                 if ($p.Source -eq 'unread') { $p.Cells[$r.Id] = @{ T = 'Could not be read'; K = 'unset' }; continue }
                 $v = $null; if ($vals.ContainsKey([string]$r.Set)) { $v = $vals[[string]$r.Set] }
                 $v2 = $null; if ($r.Set2 -and $vals.ContainsKey([string]$r.Set2)) { $v2 = $vals[[string]$r.Set2] }
-                if ($null -eq $v -and $r.Id -ne 'sleep') { $p.Cells[$r.Id] = @{ T = 'Not listed by Windows'; K = 'unset' }; continue }
+                if ($null -eq $v -and $null -eq $v2 -and $r.Id -ne 'sleep') { $p.Cells[$r.Id] = @{ T = 'Not listed by Windows'; K = 'unset' }; continue }
                 $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
             }
         } else {
@@ -2625,7 +2839,7 @@ function Get-PlanCompare {
                 $v = $null; $v2 = $null
                 if ($ref -and $ref.ContainsKey([string]$r.Id)) {
                     $x = $ref[[string]$r.Id]
-                    if ($r.Id -eq 'sleep' -and $x -is [array]) { $v = $x[0]; $v2 = $x[1] } else { $v = $x }
+                    if ($r.Set2 -and $x -is [array]) { $v = $x[0]; $v2 = $x[1] } else { $v = $x }
                 }
                 $p.Cells[$r.Id] = PlanCmp-Cell ([string]$r.Id) $v $v2
             }
@@ -3713,6 +3927,7 @@ function Custom-AcmApps-Revert {
 #   5. the end-of-life marks are taken out again: left in place they can stop Windows Update from installing updates
 # Then it is checked: when it is still installed for any account the setting fails with what Windows said.
 $script:AiCorePat = 'MicrosoftWindows.Client.CoreAI*'
+$script:AiCoreSettleMs = 1500    # how long Windows is given after a removal before it is checked
 $script:AppxStore = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx\AppxAllUserStore'
 $script:EolRoot = $script:AppxStore + '\EndOfLife'
 function Ai-CoreFind {
@@ -3818,6 +4033,30 @@ function Custom-AiCore-Apply {
         foreach ($sid in $sids) { $r = Appx-EolMark $sid $full; if ($r) { $notes += $r } }
         Say ('  marked as end of life for {0} account(s); removing it...' -f $sids.Count) 'DarkGray'
         $why = Appx-RemoveOne $full $name
+        if (-not $why) {
+            # checked the way the check of the PC does it, a moment later: Windows can still have it for an account (or put it back);
+            # then once more for each account it still lists, while the end-of-life marks are still in place
+            Start-Sleep -Milliseconds $script:AiCoreSettleMs
+            $left = @(Appx-UserStates $full $name)
+            if ($left.Count) {
+                Say ('  Windows still lists it for: {0}; removing it for those accounts too' -f ($left -join '; ')) 'DarkGray'
+                $n0 = $Error.Count
+                foreach ($st in $left) {
+                    $sid = [regex]::Match([string]$st, 'S-1-[0-9-]+').Value
+                    if (-not $sid) { continue }
+                    if ($sids -notcontains $sid) { [void](Appx-EolMark $sid $full); $sids += $sid }
+                    try { Remove-AppxPackage -Package $full -User $sid -ErrorAction Stop } catch { $notes += (([string]$_.Exception.Message -split "`r?`n")[0]) }
+                }
+                Drop-ErrorsSince $n0
+                Start-Sleep -Milliseconds $script:AiCoreSettleMs
+                $left = @(Appx-UserStates $full $name)
+                if ($left.Count) { $why = ('Windows still has it for ' + ($left -join '; ')) }
+            }
+        } else {
+            # name the accounts Windows still has it for, so the reason is plain
+            $left = @(Appx-UserStates $full $name)
+            if ($left.Count) { $why += (' (still installed for ' + ($left -join '; ') + ')') }
+        }
         foreach ($sid in $sids) { Appx-EolClear $sid $full }
         Say '  the end-of-life marks are taken out again (left in place they can stop Windows Update)' 'DarkGray'
         if ($why) {
@@ -3833,6 +4072,15 @@ function Custom-AiCore-Apply {
     }
     $script:Cache.Remove('appx')
     if ($fails.Count) { throw ('Windows did not remove ' + ($fails -join '; ')) }
+    if (-not $DryRun) {
+        # the last word is the check's own: a copy of the package under another name that is still installed is named too
+        $m2 = Ai-CoreFind
+        $still = @($m2.Pkgs.Keys | Where-Object { $m2.Live[$_] })
+        if ($still.Count) {
+            $what = @($still | ForEach-Object { $st = @(Appx-UserStates ([string]$_) ([string]$m2.Pkgs[$_])); if ($st.Count) { ('{0} ({1})' -f $_, ($st -join '; ')) } else { [string]$_ } })
+            throw ('Windows still lists the AI core package as installed: ' + ($what -join '; '))
+        }
+    }
 }
 function Custom-AiCore-Revert { param($p, $mine) Say '  (the removed AI package cannot be put back from here)' 'Yellow' }
 
@@ -4697,13 +4945,13 @@ $planTail = ' Switching it on only installs it: "Make active" on its card makes 
 Add-Tweak -Id 'plan-balanced' -Cat $cPower -Def 'On' -Plan 'PlanBalanced' -Name 'Balanced power plan' `
     -Desc ('On: the Balanced plan is installed, under its usual ID and with the settings Windows ships it with. It is the plan Windows uses unless you choose another. Off: the Balanced plan is deleted.' + $planTail) `
     -Parts @(
-        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID (to install) / powercfg /delete (to delete)'
+        pCustom 'PlanBalanced' 'powercfg /duplicatescheme 381b4222-f694-41f0-9685-ff5bb260df2e under the same ID; once it was deleted, a copy under that ID with the values Windows keeps as its defaults (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'plan-highperf' -Cat $cPower -Def 'On' -Plan 'PlanHighPerf' -Name 'High Performance power plan' `
     -Desc ('On: the High Performance plan is installed, under its usual ID and with the settings Windows ships it with. Off: it is deleted. On a PC with Modern Standby (most laptops and some desktops) Windows may offer only Balanced and refuse to create it; nothing is changed then.' + $planTail) `
     -Parts @(
-        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID (to install) / powercfg /delete (to delete)'
+        pCustom 'PlanHighPerf' 'powercfg /duplicatescheme 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c under the same ID; once it was deleted, a copy under that ID with the values Windows keeps as its defaults (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'ultimate' -Cat $cPower -Def 'Off' -Plan 'Ultimate' -Name 'Ultimate Performance power plan' `
@@ -4718,10 +4966,10 @@ Add-Tweak -Id 'khorvie-plan' -Cat $cPower -Def 'Off' -Plan 'Khorvie' -Name 'Khor
         pCustom 'Khorvie' 'powercfg /import of the built-in plan file (Khorvie''s PowerPlan, ID 8070b076-188f-428d-a9d6-e1a2f99fad5d) (to install) / powercfg /delete (to delete)'
     )
 
-Add-Tweak -Id 'endgame-plan' -Cat $cPower -Def 'Off' -Plan 'Endgame' -Name 'Endgame Performance power plan' `
-    -Desc ('On: Endgame Performance, a third-party gaming power plan made by gavot (not one of Windows'' own), is installed. Its plan file is built into Headroom and checked before it is used. Among its settings: minimum processor state 100%, processor boost mode Aggressive At Guaranteed, energy performance preference 0 (speed first), core parking off, USB selective suspend, USB 3 link power management and PCI Express link power management off, interrupts that Windows may move sent to logical processor 1, wake timers off, and the display and hard disk never turned off. While it is the active plan sleep is off: the PC cannot sleep (shutting down and restarting work as usual). Keeping the processor at its highest state means more power use and heat when the PC is idle. Off: it is deleted.' + $planTail) `
+Add-Tweak -Id 'lowlatency-plan' -Cat $cPower -Def 'Off' -Plan 'LowLatency' -Name 'Low Latency power plan' `
+    -Desc ('On: the Low Latency Power Plan is installed. It is amit''s low latency powerplan (the idle enabled version, v3), a third-party gaming power plan (not one of Windows'' own), which Headroom installs under the name Low Latency Power Plan. Its plan file is built into Headroom and checked before it is used. Among its settings: performance increase and decrease thresholds 1% (the clock speed goes up as soon as a core is busy), throttle states off, idle promote and demote thresholds 100%, interrupts that Windows may move sent to any unparked processor, USB selective suspend and USB 3 link power management off, NVMe drives given 60 seconds before their idle power states, wake timers off, and the display and hard disk never turned off. It does not set the minimum processor state, boost mode, energy performance preference, core parking, idle states or PCI Express power management, so Windows'' defaults apply to those; idle states stay allowed. Sleep works as usual. Off: it is deleted.' + $planTail) `
     -Parts @(
-        pCustom 'Endgame' 'powercfg /import of the built-in plan file (Endgame Performance, ID 287763d5-e899-4774-bad9-cc0b30c3c391) (to install) / powercfg /delete (to delete)'
+        pCustom 'LowLatency' 'powercfg /import of the built-in plan file (amit''s low latency powerplan, ID 95c05c40-e7bb-47bb-8baf-f152b0e1ffcc), then powercfg /changename to "Low Latency Power Plan" (to install) / powercfg /delete (to delete)'
     )
 
 Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast Startup and hibernation' `
@@ -6645,14 +6893,53 @@ function Get-SysUsbSuspend {
 # none of this needs a driver or another program. A drive or a driver that does not report a number gives $null for it.
 function Get-SysStorage {
     $list = @()
+    $pci = $null
     foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
         $sz = $null; try { $sz = [double]$d.Size } catch { }
-        $list += ,@{ Id = [string]$d.DeviceId; Name = ([string]$d.FriendlyName).Trim(); Media = [string]$d.MediaType; Bus = [string]$d.BusType; Bytes = $sz; Health = [string]$d.HealthStatus }
+        $bus = [string]$d.BusType
+        # an NVMe drive: the PCI device it is on, for its PCIe link (asked once; the drives do not move)
+        $p = ''
+        if ($bus -eq 'NVMe') {
+            if ($null -eq $pci) { $pci = @{}; try { $pci = Sys-DiskPciIds } catch { } }
+            if ($pci.ContainsKey([string]$d.DeviceId)) { $p = [string]$pci[[string]$d.DeviceId] }
+        }
+        $list += ,@{ Id = [string]$d.DeviceId; Name = ([string]$d.FriendlyName).Trim(); Media = [string]$d.MediaType; Bus = $bus; Bytes = $sz; Health = [string]$d.HealthStatus; Pci = $p }
     }
     return $list
 }
-# Id -> @{ Temp; Wear; Hours } for every drive Windows has numbers for
+# The PCIe link of an NVMe drive. Windows keeps it on the PCI device the drive hangs off (its NVMe controller, the drive's parent device)
+# as device properties: DEVPKEY_PciDevice_CurrentLinkSpeed and CurrentLinkWidth (the link as it is now) and MaxLinkSpeed and MaxLinkWidth
+# (what the drive supports). The speed is the PCIe generation (1 = 2.5 GT/s, 2 = 5, 3 = 8, 4 = 16, 5 = 32 GT/s), the width the lanes.
+# Only reads. Sys-DiskPciIds: disk number -> the instance ID of that PCI device (a drive that is not on a PCI device of its own is left out).
+function Sys-DiskPciIds {
+    $o = @{}
+    foreach ($dd in @(Get-CimInstance -ClassName Win32_DiskDrive -ErrorAction Stop)) {
+        $id = [string]$dd.PNPDeviceID
+        if (-not $id) { continue }
+        $par = ''
+        try { $par = [string](@(Get-PnpDeviceProperty -InstanceId $id -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop)[0].Data) } catch { }
+        if ($par -like 'PCI\*') { $o[[string]$dd.Index] = $par }
+    }
+    return $o
+}
+function Sys-PciLink {
+    param([string]$InstanceId)
+    $o = @{ Gen = $null; Width = $null; GenMax = $null; WidthMax = $null }
+    $keys = @('DEVPKEY_PciDevice_CurrentLinkSpeed', 'DEVPKEY_PciDevice_CurrentLinkWidth', 'DEVPKEY_PciDevice_MaxLinkSpeed', 'DEVPKEY_PciDevice_MaxLinkWidth')
+    foreach ($p in @(Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName $keys -ErrorAction Stop)) {
+        $v = Sys-Num $p.Data
+        switch ([string]$p.KeyName) {
+            'DEVPKEY_PciDevice_CurrentLinkSpeed' { $o.Gen = Sys-Plausible $v 1 7 }
+            'DEVPKEY_PciDevice_CurrentLinkWidth' { $o.Width = Sys-Plausible $v 1 32 }
+            'DEVPKEY_PciDevice_MaxLinkSpeed'     { $o.GenMax = Sys-Plausible $v 1 7 }
+            'DEVPKEY_PciDevice_MaxLinkWidth'     { $o.WidthMax = Sys-Plausible $v 1 32 }
+        }
+    }
+    return $o
+}
+# Id -> @{ Temp; Wear; Hours; Link } for every drive Windows has numbers for ($Drives: the static list, for the NVMe drives' PCIe links)
 function Sys-StorageLive {
+    param($Drives = $null)
     $o = @{}
     foreach ($d in @(Get-PhysicalDisk -ErrorAction Stop)) {
         $rc = $null
@@ -6664,7 +6951,15 @@ function Sys-StorageLive {
         if ($null -ne $w -and ([double]$w -lt 0 -or [double]$w -gt 100)) { $w = $null }
         $h = Sys-Num $rc.PowerOnHours
         if ($null -ne $h -and [double]$h -lt 0) { $h = $null }
-        $o[[string]$d.DeviceId] = @{ Temp = $t; Wear = $w; Hours = $h }
+        $o[[string]$d.DeviceId] = @{ Temp = $t; Wear = $w; Hours = $h; Link = $null }
+    }
+    foreach ($x in @($Drives)) {
+        if (-not $x -or -not $x.Pci) { continue }
+        $lk = $null; try { $lk = Sys-PciLink ([string]$x.Pci) } catch { }
+        if (-not $lk) { continue }
+        $k = [string]$x.Id
+        if (-not $o.ContainsKey($k)) { $o[$k] = @{ Temp = $null; Wear = $null; Hours = $null; Link = $null } }
+        $o[$k].Link = $lk
     }
     return $o
 }
@@ -7322,7 +7617,7 @@ function Get-SysLive {
     # the screens: every 5th round (the list of modes is long and changes rarely)
     if ($Round % 5 -eq 0) { try { $o.Displays = Get-SysDisplays } catch { } }
     # the drives' temperature and wear change slowly and take a moment to ask for: every 5th round as well
-    if ($Round % 5 -eq 0) { try { $o.Storage = Sys-StorageLive } catch { } }
+    if ($Round % 5 -eq 0) { $sd = $null; if ($Static) { $sd = $Static.Storage }; try { $o.Storage = Sys-StorageLive $sd } catch { } }
     # the mouse settings: every pass (three registry values); USB selective suspend runs powercfg, so every 5th round like the drives
     try { $o.Mouse = Get-SysMouse } catch { }
     if ($Round % 5 -eq 0) { try { $o.UsbSs = Get-SysUsbSuspend } catch { } }
@@ -11862,7 +12157,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '110'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '111'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -13474,6 +13769,20 @@ function Fmt-DriveKind {
     if ($Media -and $Media -notmatch '^(Unspecified|Unknown)$') { $k += $Media }
     return ($k -join ' ')
 }
+# "Gen 4 x4": the PCIe link of an NVMe drive as Windows reports it now. A link narrower than the drive supports is flagged; a lower
+# generation than the drive supports is only shown (the slot or the CPU may allow no more); a link at the top is green.
+function Info-DrivePcieLine {
+    param($nums, $lk)
+    if (-not $nums) { return (Info-Line 'PCIe link' 'Reading...' 'Dim') }
+    if (-not $lk -or $null -eq $lk.Gen -or $null -eq $lk.Width) { return (Info-Line 'PCIe link' 'not reported for this drive' 'Dim') }
+    $g = [int]$lk.Gen; $w = [int]$lk.Width
+    $gm = $g; if ($null -ne $lk.GenMax) { $gm = [Math]::Max($g, [int]$lk.GenMax) }
+    $wm = $w; if ($null -ne $lk.WidthMax) { $wm = [Math]::Max($w, [int]$lk.WidthMax) }
+    $t = ('Gen {0} x{1}' -f $g, $w)
+    if ($w -lt $wm) { return (Info-Line 'PCIe link' ($t + ('   (the drive supports Gen {0} x{1})' -f $gm, $wm)) 'Warn') }
+    if ($g -lt $gm) { return (Info-Line 'PCIe link' ($t + ('   (the drive supports Gen {0}; the slot may allow less)' -f $gm)) 'Text') }
+    return (Info-Line 'PCIe link' $t 'Good')
+}
 function Info-StorageCard {
     param($d)
     $st = $null; if ($d.Static) { $st = $d.Static.Storage }
@@ -13498,6 +13807,7 @@ function Info-StorageCard {
         if ($kind) { $v += '   ' + $kind }
         $lines += , (Info-Line ('Drive ' + $n) $v)
         $m = $null; if ($nums -and $nums.ContainsKey([string]$x.Id)) { $m = $nums[[string]$x.Id] }
+        if ([string]$x.Bus -eq 'NVMe') { $lk = $null; if ($m) { $lk = $m.Link }; $lines += , (Info-DrivePcieLine $nums $lk) }
         $temp = $null; if ($m) { $temp = $m.Temp }
         if ($null -ne $temp -or $nums) { $lines += , (Info-TempLine 'Temperature' $temp 'not reported by this drive') }
         else { $lines += , (Info-Line 'Temperature' 'Reading...' 'Dim') }
