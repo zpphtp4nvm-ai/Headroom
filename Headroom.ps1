@@ -4,13 +4,15 @@
     Headroom: a Windows 11 debloat and gaming tune-up tool in which every setting is its own switch.
 
 .DESCRIPTION
-    Opens a window with about 160 settings in 20 groups. Each setting shows what it does and exactly which registry values,
+    Opens a window with about 180 settings in 20 groups. Each setting shows what it does and exactly which registry values,
     services, tasks, features or apps it touches, and reads its current state from this PC. The switch on a card shows the
     feature itself: on means the feature is on (or the service is enabled), off means it is off (or the service is disabled),
     and every card says what Windows has by default. Nothing changes until you move a switch and apply it. Before the first
     change a restore point is created. Putting a setting back restores the Windows default for everything that setting
     changed (not the values the PC had before Headroom); Game Mode and the windowed-games optimizations are the exception:
-    switching those off really turns them off. Settings that remove apps cannot be switched back on from here.
+    switching those off really turns them off. Memory Integrity / VBS and the hypervisor boot setting, whose default differs
+    from PC to PC, get back what the PC had before Headroom changed them. Settings that remove apps cannot be switched back on
+    from here.
 
     The window opens on a welcome screen and then on Home, which shows the PC as it is right now: Windows, processor, graphics
     card, memory, motherboard, displays and drives. Windows does not report CPU temperature, CPU power or memory timings, so
@@ -1257,7 +1259,31 @@ public static class Win32Ui {
 function pReg    { param($Path, $Name, $Value, $Default = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type } }
 # A registry value that Windows protects on some builds: tried, but a refusal is not a failure and it never counts as "not applied"
 function pRegSoft { param($Path, $Name, $Value, $Default = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type; Soft = $true } }
+# A value that Windows itself sets on some PCs and not on others (Memory Integrity, say, which Windows turns on by itself on a clean install
+# on capable hardware): switching the setting off puts back what this PC had before this app first changed it (from the undo record). A value
+# that was not there, or that already had this app's value then, is removed, so Windows decides.
+function pRegPrev { param($Path, $Name, $Value, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $null; Type = $Type; Prev = $true } }
+# $Gen is run each time the parts are needed (to check, apply or undo) and gets the part itself, so a part can carry its own data
 function pRegDyn { param([scriptblock]$Gen, [string]$Info) @{ T = 'regdyn'; Gen = $Gen; Info = $Info } }
+# An accessibility keyboard shortcut (the Flags text of Sticky Keys, Filter Keys, Toggle Keys, Mouse Keys or High Contrast): only the bit that
+# turns the shortcut on (4, the "hot key active" flag of each of them) is taken out of the value this account has, and every other choice in it
+# is kept (the feature itself switched on, its sounds, its options). Undo puts only that bit back. When the value is missing or is not a
+# number, Windows' default ($Def) is the starting point.
+function pAccessFlags {
+    param([string]$Path, [int]$Def, [string]$What)
+    $info = ('{0}\Flags: the bit that turns on the {1} shortcut (4) is taken out, every other choice in it is kept (from Windows'' default {2}: {3})    (undo: that bit is put back, {2})' -f $Path, $What, $Def, ($Def -band (-bnot 4)))
+    $p = pRegDyn -Info $info -Gen { param($d) Access-FlagsPart $d }
+    $p['Path'] = $Path; $p['Def'] = $Def
+    return $p
+}
+function Access-FlagsPart {
+    param($d)
+    $cur = [int64]$d.Def
+    $c = Reg-Read ([string]$d.Path) 'Flags'
+    $n = [int64]0
+    if ($c.Exists -and [string]$c.Kind -eq 'String' -and [int64]::TryParse(([string]$c.Value).Trim(), [ref]$n) -and $n -ge 0 -and $n -le 4294967295L) { $cur = $n }
+    return (pReg ([string]$d.Path) 'Flags' ([string]($cur -band (-bnot [int64]4))) ([string]($cur -bor [int64]4)) 'String')
+}
 function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '') @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy } }
 function pTask   { param([string]$Path) @{ T = 'task'; Path = $Path } }
 # Scheduled tasks whose name starts with $Like inside one folder (for tasks that carry a changing id in their name).
@@ -1414,7 +1440,7 @@ function Expand-Parts {
     $out = @()
     foreach ($p in $t.Parts) {
         if ($p.Ed -and -not (Ed-Allows $p.Ed)) { continue }
-        if ($p.T -eq 'regdyn') { foreach ($e in @(& $p.Gen)) { $out += ,$e } }
+        if ($p.T -eq 'regdyn') { foreach ($e in @(& $p.Gen $p)) { $out += ,$e } }
         elseif ($p.T -eq 'taskdyn') { foreach ($full in @(Task-Match ([string]$p.Folder) ([string]$p.Like))) { $out += ,(pTask $full) } }
         else { $out += ,$p }
     }
@@ -1785,6 +1811,16 @@ function Revert-Part {
         'reg' {
             # Switching a setting off puts the Windows default back, never the value the PC had before this app changed it:
             # a value that Windows does not set is deleted, one that Windows sets is written with its default.
+            # The exception (pRegPrev): a value whose Windows default differs from PC to PC gets back what this PC had, when the record
+            # says it was there and was not already this app's value.
+            if ($p.Prev) {
+                $w = $null; if ($snap -and $snap.Reg) { $w = $snap.Reg["$($p.Path)|$($p.Name)"] }
+                $wk = ''; if ($w) { $wk = [string]$w.Kind }
+                if ($w -and $w.Exists -and -not $w.Unknown -and $null -ne $w.Value -and @('DWord', 'QWord', 'String', 'ExpandString') -contains $wk) {
+                    [void](Reg-Write $p.Path $p.Name $w.Value $wk -Soft:([bool]$p.Soft))
+                    return
+                }
+            }
             if ($null -eq $p.Default) {
                 [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft))
             } else {
@@ -1881,7 +1917,7 @@ function Describe-Tweak {
             continue
         }
         switch ($p.T) {
-            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
+            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none' }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
             'regdyn' { $lines += $p.Info }
             'key'    { $lines += ("registry key {0}: created    (undo: {1} deleted)" -f $p.Path, $p.Root) }
             'svc'    { $lines += ("service {0}: {1}    (undo: {2})" -f $p.Name, $p.Set, $p.Default) }
@@ -2191,23 +2227,66 @@ function Count-State {
 }
 
 # ------------------------------------------------------------- OneDrive ------
+# Where the OneDrive program is ('' when it is in none of the places it is installed to: your account's own folder or Program Files)
+function Od-Program {
+    # (a folder variable that is not set is skipped: it is never read as the root of the drive)
+    foreach ($d in @(@([string]$env:LOCALAPPDATA, 'Microsoft\OneDrive\OneDrive.exe'), @([string]$env:ProgramFiles, 'Microsoft OneDrive\OneDrive.exe'), @([string]${env:ProgramFiles(x86)}, 'Microsoft OneDrive\OneDrive.exe'))) {
+        $base = ([string]$d[0]).Trim().TrimEnd('\')
+        if ($base.Length -lt 2) { continue }
+        $f = $base + '\' + [string]$d[1]
+        if (Fs-Exists $f) { return $f }
+    }
+    return ''
+}
+# The uninstaller of the OneDrive that is installed: the one OneDrive registered for itself (for your account, or for all users with its own
+# /allusers), else the setup program Windows keeps in System32 / SysWOW64. @{ Exe; Args }, or $null when there is none.
+function Od-Uninstaller {
+    foreach ($k in @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe', 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe', 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\OneDriveSetup.exe')) {
+        $u = Reg-Read $k 'UninstallString'
+        if (-not $u.Exists) { continue }
+        $s = ([string]$u.Value).Trim()
+        $m = [regex]::Match($s, '^"([^"]+)"\s*(.*)$')
+        if (-not $m.Success) { $m = [regex]::Match($s, '^(\S+)\s*(.*)$') }
+        if (-not $m.Success) { continue }
+        $exe = [Environment]::ExpandEnvironmentVariables($m.Groups[1].Value)
+        # only OneDrive's own setup program is run, whatever else the entry says
+        if (@($exe -split '[\\/]')[-1] -ine 'OneDriveSetup.exe' -or -not (Fs-Exists $exe)) { continue }
+        $arg = ($m.Groups[2].Value -replace '\s+', ' ').Trim()
+        if ($arg -notmatch '(?i)(^|\s)/uninstall(\s|$)') { $arg = ('/uninstall ' + $arg).Trim() }
+        return @{ Exe = $exe; Args = $arg }
+    }
+    $sr = ([string]$env:SystemRoot).Trim().TrimEnd('\')
+    if ($sr.Length -ge 2) {
+        foreach ($f in @(($sr + '\System32\OneDriveSetup.exe'), ($sr + '\SysWOW64\OneDriveSetup.exe'))) { if (Fs-Exists $f) { return @{ Exe = $f; Args = '/uninstall' } } }
+    }
+    return $null
+}
 function Custom-OneDrive-Detect {
     param($p)
-    foreach ($f in @("$env:LOCALAPPDATA\Microsoft\OneDrive\OneDrive.exe", "$env:ProgramFiles\Microsoft OneDrive\OneDrive.exe", "${env:ProgramFiles(x86)}\Microsoft OneDrive\OneDrive.exe")) {
-        if (Fs-Exists $f) { $script:Now = ('OneDrive program found at {0}, wanted uninstalled' -f $f); return 'Off' }
-    }
+    $f = Od-Program
+    if ($f) { $script:Now = ('OneDrive program found at {0}, wanted uninstalled' -f $f); return 'Off' }
     $script:Now = 'OneDrive program: not found where it is normally installed, wanted uninstalled'
     return 'On'
 }
 function Custom-OneDrive-Apply {
     param($p, $mine)
-    if ($DryRun) { Say '  [dry] stop OneDrive, run OneDriveSetup /uninstall, delete leftovers' 'DarkGray'; return }
+    if ($DryRun) { Say '  [dry] stop OneDrive, run its uninstaller, then delete leftovers' 'DarkGray'; return }
     Say '  stopping and uninstalling OneDrive...' 'Gray'
     Stop-Process -Name OneDrive -Force -ErrorAction Ignore
     Stop-Process -Name OneDriveSetup -Force -ErrorAction Ignore
-    $setup = $null
-    foreach ($f in @("$env:SystemRoot\SysWOW64\OneDriveSetup.exe", "$env:SystemRoot\System32\OneDriveSetup.exe")) { if (-not $setup -and (Fs-Exists $f)) { $setup = $f } }
-    if ($setup) { Start-Process $setup -ArgumentList '/uninstall' -Wait -ErrorAction SilentlyContinue }
+    if (-not (Od-Program)) {
+        Say '  OneDrive is not installed; only its leftovers are cleaned up' 'DarkGray'
+    } else {
+        $un = Od-Uninstaller
+        if ($un) {
+            Say ('  running {0} {1}' -f $un.Exe, $un.Args) 'DarkGray'
+            Start-Process -FilePath ([string]$un.Exe) -ArgumentList ([string]$un.Args) -Wait -ErrorAction SilentlyContinue
+        } else { Say '  ! no OneDrive uninstaller was found on this PC' 'Yellow' }
+    }
+    # The folders are only cleaned up once the program is gone: while OneDrive is still installed its own folder holds the program, and deleting
+    # that by hand would leave a broken OneDrive behind
+    $left = Od-Program
+    if ($left) { Say ('  ! OneDrive is still installed ({0}), so its folders and its startup entry were left as they are' -f $left) 'Yellow'; return }
     # Leftovers: OneDrive's own folders only. A folder variable that is not set is skipped (never read as the root of the drive), and
     # the paths are taken as written (a [ or ] in a user name is not read as a wildcard that could match another folder).
     foreach ($d in @(@([string]$env:LOCALAPPDATA, 'Microsoft\OneDrive'), @([string]$env:ProgramData, 'Microsoft OneDrive'), @([string]$env:SystemDrive, 'OneDriveTemp'))) {
@@ -3798,6 +3877,16 @@ function Custom-Hypervisor-Apply {
 }
 function Custom-Hypervisor-Revert {
     param($p, $mine)
+    # What the boot entry had before this app changed it: Auto stays Auto (Hyper-V, WSL2, Windows Sandbox and the like set it, and they need
+    # it); a boot entry that had no value gets none again, so Windows decides. A record that says it was already off, or none, is the same as no value.
+    $was = ''; if ($mine -and -not $mine.Unknown) { $was = ([string]$mine.Was).Trim().ToLowerInvariant() }
+    if ($was -eq 'auto') {
+        if ($DryRun) { Say '  [dry] bcdedit /set hypervisorlaunchtype auto' 'DarkGray'; return }
+        [void](Bcd '/set' 'hypervisorlaunchtype' 'auto')
+        if ((Hv-Type) -ne 'auto') { $said = [string]$script:BcdSaid; if (-not $said) { $said = 'the boot entry has ' + (Hv-Shown (Hv-Type)) }; throw ('bcdedit did not put Auto back: ' + $said) }
+        Say '  bcdedit /set hypervisorlaunchtype auto   (what the boot entry had before; takes effect after a restart)' 'DarkGray'
+        return
+    }
     if ($DryRun) { Say '  [dry] bcdedit /deletevalue hypervisorlaunchtype' 'DarkGray'; return }
     # the Windows default is no value at all, so Windows decides again
     [void](Bcd '/deletevalue' 'hypervisorlaunchtype')
@@ -4542,8 +4631,10 @@ function Custom-GameBarLinks-Revert {
 # ------------------------------------------------------------ startup apps -----
 # Task Manager > Startup apps lists the Run keys and the two Startup folders. Whether an entry runs is a
 # small binary value under ...\Explorer\StartupApproved (first byte 02 = on, 03 = off, then the time it was
-# switched off). Writing that value for the current user is exactly what Task Manager does, and it changes
-# nothing else: the entry itself is never deleted.
+# switched off), in the same hive as the entry: HKCU for your account's Run list and Startup folder, HKLM for the
+# all-users ones (Run, Run32 for the 32-bit list, StartupFolder). Explorer only reads the mark there, so an entry for
+# all users is switched off in HKLM (for every account), exactly as Task Manager does it. Nothing else is changed:
+# the entry itself is never deleted.
 $script:ApprRoot = 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved'
 function Appr-Path { param([string]$hive, [string]$kind) return ($hive + ':\' + $script:ApprRoot + '\' + $kind) }
 # Same text -> same short code on every run (the undo record is keyed by it)
@@ -4556,23 +4647,23 @@ function Short-Hash {
 function Startup-Entries {
     $out = @()
     $runKeys = @(
-        @{ Kind = 'Run';   Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list of your account'; Tag = 'your account' }
-        @{ Kind = 'Run';   Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list for all users'; Tag = 'all users' }
-        @{ Kind = 'Run32'; Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Label = 'the Run list for all users (32-bit programs)'; Tag = 'all users, 32-bit' }
+        @{ Kind = 'Run';   Hive = 'HKCU'; Path = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list of your account'; Tag = 'your account' }
+        @{ Kind = 'Run';   Hive = 'HKLM'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run';             Label = 'the Run list for all users'; Tag = 'all users' }
+        @{ Kind = 'Run32'; Hive = 'HKLM'; Path = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run'; Label = 'the Run list for all users (32-bit programs)'; Tag = 'all users, 32-bit' }
     )
     foreach ($rk in $runKeys) {
         $vals = @()
         try { $vals = @(Reg-Values $rk.Path) } catch { }          # one unreadable list must not hide the others
         foreach ($v in $vals) {
-            $out += ,@{ Source = 'run'; From = $rk.Label; Tag = $rk.Tag; Show = [string]$v.Name; Name = [string]$v.Name; Appr = $rk.Kind; ApprName = [string]$v.Name
+            $out += ,@{ Source = 'run'; From = $rk.Label; Tag = $rk.Tag; Show = [string]$v.Name; Name = [string]$v.Name; Appr = $rk.Kind; ApprName = [string]$v.Name; Hive = $rk.Hive
                         Run = $rk.Path; Full = ''; Cmd = [string]$v.Value }
         }
     }
     $dirs = @{ User = ''; Common = '' }
     try { $dirs = Startup-Dirs } catch { }
     $folders = @(
-        @{ Path = [string]$dirs.User;   Label = 'the Startup folder of your account'; Tag = 'your Startup folder' }
-        @{ Path = [string]$dirs.Common; Label = 'the Startup folder for all users'; Tag = 'all users Startup folder' }
+        @{ Path = [string]$dirs.User;   Hive = 'HKCU'; Label = 'the Startup folder of your account'; Tag = 'your Startup folder' }
+        @{ Path = [string]$dirs.Common; Hive = 'HKLM'; Label = 'the Startup folder for all users'; Tag = 'all users Startup folder' }
     )
     foreach ($d in $folders) {
         if (-not $d.Path) { continue }
@@ -4583,7 +4674,7 @@ function Startup-Entries {
             try { $cmd = Lnk-Target $f.Path } catch { }
             if (-not $cmd) { $cmd = [string]$f.Path }
             $show = $f.Name -replace '\.(lnk|url)$', ''
-            $out += ,@{ Source = 'folder'; From = $d.Label; Tag = $d.Tag; Show = [string]$show; Name = [string]$f.Name; Appr = 'StartupFolder'; ApprName = [string]$f.Name
+            $out += ,@{ Source = 'folder'; From = $d.Label; Tag = $d.Tag; Show = [string]$show; Name = [string]$f.Name; Appr = 'StartupFolder'; ApprName = [string]$f.Name; Hive = $d.Hive
                         Run = ''; Full = [string]$f.Path; Cmd = $cmd }
         }
     }
@@ -4606,14 +4697,13 @@ function Appr-Read {
     }
     return $r
 }
-# What Windows does for this user: this user's own record wins, else the machine-wide one, else it runs
+# The hive whose StartupApproved mark Explorer reads for this entry (an entry without one is your account's)
+function Appr-Hive { param($e) if ([string]$e.Hive -eq 'HKLM') { return 'HKLM' }; return 'HKCU' }
+# What Windows does with the entry: its mark in its own hive says off, else it runs
 function Startup-Disabled {
     param($e)
-    foreach ($h in 'HKCU', 'HKLM') {
-        $r = Appr-Read $h $e
-        if ($r.Exists) { return [bool]$r.Disabled }
-    }
-    return $false
+    $r = Appr-Read (Appr-Hive $e) $e
+    return ($r.Exists -and [bool]$r.Disabled)
 }
 function Appr-Bytes {
     param([bool]$disabled)
@@ -4639,29 +4729,29 @@ function Custom-Startup-Detect {
 function Custom-Startup-Snapshot {
     param($p)
     $e = $p.Data
-    $mine = Appr-Read 'HKCU' $e
+    $mine = Appr-Read (Appr-Hive $e) $e
     return @{ Exists = $mine.Exists; Bytes = $mine.Bytes; Unknown = (Startup-Disabled $e) }
 }
 function Custom-Startup-Apply {
     param($p, $mine)
     $e = $p.Data
     if ($DryRun) { Say ("  [dry] {0}: switched off in the Startup apps list" -f $e.Show) 'DarkGray'; return }
-    $now = Appr-Read 'HKCU' $e
-    if ($now.Exists -and $now.Disabled) { Say ("  {0} is already switched off for your account" -f $e.Show) 'DarkGray'; return }     # keeps the time Windows recorded
+    $h = Appr-Hive $e
+    $who = 'for your account'; if ($h -eq 'HKLM') { $who = 'for every account' }
+    $now = Appr-Read $h $e
+    if ($now.Exists -and $now.Disabled) { Say ("  {0} is already switched off {1}" -f $e.Show, $who) 'DarkGray'; return }     # keeps the time Windows recorded
     $b = Appr-Bytes $true
-    if (Reg-Write (Appr-Path 'HKCU' $e.Appr) $e.ApprName $b 'Binary' -Quiet) { Say ("  {0} will not start with Windows any more" -f $e.Show) 'DarkGray' }
+    if (Reg-Write (Appr-Path $h $e.Appr) $e.ApprName $b 'Binary' -Quiet) { Say ("  {0} will not start with Windows any more ({1})" -f $e.Show, $who) 'DarkGray' }
 }
 function Custom-Startup-Revert {
     param($p, $mine)
     $e = $p.Data
     if ($DryRun) { Say ("  [dry] {0}: switched back on in the Startup apps list" -f $e.Show) 'DarkGray'; return }
-    $path = Appr-Path 'HKCU' $e.Appr
-    # the Windows default is no record of its own for the entry (it runs); only when a machine-wide record still keeps it off is an "on" record written for your account
-    [void](Reg-Remove $path $e.ApprName -Quiet)
-    if (Startup-Disabled $e) {
-        $b = Appr-Bytes $false
-        [void](Reg-Write $path $e.ApprName $b 'Binary' -Quiet)
-    }
+    $h = Appr-Hive $e
+    # the Windows default is no off-mark for the entry (it runs): the mark in the entry's own hive is removed
+    [void](Reg-Remove (Appr-Path $h $e.Appr) $e.ApprName -Quiet)
+    # an entry for all users: a mark for your account that a build before 118 wrote (Explorer never read it) is removed too
+    if ($h -eq 'HKLM') { [void](Reg-Remove (Appr-Path 'HKCU' $e.Appr) $e.ApprName -Quiet) }
     Say ("  {0} starts with Windows again" -f $e.Show) 'DarkGray'
 }
 
@@ -4694,8 +4784,8 @@ function Add-StartupTweaks {
                 'It starts from: ' + $e.From + $nl +
                 'What it runs: ' + $e.Cmd + $nl + $nl +
                 'If this belongs to a driver or hardware tool (audio, mouse or keyboard software, RGB lighting, a printer, antivirus), its tray icon, shortcuts and profiles will not work until you open it yourself. ' +
-                'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.'
-        $info = 'Startup apps switch for "' + $e.Show + '": HKCU\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: the entry is removed, so it starts with Windows again)'
+                $(if ((Appr-Hive $e) -eq 'HKLM') { 'This is the same switch as Task Manager > Startup apps. It is an entry for all users, so it is switched off for every account on this PC; the entry itself is not deleted.' } else { 'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.' })
+        $info = 'Startup apps switch for "' + $e.Show + '": ' + (Appr-Hive $e) + '\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: the off-mark is removed, so it starts with Windows again)'
         Add-Tweak -Id $id -Cat $script:StartupCat -Inv -Def 'On' -Name ($shown + ' starts with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
         $at++
     }
@@ -5434,23 +5524,23 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
-    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off. Only the shortcut is affected; Sticky Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off. Only the shortcut is affected: if you use Sticky Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '506' '510' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\StickyKeys' 510 'Sticky Keys'
         pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
     )
 
 Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
-    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off. Only the shortcut is affected; Filter Keys itself is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off. Only the shortcut is affected: if you use Filter Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '122' '126' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\Keyboard Response' 126 'Filter Keys'
         pCustom 'AccessLive' 'also applied to the running session' 'Filter'
     )
 
 Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
-    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, so the beeps and the window do not appear. Only the shortcut is affected; Toggle Keys itself is still there under Settings > Accessibility > Keyboard.' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, so the beeps and the window do not appear. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '58' '62' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\ToggleKeys' 62 'Toggle Keys'
         pCustom 'AccessLive' 'also applied to the running session' 'Toggle'
     )
 
@@ -5569,19 +5659,19 @@ $acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
     'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
 Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity and VBS (HVCI)' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Memory Integrity and Virtualization-Based Security are left to Windows (new Windows 11 installs on capable hardware usually have them on). Off: both are turned off, and Credential Guard with them. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this on if you play on those - you are asked about it before it is applied. Switching it back on leaves the values unset, so Windows decides again.' `
+    -Desc 'On: Memory Integrity and Virtualization-Based Security are left to Windows (new Windows 11 installs on capable hardware usually have them on). Off: both are turned off, and Credential Guard with them. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this on if you play on those - you are asked about it before it is applied. Switching it back on puts back the values this PC had before Headroom changed them, so Memory Integrity and VBS come back on where Windows had turned them on (Windows does that by itself on a clean Windows 11 install on capable hardware, and does not do it again); a value that was not there is removed again, so Windows decides. Either way it needs a restart.' `
     -Parts @(
-        pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
-        pReg "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
-        pReg $dg 'EnableVirtualizationBasedSecurity' 0
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
+        pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
+        pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
+        pRegPrev $dg 'EnableVirtualizationBasedSecurity' 0
+        pRegPrev 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
     )
 
 Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on deletes the boot setting, so Windows decides again. Turning on one of those features or memory integrity, or its installer or an update to it, can set the boot setting back to Auto; the check then offers this again, and the log names what on the PC uses the hypervisor.' `
+    -Desc 'On: Windows decides whether the hypervisor loads at boot (its default). Off: the hypervisor does not load at boot, which removes the small overhead it adds to games on some PCs. While it is off, Memory Integrity / Virtualization-Based Security cannot run (so the FACEIT / Riot Vanguard note on the Memory Integrity setting applies here too - you are asked first), and WSL2, Hyper-V virtual machines, Windows Sandbox, Docker (WSL2 mode) and the Android subsystem will not start. Switching it back on puts back what the boot entry had before Headroom changed it: Auto again where it was Auto (Hyper-V, WSL2 and the other features above set it), and no value where there was none, so Windows decides. Turning on one of those features or memory integrity, or its installer or an update to it, can set the boot setting back to Auto; the check then offers this again, and the log names what on the PC uses the hypervisor.' `
     -Parts @(
-        pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: bcdedit /deletevalue hypervisorlaunchtype)'
+        pCustom 'Hypervisor' 'bcdedit /set hypervisorlaunchtype off    (undo: bcdedit /set hypervisorlaunchtype auto where the boot entry had Auto before, else bcdedit /deletevalue hypervisorlaunchtype)'
     )
 
 Add-Tweak -Id 'bitlocker' -Cat $cSec -Inv -Def 'Depends on the PC' -OneWay -Risk 'security' -Name 'BitLocker drive encryption' `
@@ -5658,7 +5748,7 @@ Add-Tweak -Id 'xbox-svc' -Cat $cSvc -Inv -Def 'On' -Risk 'note' -Name 'Xbox serv
 Add-Tweak -Id 'svc-whe' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Health and Optimized Experiences service' `
     -Desc 'On: the service that watches CPU, heat and battery and records performance traces on this PC when Windows feels slow is enabled. Off: it is disabled. Microsoft says the traces stay on the PC unless you send them in a Feedback Hub report. Little downside on a desktop; on a laptop it may weaken battery optimisation.' `
     -Parts @(
-        pSvc 'whesvc' 'Disabled' 'Automatic'
+        pSvc 'whesvc' 'Disabled' 'AutomaticDelayed'
     )
 
 Add-Tweak -Id 'svc-diag' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Troubleshooting and diagnostics services' -NotRec 'Little to gain, and the built-in Troubleshoot wizards stop working.' `
@@ -5931,7 +6021,7 @@ Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'V
         pReg $adv 'ListviewShadow' 0 1
         pReg $adv 'IconsOnly' 1 0
         pReg 'HKCU:\Software\Microsoft\Windows\DWM' 'EnableAeroPeek' 0 1
-        pReg 'HKCU:\Software\Microsoft\Windows\DWM' 'AlwaysHibernateThumbnails' 0 1
+        pReg 'HKCU:\Software\Microsoft\Windows\DWM' 'AlwaysHibernateThumbnails' 0
         pReg 'HKCU:\Control Panel\Desktop' 'DragFullWindows' '0' '1' 'String'
         pReg 'HKCU:\Control Panel\Desktop' 'FontSmoothing' '2' '2' 'String'
         pReg 'HKCU:\Control Panel\Desktop' 'FontSmoothingType' 2 2
@@ -5986,7 +6076,7 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, sugge
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
-        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsSpotlightFeatures' 1)
+        pEd 'Ent' (pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsSpotlightFeatures' 1)
         pEd 'Pro,Ent' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0)
         pReg $cdm 'ContentDeliveryAllowed' 0 1
         pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
@@ -6121,7 +6211,7 @@ Add-Tweak -Id 'ai-page' -Cat $cAi -Inv -Def 'On' -Preset -Name 'AI components pa
 Add-Tweak -Id 'ai-agentic' -Cat $cAi -Def 'Off' -Reboot -Name 'Keep experimental agentic features off' `
     -Desc 'On: the "Experimental agentic features" switch (Settings > System > AI components > Agent tools, on the Windows builds that have it) is held off, so AI agents cannot be given their own workspace and account on this PC. Off: Windows decides, and the switch in Settings stays yours; it is off by default. This uses the value Enabled (0 = off) under HKLM\SYSTEM\CurrentControlSet\Services\IsoEnvBroker. Only a Windows build that has the feature has that key, so on any other PC the setting reads as not available and nothing is written. Switching this off again removes the value, which is how Windows ships it (the feature off); the switch in Settings is then yours again. A restart makes sure Windows reads the change.' `
     -Parts @(
-        pRegDyn -Info 'HKLM\SYSTEM\CurrentControlSet\Services\IsoEnvBroker: Enabled = 0, only when that key exists on this PC    (undo: the value Windows had)' -Gen {
+        pRegDyn -Info 'HKLM\SYSTEM\CurrentControlSet\Services\IsoEnvBroker: Enabled = 0, only when that key exists on this PC    (undo: the value is removed, so the switch in Settings is yours again)' -Gen {
             if (Reg-KeyExists 'HKLM:\SYSTEM\CurrentControlSet\Services\IsoEnvBroker') { pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\IsoEnvBroker' 'Enabled' 0 }
         }
     )
@@ -6379,15 +6469,15 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy featur
 # Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
 # Services page (marked -Untested).
 Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected; Mouse Keys itself is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '186' '190' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
     )
 
 Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off. Only the shortcut is affected; High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off. Only the shortcut is affected: a contrast theme you use stays on, and High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '122' '126' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
     )
 
 Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
@@ -12590,7 +12680,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '117'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '118'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
