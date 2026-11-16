@@ -4,7 +4,7 @@
     Headroom: a Windows 11 debloat and gaming tune-up tool in which every setting is its own switch.
 
 .DESCRIPTION
-    Opens a window with about 180 settings in 20 groups. Each setting shows what it does and exactly which registry values,
+    Opens a window with about 190 settings in 20 groups. Each setting shows what it does and exactly which registry values,
     services, tasks, features or apps it touches, and reads its current state from this PC. The switch on a card shows the
     feature itself: on means the feature is on (or the service is enabled), off means it is off (or the service is disabled),
     and every card says what Windows has by default. Nothing changes until you move a switch and apply it. Before the first
@@ -1264,28 +1264,11 @@ function pRegSoft { param($Path, $Name, $Value, $Default = $null, [string]$Type 
 # A value that Windows itself sets on some PCs and not on others (Memory Integrity, say, which Windows turns on by itself on a clean install
 # on capable hardware): switching the setting off puts back what this PC had before this app first changed it (from the undo record). A value
 # that was not there, or that already had this app's value then, is removed, so Windows decides.
-function pRegPrev { param($Path, $Name, $Value, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $null; Type = $Type; Prev = $true } }
+# $Default (optional): what undo writes when there is no record of what this PC had (switched off by hand) or the value was not there;
+# without it the value is deleted then, so Windows decides.
+function pRegPrev { param($Path, $Name, $Value, [string]$Type = 'DWord', $Default = $null) @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type; Prev = $true } }
 # $Gen is run each time the parts are needed (to check, apply or undo) and gets the part itself, so a part can carry its own data
 function pRegDyn { param([scriptblock]$Gen, [string]$Info) @{ T = 'regdyn'; Gen = $Gen; Info = $Info } }
-# An accessibility keyboard shortcut (the Flags text of Sticky Keys, Filter Keys, Toggle Keys, Mouse Keys or High Contrast): only the bit that
-# turns the shortcut on (4, the "hot key active" flag of each of them) is taken out of the value this account has, and every other choice in it
-# is kept (the feature itself switched on, its sounds, its options). Undo puts only that bit back. When the value is missing or is not a
-# number, Windows' default ($Def) is the starting point.
-function pAccessFlags {
-    param([string]$Path, [int]$Def, [string]$What)
-    $info = ('{0}\Flags: the bit that turns on the {1} shortcut (4) is taken out, every other choice in it is kept (from Windows'' default {2}: {3})    (undo: that bit is put back, {2})' -f $Path, $What, $Def, ($Def -band (-bnot 4)))
-    $p = pRegDyn -Info $info -Gen { param($d) Access-FlagsPart $d }
-    $p['Path'] = $Path; $p['Def'] = $Def
-    return $p
-}
-function Access-FlagsPart {
-    param($d)
-    $cur = [int64]$d.Def
-    $c = Reg-Read ([string]$d.Path) 'Flags'
-    $n = [int64]0
-    if ($c.Exists -and [string]$c.Kind -eq 'String' -and [int64]::TryParse(([string]$c.Value).Trim(), [ref]$n) -and $n -ge 0 -and $n -le 4294967295L) { $cur = $n }
-    return (pReg ([string]$d.Path) 'Flags' ([string]($cur -band (-bnot [int64]4))) ([string]($cur -bor [int64]4)) 'String')
-}
 function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '') @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy } }
 function pTask   { param([string]$Path) @{ T = 'task'; Path = $Path } }
 # Scheduled tasks whose name starts with $Like inside one folder (for tasks that carry a changing id in their name).
@@ -1955,7 +1938,7 @@ function Describe-Tweak {
             continue
         }
         switch ($p.T) {
-            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none' }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
+            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
             'regdyn' { $lines += $p.Info }
             'key'    { $lines += ("registry key {0}: created    (undo: {1} deleted)" -f $p.Path, $p.Root) }
             'svc'    { $lines += ("service {0}: {1}    (undo: {2})" -f $p.Name, $p.Set, $p.Default) }
@@ -5167,6 +5150,8 @@ Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
+        # the copy of the same switch that the Settings app keeps in its own store (undo: what the PC had)
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\TailoredExperiencesWithDiagnosticDataEnabled' 'Value' 0
     )
 
 Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity history' `
@@ -5206,6 +5191,56 @@ Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
         pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
         pSvc 'lfsvc' 'Disabled' 'Manual'
+    )
+
+# The app permissions under Settings > Privacy and security > App permissions, for every account on this PC (the ConsentStore values the
+# switches in Settings write). Each is Deny when applied, and undo sets it back to Allow, the Windows default (like the location switch
+# above). Camera and microphone are left alone: games and voice chat need them.
+Add-Tweak -Id 'location-prompts' -Cat $cPriv -Inv -Def 'On' -Name 'Location prompts and location override' `
+    -Desc 'On: Windows shows a notice when an app asks for your location, and "Allow location override" lets apps use the location of a PC you are connected to through Remote Desktop instead of this one. Off: neither the notice nor the override. Both switches are under Settings > Privacy and security > Location; undo puts back what this PC had.' `
+    -Parts @(
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'ShowGlobalPrompts' 0
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\UserLocationOverridePrivacySetting' 'Value' 0
+    )
+
+Add-Tweak -Id 'perm-personal' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App access to your personal info' `
+    -Desc 'On: apps can ask for your account info, contacts, calendar, phone calls, call history, email, tasks and messages, can read your notifications, and can see diagnostic info about other apps (each one is a switch under Settings > Privacy and security > App permissions). Off: all of these are denied to every app, for every account on this PC. Normal desktop programs such as Discord, Steam and browsers are not affected; Store apps such as Mail, Calendar, People and Phone Link lose that access. Undo sets them back to Allow, the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userAccountInformation' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\contacts' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appointments' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\phoneCall' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\phoneCallHistory' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\email' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userDataTasks' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\chat' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\userNotificationListener' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\appDiagnostics' 'Value' 'Deny' 'Allow' 'String'
+    )
+
+Add-Tweak -Id 'perm-files' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App access to your files' `
+    -Desc 'On: apps can be given access to your Documents, Downloads, Music, Pictures and Videos folders and to the whole file system (switches under Settings > Privacy and security > App permissions). Off: all of these are denied to every app, for every account on this PC. Normal desktop programs are not affected, but Store apps such as Photos and Media Player can no longer open your files from those folders. Undo sets them back to Allow, the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\documentsLibrary' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\downloadsFolder' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\musicLibrary' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\picturesLibrary' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\videosLibrary' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\broadFileSystemAccess' 'Value' 'Deny' 'Allow' 'String'
+    )
+
+Add-Tweak -Id 'perm-devices' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App access to radios and other devices' `
+    -Desc 'On: apps can turn radios such as Bluetooth on and off, and can talk to devices that are not paired with this PC ("Radios" and "Other devices" under Settings > Privacy and security > App permissions). Off: both are denied to every app. Bluetooth itself and paired devices keep working, but a Store app that sets up a controller, headset or lighting over Bluetooth may stop working. Undo sets them back to Allow, the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\radios' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\bluetoothSync' 'Value' 'Deny' 'Allow' 'String'
+    )
+
+Add-Tweak -Id 'perm-passkeys' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App access to your passkeys' `
+    -Desc 'On: apps can use the passkeys saved on this PC and can offer them to fill in ("Passkeys" and "Passkey autofill" under Settings > Privacy and security > App permissions). Off: both are denied to every app. A password manager or browser that uses the passkeys Windows keeps may stop offering them; signing in to Windows with Windows Hello is not affected. Undo sets them back to Allow, the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\passkeys' 'Value' 'Deny' 'Allow' 'String'
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\passkeysEnumeration' 'Value' 'Deny' 'Allow' 'String'
     )
 
 Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name 'Find my device' `
@@ -5272,6 +5307,14 @@ Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing an
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
         pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
+    )
+
+Add-Tweak -Id 'resume' -Cat $cCloud -Inv -Def 'On' -Name 'Resume apps from your phone' `
+    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off, and Resume is turned off for every account on this PC (the value Windows keeps for its DisableCrossDeviceResume policy). Undo puts back what this PC had.' `
+    -Parts @(
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsOneDriveResumeAllowed' 0
+        pRegPrev 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 'DWord' 0
     )
 
 Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
@@ -5495,6 +5538,19 @@ Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse accelerati
         pCustom 'MouseLive' 'also applied to the running session'
     )
 
+Add-Tweak -Id 'mouse-bgcap' -Cat $cGame -Inv -Def 'On' -Reboot -NotRec 'Microsoft added this cap to stop stutter with high polling rate mice. Turn it off only if a game feels like a 125 Hz mouse.' -Name 'Background mouse rate cap' `
+    -Desc 'On: Windows 11 limits how often programs in the background are told that the mouse moved (to about 125 times a second), so a high polling rate mouse does not slow the game down; the program in front always gets every update. Off: the limit is removed, so every program that listens to the mouse (overlays, mouse software, chat apps) gets every update again, which is the stutter Microsoft added the limit to stop. It can help when Windows treats a game as a background program (players have reported this with Battlefield 6). Undo removes the value, so Windows decides again. Takes effect after a restart.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Mouse' 'RawMouseThrottleEnabled' 0
+    )
+
+Add-Tweak -Id 'input-preload' -Cat $cGame -Inv -Def 'On' -Reboot -Name 'Touch keyboard and Widgets preloading' `
+    -Desc 'On: Windows starts the touch keyboard and text input app (TextInputHost) and the Widgets board ahead of time, so they open faster. Off: they start only when they are used, so fewer programs run in the background. On a desktop without a touch screen you will not notice the difference. Undo removes both values, so Windows decides again.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\input' 'IsInputAppPreloadEnabled' 0
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Dsh' 'IsPrelaunchEnabled' 0
+    )
+
 Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver updates through Windows Update' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
     -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting, Windows Update''s own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted.' `
     -Parts @(
@@ -5562,23 +5618,23 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
-    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off. Only the shortcut is affected: if you use Sticky Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: the shortcut is turned off, and so is Sticky Keys itself; its other options (the sounds, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (510). It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\StickyKeys' 510 'Sticky Keys'
+        pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '2' '510' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
     )
 
 Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
-    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off. Only the shortcut is affected: if you use Filter Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard. It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: the shortcut is turned off, and so is Filter Keys itself; its other options (the beeps, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (126). It takes effect straight away; if the window still shows up once, sign out and back in.' `
     -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\Keyboard Response' 126 'Filter Keys'
+        pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '2' '126' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Filter'
     )
 
 Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
-    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, so the beeps and the window do not appear. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Keyboard.' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: the shortcut is turned off, and so is Toggle Keys itself, so the beeps and the window do not appear; its other options are reset too, because the whole value is set to 34, as gaming guides do. Undo puts back the Windows default (62).' `
     -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\ToggleKeys' 62 'Toggle Keys'
+        pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '34' '62' 'String'
         pCustom 'AccessLive' 'also applied to the running session' 'Toggle'
     )
 
@@ -6191,6 +6247,14 @@ Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilo
         pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
         pReg $adv 'ShowCopilotButton' 0 1
+        # the value Windows keeps for whether this account may use Copilot (Windows sets it itself; undo: what the PC had)
+        pRegPrev 'HKLM:\Software\Microsoft\Windows\Shell\Copilot\BingChat' 'IsUserEligible' 0
+    )
+
+Add-Tweak -Id 'perm-ai' -Cat $cAi -Inv -Def 'On' -Name 'App access to text and image generation' `
+    -Desc 'On: apps can use the text and image generation built into Windows (the on-device AI models of Copilot+ PCs; "Text and image generation" under Settings > Privacy and security > App permissions). Off: it is denied to every app. On a PC that is not a Copilot+ PC nothing uses it. Undo sets them back to Allow, the Windows default.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\systemAIModels' 'Value' 'Deny' 'Allow' 'String'
     )
 
 Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, Click to Do and Settings AI search' `
@@ -6507,15 +6571,15 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy featur
 # Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
 # Services page (marked -Untested).
 Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: the shortcut is turned off, and so is Mouse Keys itself; its other options are reset too, because the whole value is set to 130, as gaming guides do. Undo puts back the Windows default (62). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
+        pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '130' '62' 'String'
     )
 
 Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off. Only the shortcut is affected: a contrast theme you use stays on, and High Contrast themes are still there under Settings > Accessibility > Contrast themes. This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: the shortcut is turned off and the other High Contrast options are reset, because the whole value is set to 4194, as gaming guides do; if you use a contrast theme, leave this one on. Undo puts back the Windows default (126). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
+        pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '4194' '126' 'String'
     )
 
 Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
@@ -13222,7 +13286,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '119'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '120'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
