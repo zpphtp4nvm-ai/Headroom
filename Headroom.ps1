@@ -9387,7 +9387,7 @@ function Get-DiffItems {
     }
     return $out
 }
-# The settings of a plan to apply again, for the window: @{ Id; Name; Kind = 'partial' | 'back'; Detail; Changes; Open }
+# The settings of a plan to apply again, for the window: @{ Id; Name; Kind = 'partial' | 'back'; Detail; Changes; Open; Pick (ticked) }
 function Get-ReapplyItems {
     param($Plan)
     $out = @()
@@ -9397,7 +9397,7 @@ function Get-ReapplyItems {
         if (-not $row) { continue }
         $kind = 'back'
         if ([string]$row.State -eq 'Partial') { $kind = 'partial' }
-        $out += , @{ Id = [string]$p.Id; Name = [string]$row.T.Name; Kind = $kind; Detail = [string]$row.Detail; Changes = @(Get-DiffItems $row); Open = $false }
+        $out += , @{ Id = [string]$p.Id; Name = [string]$row.T.Name; Kind = $kind; Detail = [string]$row.Detail; Changes = @(Get-DiffItems $row); Open = $false; Pick = $true }
     }
     return $out
 }
@@ -9411,7 +9411,7 @@ function Get-ReapplyIntro {
     if ($back) { $s += ('{0} setting(s) that Headroom applied earlier are off now.' -f $back) }
     if ($part) { $s += ('{0} setting(s) are only partly applied: some of their values are set and the others are not.' -f $part) }
     $s += 'That happens when a newer version of Headroom changes a setting you applied, or when Windows or another program (a driver install, for example) changes a value back.'
-    $s += 'Click a setting to see exactly what changed: each value, where it is, what it is now and what Headroom sets.'
+    $s += 'Untick any you want to leave as they are, and click a setting to see exactly what changed: each value, where it is, what it is now and what Headroom sets.'
     return ($s -join ' ')
 }
 # The text under the list: the usual warnings, a restart if one is needed, and what the two buttons do
@@ -9422,7 +9422,7 @@ function Get-ReapplyFoot {
     $s = Get-NoteSections $apply
     $rb = @($apply | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
     if ($rb.Count) { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl }
-    $s += 'Apply again makes a restore point first, then sets these values the way Headroom sets them. Leave as is changes nothing.'
+    $s += 'Apply makes a restore point first, then sets the values of the ticked settings the way Headroom sets them; unticked ones are left as they are. Leave as is changes nothing.'
     return $s
 }
 
@@ -12409,9 +12409,9 @@ function Test-MainWindowActive {
 }
 
 # After a check: the settings that are only partly applied, or that this app applied earlier and that read off now, are offered for applying again (Get-ReapplyOffer says which). One window
-# lists them all, and each one opens to show exactly which values changed (Ui-AskReapply). Apply again ticks them and goes through the
-# usual Apply (the questions some settings ask, the restore point, the undo record); Leave as is leaves them as they are. A setting is
-# asked about once each time the window is opened, whatever the answer was.
+# lists them all, each with a tick box, and each one opens to show exactly which values changed (Ui-AskReapply). Apply goes through the
+# usual Apply for the ticked ones (the questions some settings ask, the restore point, the undo record); unticked ones and everything
+# after Leave as is are left as they are. A setting is asked about once each time the window is opened, whatever the answer was.
 function Ui-OfferReapply {
     if (Get-BusyReason) { return }
     if ($script:UI.dry -and [bool]$script:UI.dry.Checked) { return }     # "Preview only" is on: a preview of this would only confuse
@@ -12426,7 +12426,10 @@ function Ui-OfferReapply {
     $tm = $script:UI.timer
     if ($tm) { try { $tm.Stop() } catch { } }
     try {
-        if (Ui-AskReapply $plan) {
+        $picked = @(Ui-AskReapply $plan)
+        if ($picked.Count -gt 0) {
+            # the ones that were unticked are left as they are (and, like the rest, not asked about again this session)
+            foreach ($p in $plan) { if ($picked -notcontains [string]$p.Id) { [void](Try-SetWant ([string]$p.Id) $false) } }
             Ui-DoApply '' 'Finish applying these settings?' $false $true
         } else {
             Reset-Ticks
@@ -12440,14 +12443,16 @@ function Ui-OfferReapply {
 }
 
 # ------------------------------------------------------------ the window that offers to apply settings again ----
-# "Finish applying these settings?": the text at the top, then one line for each setting. A click on a setting opens it like a drop-down
-# and shows exactly what is not the way Headroom sets it (Get-ReapplyItems: each value, what kind of thing it is, where it is, what it
-# is now and what Headroom sets); a second click closes it, and "Show all changes" opens every one. Under the list: the usual warnings
-# and what the buttons do. Apply again = Yes, Leave as is = No (the one with the keyboard focus, and Esc). The window only shows what
-# the last check read; it reads and changes nothing itself.
-# $script:RA while it is open: Form, Scroll (the panel that scrolls), Body (the control the list is drawn on), Items, Intro, Foot,
-# W and H (the size of the body), Hot (the index of the setting under the pointer, -2 = the link, -1 = nothing), and the places worked
-# out by Ui-ReapplyLayout.
+# "Finish applying these settings?": the text at the top, then one line for each setting, each with a tick box (all ticked at first).
+# A click on the box ticks or unticks the setting; a click anywhere else on its line opens it like a drop-down and shows exactly what
+# is not the way Headroom sets it (Get-ReapplyItems: each value, what kind of thing it is, where it is, what it is now and what Headroom
+# sets); a second click closes it. "Select none" / "Select all" and "Show all changes" do that for every one. Under the list: the usual
+# warnings and what the buttons do. Apply again (Yes) applies the ticked settings only; it reads "Apply 2 of 3" when some are unticked
+# and is greyed out when none is ticked. Leave as is (No, the one with the keyboard focus, and Esc) applies none. The window only shows
+# what the last check read; it reads and changes nothing itself.
+# $script:RA while it is open: Form, Scroll (the panel that scrolls), Body (the control the list is drawn on), Yes, No, Items, Intro,
+# Foot, W and H (the size of the body), Hot (what is under the pointer: 'line:<i>', 'check:<i>', 'link', 'sel' or ''), and the places
+# worked out by Ui-ReapplyLayout.
 $script:RA = $null
 
 # A text broken into lines no wider than $Width: between words, and inside a registry path or a file path after a backslash. A piece that
@@ -12483,16 +12488,21 @@ function Ui-ReapplyLayout {
     $ra.IntroLines = @(Info-Wrap ([string]$ra.Intro) (Ui-Font 'body') $iw)
     $ra.IntroY = $y
     $y += @($ra.IntroLines).Count * (Px 20) + (Px 14)
-    # the line above the list: how many there are, and the link that opens or closes them all
+    # the line above the list: how many are ticked, the link that ticks or unticks them all, and the one that opens or closes them all
     $ra.HeadY = $y
     $lt = 'SHOW ALL CHANGES'
     if (@($ra.Items).Count -gt 0 -and @(@($ra.Items) | Where-Object { -not $_.Open }).Count -eq 0) { $lt = 'HIDE ALL CHANGES' }
     $ra.LinkText = $lt
     $lw = (Ui-TextWidth $lt (Ui-Font 'smallb')) + (Px 16)
     $ra.LinkRect = @{ X = $pad + $iw - $lw; Y = $y; W = $lw; H = Px 22 }
+    $st = 'SELECT NONE'
+    if (@(@($ra.Items) | Where-Object { -not $_.Pick }).Count -gt 0) { $st = 'SELECT ALL' }
+    $ra.SelText = $st
+    $sw = (Ui-TextWidth $st (Ui-Font 'smallb')) + (Px 16)
+    $ra.SelRect = @{ X = [int]$ra.LinkRect.X - (Px 20) - $sw; Y = $y; W = $sw; H = Px 22 }
     $y += Px 30
     # each setting: its line, and under it, while it is open, one box for each value that changed
-    $bx = $pad + (Px 40)
+    $bx = $pad + (Px 52)
     $bw = [Math]::Max((Px 80), $pad + $iw - (Px 14) - $bx)
     $tw = $bw - 2 * (Px 14)
     foreach ($it in @($ra.Items)) {
@@ -12564,23 +12574,43 @@ function Ui-PaintReapply {
     $y = [int]$ra.IntroY
     foreach ($l in @($ra.IntroLines)) { Ui-Text $g ([string]$l) (Ui-Font 'body') $Th.Sub $pad $y $iw (Px 20) $TF.L; $y += Px 20 }
     $n = @($ra.Items).Count
-    Ui-Text $g ('SETTINGS ({0})' -f $n) (Ui-Font 'cap') $Th.Mute $pad ([int]$ra.HeadY) ([int]($iw / 2)) (Px 22) $TF.L
+    $np = @(@($ra.Items) | Where-Object { $_.Pick }).Count
+    $hot = [string]$ra.Hot
+    $sr = $ra.SelRect
+    $hw = [int]$sr.X - $pad - (Px 10)
+    if ($hw -gt 0) { Ui-Text $g ('{0} OF {1} SELECTED' -f $np, $n) (Ui-Font 'cap') $Th.Mute $pad ([int]$ra.HeadY) $hw (Px 22) $TF.L }
+    $sc = $Th.AccentText
+    if ($hot -eq 'sel') { $sc = $Th.Text }
+    Ui-Text $g ([string]$ra.SelText) (Ui-Font 'smallb') $sc ([int]$sr.X) ([int]$sr.Y) ([int]$sr.W) ([int]$sr.H) $TF.R
     $lr = $ra.LinkRect
     $lc = $Th.AccentText
-    if ([int]$ra.Hot -eq -2) { $lc = $Th.Text }
+    if ($hot -eq 'link') { $lc = $Th.Text }
     Ui-Text $g ([string]$ra.LinkText) (Ui-Font 'smallb') $lc ([int]$lr.X) ([int]$lr.Y) ([int]$lr.W) ([int]$lr.H) $TF.R
     $i = 0
     foreach ($it in @($ra.Items)) {
         $iy = [int]$it.Y
+        $lineHot = ($hot -eq ('line:' + $i))
         $fill = $Th.Card
-        if ([int]$ra.Hot -eq $i) { $fill = $Th.CardHot }
+        if ($lineHot -or $hot -eq ('check:' + $i)) { $fill = $Th.CardHot }
         Ui-FillRound $g $fill $pad $iy $iw ([int]$it.H) (Px 10)
+        # the tick box: blue with a white tick when ticked, an outline when not
+        $cb = Px 18
+        $cx = $pad + (Px 16)
+        $cy = $iy + (Px 15)
+        if ($it.Pick) {
+            Ui-FillRound $g $Th.Accent $cx $cy $cb $cb (Px 4)
+            Ui-StrokePoly $g $Th.KnobOn 2 @(@(($cx + (Px 4)), ($cy + (Px 9))), @(($cx + (Px 8)), ($cy + (Px 13))), @(($cx + (Px 14)), ($cy + (Px 5))))
+        } else {
+            $ec = $Th.TrackEdge
+            if ($hot -eq ('check:' + $i)) { $ec = $Th.Text }
+            Ui-StrokeRound $g $ec 1.5 $cx $cy $cb $cb (Px 4)
+        }
         # the arrow: right while closed, down while open
-        $ax = $pad + (Px 20)
+        $ax = $pad + (Px 56)
         $ay = $iy + (Px 24)
         $d4 = Px 4; $d2 = Px 2
         $ac = $Th.Mute
-        if ($it.Open -or [int]$ra.Hot -eq $i) { $ac = $Th.AccentText }
+        if ($it.Open -or $lineHot) { $ac = $Th.AccentText }
         if ($it.Open) { Ui-Line $g $ac 1.6 ($ax - $d4) ($ay - $d2) $ax ($ay + $d2); Ui-Line $g $ac 1.6 $ax ($ay + $d2) ($ax + $d4) ($ay - $d2) }
         else { Ui-Line $g $ac 1.6 ($ax - $d2) ($ay - $d4) ($ax + $d2) $ay; Ui-Line $g $ac 1.6 ($ax + $d2) $ay ($ax - $d2) ($ay + $d4) }
         # at the right: how many values changed, and a tag that says which kind it is
@@ -12601,8 +12631,11 @@ function Ui-PaintReapply {
             Ui-Text $g $ct (Ui-Font 'small') $Th.Mute ($tx - (Px 10) - $cw) $iy $cw (Px 48) $TF.R
             $cw += Px 10
         }
-        $nx = $pad + (Px 40)
-        Ui-Text $g ([string]$it.Name) (Ui-Font 'rowName') $Th.Text $nx $iy ([Math]::Max(0, $tx - $cw - (Px 12) - $nx)) (Px 48) $TF.L
+        $nx = $pad + (Px 72)
+        $ncol = $Th.Text
+        if (-not $it.Pick) { $ncol = $Th.Mute }
+        $nmW = $tx - $cw - (Px 12) - $nx
+        if ($nmW -gt 0) { Ui-Text $g ([string]$it.Name) (Ui-Font 'rowName') $ncol $nx $iy $nmW (Px 48) $TF.L }
         # the values, while it is open
         $bx = [int]$ra.BoxX
         $bw = [int]$ra.BoxW
@@ -12644,32 +12677,63 @@ function Ui-PaintReapply {
     foreach ($l in @($ra.FootLines)) { Ui-Text $g ([string]$l) (Ui-Font 'small') $Th.Mute $pad $fy $iw (Px 18) $TF.L; $fy += Px 18 }
 }
 
-# What is at (x, y) of the body: -2 = the link, the index of a setting whose line it is, -1 = nothing (a value box opens nothing)
+# What is at (x, y) of the body: 'link' (Show / Hide all changes), 'sel' (Select all / none), 'check:<i>' (the tick box of setting i, a
+# little more than the box), 'line:<i>' (the rest of its line), or '' (nothing: a value box opens nothing)
 function Ui-ReapplyHit {
     param([int]$x, [int]$y)
     $ra = $script:RA
-    if (-not $ra) { return -1 }
-    $lr = $ra.LinkRect
-    if ($lr -and $x -ge [int]$lr.X -and $x -lt ([int]$lr.X + [int]$lr.W) -and $y -ge [int]$lr.Y -and $y -lt ([int]$lr.Y + [int]$lr.H)) { return -2 }
+    if (-not $ra) { return '' }
+    foreach ($k in 'link', 'sel') {
+        $r = $ra.LinkRect
+        if ($k -eq 'sel') { $r = $ra.SelRect }
+        if ($r -and $x -ge [int]$r.X -and $x -lt ([int]$r.X + [int]$r.W) -and $y -ge [int]$r.Y -and $y -lt ([int]$r.Y + [int]$r.H)) { return $k }
+    }
     $pad = Px 24
-    if ($x -lt $pad -or $x -ge ([int]$ra.W - $pad)) { return -1 }
+    if ($x -lt $pad -or $x -ge ([int]$ra.W - $pad)) { return '' }
     $i = 0
     foreach ($it in @($ra.Items)) {
-        if ($y -ge [int]$it.Y -and $y -lt ([int]$it.Y + (Px 48))) { return $i }
+        if ($y -ge [int]$it.Y -and $y -lt ([int]$it.Y + (Px 48))) {
+            if ($x -lt ($pad + (Px 44))) { return ('check:' + $i) }
+            return ('line:' + $i)
+        }
         $i++
     }
-    return -1
+    return ''
+}
+# The Apply button: "Apply again" when every setting is ticked, "Apply 2 of 3" when only some are, greyed out when none is. The text
+# under the list follows the ticks too: its warnings are about the ticked settings only.
+function Ui-ReapplyUpdateYes {
+    $ra = $script:RA
+    if (-not $ra) { return }
+    $ids = @(@($ra.Items) | Where-Object { $_.Pick } | ForEach-Object { [string]$_.Id })
+    $ra.Foot = Get-ReapplyFoot @(@($ra.Plan) | Where-Object { $ids -contains [string]$_.Id })
+    if (-not $ra.Yes) { return }
+    $n = @($ra.Items).Count
+    $np = @(@($ra.Items) | Where-Object { $_.Pick }).Count
+    $t = 'Apply again'
+    if ($np -gt 0 -and $np -lt $n) { $t = ('Apply {0} of {1}' -f $np, $n) }
+    if ([string]$ra.Yes.Text -ne $t) { $ra.Yes.Text = $t }
+    Ui-SetEnabled $ra.Yes ($np -gt 0)
+    $ra.Yes.Invalidate()
 }
 function Ui-ReapplyClick {
     param([int]$x, [int]$y)
     $ra = $script:RA
     if (-not $ra) { return }
-    $hit = Ui-ReapplyHit $x $y
-    if ($hit -eq -2) {
+    $hit = [string](Ui-ReapplyHit $x $y)
+    if ($hit -eq 'link') {
         $open = (@(@($ra.Items) | Where-Object { -not $_.Open }).Count -gt 0)
         foreach ($it in @($ra.Items)) { $it.Open = $open }
-    } elseif ($hit -ge 0) {
-        $it = @($ra.Items)[$hit]
+    } elseif ($hit -eq 'sel') {
+        $pick = (@(@($ra.Items) | Where-Object { -not $_.Pick }).Count -gt 0)
+        foreach ($it in @($ra.Items)) { $it.Pick = $pick }
+        Ui-ReapplyUpdateYes
+    } elseif ($hit.StartsWith('check:')) {
+        $it = @($ra.Items)[[int]$hit.Substring(6)]
+        $it.Pick = -not [bool]$it.Pick
+        Ui-ReapplyUpdateYes
+    } elseif ($hit.StartsWith('line:')) {
+        $it = @($ra.Items)[[int]$hit.Substring(5)]
         $it.Open = -not [bool]$it.Open
     } else { return }
     Ui-ReapplyLayout ([int]$ra.W)
@@ -12678,12 +12742,12 @@ function Ui-ReapplyHover {
     param([int]$x, [int]$y)
     $ra = $script:RA
     if (-not $ra) { return }
-    $hit = Ui-ReapplyHit $x $y
-    if ($hit -eq [int]$ra.Hot) { return }
+    $hit = [string](Ui-ReapplyHit $x $y)
+    if ($hit -eq [string]$ra.Hot) { return }
     $ra.Hot = $hit
     $b = $ra.Body
     if ($b) {
-        if ($hit -ne -1) { $b.Cursor = [System.Windows.Forms.Cursors]::Hand } else { $b.Cursor = [System.Windows.Forms.Cursors]::Default }
+        if ($hit) { $b.Cursor = [System.Windows.Forms.Cursors]::Hand } else { $b.Cursor = [System.Windows.Forms.Cursors]::Default }
         $b.Invalidate()
     }
 }
@@ -12722,7 +12786,7 @@ function Ui-BuildReapplyWindow {
     $head.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 4), (Px 24), 0)
     $bar = New-Pnl 'Bottom' (Px 64) $Th.Bg
     $no = New-Btn 'Leave as is' 120 'secondary' 'Change nothing. You are not asked about these settings again until Headroom is opened again.' 36
-    $yes = New-Btn 'Apply again' 120 'primary' 'Set these values the way Headroom sets them (a restore point is made first).' 36
+    $yes = New-Btn 'Apply again' 128 'primary' 'Set the values of the ticked settings the way Headroom sets them (a restore point is made first).' 36
     $no.DialogResult = [System.Windows.Forms.DialogResult]::No
     $yes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
     Ui-ReapplyPlaceButtons $yes $no $w
@@ -12740,7 +12804,7 @@ function Ui-BuildReapplyWindow {
     $body.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintReapply $e.Graphics } catch { Ui-Fail $_ } })
     $body.Add_MouseDown({ param($s, $e) try { if ([string]$e.Button -eq 'Left') { Ui-ReapplyClick ([int]$e.X) ([int]$e.Y) } } catch { Ui-Fail $_ } })
     $body.Add_MouseMove({ param($s, $e) try { Ui-ReapplyHover ([int]$e.X) ([int]$e.Y) } catch { Ui-Fail $_ } })
-    $body.Add_MouseLeave({ param($s, $e) try { Ui-ReapplyHover -1 -1 } catch { Ui-Fail $_ } })
+    $body.Add_MouseLeave({ param($s, $e) try { Ui-ReapplyHover -1000 -1000 } catch { Ui-Fail $_ } })
     $scroll.Controls.Add($body)
     # the one added first fills what is left; each one added later is laid out before it
     $f.Controls.Add($scroll)
@@ -12749,8 +12813,9 @@ function Ui-BuildReapplyWindow {
     $f.Controls.Add($strip)
     $f.CancelButton = $no
     $f.ActiveControl = $no
-    $script:RA = @{ Form = $f; Scroll = $scroll; Body = $body; Yes = $yes; No = $no; Items = $items; Intro = (Get-ReapplyIntro $items); Foot = (Get-ReapplyFoot $Plan)
-                    W = 0; H = 0; Hot = -1; IntroLines = @(); IntroY = 0; HeadY = 0; LinkText = ''; LinkRect = $null; BoxX = 0; BoxW = 0; FootY = 0; FootLines = @() }
+    $script:RA = @{ Form = $f; Scroll = $scroll; Body = $body; Yes = $yes; No = $no; Plan = @($Plan); Items = $items; Intro = (Get-ReapplyIntro $items); Foot = (Get-ReapplyFoot $Plan)
+                    W = 0; H = 0; Hot = ''; IntroLines = @(); IntroY = 0; HeadY = 0; LinkText = ''; LinkRect = $null; SelText = ''; SelRect = $null; BoxX = 0; BoxW = 0
+                    FootY = 0; FootLines = @() }
     # the body is a little narrower than the panel, so that the panel's own scroll bar never covers it
     Ui-ReapplyLayout ([Math]::Max((Px 420), $w - (Px 20)))
     $scroll.Add_Resize({ param($s, $e) try { $cw = [int]$s.ClientSize.Width; if ($cw -gt 0) { Ui-ReapplyLayout ([Math]::Max((Px 420), $cw - (Px 20))) } } catch { Ui-Fail $_ } })
@@ -12767,16 +12832,22 @@ function Ui-ReapplyPlaceButtons {
     $yes.Location = New-Object System.Drawing.Point(([int]$no.Left - (Px 10) - [int]$yes.Width), (Px 14))
 }
 
-# Asks with that window; $true = Apply again. If the window cannot be built, the plain question with the same list is asked instead.
+# Asks with that window. Returns the ids of the settings to apply again: the ticked ones after Apply, none after Leave as is. If the
+# window cannot be built, the plain question with the same list is asked instead (Yes = all of them).
 function Ui-AskReapply {
     param($Plan)
+    $all = @(@($Plan) | Where-Object { [string]$_.Action -eq 'Apply' } | ForEach-Object { [string]$_.Id })
     $f = $null
     try { $f = Ui-BuildReapplyWindow $Plan } catch { $f = $null; $script:RA = $null }
-    if (-not $f) { return (Ui-Ask (Get-ConfirmText $Plan (Get-ReapplyNote $Plan)) 'Finish applying these settings?' $false) }
+    if (-not $f) {
+        if (Ui-Ask (Get-ConfirmText $Plan (Get-ReapplyNote $Plan)) 'Finish applying these settings?' $false) { return $all }
+        return @()
+    }
     try {
         $owner = $script:UI.form
         if ($owner) { $ans = $f.ShowDialog($owner) } else { $ans = $f.ShowDialog() }
-        return ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
+        if ($ans -ne [System.Windows.Forms.DialogResult]::Yes) { return @() }
+        return @(@($script:RA.Items) | Where-Object { $_.Pick } | ForEach-Object { [string]$_.Id })
     } finally {
         try { $f.Dispose() } catch { }
         $script:RA = $null
