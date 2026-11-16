@@ -17,7 +17,8 @@
     The window opens on a welcome screen and then on Home, which shows the PC as it is right now: Windows, processor, graphics
     card, memory, motherboard, displays and drives. Windows does not report CPU temperature, CPU power or memory timings, so
     those come from HWiNFO or LibreHardwareMonitor. The Start HWiNFO button turns on HWiNFO's sensor sharing for you, after
-    asking, and keeps a copy of its settings file. Headroom installs no driver and downloads nothing.
+    asking, and keeps a copy of its settings file. Copy system info puts the text of every card of Home on the clipboard.
+    Headroom installs no driver and downloads nothing.
 
     Select Optimization Preset offers two presets, and each one lists what it will change before anything is applied:
       Question Preset       you answer short questions about how you use this PC (gaming, Riot or FACEIT games, VPN, virtual
@@ -122,9 +123,10 @@ function Emit {
     # Choice: for a setting with several options (see Add-Tweak -Choices), the key of the option that is in force ('' for the others)
     # Read:   what the check actually read from this PC, one line per value (see Get-PartState)
     # Mine:   'yes' = this app has an undo record for the setting (it changed it), 'no' = it was already like this, '' = not known / not applied
-    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '')
+    # Diff:   the values that are not the way the setting sets them, one line each (see Get-DiffLine); '' when the setting is applied
+    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '')
     if ($null -eq $Q) { return }
-    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine })
+    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff })
 }
 
 # --------------------------------------------------- the undo record (store) --
@@ -1470,14 +1472,20 @@ function Now-RegText {
     } catch { return ('"' + (Now-Clip ([string]$v)) + '"') }
 }
 # Returns 'On' | 'Off' | 'Partial' | 'NA' (not applicable on this PC) | 'Skip' (no state of its own)
-# and leaves in $script:Now what it read ("<where>: <what is there>, wanted <what the setting sets>")
+# and leaves in $script:Now what it read ("<where>: <what is there>, wanted <what the setting sets>"), and the same in three pieces for
+# the window's list of what changed: $script:NowAt (where), $script:NowIs (what is there) and $script:NowWant (what the setting sets).
+# A custom part leaves only $script:Now.
 function Get-PartState {
     param($p)
     $script:Now = ''
+    $script:NowAt = ''; $script:NowIs = ''; $script:NowWant = ''
     switch ($p.T) {
         'reg' {
             $c = Reg-Read $p.Path $p.Name
-            $script:Now = ('{0}\{1}: {2}, wanted {3}' -f $p.Path, $p.Name, (Now-RegText $c), (Now-RegText @{ Exists = $true; Value = $p.Value; Kind = [string]$p.Type }))
+            $script:NowAt = ('{0}\{1}' -f $p.Path, $p.Name)
+            $script:NowIs = Now-RegText $c
+            $script:NowWant = Now-RegText @{ Exists = $true; Value = $p.Value; Kind = [string]$p.Type }
+            $script:Now = ('{0}: {1}, wanted {2}' -f $script:NowAt, $script:NowIs, $script:NowWant)
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
             if ($p.Soft) { return 'Skip' }          # a protected switch can show that a setting is on, never that it is off
             return 'Off'
@@ -1485,6 +1493,7 @@ function Get-PartState {
         'key' {
             $e = Reg-KeyExists $p.Path
             $script:Now = ('Key {0}: {1}' -f $p.Path, $(if ($e) { 'exists' } else { 'not there' }))
+            $script:NowAt = [string]$p.Path; $script:NowIs = $(if ($e) { 'exists' } else { 'not there' }); $script:NowWant = 'exists'
             if ($e) { return 'On' }
             return 'Off'
         }
@@ -1493,6 +1502,7 @@ function Get-PartState {
             $c = Svc-Read $p.Name
             if ($null -eq $c) { $script:Now = ('Service {0}: not on this PC' -f $p.Name); return 'NA' }
             $script:Now = ('Service {0}: {1}, wanted {2}' -f $p.Name, (Svc-Label $c), $p.Set)
+            $script:NowAt = [string]$p.Name; $script:NowIs = (Svc-Label $c); $script:NowWant = [string]$p.Set
             if (Svc-IsApplied $c $p) { return 'On' }
             return 'Off'
         }
@@ -1500,6 +1510,7 @@ function Get-PartState {
             $c = Task-Read $p.Path
             if ($null -eq $c) { $script:Now = ('Task {0}: not on this PC' -f $p.Path); return 'NA' }
             $script:Now = ('Task {0}: {1}, wanted disabled' -f $p.Path, $(if ($c.Enabled) { 'enabled' } else { 'disabled' }))
+            $script:NowAt = [string]$p.Path; $script:NowIs = $(if ($c.Enabled) { 'enabled' } else { 'disabled' }); $script:NowWant = 'disabled'
             if ($c.Enabled) { return 'Off' }
             return 'On'
         }
@@ -1508,6 +1519,7 @@ function Get-PartState {
             if ($r.Count -eq 0) { $script:Now = ('Firewall rules "{0}": none on this PC' -f $p.Group); return 'NA' }
             $n = 0; foreach ($x in $r) { if ($x.Enabled) { $n++ } }
             $script:Now = ('Firewall rules "{0}": {1} of {2} switched on, wanted all off' -f $p.Group, $n, $r.Count)
+            $script:NowAt = [string]$p.Group; $script:NowIs = ('{0} of {1} switched on' -f $n, $r.Count); $script:NowWant = 'all off'
             if ($n -gt 0) { return 'Off' }
             return 'On'
         }
@@ -1516,6 +1528,7 @@ function Get-PartState {
             if ($r.Count -eq 0) { $script:Now = ('Network adapter item {0}: no adapter has it' -f $p.Comp); return 'NA' }
             $n = 0; foreach ($x in $r) { if ($x.Enabled) { $n++ } }
             $script:Now = ('Network adapter item {0}: on for {1} of {2} adapter(s), wanted off' -f $p.Comp, $n, $r.Count)
+            $script:NowAt = [string]$p.Comp; $script:NowIs = ('on for {0} of {1} adapter(s)' -f $n, $r.Count); $script:NowWant = 'off'
             if ($n -gt 0) { return 'Off' }
             return 'On'
         }
@@ -1523,6 +1536,7 @@ function Get-PartState {
             $s = Feat-State $p.Name
             if (-not $s) { $script:Now = ('Windows feature {0}: not on this PC' -f $p.Name); return 'NA' }
             $script:Now = ('Windows feature {0}: {1}, wanted removed' -f $p.Name, $s)
+            $script:NowAt = [string]$p.Name; $script:NowIs = [string]$s; $script:NowWant = 'removed'
             if ($s -eq 'Enabled') { return 'Off' }
             return 'On'
         }
@@ -1531,6 +1545,7 @@ function Get-PartState {
             if ($r.Count -eq 0) { $script:Now = ('Windows capability {0}: not on this PC' -f $p.Pattern); return 'NA' }
             $n = 0; foreach ($x in $r) { if ($x.State -eq 'Installed') { $n++ } }
             $script:Now = ('Windows capability {0}: {1} of {2} installed, wanted removed' -f $p.Pattern, $n, $r.Count)
+            $script:NowAt = [string]$p.Pattern; $script:NowIs = ('{0} of {1} installed' -f $n, $r.Count); $script:NowWant = 'removed'
             if ($n -gt 0) { return 'Off' }
             return 'On'
         }
@@ -1543,6 +1558,9 @@ function Get-PartState {
             $script:Now = ('Apps {0}: {1} installed' -f ((@($p.Patterns) | ForEach-Object { [string]$_ }) -join ', '), $inst)
             if ($sysk -gt 0) { $script:Now += (', {0} kept only for Windows'' own system account (S-1-5-18, not for anyone who signs in)' -f $sysk) }
             if ($left -gt 0) { $script:Now += (', {0} only kept for new accounts (not installed for anyone)' -f $left) }
+            $script:NowAt = ((@($p.Patterns) | ForEach-Object { [string]$_ }) -join ', ')
+            $script:NowIs = ('{0} installed' -f $inst)
+            $script:NowWant = 'none installed'
             $script:Now += ', wanted none installed'
             if ($inst -gt 0) { return 'Off' }
             return 'On'
@@ -1640,10 +1658,12 @@ function Get-PartsState {
     param($t)
     $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
     $reads = New-Object System.Collections.ArrayList
+    $diff = New-Object System.Collections.ArrayList
     foreach ($p in (Expand-Parts $t)) {
         $script:Why = ''
         $r = Get-PartState $p
         if ($script:Now) { [void]$reads.Add([string]$script:Now) }
+        if ($r -eq 'Off' -or $r -eq 'Partial') { [void]$diff.Add((Get-DiffLine $p)) }
         switch ($r) {
             'On'      { $on++; if (Test-Informative $p) { $onI++ } }
             'Off'     { $off++ }
@@ -1654,6 +1674,7 @@ function Get-PartsState {
     $note = ''; if ($why.Count) { $note = ' (' + (($why | Select-Object -Unique) -join '; ') + ')' }
     $gated = @(Get-GatedParts $t)
     $rd = Join-Reads $reads
+    $df = Join-Diff $diff
     if ($on + $off -eq 0) {
         $d = 'Nothing to change on this PC'; if ($why.Count) { $d = ($why | Select-Object -First 1) }
         elseif ($gated.Count) { $d = (Ed-ClassName (Get-WinEdition).Class) + ' ignores this setting: ' + (Ed-Reason $gated[0].Ed) }
@@ -1667,8 +1688,25 @@ function Get-PartsState {
         $note += (' ({0} value{1} left out on {2}: {3})' -f $gated.Count, $(if ($gated.Count -gt 1) { 's' } else { '' }), (Ed-ClassName (Get-WinEdition).Class), $gWhyText)
     }
     if ($off -eq 0)  { return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note } }
-    if ($onI -eq 0)  { return @{ State = 'Off'; Read = $rd; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note } }
-    return @{ State = 'Partial'; Read = $rd; Detail = "Partly applied: $on of $($on + $off) parts" + $note }
+    if ($onI -eq 0)  { return @{ State = 'Off'; Read = $rd; Diff = $df; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note } }
+    return @{ State = 'Partial'; Read = $rd; Diff = $df; Detail = "Partly applied: $on of $($on + $off) parts" + $note }
+}
+# One value of a setting that is not the way the setting sets it, as one line for the window: what it is (the part's kind), where, what
+# it is now and what the setting sets, separated by tabs; a custom part, which has no such pieces, gives its whole reading instead
+# (where = '', now = the reading). Tabs and line breaks inside a piece become spaces.
+function Get-DiffLine {
+    param($p)
+    $clean = { param($x) return (([string]$x) -replace '[\t\r\n]+', ' ').Trim() }
+    $at = [string]$script:NowAt; $is = [string]$script:NowIs; $want = [string]$script:NowWant
+    if (-not $at -and -not $is) { $is = [string]$script:Now }
+    return ((& $clean $p.T) + "`t" + (& $clean $at) + "`t" + (& $clean $is) + "`t" + (& $clean $want))
+}
+# The lines of Get-DiffLine as one text (one line each; a long list is cut after 40 and the last line says how many more there are)
+function Join-Diff {
+    param($lines)
+    $l = @($lines | ForEach-Object { [string]$_ } | Where-Object { $_ })
+    if ($l.Count -gt 40) { $l = @($l | Select-Object -First 40) + ("more`t`t{0}`t" -f ($lines.Count - 40)) }
+    return ($l -join "`n")
 }
 
 # ------------------------------------------------------------ snapshot -------
@@ -2054,7 +2092,7 @@ function Invoke-Scan {
             $i++
             $r = $null
             try { $r = Get-TweakState $t } catch { $r = @{ State = 'Unknown'; Detail = "Could not check: $($_.Exception.Message)" } }
-            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id)
+            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id) ([string]$r.Diff)
             $moved = $clock.Elapsed.TotalSeconds
         }
         [void](Pre-Note)
@@ -2183,13 +2221,13 @@ function Invoke-Plan {
             if ($t.Reboot) { $reboot += $t.Name }
             Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
         }
-        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id)
+        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id) ([string]$after.Diff)
         # a power plan was installed, deleted or made active: which plan is active may have changed, so every plan switch is read again
         if ($t.Plan) {
             foreach ($o in @($script:Catalog | Where-Object { $_.Plan -and $_.Id -ne $t.Id })) {
                 Clear-CacheFor $o
                 $oa = Get-TweakState $o
-                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id)
+                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id) ([string]$oa.Diff)
             }
         }
     }
@@ -2450,10 +2488,10 @@ function Plan-DefaultsDiff {
     if (-not $def -or $def.Kind -ne 'windows') { return $o }
     $vals = @(Plan-WindowsDefaults ([string]$def.Guid))
     if ($vals.Count -lt 20) { return $o }
-    $cur = $Cur
-    if ($null -eq $cur) { $cur = @{}; try { $cur = Pwr-ParseQuery (Pwr '/qh' $Guid) -Both } catch { } }     # (or what the caller has read already)
+    $have = $Cur
+    if ($null -eq $have) { $have = @{}; try { $have = Pwr-ParseQuery (Pwr '/qh' $Guid) -Both } catch { } }     # (or what the caller has read already)
     foreach ($s in $vals) {
-        $c = $cur[[string]$s.Set]
+        $c = $have[[string]$s.Set]
         if (-not $c) { continue }                       # (a setting this PC does not list for the plan)
         $o.Checked++
         $d = $false
@@ -8157,7 +8195,7 @@ function New-Rows {
     $script:Cats = @()
     foreach ($t in $script:Catalog) {
         $script:Rows[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
-                                 Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = '' }
+                                 Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = '' }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
 }
@@ -8176,7 +8214,7 @@ function Sync-StartupRows {
             $fresh[$t.Id] = $old
         } else {
             $fresh[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
-                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = '' }
+                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = '' }
         }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
@@ -8668,7 +8706,7 @@ function Get-RealPick {
 
 # The state of a row was (re)checked. During the first check the tick follows the real state.
 function Set-RowState {
-    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '')
+    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '', [string]$diff = '')
     $row = $script:Rows[$id]
     if (-not $row) { return }
     $row.State = $state
@@ -8676,6 +8714,7 @@ function Set-RowState {
     $row.Choice = $choice
     $row.Read = $read          # what the check read from the PC (one line per value)
     $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
+    $row.Diff = $diff          # the values that are not the way the setting sets them (see Get-DiffItems), '' when it is applied
     $row.Force = ''
     if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row }
 }
@@ -9320,6 +9359,73 @@ function Get-ReapplyNote {
     return $s
 }
 
+# ------------------------------------------------------------ what changed ----
+# The window that offers to apply the settings again (Ui-AskReapply) lists each one, and a click on it opens exactly what is not the way
+# Headroom sets it: each value, what kind of thing it is, where it is, what it is now and what Headroom sets. That comes from the last
+# check (Row.Diff, one line per value: kind, where, now, wanted, separated by tabs; see Get-DiffLine in the engine). Nothing is read here.
+$script:DiffKinds = @{ reg = 'Registry value'; key = 'Registry key'; svc = 'Service'; task = 'Scheduled task'; fw = 'Firewall rules'
+                       bind = 'Network adapter item'; feat = 'Windows feature'; cap = 'Windows capability'; appx = 'Apps'; custom = 'Windows setting' }
+# A setting's values that are not the way it sets them: @{ What; At; Now; Want; More } (More = how many more there are, on a last item
+# that stands for a list that was cut short; What = '' there)
+function Get-DiffItems {
+    param($row)
+    $out = @()
+    if (-not $row) { return $out }
+    foreach ($ln in @(([string]$row.Diff) -split "`n")) {
+        if (-not $ln) { continue }
+        $f = @($ln -split "`t")
+        while ($f.Count -lt 4) { $f += '' }
+        $k = [string]$f[0]
+        if ($k -eq 'more') {
+            $m = 0; [void][int]::TryParse([string]$f[2], [ref]$m)
+            $out += , @{ What = ''; At = ''; Now = ''; Want = ''; More = $m }
+            continue
+        }
+        $w = [string]$script:DiffKinds[$k]
+        if (-not $w) { $w = 'Windows setting' }
+        $out += , @{ What = $w; At = [string]$f[1]; Now = [string]$f[2]; Want = [string]$f[3]; More = 0 }
+    }
+    return $out
+}
+# The settings of a plan to apply again, for the window: @{ Id; Name; Kind = 'partial' | 'back'; Detail; Changes; Open }
+function Get-ReapplyItems {
+    param($Plan)
+    $out = @()
+    foreach ($p in @($Plan)) {
+        if ([string]$p.Action -ne 'Apply') { continue }
+        $row = $script:Rows[[string]$p.Id]
+        if (-not $row) { continue }
+        $kind = 'back'
+        if ([string]$row.State -eq 'Partial') { $kind = 'partial' }
+        $out += , @{ Id = [string]$p.Id; Name = [string]$row.T.Name; Kind = $kind; Detail = [string]$row.Detail; Changes = @(Get-DiffItems $row); Open = $false }
+    }
+    return $out
+}
+# The text at the top of the window: how many of each kind, why it happens, and that a click shows what changed
+function Get-ReapplyIntro {
+    param($Items)
+    $Items = @($Items)
+    $back = @($Items | Where-Object { $_.Kind -eq 'back' }).Count
+    $part = @($Items | Where-Object { $_.Kind -eq 'partial' }).Count
+    $s = @()
+    if ($back) { $s += ('{0} setting(s) that Headroom applied earlier are off now.' -f $back) }
+    if ($part) { $s += ('{0} setting(s) are only partly applied: some of their values are set and the others are not.' -f $part) }
+    $s += 'That happens when a newer version of Headroom changes a setting you applied, or when Windows or another program (a driver install, for example) changes a value back.'
+    $s += 'Click a setting to see exactly what changed: each value, where it is, what it is now and what Headroom sets.'
+    return ($s -join ' ')
+}
+# The text under the list: the usual warnings, a restart if one is needed, and what the two buttons do
+function Get-ReapplyFoot {
+    param($Plan)
+    $nl = "`r`n"
+    $apply = @(@($Plan) | Where-Object { $_.Action -eq 'Apply' })
+    $s = Get-NoteSections $apply
+    $rb = @($apply | Where-Object { $script:ById[$_.Id].Reboot } | ForEach-Object { $script:ById[$_.Id].Name })
+    if ($rb.Count) { $s += 'A restart is needed afterwards for: ' + (($rb | Select-Object -First 6) -join ', ') + $(if ($rb.Count -gt 6) { ', ...' } else { '' }) + $nl }
+    $s += 'Apply again makes a restore point first, then sets these values the way Headroom sets them. Leave as is changes nothing.'
+    return $s
+}
+
 # ------------------------------------------------------------ the questions ----
 # Some settings ask a question before they are turned on (anti-cheat, printing). These work out what to ask for a plan.
 # One entry per question: Group, Title, Ask (the text), Ids and Names of the settings it covers (in plan order).
@@ -9378,7 +9484,7 @@ function Handle-Event {
     switch ([string]$ev.Kind) {
         'log' { Ui-Log ([string]$ev.Text) ([string]$ev.Color) }
         'state' {
-            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine)
+            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine) ([string]$ev.Diff)
             if ($script:Scanning) { Ui-Progress ([int]$ev.A) ([int]$ev.B) }
             Ui-RefreshRow ([string]$ev.Id)
         }
@@ -10123,63 +10229,74 @@ function Rgb {
 }
 
 function Ui-InitTheme {
-    # Near-black navy with one light-purple accent: the window and side menu are the darkest navy (#0f0f19), the page is a little lighter,
-    # cards lighter again. Purple (accent) is used for the selected tab, switches that are on, the main button and a change that is waiting.
+    # Neutral dark greys with one blue accent: the window and side menu are the darkest grey (#1e1e1e), the page is a little lighter (#252526),
+    # cards lighter again (#2d2d30), and the tiles and rows inside a Home card lighter still (#474749). Blue (accent, #0271f9) fills the main
+    # button, switches that are on, the selected setting's outline and the bars; text and line icons in blue use a lighter blue of the same
+    # hue (AccentText) so that small text stays easy to read on the dark greys. Green (#4caf50) is a status that is good.
     # The look is flat: a card, a page of the side menu and a panel are a fill with round corners and no outline. An outline is only drawn
-    # where it says something: the selected setting and a text box that is being typed in (purple).
+    # where it says something: the selected setting and a text box that is being typed in (blue).
     $script:Th = @{
-        Bg        = (Rgb 18 18 30)       # the page
-        Side      = (Rgb 15 15 25)       # the window frame and the side menu
-        SideHot   = (Rgb 31 31 49)       # the page of the side menu under the pointer
-        SideSel   = (Rgb 36 32 62)       # the open page of the side menu (a soft purple fill)
-        SideBox   = (Rgb 24 24 39)       # a choice in a list at rest (the preset window)
-        Panel     = (Rgb 24 24 39)       # dialogs
-        Card      = (Rgb 24 24 39)       # cards
-        CardHot   = (Rgb 29 29 46)
-        CardSel   = (Rgb 33 33 52)
-        Head      = (Rgb 24 24 39)
-        HeadHot   = (Rgb 29 29 46)
-        Raised    = (Rgb 40 40 62)       # buttons, tags
-        RaisedHot = (Rgb 52 52 78)
-        RaisedDown = (Rgb 31 31 48)
-        Border    = (Rgb 64 64 92)
-        Tag       = (Rgb 34 34 53)       # the tag pills on a card (quieter than the buttons)
-        TagText   = (Rgb 170 170 194)
-        Edge      = (Rgb 40 40 60)       # hairlines (under the app name when the menu is scrolled, the track of the progress bar)
-        Text      = (Rgb 244 244 251)
-        Sub       = (Rgb 200 200 216)
-        Mute      = (Rgb 152 152 174)    # descriptions
-        Dim       = (Rgb 106 106 128)
-        Accent    = (Rgb 183 156 255)    # light purple
-        AccentHot = (Rgb 62 51 102)
-        AccentDim = (Rgb 49 40 82)
-        AccentSoft = (Rgb 43 35 74)      # tinted chips and buttons
-        Good      = (Rgb 112 206 100)
-        GoodSoft  = (Rgb 28 52 44)
-        Warn      = (Rgb 255 160 92)
-        WarnSoft  = (Rgb 66 47 40)
-        Bad       = (Rgb 255 138 138)
-        BadSoft   = (Rgb 70 38 52)
-        TintApply = (Rgb 30 28 50)       # a card waiting to be turned on
-        TintUndo  = (Rgb 36 27 43)       # a card waiting to be turned off
-        TintApplySel = (Rgb 35 33 57)
-        TintUndoSel  = (Rgb 42 31 50)
-        Hover     = (Rgb 29 29 46)
-        Sel       = (Rgb 33 33 52)
-        Track     = (Rgb 46 46 68)       # switch, off
-        TrackEdge = (Rgb 100 100 130)    # the outline of a switch that is off
-        TrackOff  = (Rgb 28 28 44)       # switch, not available
-        KnobOff   = (Rgb 196 196 214)
-        KnobOn    = (Rgb 22 16 48)
-        KnobDim   = (Rgb 72 72 96)
-        Thumb     = (Rgb 76 76 104)
-        ThumbHot  = (Rgb 124 124 162)
-        ThumbTrack = (Rgb 27 27 42)      # the faint groove behind a scroll thumb while the pointer is on the scroll bar
-        LogBg     = (Rgb 13 13 22)
-        BtnText   = (Rgb 24 16 52)
-        GoodText  = (Rgb 118 214 106)       # the green dot of Low risk
-        WarnText  = (Rgb 255 170 90)        # the orange dot of Medium risk
-        BadText   = (Rgb 255 142 142)       # the red dot of Risky
+        Bg        = (Rgb 37 37 38)       # the page (#252526)
+        Side      = (Rgb 30 30 30)       # the window frame and the side menu (#1e1e1e)
+        SideHot   = (Rgb 42 42 45)       # the page of the side menu under the pointer
+        SideSel   = (Rgb 24 47 74)       # the open page of the side menu (a soft blue fill)
+        SideBox   = (Rgb 45 45 48)       # a choice in a list at rest (the preset window)
+        Panel     = (Rgb 45 45 48)       # dialogs
+        Card      = (Rgb 45 45 48)       # cards (#2d2d30)
+        CardHot   = (Rgb 51 51 55)
+        CardSel   = (Rgb 55 55 59)
+        Head      = (Rgb 45 45 48)
+        HeadHot   = (Rgb 51 51 55)
+        Raised    = (Rgb 62 62 66)       # buttons, tags (#3e3e42)
+        RaisedHot = (Rgb 78 78 82)
+        RaisedDown = (Rgb 54 54 58)
+        Border    = (Rgb 85 85 90)
+        Tag       = (Rgb 58 58 62)       # the tag pills on a card (quieter than the buttons)
+        TagText   = (Rgb 172 172 174)
+        Tile      = (Rgb 71 71 73)       # a tile or a row inside a Home card, the track of a meter (#474749)
+        TileHot   = (Rgb 82 82 85)       # a row or tile of a Home card under the pointer
+        Edge      = (Rgb 62 62 66)       # hairlines (under the app name when the menu is scrolled, the track of the progress bar)
+        Text      = (Rgb 234 234 235)
+        Sub       = (Rgb 189 189 190)
+        Mute      = (Rgb 158 158 159)    # descriptions
+        Dim       = (Rgb 112 112 115)
+        Accent    = (Rgb 2 113 249)      # blue (#0271f9), for fills
+        AccentText = (Rgb 77 157 255)    # the same blue a little lighter, for text and line icons
+        AccentHot = (Rgb 31 67 113)
+        AccentDim = (Rgb 39 54 76)
+        AccentSoft = (Rgb 35 60 92)      # tinted chips and buttons
+        PrimaryHot = (Rgb 35 133 255)    # the main button under the pointer
+        PrimaryDown = (Rgb 0 94 210)     # the main button while it is pressed
+        Good      = (Rgb 76 175 80)      # green (#4caf50)
+        GoodSoft  = (Rgb 51 71 54)
+        Warn      = (Rgb 255 167 38)
+        WarnSoft  = (Rgb 87 69 46)
+        Bad       = (Rgb 239 83 80)
+        BadSoft   = (Rgb 84 53 54)
+        TintApply = (Rgb 40 51 68)       # a card waiting to be turned on
+        TintUndo  = (Rgb 56 50 46)       # a card waiting to be turned off
+        TintApplySel = (Rgb 42 56 76)
+        TintUndoSel  = (Rgb 62 54 48)
+        Hover     = (Rgb 51 51 55)
+        Sel       = (Rgb 55 55 59)
+        Track     = (Rgb 71 71 73)       # switch, off
+        TrackEdge = (Rgb 128 128 132)    # the outline of a switch that is off
+        TrackOff  = (Rgb 52 52 55)       # switch, not available
+        KnobOff   = (Rgb 200 200 202)
+        KnobOn    = (Rgb 255 255 255)
+        KnobDim   = (Rgb 92 92 96)
+        Thumb     = (Rgb 85 85 88)
+        ThumbHot  = (Rgb 130 130 134)
+        ThumbTrack = (Rgb 42 42 44)      # the faint groove behind a scroll thumb while the pointer is on the scroll bar
+        LogBg     = (Rgb 30 30 30)
+        BtnText   = (Rgb 255 255 255)
+        GoodText  = (Rgb 76 175 80)         # the green dot of Low risk
+        WarnText  = (Rgb 255 167 38)        # the orange dot of Medium risk
+        BadText   = (Rgb 239 83 80)         # the red dot of Risky
+        BrandRed  = (Rgb 237 28 36)         # the maker badges on Home: AMD, MSI
+        BrandGreen = (Rgb 118 185 0)        # NVIDIA
+        BrandBlue = (Rgb 0 113 197)         # Intel
+        BrandText = (Rgb 255 255 255)
     }
 }
 
@@ -10208,7 +10325,8 @@ function Ui-InitFlags {
 
 # ----------------------------------------------------------- fonts, brushes, pens ----
 function Ui-NewFont {
-    param([string]$family, [double]$size)
+    param([string]$family, [double]$size, [string]$style = '')
+    if ($style -eq 'Bold') { return (New-Object System.Drawing.Font($family, [single]$size, [System.Drawing.FontStyle]::Bold)) }
     return (New-Object System.Drawing.Font($family, [single]$size))
 }
 
@@ -10229,6 +10347,9 @@ function Ui-Font {
         'title'    { $f = Ui-NewFont 'Segoe UI Semibold' 22 }
         'titleS'   { $f = Ui-NewFont 'Segoe UI Semibold' 16 }       # the page title when the name is too long for the big size
         'cardName' { $f = Ui-NewFont 'Segoe UI Semibold' 11.5 }
+        'badge'    { $f = Ui-NewFont 'Segoe UI' 10.5 'Bold' }        # a maker's name on its box (Home)
+        'meter'    { $f = Ui-NewFont 'Segoe UI Light' 21 }           # the big percentage of a meter (Home)
+        'tileVal'  { $f = Ui-NewFont 'Segoe UI Semibold' 11 }        # the value on a tile (Home)
         'cardId'   { $f = Ui-NewFont 'Segoe UI' 8 }
         'cardDesc' { $f = Ui-NewFont 'Segoe UI' 9.5 }
         'sub'      { $f = Ui-NewFont 'Segoe UI' 10 }
@@ -10599,7 +10720,7 @@ function Ui-ApplyBar {
 # ----------------------------------------------------------- buttons ----------------
 # Buttons are ordinary flat buttons whose Paint event draws over everything (round corners, quiet colours).
 # Ui-StyleBtn only sets the colours; Ui-PaintBtn reads them back, so there is one place that decides how a button looks.
-# kinds: primary (the purple one) | accent (tinted purple) | secondary | ghost (no background) | chip | chipon | tab | tabon (the filter tabs)
+# kinds: primary (the blue one) | accent (tinted blue) | secondary | ghost (no background) | chip | chipon | tab | tabon (the filter tabs)
 function Ui-StyleBtn {
     param($b)
     $Th = $script:Th
@@ -10609,10 +10730,10 @@ function Ui-StyleBtn {
     $bsize = 0
     $kind = $kind -replace '^big', ''           # 'bigprimary' / 'bigghost' (the welcome screen) look like 'primary' / 'ghost', only larger
     if ($kind -eq 'primary') {
-        if ($on) { $back = $Th.Accent; $fore = $Th.BtnText; $hover = (Rgb 203 184 255); $down = (Rgb 158 128 236) }
+        if ($on) { $back = $Th.Accent; $fore = $Th.BtnText; $hover = $Th.PrimaryHot; $down = $Th.PrimaryDown }
         else { $back = $Th.Raised; $fore = $Th.Dim; $hover = $back; $down = $back }
     } elseif ($kind -eq 'accent') {
-        $back = $Th.AccentSoft; $fore = $Th.Accent; $hover = $Th.AccentHot; $down = $Th.AccentDim
+        $back = $Th.AccentSoft; $fore = $Th.AccentText; $hover = $Th.AccentHot; $down = $Th.AccentDim
         if (-not $on) { $back = $Th.Card; $fore = $Th.Dim; $hover = $back; $down = $back }
     } elseif ($kind -eq 'ghost') {
         $back = $Th.Bg; $fore = $Th.Sub; $hover = $Th.Raised; $down = $Th.RaisedDown
@@ -10620,7 +10741,7 @@ function Ui-StyleBtn {
     } elseif ($kind -eq 'chip') {
         $back = $Th.Card; $fore = $Th.Sub; $hover = $Th.Raised; $down = $Th.RaisedDown
     } elseif ($kind -eq 'chipon') {
-        $back = $Th.AccentSoft; $fore = $Th.Accent; $hover = $Th.AccentSoft; $down = $Th.AccentSoft
+        $back = $Th.AccentSoft; $fore = $Th.AccentText; $hover = $Th.AccentSoft; $down = $Th.AccentSoft
     } elseif ($kind -eq 'choice' -or $kind -eq 'choiceon') {
         $back = $Th.SideBox; $fore = $Th.Mute; $hover = $Th.SideHot; $down = $Th.SideHot
         if ($kind -eq 'choiceon') { $back = $Th.SideSel; $fore = $Th.Text }
@@ -10694,7 +10815,7 @@ function Ui-PaintBtn {
         return
     }
     if ($kind -eq 'tabon') {
-        # the open tab is a filled box (no line under it): the soft purple, or a tint of the tab's own colour (the preset window's tabs)
+        # the open tab is a filled box (no line under it): the soft blue, or a tint of the tab's own colour (the preset window's tabs)
         $boxFill = $Th.AccentSoft
         if ($script:TabAccent.ContainsKey([string]$b.Name)) {
             $ta = $script:TabAccent[[string]$b.Name]
@@ -10721,8 +10842,8 @@ function Ui-PaintBtn {
         $gap = Px 7
         $x0 = [int](($w - ($lw + $gap + $cw)) / 2)
         $cc = $Th.Dim
-        if ($kind -eq 'chipon') { $cc = $Th.Accent }
-        if ($kind -eq 'tabon') { $cc = $Th.Accent }
+        if ($kind -eq 'chipon') { $cc = $Th.AccentText }
+        if ($kind -eq 'tabon') { $cc = $Th.AccentText }
         if ($isTab -and $script:TabAccent.ContainsKey([string]$b.Name)) { $cc = $script:TabAccent[[string]$b.Name] }
         Ui-Text $g $label $font $fore $x0 0 ($lw + (Px 6)) $h $TF.L
         Ui-Text $g $cnt $sf $cc ($x0 + $lw + $gap) 0 ($cw + (Px 6)) $h $TF.L
@@ -11085,9 +11206,9 @@ function Ui-FillEntry {
     $nk = 'Sub'
     if ($e.Failed) { $nk = 'Bad' }
     elseif ($note -eq 'Done') { $nk = 'Good' }
-    elseif ($note -eq 'Working...') { $nk = 'Accent' }
+    elseif ($note -eq 'Working...') { $nk = 'AccentText' }
     elseif (-not $note) {
-        if ($a -eq 'Apply') { $nk = 'Accent' } elseif ($a -eq 'Undo') { $nk = 'Warn' }
+        if ($a -eq 'Apply') { $nk = 'AccentText' } elseif ($a -eq 'Undo') { $nk = 'Warn' }
     }
     $e.NextKey = $nk
     $hk = 'Sub'
@@ -11100,7 +11221,7 @@ function Ui-FillEntry {
         # the chip says what the SWITCH will do (an -Inv setting that is applied goes off)
         $goOn = $false
         if (-not $row.T.Choices) { $goOn = [bool](Get-SwitchGoesOn $row.T ($a -eq 'Undo')) } else { $goOn = ($a -eq 'Apply') }
-        if ($goOn) { $ct = 'Will turn on'; $ck = 'Accent' } else { $ct = 'Will turn off'; $ck = 'Warn' }
+        if ($goOn) { $ct = 'Will turn on'; $ck = 'AccentText' } else { $ct = 'Will turn off'; $ck = 'Warn' }
         if ($row.T.Choices) { if ($a -eq 'Apply') { $ct = 'Will change' } else { $ct = 'Will reset' } }
         if ($row.T.Once) { $ct = 'Will run' }
         if ($row.T.Plan) { if ($a -eq 'Apply') { $ct = 'Will install' } else { $ct = 'Will delete' } }
@@ -11317,7 +11438,7 @@ function Ui-SetMode {
 }
 
 # ----------------------------------------------------------- painting ---------------
-# The switch. $w and $h default to the size used in the list. On: purple with a dark knob. Off: grey with an outline and a light knob.
+# The switch. $w and $h default to the size used in the list. On: blue with a white knob. Off: grey with an outline and a light knob.
 function Ui-DrawToggle {
     param($g, [int]$x, [int]$y, [bool]$on, [bool]$enabled, [int]$w = 0, [int]$h = 0)
     $Th = $script:Th
@@ -11356,7 +11477,7 @@ function Ui-PaintHead {
     $d = Px 4
     $d2 = Px 2
     $ac = $Th.Mute
-    if ($sel -or $hot) { $ac = $Th.Accent }
+    if ($sel -or $hot) { $ac = $Th.AccentText }
     if ($e.Open) {
         Ui-Line $g $ac 1.6 ($cx - $d) ($cy - $d2) $cx ($cy + $d2)
         Ui-Line $g $ac 1.6 $cx ($cy + $d2) ($cx + $d) ($cy - $d2)
@@ -11377,6 +11498,7 @@ function Ui-SoftKey {
     param([string]$key)
     switch ($key) {
         'Accent' { return 'AccentSoft' }
+        'AccentText' { return 'AccentSoft' }
         'Warn'   { return 'WarnSoft' }
         'Good'   { return 'GoodSoft' }
         'Bad'    { return 'BadSoft' }
@@ -11516,7 +11638,7 @@ function Ui-PaintRow {
     $cw = [int]$e.W
     $o = Ui-RowGeom $e
     $ch = $o.CardH                                        # the card is a little shorter than its line: that is the gap
-    # a flat card: a fill and no outline. Only the selected card has an outline (purple); the one under the pointer is a little lighter.
+    # a flat card: a fill and no outline. Only the selected card has an outline (blue); the one under the pointer is a little lighter.
     $fill = $Th.Card
     if ($e.Tint) { $fill = $Th[$e.Tint] }
     if ($sel) {
@@ -11527,7 +11649,7 @@ function Ui-PaintRow {
     Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
     if ($sel) { Ui-StrokeRound $g $Th.Accent 1 $x $y $cw $ch $M.Radius }
     if ($e.Tint) {
-        # a change waiting to be made: a short bar at the left edge (purple: the switch will go on, orange: it will go off)
+        # a change waiting to be made: a short bar at the left edge (blue: the switch will go on, orange: it will go off)
         $bar = $Th.Accent
         if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
         Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 14)) (Px 3) ($o.TopH - (Px 28)) (Px 1)
@@ -11676,7 +11798,7 @@ function Ui-OnPaint {
 }
 
 # ----------------------------------------------------------- the mouse ----------------
-# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | reinst | row | head | ''
+# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | reinst | row | head | info | infolink | ''
 function Ui-Zone {
     param([int]$x, [int]$y)
     $M = $script:M
@@ -11687,7 +11809,8 @@ function Ui-Zone {
     if ($i -lt 0) { return @{ Zone = ''; Entry = $null } }
     $e = $script:View[$i]
     if ($e.Kind -eq 'info') {
-        # a read-out: only a line that has an explanation can be clicked (it opens the explanation)
+        # a read-out: only a line that has an explanation can be clicked (it opens the explanation), and the link of the Windows card
+        if (Info-HitLink $e ($x - [int]$e.X) ($ly - [int]$e.Y)) { return @{ Zone = 'infolink'; Entry = $e; Line = '#link' } }
         $hl = Info-HitLine $e ($x - [int]$e.X) ($ly - [int]$e.Y)
         if ($hl) { return @{ Zone = 'info'; Entry = $e; Line = [string]$hl.Id } }
         return @{ Zone = ''; Entry = $null }
@@ -11753,7 +11876,7 @@ function Ui-UpdateHot {
     if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'infolink' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -11824,6 +11947,7 @@ function Ui-OnMouseDown {
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
     elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
+    elseif ($zone -eq 'infolink') { Ui-CopySysInfo }
     Ui-Flush
 }
 
@@ -12034,7 +12158,7 @@ function Ui-PartStyle {
             if ($p.C -eq 'good') { $c = $Th.Good } elseif ($p.C -eq 'warn') { $c = $Th.Warn }
             return @{ F = 'uib'; C = $c }
         }
-        'wait'  { return @{ F = 'uib'; C = $Th.Accent } }
+        'wait'  { return @{ F = 'uib'; C = $Th.AccentText } }
         'last'  { return @{ F = 'ui'; C = $Th.Sub } }
         'body'  { return @{ F = 'body'; C = $Th.Text } }
         'warn'  { return @{ F = 'ui'; C = $Th.Warn } }
@@ -12282,9 +12406,10 @@ function Test-MainWindowActive {
     return [bool]($af -and $script:UI.form -and [object]::ReferenceEquals($af, $script:UI.form))
 }
 
-# After a check: the settings that are only partly applied, or that this app applied earlier and that read off now, are offered for applying again (Get-ReapplyOffer says which). One question
-# lists them all. Yes ticks them and goes through the usual Apply (the questions some settings ask, the restore point, the undo
-# record); No leaves them as they are. A setting is asked about once each time the window is opened, whatever the answer was.
+# After a check: the settings that are only partly applied, or that this app applied earlier and that read off now, are offered for applying again (Get-ReapplyOffer says which). One window
+# lists them all, and each one opens to show exactly which values changed (Ui-AskReapply). Apply again ticks them and goes through the
+# usual Apply (the questions some settings ask, the restore point, the undo record); Leave as is leaves them as they are. A setting is
+# asked about once each time the window is opened, whatever the answer was.
 function Ui-OfferReapply {
     if (Get-BusyReason) { return }
     if ($script:UI.dry -and [bool]$script:UI.dry.Checked) { return }     # "Preview only" is on: a preview of this would only confuse
@@ -12299,7 +12424,7 @@ function Ui-OfferReapply {
     $tm = $script:UI.timer
     if ($tm) { try { $tm.Stop() } catch { } }
     try {
-        if (Ui-Ask (Get-ConfirmText $plan (Get-ReapplyNote $plan)) 'Finish applying these settings?' $false) {
+        if (Ui-AskReapply $plan) {
             Ui-DoApply '' 'Finish applying these settings?' $false $true
         } else {
             Reset-Ticks
@@ -12309,6 +12434,350 @@ function Ui-OfferReapply {
         }
     } finally {
         if ($tm) { try { $tm.Start() } catch { } }
+    }
+}
+
+# ------------------------------------------------------------ the window that offers to apply settings again ----
+# "Finish applying these settings?": the text at the top, then one line for each setting. A click on a setting opens it like a drop-down
+# and shows exactly what is not the way Headroom sets it (Get-ReapplyItems: each value, what kind of thing it is, where it is, what it
+# is now and what Headroom sets); a second click closes it, and "Show all changes" opens every one. Under the list: the usual warnings
+# and what the buttons do. Apply again = Yes, Leave as is = No (the one with the keyboard focus, and Esc). The window only shows what
+# the last check read; it reads and changes nothing itself.
+# $script:RA while it is open: Form, Scroll (the panel that scrolls), Body (the control the list is drawn on), Items, Intro, Foot,
+# W and H (the size of the body), Hot (the index of the setting under the pointer, -2 = the link, -1 = nothing), and the places worked
+# out by Ui-ReapplyLayout.
+$script:RA = $null
+
+# A text broken into lines no wider than $Width: between words, and inside a registry path or a file path after a backslash. A piece that
+# is still too wide alone is cut where it has to be.
+function Ra-Wrap {
+    param([string]$Text, $Font, [int]$Width)
+    $out = @()
+    $line = ''
+    foreach ($pc in [regex]::Split([string]$Text, '(?<=[\\ ])')) {
+        if (-not $pc) { continue }
+        $try = $line + $pc
+        if ($line -and (Ui-TextWidth $try.TrimEnd() $Font) -gt $Width) { $out += $line.TrimEnd(); $line = $pc } else { $line = $try }
+        while ($line.Length -gt 1 -and (Ui-TextWidth $line.TrimEnd() $Font) -gt $Width) {
+            $n = $line.Length - 1
+            while ($n -gt 1 -and (Ui-TextWidth $line.Substring(0, $n) $Font) -gt $Width) { $n-- }
+            $out += $line.Substring(0, $n)
+            $line = $line.Substring($n)
+        }
+    }
+    if ($line.TrimEnd()) { $out += $line.TrimEnd() }
+    return $out
+}
+
+# Work out where everything goes for a body $W wide; sets the items' places and the body's height ($script:RA.H)
+function Ui-ReapplyLayout {
+    param([int]$W)
+    $ra = $script:RA
+    if (-not $ra) { return }
+    $ra.W = $W
+    $pad = Px 24
+    $iw = [Math]::Max((Px 100), $W - 2 * $pad)
+    $y = Px 10
+    $ra.IntroLines = @(Info-Wrap ([string]$ra.Intro) (Ui-Font 'body') $iw)
+    $ra.IntroY = $y
+    $y += @($ra.IntroLines).Count * (Px 20) + (Px 14)
+    # the line above the list: how many there are, and the link that opens or closes them all
+    $ra.HeadY = $y
+    $lt = 'SHOW ALL CHANGES'
+    if (@($ra.Items).Count -gt 0 -and @(@($ra.Items) | Where-Object { -not $_.Open }).Count -eq 0) { $lt = 'HIDE ALL CHANGES' }
+    $ra.LinkText = $lt
+    $lw = (Ui-TextWidth $lt (Ui-Font 'smallb')) + (Px 16)
+    $ra.LinkRect = @{ X = $pad + $iw - $lw; Y = $y; W = $lw; H = Px 22 }
+    $y += Px 30
+    # each setting: its line, and under it, while it is open, one box for each value that changed
+    $bx = $pad + (Px 40)
+    $bw = [Math]::Max((Px 80), $pad + $iw - (Px 14) - $bx)
+    $tw = $bw - 2 * (Px 14)
+    foreach ($it in @($ra.Items)) {
+        $it.Y = $y
+        $h = Px 48
+        $it.Boxes = @()
+        if ($it.Open) {
+            $by = $y + $h
+            $ch = @($it.Changes)
+            if ($ch.Count -eq 0) {
+                $lines = @(Info-Wrap ('Headroom could not tell which values changed. The check found: ' + [string]$it.Detail) (Ui-Font 'small') $tw)
+                $bh = (Px 12) + $lines.Count * (Px 18) + (Px 12)
+                $it.Boxes += , @{ Kind = 'note'; Y = $by; H = $bh; Lines = $lines }
+                $by += $bh + (Px 8)
+            }
+            foreach ($c in $ch) {
+                if ([int]$c.More -gt 0) {
+                    $it.Boxes += , @{ Kind = 'more'; Y = $by; H = Px 24; Text = ('... and {0} more value(s)' -f [int]$c.More) }
+                    $by += (Px 24) + (Px 8)
+                    continue
+                }
+                $at = @()
+                if ($c.At) { $at = @(Ra-Wrap ([string]$c.At) (Ui-Font 'mono') $tw) }
+                $vw = $tw - (Px 120)
+                $nowL = @(Ra-Wrap ([string]$c.Now) (Ui-Font 'uib') $vw)
+                if ($nowL.Count -eq 0) { $nowL = @('') }
+                $wantL = @()
+                if ($c.Want) { $wantL = @(Ra-Wrap ([string]$c.Want) (Ui-Font 'uib') $vw) }
+                $bh = (Px 10) + (Px 16)
+                if ($at.Count) { $bh += (Px 4) + $at.Count * (Px 17) }
+                $bh += (Px 8) + $nowL.Count * (Px 19)
+                if ($wantL.Count) { $bh += (Px 2) + $wantL.Count * (Px 19) }
+                $bh += Px 10
+                $it.Boxes += , @{ Kind = 'value'; Y = $by; H = $bh; What = [string]$c.What; At = $at; Now = $nowL; Want = $wantL }
+                $by += $bh + (Px 8)
+            }
+            $h = $by - $y + (Px 6)
+        }
+        $it.H = $h
+        $y += $h + (Px 8)
+    }
+    $ra.BoxX = $bx
+    $ra.BoxW = $bw
+    # the text under the list, one paragraph per line of it
+    $y += Px 6
+    $ra.FootY = $y
+    $fl = @()
+    foreach ($para in @(([string]$ra.Foot) -split "`r?`n")) {
+        if (-not $para.Trim()) { continue }
+        $fl += @(Info-Wrap $para (Ui-Font 'small') $iw)
+    }
+    $ra.FootLines = $fl
+    $y += $fl.Count * (Px 18) + (Px 16)
+    $ra.H = $y
+    $b = $ra.Body
+    if ($b) { $b.Size = New-Object System.Drawing.Size($W, $y); $b.Invalidate() }
+}
+
+function Ui-PaintReapply {
+    param($g)
+    $ra = $script:RA
+    if (-not $ra) { return }
+    $Th = $script:Th
+    $TF = $script:TF
+    $W = [int]$ra.W
+    $pad = Px 24
+    $iw = $W - 2 * $pad
+    Ui-Fill $g $Th.Bg 0 0 $W ([int]$ra.H)
+    $y = [int]$ra.IntroY
+    foreach ($l in @($ra.IntroLines)) { Ui-Text $g ([string]$l) (Ui-Font 'body') $Th.Sub $pad $y $iw (Px 20) $TF.L; $y += Px 20 }
+    $n = @($ra.Items).Count
+    Ui-Text $g ('SETTINGS ({0})' -f $n) (Ui-Font 'cap') $Th.Mute $pad ([int]$ra.HeadY) ([int]($iw / 2)) (Px 22) $TF.L
+    $lr = $ra.LinkRect
+    $lc = $Th.AccentText
+    if ([int]$ra.Hot -eq -2) { $lc = $Th.Text }
+    Ui-Text $g ([string]$ra.LinkText) (Ui-Font 'smallb') $lc ([int]$lr.X) ([int]$lr.Y) ([int]$lr.W) ([int]$lr.H) $TF.R
+    $i = 0
+    foreach ($it in @($ra.Items)) {
+        $iy = [int]$it.Y
+        $fill = $Th.Card
+        if ([int]$ra.Hot -eq $i) { $fill = $Th.CardHot }
+        Ui-FillRound $g $fill $pad $iy $iw ([int]$it.H) (Px 10)
+        # the arrow: right while closed, down while open
+        $ax = $pad + (Px 20)
+        $ay = $iy + (Px 24)
+        $d4 = Px 4; $d2 = Px 2
+        $ac = $Th.Mute
+        if ($it.Open -or [int]$ra.Hot -eq $i) { $ac = $Th.AccentText }
+        if ($it.Open) { Ui-Line $g $ac 1.6 ($ax - $d4) ($ay - $d2) $ax ($ay + $d2); Ui-Line $g $ac 1.6 $ax ($ay + $d2) ($ax + $d4) ($ay - $d2) }
+        else { Ui-Line $g $ac 1.6 ($ax - $d2) ($ay - $d4) ($ax + $d2) $ay; Ui-Line $g $ac 1.6 ($ax + $d2) $ay ($ax - $d2) ($ay + $d4) }
+        # at the right: how many values changed, and a tag that says which kind it is
+        $tag = 'Changed back'
+        if ([string]$it.Kind -eq 'partial') { $tag = 'Partly applied' }
+        $tagF = Ui-Font 'smallb'
+        $tagW = (Ui-Measure $g $tag $tagF) + (Px 20)
+        $tx = $pad + $iw - (Px 14) - $tagW
+        Ui-FillRound $g $Th.WarnSoft $tx ($iy + (Px 13)) $tagW (Px 22) (Px 6)
+        Ui-Text $g $tag $tagF $Th.Warn $tx ($iy + (Px 13)) $tagW (Px 22) $TF.C
+        $cnt = 0
+        foreach ($c in @($it.Changes)) { if ([int]$c.More -gt 0) { $cnt += [int]$c.More } else { $cnt++ } }
+        $ct = ''
+        if ($cnt -eq 1) { $ct = '1 value' } elseif ($cnt -gt 1) { $ct = ('{0} values' -f $cnt) }
+        $cw = 0
+        if ($ct) {
+            $cw = (Ui-Measure $g $ct (Ui-Font 'small')) + (Px 6)
+            Ui-Text $g $ct (Ui-Font 'small') $Th.Mute ($tx - (Px 10) - $cw) $iy $cw (Px 48) $TF.R
+            $cw += Px 10
+        }
+        $nx = $pad + (Px 40)
+        Ui-Text $g ([string]$it.Name) (Ui-Font 'rowName') $Th.Text $nx $iy ([Math]::Max(0, $tx - $cw - (Px 12) - $nx)) (Px 48) $TF.L
+        # the values, while it is open
+        $bx = [int]$ra.BoxX
+        $bw = [int]$ra.BoxW
+        $px = $bx + (Px 14)
+        $pw = $bw - 2 * (Px 14)
+        foreach ($b in @($it.Boxes)) {
+            $by = [int]$b.Y
+            if ([string]$b.Kind -eq 'more') {
+                Ui-Text $g ([string]$b.Text) (Ui-Font 'small') $Th.Mute $px $by $pw ([int]$b.H) $TF.L
+                continue
+            }
+            Ui-FillRound $g $Th.Tile $bx $by $bw ([int]$b.H) (Px 8)
+            $ty = $by + (Px 10)
+            if ([string]$b.Kind -eq 'note') {
+                $ty += Px 2
+                foreach ($l in @($b.Lines)) { Ui-Text $g ([string]$l) (Ui-Font 'small') $Th.Sub $px $ty $pw (Px 18) $TF.L; $ty += Px 18 }
+                continue
+            }
+            Ui-Text $g ([string]$b.What).ToUpperInvariant() (Ui-Font 'cap') $Th.Sub $px $ty $pw (Px 16) $TF.L
+            $ty += Px 16
+            if (@($b.At).Count) {
+                $ty += Px 4
+                foreach ($l in @($b.At)) { Ui-Text $g ([string]$l) (Ui-Font 'mono') $Th.Text $px $ty $pw (Px 17) $TF.L; $ty += Px 17 }
+            }
+            $ty += Px 8
+            $vx = $px + (Px 120)
+            $vw = $pw - (Px 120)
+            Ui-Text $g 'Now' (Ui-Font 'small') $Th.Mute $px $ty (Px 114) (Px 19) $TF.L
+            foreach ($l in @($b.Now)) { Ui-Text $g ([string]$l) (Ui-Font 'uib') $Th.Warn $vx $ty $vw (Px 19) $TF.L; $ty += Px 19 }
+            if (@($b.Want).Count) {
+                $ty += Px 2
+                Ui-Text $g 'Headroom sets' (Ui-Font 'small') $Th.Mute $px $ty (Px 114) (Px 19) $TF.L
+                foreach ($l in @($b.Want)) { Ui-Text $g ([string]$l) (Ui-Font 'uib') $Th.Good $vx $ty $vw (Px 19) $TF.L; $ty += Px 19 }
+            }
+        }
+        $i++
+    }
+    $fy = [int]$ra.FootY
+    foreach ($l in @($ra.FootLines)) { Ui-Text $g ([string]$l) (Ui-Font 'small') $Th.Mute $pad $fy $iw (Px 18) $TF.L; $fy += Px 18 }
+}
+
+# What is at (x, y) of the body: -2 = the link, the index of a setting whose line it is, -1 = nothing (a value box opens nothing)
+function Ui-ReapplyHit {
+    param([int]$x, [int]$y)
+    $ra = $script:RA
+    if (-not $ra) { return -1 }
+    $lr = $ra.LinkRect
+    if ($lr -and $x -ge [int]$lr.X -and $x -lt ([int]$lr.X + [int]$lr.W) -and $y -ge [int]$lr.Y -and $y -lt ([int]$lr.Y + [int]$lr.H)) { return -2 }
+    $pad = Px 24
+    if ($x -lt $pad -or $x -ge ([int]$ra.W - $pad)) { return -1 }
+    $i = 0
+    foreach ($it in @($ra.Items)) {
+        if ($y -ge [int]$it.Y -and $y -lt ([int]$it.Y + (Px 48))) { return $i }
+        $i++
+    }
+    return -1
+}
+function Ui-ReapplyClick {
+    param([int]$x, [int]$y)
+    $ra = $script:RA
+    if (-not $ra) { return }
+    $hit = Ui-ReapplyHit $x $y
+    if ($hit -eq -2) {
+        $open = (@(@($ra.Items) | Where-Object { -not $_.Open }).Count -gt 0)
+        foreach ($it in @($ra.Items)) { $it.Open = $open }
+    } elseif ($hit -ge 0) {
+        $it = @($ra.Items)[$hit]
+        $it.Open = -not [bool]$it.Open
+    } else { return }
+    Ui-ReapplyLayout ([int]$ra.W)
+}
+function Ui-ReapplyHover {
+    param([int]$x, [int]$y)
+    $ra = $script:RA
+    if (-not $ra) { return }
+    $hit = Ui-ReapplyHit $x $y
+    if ($hit -eq [int]$ra.Hot) { return }
+    $ra.Hot = $hit
+    $b = $ra.Body
+    if ($b) {
+        if ($hit -ne -1) { $b.Cursor = [System.Windows.Forms.Cursors]::Hand } else { $b.Cursor = [System.Windows.Forms.Cursors]::Default }
+        $b.Invalidate()
+    }
+}
+
+function Ui-BuildReapplyWindow {
+    param($Plan)
+    $Th = $script:Th
+    $items = @(Get-ReapplyItems $Plan)
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Finish applying these settings?'
+    $f.Font = (Ui-Font 'ui')
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $f.MaximizeBox = $false
+    $f.MinimizeBox = $false
+    $f.ShowInTaskbar = $false
+    $f.BackColor = $Th.Bg
+    $wa = Ui-WorkArea
+    $w = [Math]::Min((Px 780), ([int]$wa.Width - (Px 40)))
+    $h = [Math]::Min((Px 660), ([int]$wa.Height - (Px 90)))
+    $f.ClientSize = New-Object System.Drawing.Size($w, $h)
+    $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 560), $w), [Math]::Min((Px 380), $h))
+    $strip = New-Object System.Windows.Forms.Panel
+    $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+    $strip.Height = (Px 3)
+    $strip.BackColor = $Th.Accent
+    $head = New-Object System.Windows.Forms.Label
+    $head.Dock = [System.Windows.Forms.DockStyle]::Top
+    $head.Height = (Px 54)
+    $head.Text = 'Finish applying these settings?'
+    $head.Font = (Ui-Font 'detTitle')
+    $head.ForeColor = $Th.Text
+    $head.BackColor = $Th.Bg
+    $head.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $head.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 4), (Px 24), 0)
+    $bar = New-Pnl 'Bottom' (Px 64) $Th.Bg
+    $no = New-Btn 'Leave as is' 120 'secondary' 'Change nothing. You are not asked about these settings again until Headroom is opened again.' 36
+    $yes = New-Btn 'Apply again' 120 'primary' 'Set these values the way Headroom sets them (a restore point is made first).' 36
+    $no.DialogResult = [System.Windows.Forms.DialogResult]::No
+    $yes.DialogResult = [System.Windows.Forms.DialogResult]::Yes
+    Ui-ReapplyPlaceButtons $yes $no $w
+    $bar.Add_Resize({ param($s, $e) try { $ra = $script:RA; if ($ra) { Ui-ReapplyPlaceButtons $ra.Yes $ra.No ([int]$s.Width) } } catch { Ui-Fail $_ } })
+    $bar.Controls.Add($yes)
+    $bar.Controls.Add($no)
+    $scroll = New-Object System.Windows.Forms.Panel
+    $scroll.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $scroll.AutoScroll = $true
+    $scroll.BackColor = $Th.Bg
+    $body = New-Object System.Windows.Forms.Control
+    $body.BackColor = $Th.Bg
+    $body.Location = New-Object System.Drawing.Point(0, 0)
+    Ui-DoubleBuffer $body
+    $body.Add_Paint({ param($s, $e) try { $e.Graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias; Ui-PaintReapply $e.Graphics } catch { Ui-Fail $_ } })
+    $body.Add_MouseDown({ param($s, $e) try { if ([string]$e.Button -eq 'Left') { Ui-ReapplyClick ([int]$e.X) ([int]$e.Y) } } catch { Ui-Fail $_ } })
+    $body.Add_MouseMove({ param($s, $e) try { Ui-ReapplyHover ([int]$e.X) ([int]$e.Y) } catch { Ui-Fail $_ } })
+    $body.Add_MouseLeave({ param($s, $e) try { Ui-ReapplyHover -1 -1 } catch { Ui-Fail $_ } })
+    $scroll.Controls.Add($body)
+    # the one added first fills what is left; each one added later is laid out before it
+    $f.Controls.Add($scroll)
+    $f.Controls.Add($bar)
+    $f.Controls.Add($head)
+    $f.Controls.Add($strip)
+    $f.CancelButton = $no
+    $f.ActiveControl = $no
+    $script:RA = @{ Form = $f; Scroll = $scroll; Body = $body; Yes = $yes; No = $no; Items = $items; Intro = (Get-ReapplyIntro $items); Foot = (Get-ReapplyFoot $Plan)
+                    W = 0; H = 0; Hot = -1; IntroLines = @(); IntroY = 0; HeadY = 0; LinkText = ''; LinkRect = $null; BoxX = 0; BoxW = 0; FootY = 0; FootLines = @() }
+    # the body is a little narrower than the panel, so that the panel's own scroll bar never covers it
+    Ui-ReapplyLayout ([Math]::Max((Px 420), $w - (Px 20)))
+    $scroll.Add_Resize({ param($s, $e) try { $cw = [int]$s.ClientSize.Width; if ($cw -gt 0) { Ui-ReapplyLayout ([Math]::Max((Px 420), $cw - (Px 20))) } } catch { Ui-Fail $_ } })
+    $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+    $scroll.Add_HandleCreated({ param($s, $e) try { Ui-DarkScroll $s } catch { } })
+    return $f
+}
+
+# The two buttons at the right end of the bar ($w = the bar's width): Leave as is at the edge, Apply again before it
+function Ui-ReapplyPlaceButtons {
+    param($yes, $no, [int]$w)
+    if (-not $yes -or -not $no -or $w -le 0) { return }
+    $no.Location = New-Object System.Drawing.Point(($w - (Px 24) - [int]$no.Width), (Px 14))
+    $yes.Location = New-Object System.Drawing.Point(([int]$no.Left - (Px 10) - [int]$yes.Width), (Px 14))
+}
+
+# Asks with that window; $true = Apply again. If the window cannot be built, the plain question with the same list is asked instead.
+function Ui-AskReapply {
+    param($Plan)
+    $f = $null
+    try { $f = Ui-BuildReapplyWindow $Plan } catch { $f = $null; $script:RA = $null }
+    if (-not $f) { return (Ui-Ask (Get-ConfirmText $Plan (Get-ReapplyNote $Plan)) 'Finish applying these settings?' $false) }
+    try {
+        $owner = $script:UI.form
+        if ($owner) { $ans = $f.ShowDialog($owner) } else { $ans = $f.ShowDialog() }
+        return ($ans -eq [System.Windows.Forms.DialogResult]::Yes)
+    } finally {
+        try { $f.Dispose() } catch { }
+        $script:RA = $null
     }
 }
 
@@ -12680,7 +13149,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '118'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '119'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -12805,7 +13274,7 @@ function Ui-OnNavResize {
 }
 
 # ----------------------------------------------------------- painting ---------------
-# The Headroom mark: a light purple rounded square holding a tall meter that is only part full, with a chevron pointing at the free space
+# The Headroom mark: a blue rounded square holding a tall meter that is only part full, with a chevron pointing at the free space
 # above the fill (that free space is the headroom). $x, $y, $s = the top-left corner of the square and its size.
 # The meter is laid out on a grid of 120 units that is 74% as tall as the square; its outline is 55 x 103 units wide and tall.
 # At small sizes the outline, the gap and the chevron keep a minimum thickness so that they stay clear.
@@ -12889,6 +13358,13 @@ $script:NavIcons = @{
     'Security'            = @(@('c', 12, 3, 20, 6, 20, 12, 12, 21, 4, 12, 4, 6), @('d', 12, 11, 1.5), @('p', 12, 12, 12, 15.5))
     'Mouse'               = @(@('r', 6, 2.5, 12, 19, 6), @('p', 12, 6, 12, 9.5), @('p', 6, 10.5, 18, 10.5))
     'Sensors'             = @(@('r', 9.5, 3, 5, 13, 2.5), @('o', 7.5, 13, 9, 9), @('p', 12, 8, 12, 16))
+    # the tiles of the Home cards, and the link that copies the system information
+    'power'               = @(, @('c', 13, 2.5, 4.5, 13.5, 11, 13.5, 10, 21.5, 19.5, 10, 13, 10))
+    'temp'                = @(@('r', 9.5, 2.5, 5, 13, 2.5), @('o', 7.5, 13, 9, 9), @('d', 12, 17.5, 2), @('p', 12, 9, 12, 16))
+    'gauge'               = @(@('a', 12, 15, 9, 180, 180), @('p', 12, 15, 16.5, 9.5), @('d', 12, 15, 1.4), @('p', 3, 15, 5, 15), @('p', 19, 15, 21, 15))
+    'down'                = @(@('p', 12, 4, 12, 15), @('p', 7.5, 10.5, 12, 15, 16.5, 10.5), @('p', 5, 20, 19, 20))
+    'box'                 = @(@('c', 12, 3, 20, 7.5, 20, 16.5, 12, 21, 4, 16.5, 4, 7.5), @('p', 4, 7.5, 12, 12, 20, 7.5), @('p', 12, 12, 12, 21))
+    'copy'                = @(@('r', 8, 8, 12, 12, 2), @('p', 15.5, 4, 6, 4, 4, 6, 4, 15.5))
 }
 # the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
 function Get-IconPts {
@@ -12956,14 +13432,14 @@ function Ui-PaintNav {
         $sel = ([string]$e.Cat -eq $curCat)
         $hot = ($script:NavHot -eq $e.Key)
         $ih = $e.H - $M.NavGap
-        # a flat list: a page at rest is only its icon, name and count. The open page has a soft purple fill, the one under the pointer a
+        # a flat list: a page at rest is only its icon, name and count. The open page has a soft blue fill, the one under the pointer a
         # lighter fill. Nothing has an outline.
         if ($sel) { Ui-FillRound $g $Th.SideSel $ix $e.Y $iw $ih (Px 12) }
         elseif ($hot) { Ui-FillRound $g $Th.SideHot $ix $e.Y $iw $ih (Px 12) }
         $col = $Th.Mute
         $icol = $Th.Dim
         $font = Ui-Font 'nav'
-        if ($sel) { $col = $Th.Text; $icol = $Th.Accent; $font = Ui-Font 'navb' } elseif ($hot) { $col = $Th.Text; $icol = $Th.Sub }
+        if ($sel) { $col = $Th.Text; $icol = $Th.AccentText; $font = Ui-Font 'navb' } elseif ($hot) { $col = $Th.Text; $icol = $Th.Sub }
         # the icon, then the name; a fixed column for the count at the right edge, the name gets what is left
         $isz = [int][Math]::Min((Px 18), [Math]::Max((Px 12), $ih - (Px 6)))
         $ixx = $ix + (Px 12)
@@ -12973,14 +13449,14 @@ function Ui-PaintNav {
         $limit = $right
         $pw = 0
         if ($e.CountText) {
-            # the count is a plain number at the right edge (purple for the open page)
+            # the count is a plain number at the right edge (blue for the open page)
             $cf = Ui-Font 'small'
             $pw = (Ui-Measure $g ([string]$e.CountText) $cf) + (Px 12)
             $ph = Px 20
             $pxx = $right - $pw
             $pyy = $e.Y + [int](($ih - $ph) / 2)
             $pcol = $Th.Dim
-            if ($sel) { $pcol = $Th.Accent }
+            if ($sel) { $pcol = $Th.AccentText }
             Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.R
             $limit = $pxx - (Px 6)
         }
@@ -13257,7 +13733,7 @@ function Ui-StyleDry {
     $d = $script:UI.dry
     if (-not $d) { return }
     $d.BackColor = $script:Th.Card
-    if ($d.Checked) { $d.ForeColor = $script:Th.Accent } else { $d.ForeColor = $script:Th.Sub }
+    if ($d.Checked) { $d.ForeColor = $script:Th.AccentText } else { $d.ForeColor = $script:Th.Sub }
     $d.Invalidate()
 }
 
@@ -13737,16 +14213,90 @@ function Info-NvDriver {
 }
 
 # ----------------------------------------------------------- building cards ----
+# How a card looks (all set by the card's builder; nothing here reads the PC):
+#   Look     'list' (a head, then a meter, tiles and rows) or 'grid' (a section: a small title in capitals, then tiles and rows)
+#   Caps     the small title in capitals above the name ('' = the Title)
+#   Icon     the icon in the box at the left of the head; Badge = @{ T; C } a maker's name on a box in its colour instead of the icon
+#   Sub2     a quieter line under the name
+#   Link     a link at the right of the head ("Copy system info")
+#   Meter    @{ L; Line } a big percentage with a bar (from a line that has a Bar)
+#   Tiles    the small boxes in a grid: @{ L; V; N; K; Icon; Line; Bar } (N = a small note under the value; Line = the line it shows, $null for one
+#            that is not a line); TileMin = the narrowest a tile may be (unscaled pixels)
+# Every line is still in Lines (in its order); a line's Show says where it is drawn: row (the default), tile, meter or head (in the head's text).
 function Info-Card {
     param([string]$Key, [string]$Title, [string]$Sub = '', $Lines = @(), [string]$Note = '', [string]$Chip = '', [string]$ChipKey = 'Sub', [int]$Span = 1)
     return @{ Kind = 'info'; Key = $Key; Id = $Key; Cat = ''; Title = $Title; Sub = $Sub; Lines = @($Lines); Note = $Note; NoteLines = @(); Chip = $Chip; ChipKey = $ChipKey
-              Span = $Span; Top = 0; X = 0; W = 0; Y = 0; H = 0; Idx = 0 }
+              Span = $Span; Top = 0; X = 0; W = 0; Y = 0; H = 0; Idx = 0
+              Look = 'list'; Caps = ''; Icon = ''; Badge = $null; Sub2 = ''; Link = ''; Meter = $null; Tiles = @(); TileMin = 150; BoxW = 0; LinkRect = $null }
 }
 function Info-Line {
     param([string]$L, [string]$V, [string]$K = 'Text', $Bar = $null)
-    return @{ L = $L; V = $V; K = $K; Bar = $Bar }
+    return @{ L = $L; V = $V; K = $K; Bar = $Bar; Show = 'row' }
 }
 function Info-Reading { return (Info-Line 'Status' 'Reading your PC...' 'Dim') }
+
+# the first line of a card with this label, or $null
+function Info-LineOf {
+    param($e, [string]$Label)
+    foreach ($l in @($e.Lines)) { if ([string]$l.L -eq $Label) { return $l } }
+    return $null
+}
+# "5,170 MHz   (base 4,700)" -> "5,170 MHz" and "base 4,700": a value up to its first three spaces, and the rest without its brackets
+function Info-SplitV {
+    param([string]$V)
+    $i = $V.IndexOf('   ', [System.StringComparison]::Ordinal)
+    if ($i -lt 0) { return @($V.Trim(), '') }
+    $a = $V.Substring(0, $i).Trim()
+    $b = $V.Substring($i).Trim()
+    if ($b.Length -ge 2 -and $b.StartsWith('(') -and $b.EndsWith(')')) { $b = $b.Substring(1, $b.Length - 2).Trim() }
+    return @($a, $b)
+}
+# Show a line as a tile (with a shorter label or another value for the tile when given). A line that is not there adds nothing.
+function Info-Tile {
+    param($e, $l, [string]$Icon = '', [string]$Label = '', [string]$Value = '')
+    if (-not $l) { return }
+    $sv = Info-SplitV ([string]$l.V)
+    $t = @{ L = [string]$l.L; V = [string]$sv[0]; N = [string]$sv[1]; K = [string]$l.K; Icon = $Icon; Line = $l; Bar = $null; X = 0; Y = 0; W = 0; H = 0; VLines = @(); VFont = 'tileVal'; VH = 0 }
+    if ($Label) { $t.L = $Label }
+    if ($Value) { $t.V = $Value; $t.N = '' }
+    $l.Show = 'tile'
+    $e.Tiles = @($e.Tiles) + @($t)
+}
+# A tile that is not one of the lines (the memory card's In use and Available)
+function Info-TileNew {
+    param($e, [string]$L, [string]$V, [string]$K = 'Text', [string]$Icon = '')
+    $t = @{ L = $L; V = $V; N = ''; K = $K; Icon = $Icon; Line = $null; Bar = $null; X = 0; Y = 0; W = 0; H = 0; VLines = @(); VFont = 'tileVal'; VH = 0 }
+    $e.Tiles = @($e.Tiles) + @($t)
+}
+# Show a line as the card's meter: the line's percentage big at the right, a bar under it (a line without a percentage shows its text)
+function Info-MeterOf {
+    param($e, $l, [string]$Label = '')
+    if (-not $l) { return }
+    $lab = [string]$l.L
+    if ($Label) { $lab = $Label }
+    $e.Meter = @{ L = $lab; Line = $l; Top = 0 }
+    $l.Show = 'meter'
+}
+# A line that the head already says (in the name or the line under it)
+function Info-Hide {
+    param($l)
+    if ($l) { $l.Show = 'head' }
+}
+# The maker's name on a box in its colour, for the head of the processor, graphics card and motherboard cards; $null for a maker this app
+# has no box for (the card then shows its icon)
+function Info-Brand {
+    param([string]$Text)
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $null }
+    if ($t -match '(?i)\bNVIDIA\b|GeForce') { return @{ T = 'NVIDIA'; C = 'BrandGreen' } }
+    if ($t -match '(?i)\bAMD\b|Advanced Micro Devices|\bRadeon\b|\bRyzen\b') { return @{ T = 'AMD'; C = 'BrandRed' } }
+    if ($t -match '(?i)\bIntel\b') { return @{ T = 'Intel'; C = 'BrandBlue' } }
+    if ($t -match '(?i)Micro-Star|^MSI\b') { return @{ T = 'MSI'; C = 'BrandRed' } }
+    if ($t -match '(?i)\bASUS') { return @{ T = 'ASUS'; C = 'Tile' } }
+    if ($t -match '(?i)Gigabyte') { return @{ T = 'GIGABYTE'; C = 'Tile' } }
+    if ($t -match '(?i)ASRock') { return @{ T = 'ASRock'; C = 'Tile' } }
+    return $null
+}
 
 # what the background reader has so far
 function Info-Data {
@@ -13755,7 +14305,7 @@ function Info-Data {
     if ($s) { $d.Static = $s.Static; $d.Live = $s.Live; $d.Clock = $s.Clock; $d.Sec = $s.Sec }
     return $d
 }
-# a temperature as a line: green is not used, only a warning when it is hot
+# a temperature as a line: never green, only a warning when it is hot
 function Info-TempLine {
     param([string]$Label, $T, [string]$Missing)
     if ($null -eq $T) { return (Info-Line $Label $Missing 'Dim') }
@@ -13925,7 +14475,7 @@ function Info-SecureBootLine {
     }
     return (Info-Line 'Secure Boot' 'could not be read' 'Dim')
 }
-# Fast startup on the Windows card: green when it is off (Shut down then starts Windows and its drivers fresh), plain when it is on
+# Fast startup on the Windows card: a green dot when it is off (Shut down then starts Windows and its drivers fresh), plain when it is on
 function Info-FastStartupLine {
     param($lv)
     if (-not $lv -or -not $lv.FastStart) { return (Info-Line 'Fast startup' 'Reading...' 'Dim') }
@@ -13951,8 +14501,8 @@ function Info-IommuLine {
 }
 
 # ----------------------------------------------------------- the mouse card (read only) ----
-# The three Windows settings that change how the pointer follows the mouse. A line is green when it is set the way that is best for games;
-# otherwise it is in the plain colour (each only matters where Windows moves the pointer: the desktop and games without raw input).
+# The three Windows settings that change how the pointer follows the mouse. A line has a green dot when it is set the way that is best for
+# games; otherwise it has none (each only matters where Windows moves the pointer: the desktop and games without raw input).
 function Info-MouseCard {
     param($d)
     $lv = $d.Live
@@ -14016,11 +14566,11 @@ $script:InfoHelp = @{
                D = 'On, as long as hibernation is on (it is on most PCs).' }
     iommu = @{ T = 'The IOMMU (AMD-Vi on AMD, VT-d on Intel) lets Windows control which memory a device may reach. Windows uses it for Kernel DMA Protection, and Riot Vanguard needs it on. The firmware tells Windows about it in an ACPI table (IVRS on AMD, DMAR on Intel), and this line looks for that table: without one Windows has no IOMMU to use, which usually means it is off in the BIOS. "DMA protection available" is what Windows reports when it can use the IOMMU to protect memory.'
                D = 'Not a Windows setting: it is set in the BIOS (AMD: IOMMU or AMD-Vi; Intel: VT-d). When it is on, Windows turns on Kernel DMA Protection by itself on PCs that support it.' }
-    mprec = @{ T = 'Enhance pointer precision, in the mouse settings of Windows (Additional mouse settings > Pointer Options). When it is on, the pointer goes further the faster you move the mouse, so the same hand movement does not always cover the same distance. Games that read the mouse directly (raw input, as most current shooters do) are not affected; the desktop and games that use the Windows pointer are. Headroom''s Mouse acceleration setting on the Gaming page turns it off. Green: off.'
+    mprec = @{ T = 'Enhance pointer precision, in the mouse settings of Windows (Additional mouse settings > Pointer Options). When it is on, the pointer goes further the faster you move the mouse, so the same hand movement does not always cover the same distance. Games that read the mouse directly (raw input, as most current shooters do) are not affected; the desktop and games that use the Windows pointer are. Headroom''s Mouse acceleration setting on the Gaming page turns it off. A green dot: off.'
                D = 'On.' }
-    mspeed = @{ T = 'The pointer speed, the slider in the mouse settings of Windows. 10 of 20, the middle notch, moves the pointer one pixel for each count the mouse sends; other values scale the movement up or down. Like pointer precision it only matters on the desktop and in games that use the Windows pointer: set your sensitivity in the game and the DPI in the mouse''s own software. Green: 10.'
+    mspeed = @{ T = 'The pointer speed, the slider in the mouse settings of Windows. 10 of 20, the middle notch, moves the pointer one pixel for each count the mouse sends; other values scale the movement up or down. Like pointer precision it only matters on the desktop and in games that use the Windows pointer: set your sensitivity in the game and the DPI in the mouse''s own software. A green dot: 10.'
                D = '10 of 20, the middle notch.' }
-    usbss = @{ T = 'USB selective suspend, a setting of the power plan in use (here: while plugged in). When it is on, Windows can put a USB device that is idle into a low-power state. A mouse that is being moved is not suspended, so this mostly matters for devices that are slow to wake after a pause. Headroom''s USB power saving setting and its Ultimate Performance plan turn it off. Green: off.'
+    usbss = @{ T = 'USB selective suspend, a setting of the power plan in use (here: while plugged in). When it is on, Windows can put a USB device that is idle into a low-power state. A mouse that is being moved is not suspended, so this mostly matters for devices that are slow to wake after a pause. Headroom''s USB power saving setting and its Ultimate Performance plan turn it off. A green dot: off.'
                D = 'On, in the power plans that come with Windows.' }
 }
 # Give a line its explanation (by Id) and return it
@@ -14034,10 +14584,21 @@ function Info-Help {
     return $l
 }
 
+# The Windows card: the whole width at the top of Home, like a title bar for the page. Its name says the version, the line under it the build;
+# the other facts are tiles, and "Copy system info" at the right puts every card of Home on the clipboard as text.
+function Info-OsShape {
+    param($e)
+    $e.Span = 2
+    $e.Caps = 'Operating system'
+    $e.Icon = 'Windows'
+    $e.Link = 'Copy system info'
+    $e.TileMin = 128
+    return $e
+}
 function Info-OsCard {
     param($d)
     $o = $null; if ($d.Static) { $o = $d.Static.Os }
-    if (-not $o) { return (Info-Card 'info:os' 'Windows' '' @((Info-Reading))) }
+    if (-not $o) { return (Info-OsShape (Info-Card 'info:os' 'Windows' '' @((Info-Reading)))) }
     $lv = $d.Live
     $sub = [string]$o.Name
     if ($o.Display) { $sub += ' ' + [string]$o.Display }
@@ -14056,7 +14617,17 @@ function Info-OsCard {
     $lines += , (Info-Help (Info-FastStartupLine $lv) 'fstart')
     if ($lv -and $null -ne $lv.Procs) { $lines += , (Info-Line 'Processes' (Fmt-N $lv.Procs 0)) } else { $lines += , (Info-Line 'Processes' 'Reading...' 'Dim') }
     if ($lv -and $null -ne $lv.Threads) { $lines += , (Info-Line 'Threads' (Fmt-N $lv.Threads 0)) }
-    return (Info-Card 'info:os' 'Windows' $sub $lines)
+    $e = Info-OsShape (Info-Card 'info:os' 'Windows' $sub $lines)
+    $s2 = @()
+    if ($o.Full) { $s2 += ('Build ' + [string]$o.Full) }
+    if ($o.Arch) { $s2 += [string]$o.Arch }
+    $e.Sub2 = ($s2 -join ', ')
+    # the version is in the name and the build in the line under it; when Windows did not give one, it stays a tile ("-")
+    if ($o.Display) { Info-Hide (Info-LineOf $e 'Version') } else { Info-Tile $e (Info-LineOf $e 'Version') }
+    if ($o.Full) { Info-Hide (Info-LineOf $e 'OS build') } else { Info-Tile $e (Info-LineOf $e 'OS build') }
+    Info-Hide (Info-LineOf $e 'Architecture')
+    foreach ($n in 'Edition', 'Installed', 'Running for', 'Fast startup', 'Processes', 'Threads') { Info-Tile $e (Info-LineOf $e $n) }
+    return $e
 }
 
 # The timer and the clocks (read only): a card of its own under the Windows card. Its name says the two things most people look for, the tick
@@ -14100,7 +14671,13 @@ function Info-SecCard {
     }
     if ($sec -and $sec.Iommu -and $sec.Iommu.Read) { if ([string]$sec.Iommu.Kind) { $parts += 'IOMMU on' } else { $parts += 'IOMMU off' } }
     if ($sec -and $sec.Sb -and $sec.Sb.Read) { if ([string]$sec.Sb.State -eq 'on') { $parts += 'Secure Boot on' } else { $parts += 'Secure Boot off' } }
-    return (Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines)
+    # a section the whole width wide: one tile for each, a click on a tile opens its explanation under the tiles
+    $e = Info-Card 'info:sec' 'Security' ($parts -join ', ') $lines '' '' 'Sub' 2
+    $e.Look = 'grid'
+    $e.Caps = 'Platform security'
+    $e.TileMin = 180
+    foreach ($l in $lines) { Info-Tile $e $l }
+    return $e
 }
 
 function Info-CpuCard {
@@ -14124,12 +14701,22 @@ function Info-CpuCard {
     if ($c.L3MB -gt 0) { $lines += , (Info-Line 'L3 cache' ((Fmt-N $c.L3MB 0) + ' MB')) }
     $chip = ''; $ck = 'Sub'
     if ($sn -and $sn.Source) { $chip = 'Sensors: ' + [string]$sn.Source; $ck = 'Good' }
-    return (Info-Card 'info:cpu' 'Processor' ([string]$c.Name) $lines '' $chip $ck)
+    $e = Info-Card 'info:cpu' 'Processor' ([string]$c.Name) $lines '' $chip $ck
+    $e.Badge = Info-Brand ([string]$c.Vendor)
+    if (-not $e.Badge) { $e.Badge = Info-Brand ([string]$c.Name) }
+    if ($c.Cores -gt 0) { $e.Sub2 = ('{0} cores / {1} threads' -f $c.Cores, $c.Threads); Info-Hide (Info-LineOf $e 'Cores') }
+    Info-MeterOf $e (Info-LineOf $e 'Usage') 'Load'
+    $e.TileMin = 96
+    Info-Tile $e (Info-LineOf $e 'Power') 'power'
+    Info-Tile $e (Info-LineOf $e 'Temperature') 'temp'
+    Info-Tile $e (Info-LineOf $e 'Clock speed') 'gauge' 'Clock'
+    Info-Tile $e (Info-LineOf $e 'L3 cache') 'Processor'
+    return $e
 }
 
 # "Gen 5 x16": the PCIe link between the card and the CPU as it is right now. A card slows its link down when it is idle, so a lower
 # generation than the top one is normal at rest and is only shown; a link that is narrower than the card supports (x8 for an x16 card) is
-# flagged, and a link at the top is green.
+# flagged, and a link at the top has a green dot.
 function Info-PcieLine {
     param($lv, $x, [bool]$nv)
     if (-not $lv) { return (Info-Line 'PCIe link' 'Reading...' 'Dim') }
@@ -14206,7 +14793,30 @@ function Info-GpuCard {
     $chip = ''; $ck = 'Sub'
     if ($nv) { $chip = 'Sensors: nvidia-smi'; $ck = 'Good' }
     elseif ($lv) { $chip = 'Windows counters only'; $ck = 'Dim' }
-    return (Info-Card 'info:gpu' 'Graphics card' $name $lines '' $chip $ck)
+    $e = Info-Card 'info:gpu' 'Graphics card' $name $lines '' $chip $ck
+    $e.Badge = Info-Brand ([string]$g.Vendor)
+    if (-not $e.Badge) { $e.Badge = Info-Brand $name }
+    if ($drv) { $e.Sub2 = 'Driver ' + $drv; Info-Hide (Info-LineOf $e 'Driver') }
+    Info-MeterOf $e (Info-LineOf $e 'Usage') 'Load'
+    $e.TileMin = 96
+    Info-Tile $e (Info-LineOf $e 'Power') 'power'
+    Info-Tile $e (Info-LineOf $e 'Temperature') 'temp'
+    Info-Tile $e (Info-LineOf $e 'Clock speed') 'gauge' 'Clock'
+    # video memory in GB on its tile ("2.1 / 16 GB"), with the bar of how full it is
+    $vm = Info-LineOf $e 'Video memory'
+    if ($vm) {
+        $vt = ''
+        if ($x -and $null -ne $x.MemUsedMB) {
+            $tot = $null
+            if ($null -ne $x.MemTotalMB) { $tot = [double]$x.MemTotalMB } elseif ($g.VramMB -gt 0) { $tot = [double]$g.VramMB }
+            if ($tot -and $tot -gt 0) { $vt = (Fmt-N ([double]$x.MemUsedMB / 1024.0) 1) + ' / ' + (Fmt-N ($tot / 1024.0) 0) + ' GB' }
+            else { $vt = (Fmt-Gb $x.MemUsedMB) + ' in use' }
+        } elseif ($g.VramMB -gt 0) { $vt = Fmt-Gb $g.VramMB 0 }
+        Info-Tile $e $vm 'Memory' 'VRAM' $vt
+        $tl = @($e.Tiles)
+        $tl[$tl.Count - 1].Bar = $vm.Bar
+    }
+    return $e
 }
 
 # the memory timings as the usual four numbers, "30-36-36-96", or '' when HWiNFO has not given them
@@ -14306,7 +14916,16 @@ function Info-RamCard {
     }
     $chip = ''; $ck = 'Sub'
     if ($tm) { $chip = 'Timings: HWiNFO'; $ck = 'Good' }
-    return (Info-Card 'info:ram' 'Memory' $sub $lines '' $chip $ck)
+    $e = Info-Card 'info:ram' 'Memory' $sub $lines '' $chip $ck
+    if ($r.SpeedMT -gt 0) { $e.Sub2 = (Fmt-N $r.SpeedMT 0) + ' MT/s'; Info-Hide (Info-LineOf $e 'Speed') }
+    Info-MeterOf $e (Info-LineOf $e 'In use') 'Usage'
+    $e.TileMin = 96
+    if ($lv -and $null -ne $lv.RamUsedMB -and $null -ne $lv.RamTotalMB -and [double]$lv.RamTotalMB -gt 0) {
+        $free = [Math]::Max(0.0, [double]$lv.RamTotalMB - [double]$lv.RamUsedMB)
+        Info-TileNew $e 'In use' (Fmt-Gb $lv.RamUsedMB) 'Text' 'down'
+        Info-TileNew $e 'Available' (Fmt-Gb $free) 'Text' 'box'
+    }
+    return $e
 }
 
 # a drive size the way the makers write it (decimal): 2000398934016 -> "2.0 TB", 512110190592 -> "512 GB"
@@ -14326,7 +14945,7 @@ function Fmt-DriveKind {
     return ($k -join ' ')
 }
 # "Gen 4 x4": the PCIe link of an NVMe drive as Windows reports it now. A link narrower than the drive supports is flagged; a lower
-# generation than the drive supports is only shown (the slot or the CPU may allow no more); a link at the top is green.
+# generation than the drive supports is only shown (the slot or the CPU may allow no more); a link at the top has a green dot.
 function Info-DrivePcieLine {
     param($nums, $lk)
     if (-not $nums) { return (Info-Line 'PCIe link' 'Reading...' 'Dim') }
@@ -14406,7 +15025,16 @@ function Info-BoardCard {
     $day = Fmt-Day $b.BiosDate
     if ($day) { $lines += , (Info-Line 'BIOS date' $day) }
     if ($b.BiosVendor) { $lines += , (Info-Line 'BIOS maker' ([string]$b.BiosVendor)) }
-    return (Info-Card 'info:board' 'Motherboard' $sub $lines)
+    $e = Info-Card 'info:board' 'Motherboard' $sub $lines
+    $e.Badge = Info-Brand ([string]$b.Maker)
+    # the BIOS version (and its date) in the line under the name
+    if ($b.BiosVersion) {
+        $e.Sub2 = 'BIOS ' + [string]$b.BiosVersion
+        if ($day) { $e.Sub2 += ', ' + $day }
+        Info-Hide (Info-LineOf $e 'BIOS version')
+        Info-Hide (Info-LineOf $e 'BIOS date')
+    }
+    return $e
 }
 
 # One card per screen. $compact = the short version for the Home page.
@@ -14458,7 +15086,10 @@ function Info-DisplayCards {
             if ($sm.Biggest) { $lines += , (Info-Line 'Biggest picture' ('{0} x {1}' -f $sm.Biggest.W, $sm.Biggest.H)) }
             $lines += , (Info-Line 'Modes listed' ([string]$sm.ModeCount))
         }
-        $cards += , (Info-Card ('info:disp' + $n) $title $name $lines '' $chip $ck)
+        $c = Info-Card ('info:disp' + $n) $title $name $lines '' $chip $ck
+        $c.TileMin = 110
+        foreach ($tn in 'Resolution', 'Refresh rate', 'HDR') { Info-Tile $c (Info-LineOf $c $tn) }
+        $cards += , $c
     }
     if ($cards.Count -eq 0) { $cards += , (Info-Card 'info:disp' 'Display' '' @() 'No screen was found.') }
     return $cards
@@ -14467,7 +15098,7 @@ function Info-DisplayCards {
 function Info-SensorCard {
     param($d)
     $lv = $d.Live
-    if (-not $lv) { return (Info-Card 'info:sensors' 'Sensors' '' @((Info-Reading)) '' '' 'Sub' 2) }
+    if (-not $lv) { $e = Info-Card 'info:sensors' 'Sensors' '' @((Info-Reading)) '' '' 'Sub' 2; $e.Look = 'grid'; $e.Caps = 'Sensor sources'; return $e }
     $sn = $lv.Sensors
     $lines = @()
     $g = $lv.Gpu
@@ -14504,7 +15135,13 @@ function Info-SensorCard {
             $note += 'HWiNFO is sharing its readings, but it has no row this app recognises for the missing numbers. The CPU rows are matched by their usual HWiNFO names, such as "CPU (Tctl/Tdie)" and "CPU Package Power".'
         }
     }
-    return (Info-Card 'info:sensors' 'Sensors' '' $lines $note '' 'Sub' 2)
+    # a section the whole width wide: a tile for each program that gives readings, the rows they were taken from under them
+    $e = Info-Card 'info:sensors' 'Sensors' '' $lines $note '' 'Sub' 2
+    $e.Look = 'grid'
+    $e.Caps = 'Sensor sources'
+    $e.TileMin = 200
+    foreach ($tn in 'nvidia-smi', 'HWiNFO', 'LibreHardwareMonitor') { Info-Tile $e (Info-LineOf $e $tn) }
+    return $e
 }
 
 # The note on the Display page: there is no switch that forces a refresh rate
@@ -14522,21 +15159,21 @@ function Get-PageCards {
     $list = @()
     if ($cat -eq $script:PageHome) {
         $d = Info-Data
-        # two to a line: Windows and the motherboard, the timer and the security cards, the processor and the graphics card side by side,
-        # then the memory and the screen
+        # Windows across the top; then two to a line, cards of about the same height side by side: the processor and the graphics card,
+        # the memory and the drives, the motherboard and the timer; the security section across; then the mouse and the screens; the
+        # sensor sources across at the bottom
         $list += , (Info-OsCard $d)
-        $list += , (Info-BoardCard $d)
-        $list += , (Info-TimerCard $d)
-        $list += , (Info-SecCard $d)
         $list += , (Info-CpuCard $d)
         $list += , (Info-GpuCard $d)
         $list += , (Info-RamCard $d)
-        # the screens; with an even number of them the last one takes the whole width, so storage and the mouse always share a line
-        $disps = @(Info-DisplayCards $d $true)
-        if ($disps.Count -ge 2 -and ($disps.Count % 2) -eq 0) { $disps[$disps.Count - 1].Span = 2 }
-        foreach ($c in $disps) { $list += , $c }
         $list += , (Info-StorageCard $d)
-        $list += , (Info-MouseCard $d)
+        $list += , (Info-BoardCard $d)
+        $list += , (Info-TimerCard $d)
+        $list += , (Info-SecCard $d)
+        # the mouse and the screens pair up; when that leaves one alone, the last one takes the whole width
+        $pair = @((Info-MouseCard $d)) + @(Info-DisplayCards $d $true)
+        if (($pair.Count % 2) -eq 1) { $pair[$pair.Count - 1].Span = 2 }
+        foreach ($c in $pair) { $list += , $c }
         $list += , (Info-SensorCard $d)
     } elseif ($cat -eq $script:DisplayCat) {
         $d = Info-Data
@@ -14567,48 +15204,158 @@ function Info-Wrap {
     return $out
 }
 
-# Work out the height of a card that is $w wide (the gap below it included) and wrap its note
+# Sizes inside a Home card, in unscaled pixels (Px fits them to the screen):
+#   the head: a box 40 tall (64 wide, or wider for a long maker's name) 18 from the top; what is under the head starts 76 from the top
+#   (44 in a section, whose head is only its small title in capitals)
+#   the meter: 46 tall (the big number, then a bar 6 tall)
+#   the tiles: 10 apart; inside them 12 at the sides and 10 at the top and bottom, the label 16, then the value (20 a line: at most two
+#   lines, three in a section), a note 16, a bar 10
+#   the rows: 32 tall, 6 apart
+$script:InfoRowH = 32
+$script:InfoRowGap = 6
+$script:InfoTileGap = 10
+
+# The text of an open explanation, wrapped to $tw pixels, and the height of its panel
+function Info-HelpSize {
+    param($l, [int]$tw)
+    $l.HelpLines = @(Info-Wrap ([string]$l.Help) (Ui-Font 'cardDesc') $tw)
+    $l.DefLines = @(Info-Wrap ('Windows default: ' + [string]$l.Def) (Ui-Font 'cardDesc') $tw)
+    $l.HelpH = (Px 12) + (@($l.HelpLines).Count + @($l.DefLines).Count) * (Px 18) + (Px 6) + (Px 12)
+}
+
+# Work out where everything of a card goes when it is $w wide, and its height (the gap below it included). Positions are from the card's
+# top (Y) and from the left of its inside (X, the padding not counted).
 function Info-Prepare {
     param($e, [int]$w)
     $M = $script:M
     $iw = $w - 2 * $M.Pad
-    $top = Px 66                                          # the icon tile and the name beside it, then the lines
-    $h = $top
+    $tw = $iw - 2 * (Px 14)
+    $grid = ([string]$e.Look -eq 'grid')
     $lines = @($e.Lines)
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        $l = $lines[$i]
-        $l.Top = $h                                       # where the line starts, from the top of the card (for a click on it)
-        if ($null -ne $l.Bar) { $h += Px 32 } else { $h += Px 22 }
-        $l.HelpH = 0
-        $l.HelpLines = @()
-        $l.DefLines = @()
-        $l.Open = $false
-        if (-not $l.Id) { continue }
-        $l.Open = [bool]$script:InfoOpen.ContainsKey([string]$e.Key + '|' + [string]$l.Id)
-        # an open explanation goes under the last line of its group
-        $last = ($i -eq ($lines.Count - 1) -or [string]$lines[$i + 1].Id -ne [string]$l.Id)
-        if ($l.Open -and $last) {
-            $tw = $iw - 2 * (Px 14)
-            $l.HelpLines = @(Info-Wrap ([string]$l.Help) (Ui-Font 'cardDesc') $tw)
-            $l.DefLines = @(Info-Wrap ('Windows default: ' + [string]$l.Def) (Ui-Font 'cardDesc') $tw)
-            $l.HelpH = (Px 12) + (@($l.HelpLines).Count + @($l.DefLines).Count) * (Px 18) + (Px 6) + (Px 12)
-            $h += $l.HelpH + (Px 6)
+    foreach ($l in $lines) {
+        if (-not $l.Show) { $l.Show = 'row' }
+        $l.Top = $null; $l.HitTop = $null; $l.PanelTop = $null
+        $l.HelpH = 0; $l.HelpLines = @(); $l.DefLines = @()
+        $l.Open = [bool]($l.Id -and $script:InfoOpen.ContainsKey([string]$e.Key + '|' + [string]$l.Id))
+    }
+    # the head: the box at the left (wider for a long maker's name) and the link at the right
+    $e.BoxW = Px 64
+    if ($e.Badge) {
+        $bw = (Ui-TextWidth ([string]$e.Badge.T) (Ui-Font 'badge')) + (Px 24)
+        if ($bw -gt $e.BoxW) { $e.BoxW = $bw }
+    }
+    $e.LinkRect = $null
+    if ($e.Link) {
+        $lw = (Ui-TextWidth ([string]$e.Link).ToUpperInvariant() (Ui-Font 'smallb')) + (Px 30)
+        $ly = Px 27
+        if ($grid) { $ly = Px 10 }
+        $e.LinkRect = @{ X = $M.Pad + $iw - $lw; Y = $ly; W = $lw; H = Px 22 }
+    }
+    # $y is where the next part starts, $gap the space that was left after the part before it (taken off again at the bottom)
+    $y = Px 76
+    $gap = Px 18
+    if ($grid) { $y = Px 44; $gap = Px 12 }
+    $e.Top = $y
+    # the meter
+    if ($e.Meter) {
+        $e.Meter.Top = $y
+        $y += Px 46
+        $gap = Px 18
+        $y += $gap
+    }
+    # the tiles, as many to a line as fit (and the same number on every line as far as it goes: four are 2 + 2, not 3 + 1)
+    $tiles = @($e.Tiles)
+    if ($tiles.Count -gt 0) {
+        $tg = Px $script:InfoTileGap
+        $min = Px ([int]$e.TileMin)
+        $cols = [int][Math]::Max(1, [Math]::Floor(($iw + $tg) / ($min + $tg)))
+        if ($cols -gt $tiles.Count) { $cols = $tiles.Count }
+        $nrows = [int][Math]::Ceiling($tiles.Count / $cols)
+        $cols = [int][Math]::Ceiling($tiles.Count / $nrows)
+        $twid = [int][Math]::Floor(($iw - ($cols - 1) * $tg) / $cols)
+        $vmax = 2
+        if ($grid) { $vmax = 3 }
+        for ($r = 0; $r -lt $nrows; $r++) {
+            $rowH = 0
+            $inRow = @()
+            for ($c = 0; $c -lt $cols; $c++) {
+                $i = $r * $cols + $c
+                if ($i -ge $tiles.Count) { break }
+                $t = $tiles[$i]
+                $t.X = $c * ($twid + $tg)
+                $t.Y = $y
+                $t.W = $twid
+                $t.VFont = 'tileVal'
+                $t.VH = Px 20
+                if ([string]$t.K -eq 'Dim') { $t.VFont = 'small'; $t.VH = Px 16 }
+                $vl = @(Info-Wrap ([string]$t.V) (Ui-Font $t.VFont) ($twid - 2 * (Px 12)))
+                if ($vl.Count -eq 0) { $vl = @('') }
+                if ($vl.Count -gt $vmax) { $vl = @($vl[0..($vmax - 1)]); $vl[$vmax - 1] = [string]$vl[$vmax - 1] + ' ...' }
+                $t.VLines = $vl
+                $hT = (Px 10) + (Px 16) + (Px 4) + $vl.Count * $t.VH + (Px 10)
+                if ($t.N) { $hT += Px 16 }
+                if ($null -ne $t.Bar) { $hT += Px 10 }
+                if ($hT -gt $rowH) { $rowH = $hT }
+                $inRow += , $t
+            }
+            foreach ($t in $inRow) { $t.H = $rowH }
+            $y += $rowH + $tg
+        }
+        $y -= $tg
+        $gap = Px 14
+        $y += $gap
+        # the explanations of the tiles that are open, under the tiles, in the order of the tiles
+        foreach ($t in $tiles) {
+            $l = $t.Line
+            if (-not $l -or -not $l.Id) { continue }
+            $l.HitTop = [int]$t.Y
+            if ($l.Open) {
+                Info-HelpSize $l $tw
+                $l.PanelTop = $y
+                $y += [int]$l.HelpH
+                $gap = Px 10
+                $y += $gap
+            }
         }
     }
+    # the rows; an open explanation goes under the last row of its group (the boot options are one group)
+    $rows = @($lines | Where-Object { [string]$_.Show -eq 'row' })
+    $rh = Px $script:InfoRowH
+    $rg = Px $script:InfoRowGap
+    for ($i = 0; $i -lt $rows.Count; $i++) {
+        $l = $rows[$i]
+        $l.Top = $y
+        $l.HitTop = $y
+        $y += $rh
+        if ($l.Id -and $l.Open) {
+            $last = ($i -eq ($rows.Count - 1) -or [string]$rows[$i + 1].Id -ne [string]$l.Id)
+            if ($last) {
+                Info-HelpSize $l $tw
+                $l.PanelTop = $y + (Px 6)
+                $y += (Px 6) + [int]$l.HelpH
+            }
+        }
+        $gap = $rg
+        $y += $gap
+    }
+    # the note
     $e.NoteLines = @()
+    $e.NoteTop = $null
     if ($e.Note) {
         $e.NoteLines = @(Info-Wrap ([string]$e.Note) (Ui-Font 'cardDesc') $iw)
-        $h += (Px 8) + (@($e.NoteLines).Count * (Px 18))
+        if ($rows.Count -gt 0) { $y += Px 4 }
+        $e.NoteTop = $y
+        $y += @($e.NoteLines).Count * (Px 18)
+        $gap = 0
     }
-    $h += Px 16
-    $e.Top = $top
     $e.W = $w
-    $e.H = $h + $M.Gap
+    $e.H = $y - $gap + $M.Pad + $M.Gap
 }
 
 # The icon on a Home card: by what the card shows
 function Info-IconKey {
     param($e)
+    if ($e.Icon) { return [string]$e.Icon }
     $k = [string]$e.Key
     if ($k -eq 'info:os') { return 'Windows' }
     if ($k -eq 'info:cpu') { return 'Processor' }
@@ -14624,6 +15371,57 @@ function Info-IconKey {
     return '_'
 }
 
+# The dot after a value: green for good, orange and red for a warning; in a section a value that is missing has a grey one. $null = no dot.
+function Info-DotColor {
+    param([string]$K, [bool]$Grid)
+    $Th = $script:Th
+    if ($K -eq 'Good') { return $Th.Good }
+    if ($K -eq 'Warn') { return $Th.Warn }
+    if ($K -eq 'Bad') { return $Th.Bad }
+    if ($K -eq 'Dim' -and $Grid) { return $Th.Dim }
+    return $null
+}
+# The colour of a value: a good one is in the plain colour (its dot is green), a warning keeps its colour, a missing one is quiet
+function Info-ValColor {
+    param([string]$K)
+    $Th = $script:Th
+    if (-not $K -or $K -eq 'Good') { return $Th.Text }
+    $c = $Th[$K]
+    if ($c) { return $c }
+    return $Th.Text
+}
+# The small arrow of a line that opens an explanation, its middle at ($ax, $ay): down while it is closed, up while it is open
+function Info-Chevron {
+    param($g, $c, [int]$ax, [int]$ay, [bool]$open)
+    $d4 = Px 4; $d2 = Px 2
+    if ($open) { Ui-Line $g $c 1.6 ($ax - $d4) ($ay + $d2) $ax ($ay - $d2); Ui-Line $g $c 1.6 $ax ($ay - $d2) ($ax + $d4) ($ay + $d2) }
+    else { Ui-Line $g $c 1.6 ($ax - $d4) ($ay - $d2) $ax ($ay + $d2); Ui-Line $g $c 1.6 $ax ($ay + $d2) ($ax + $d4) ($ay - $d2) }
+}
+# An open explanation: a panel in the page colour, what it is in the quiet colour, then the Windows default in the brighter one
+function Info-PaintHelp {
+    param($g, $l, [int]$x, [int]$py, [int]$w)
+    $Th = $script:Th
+    $TF = $script:TF
+    Ui-FillRound $g $Th.Bg $x $py $w ([int]$l.HelpH) (Px 10)
+    $ty = $py + (Px 12)
+    foreach ($hl in @($l.HelpLines)) { Ui-Text $g ([string]$hl) (Ui-Font 'cardDesc') $Th.Mute ($x + (Px 14)) $ty ($w - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
+    $ty += Px 6
+    foreach ($dl in @($l.DefLines)) { Ui-Text $g ([string]$dl) (Ui-Font 'cardDesc') $Th.Sub ($x + (Px 14)) $ty ($w - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
+}
+# A bar of how full something is: the track, then the part that is used (blue; orange from 85 %, red from 95 %)
+function Info-PaintBar {
+    param($g, [int]$x, [int]$y, [int]$w, [int]$h, $pct)
+    $Th = $script:Th
+    Ui-FillRound $g $Th.Tile $x $y $w $h ([int]($h / 2))
+    if ($null -eq $pct) { return }
+    $p = [Math]::Max(0.0, [Math]::Min(100.0, [double]$pct))
+    if ($p -le 0) { return }
+    $fw = [Math]::Max($h, [int]($w * $p / 100.0))
+    $bc = $Th.Accent
+    if ($p -ge 95) { $bc = $Th.Bad } elseif ($p -ge 85) { $bc = $Th.Warn }
+    Ui-FillRound $g $bc $x $y $fw $h ([int]($h / 2))
+}
+
 function Ui-PaintInfo {
     param($g, $e, [int]$y)
     $Th = $script:Th
@@ -14635,82 +15433,195 @@ function Ui-PaintInfo {
     Ui-FillRound $g $Th.Card $x $y $cw $ch $M.Radius            # a flat card: a fill, no outline
     $ix = $x + $M.Pad
     $iw = $cw - 2 * $M.Pad
-    $chipW = 0
+    $grid = ([string]$e.Look -eq 'grid')
+    $hotId = ''
+    if ($script:HotEntry -and [string]$script:HotEntry.Key -eq [string]$e.Key) { $hotId = [string]$script:HotLine }
+    $caps = [string]$e.Caps
+    if (-not $caps) { $caps = [string]$e.Title }
+    # --- the head. At its right: the chip, or the link
+    $right = $ix + $iw
+    $midY = $y + (Px 38)
+    if ($grid) { $midY = $y + (Px 21) }
     if ($e.Chip) {
         $font = Ui-Font 'smallb'
         $chipW = (Ui-Measure $g ([string]$e.Chip) $font) + (Px 22)
-        $cx = $ix + $iw - $chipW
+        $cx = $right - $chipW
         $key = [string]$e.ChipKey
-        Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx ($y + (Px 10)) $chipW (Px 22) (Px 6)
-        Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx ($y + (Px 10)) $chipW (Px 22) $TF.C
+        Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx ($midY - (Px 11)) $chipW (Px 22) (Px 6)
+        Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx ($midY - (Px 11)) $chipW (Px 22) $TF.C
+        $right = $cx - (Px 10)
     }
-    # the icon tile, and the name beside it
-    $tx0 = $ix + $M.IconD + $M.IconGap
-    $tw = $iw - $M.IconD - $M.IconGap
-    if ($chipW -gt 0) { $tw = $tw - $chipW - (Px 8) }
-    Ui-FillRound $g $Th.AccentSoft $ix ($y + (Px 12)) $M.IconD $M.IconD (Px 12)
-    $isz = Px 22
-    Ui-PaintIcon $g (Info-IconKey $e) ($ix + [int](($M.IconD - $isz) / 2)) ($y + (Px 12) + [int](($M.IconD - $isz) / 2)) $isz $Th.Accent
-    if ($e.Sub) {
-        Ui-Text $g ([string]$e.Title).ToUpperInvariant() (Ui-Font 'cap') $Th.Dim $tx0 ($y + (Px 15)) $tw (Px 14) $TF.L
-        Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 31)) ($cw - 2 * $M.Pad - $M.IconD - $M.IconGap) (Px 26) $TF.L
+    if ($e.LinkRect) {
+        $r = $e.LinkRect
+        $lc = $Th.AccentText
+        if ($hotId -eq '#link') { $lc = $Th.Text }
+        $lx = $x + [int]$r.X
+        $lyy = $y + [int]$r.Y
+        Ui-PaintIcon $g 'copy' ($lx + (Px 4)) ($lyy + (Px 4)) (Px 14) $lc
+        Ui-Text $g ([string]$e.Link).ToUpperInvariant() (Ui-Font 'smallb') $lc ($lx + (Px 24)) $lyy ([int]$r.W - (Px 24)) ([int]$r.H) $TF.L
+        $right = $lx - (Px 10)
+    }
+    if ($grid) {
+        # a section: its title in small capitals, what it sums up at the right in the quiet colour
+        $capW = (Ui-Measure $g $caps.ToUpperInvariant() (Ui-Font 'cap')) + (Px 8)
+        Ui-Text $g $caps.ToUpperInvariant() (Ui-Font 'cap') $Th.Sub $ix ($midY - (Px 8)) $capW (Px 16) $TF.L
+        if ($e.Sub) {
+            $sx = $ix + $capW + (Px 16)
+            if ($right -gt $sx) { Ui-Text $g ([string]$e.Sub) (Ui-Font 'small') $Th.Mute $sx ($midY - (Px 8)) ($right - $sx) (Px 16) $TF.R }
+        }
     } else {
-        Ui-Text $g (Get-TitleCase ([string]$e.Title)) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 12)) $tw $M.IconD $TF.L
-    }
-    $ly = $y + [int]$e.Top
-    $lw = [Math]::Min((Px 150), [int]($iw * 0.42))
-    foreach ($l in @($e.Lines)) {
-        $ck = [string]$l.K
-        if (-not $ck) { $ck = 'Text' }
-        $vw = $iw - $lw
-        $lcol = $Th.Mute
-        if ($l.Id) {
-            # a line with an explanation: lit under the pointer, a small arrow at its right end (down: closed, up: open)
-            $hotL = ($script:HotEntry -and [string]$script:HotEntry.Key -eq [string]$e.Key -and [string]$script:HotLine -eq [string]$l.Id)
-            if ($hotL) { Ui-FillRound $g $Th.CardHot ($ix - (Px 8)) ($ly - (Px 1)) ($iw + (Px 16)) (Px 22) (Px 6) }
-            if ($l.Open) { $lcol = $Th.Sub }
-            $vw = $vw - (Px 18)
-            if ($l.L) {
-                $acol = $Th.Dim; if ($hotL -or $l.Open) { $acol = $Th.Accent }
-                $ax = $ix + $iw - (Px 6)
-                $ay = $ly + (Px 10)
-                $d4 = Px 4; $d2 = Px 2
-                if ($l.Open) { Ui-Line $g $acol 1.6 ($ax - $d4) ($ay + $d2) $ax ($ay - $d2); Ui-Line $g $acol 1.6 $ax ($ay - $d2) ($ax + $d4) ($ay + $d2) }
-                else { Ui-Line $g $acol 1.6 ($ax - $d4) ($ay - $d2) $ax ($ay + $d2); Ui-Line $g $acol 1.6 $ax ($ay + $d2) ($ax + $d4) ($ay - $d2) }
-            }
-        }
-        Ui-Text $g (Get-TitleCase ([string]$l.L)) (Ui-Font 'small') $lcol $ix $ly $lw (Px 20) $TF.L
-        Ui-Text $g ([string]$l.V) (Ui-Font 'uib') $Th[$ck] ($ix + $lw) $ly $vw (Px 20) $TF.L
-        if ($null -ne $l.Bar) {
-            $by = $ly + (Px 23)
-            $bh = Px 5
-            Ui-FillRound $g $Th.Raised $ix $by $iw $bh 2
-            $pct = [Math]::Max(0.0, [Math]::Min(100.0, [double]$l.Bar))
-            if ($pct -gt 0) {
-                $fw = [Math]::Max($bh, [int]($iw * $pct / 100.0))
-                $bc = $Th.Accent
-                if ($pct -ge 95) { $bc = $Th.Bad } elseif ($pct -ge 85) { $bc = $Th.Warn }
-                Ui-FillRound $g $bc $ix $by $fw $bh 2
-            }
-            $ly += Px 32
+        # the box: a maker's name on its colour, or the card's icon on a tile
+        $bw = [int]$e.BoxW
+        if ($bw -le 0) { $bw = Px 64 }
+        $by = $y + (Px 18)
+        $bh = Px 40
+        if ($e.Badge) {
+            $bc = $Th[[string]$e.Badge.C]
+            if (-not $bc) { $bc = $Th.Tile }
+            Ui-FillRound $g $bc $ix $by $bw $bh (Px 6)
+            Ui-Text $g ([string]$e.Badge.T) (Ui-Font 'badge') $Th.BrandText $ix $by $bw $bh $TF.C
         } else {
-            $ly += Px 22
+            Ui-FillRound $g $Th.Tile $ix $by $bw $bh (Px 6)
+            $isz = Px 22
+            Ui-PaintIcon $g (Info-IconKey $e) ($ix + [int](($bw - $isz) / 2)) ($by + [int](($bh - $isz) / 2)) $isz $Th.Mute
         }
-        if ([int]$l.HelpH -gt 0) {
-            # the explanation: a panel in the page colour under the line, what it is, then what Windows has by default
-            $py = $ly + (Px 2)
-            Ui-FillRound $g $Th.Bg $ix $py $iw ([int]$l.HelpH) (Px 10)
-            $ty = $py + (Px 12)
-            foreach ($hl in @($l.HelpLines)) { Ui-Text $g ([string]$hl) (Ui-Font 'cardDesc') $Th.Mute ($ix + (Px 14)) $ty ($iw - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
-            $ty += Px 6
-            foreach ($dl in @($l.DefLines)) { Ui-Text $g ([string]$dl) (Ui-Font 'cardDesc') $Th.Sub ($ix + (Px 14)) $ty ($iw - 2 * (Px 14)) (Px 18) $TF.L; $ty += Px 18 }
-            $ly += [int]$l.HelpH + (Px 6)
+        $tx0 = $ix + $bw + (Px 14)
+        $tw = [Math]::Max(0, $right - $tx0)
+        $nameW = [Math]::Max(0, $ix + $iw - $tx0)
+        if ($e.Sub) {
+            Ui-Text $g $caps.ToUpperInvariant() (Ui-Font 'cap') $Th.Sub $tx0 ($y + (Px 16)) $tw (Px 14) $TF.L
+            # the name may run under the chip's height only when there is no link (the chip sits higher than the name)
+            $nw = $tw
+            if (-not $e.LinkRect) { $nw = $nameW }
+            Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 30)) $nw (Px 22) $TF.L
+            if ($e.Sub2) { Ui-Text $g ([string]$e.Sub2) (Ui-Font 'small') $Th.Mute $tx0 ($y + (Px 52)) $nameW (Px 16) $TF.L }
+        } else {
+            Ui-Text $g (Get-TitleCase ([string]$e.Title)) (Ui-Font 'cardName') $Th.Text $tx0 $by $tw $bh $TF.L
         }
     }
-    $ny = $ly + (Px 6)
-    foreach ($nl in @($e.NoteLines)) {
-        Ui-Text $g ([string]$nl) (Ui-Font 'cardDesc') $Th.Mute $ix $ny $iw (Px 18) $TF.L
-        $ny += Px 18
+    # --- the meter: its label at the left, the percentage big at the right, the bar under them
+    $mt = $e.Meter
+    if ($mt -and $mt.Line) {
+        $ml = $mt.Line
+        $my = $y + [int]$mt.Top
+        Ui-Text $g ([string]$mt.L) (Ui-Font 'small') $Th.Sub $ix ($my + (Px 14)) ([int]($iw / 2)) (Px 18) $TF.L
+        if ($null -ne $ml.Bar) {
+            $nc = Info-ValColor ([string]$ml.K)
+            Ui-Text $g ((Fmt-N $ml.Bar 0) + '%') (Ui-Font 'meter') $nc $ix $my $iw (Px 34) $TF.R
+        } else {
+            Ui-Text $g ([string]$ml.V) (Ui-Font 'small') (Info-ValColor ([string]$ml.K)) ($ix + [int]($iw / 2)) ($my + (Px 14)) ($iw - [int]($iw / 2)) (Px 18) $TF.R
+        }
+        Info-PaintBar $g $ix ($my + (Px 40)) $iw (Px 6) $ml.Bar
+    }
+    # --- the tiles: the label (with its icon) at the top, the dot and the arrow at its right, the value under it
+    foreach ($t in @($e.Tiles)) {
+        $tx = $ix + [int]$t.X
+        $ty = $y + [int]$t.Y
+        $tw2 = [int]$t.W
+        $tileH = [int]$t.H
+        $tl = $t.Line
+        $help = [bool]($tl -and $tl.Id)
+        $lit = ($help -and $hotId -and $hotId -eq [string]$tl.Id)
+        $open = ($help -and [bool]$tl.Open)
+        $fill = $Th.Tile
+        if ($lit) { $fill = $Th.TileHot }
+        Ui-FillRound $g $fill $tx $ty $tw2 $tileH (Px 8)
+        if ($open) { Ui-StrokeRound $g $Th.Accent 1 $tx $ty $tw2 $tileH (Px 8) }
+        $px = $tx + (Px 12)
+        $pw = $tw2 - 2 * (Px 12)
+        $ly = $ty + (Px 10)
+        $re = $px + $pw
+        if ($help) {
+            $ac = $Th.Dim
+            if ($lit -or $open) { $ac = $Th.AccentText }
+            Info-Chevron $g $ac ($re - (Px 4)) ($ly + (Px 8)) $open
+            $re -= Px 18
+        }
+        $dc = Info-DotColor ([string]$t.K) $grid
+        if ($dc) {
+            $dd = Px 8
+            Ui-FillOval $g $dc ($re - $dd) ($ly + (Px 4)) $dd $dd
+            $re -= $dd + (Px 8)
+        }
+        $lx = $px
+        if ($t.Icon) { Ui-PaintIcon $g ([string]$t.Icon) $px ($ly + (Px 1)) (Px 14) $Th.Mute; $lx += Px 20 }
+        Ui-Text $g (Get-TitleCase ([string]$t.L)) (Ui-Font 'small') $Th.Sub $lx $ly ([Math]::Max(0, $re - $lx)) (Px 16) $TF.L
+        $vy = $ly + (Px 20)
+        $vc = Info-ValColor ([string]$t.K)
+        foreach ($vl in @($t.VLines)) { Ui-Text $g ([string]$vl) (Ui-Font ([string]$t.VFont)) $vc $px $vy $pw ([int]$t.VH) $TF.L; $vy += [int]$t.VH }
+        if ($t.N) { Ui-Text $g ([string]$t.N) (Ui-Font 'small') $Th.Mute $px $vy $pw (Px 16) $TF.L; $vy += Px 16 }
+        if ($null -ne $t.Bar) { Info-PaintBar $g $px ($vy + (Px 4)) $pw (Px 4) $t.Bar }
+        if ($open -and [int]$tl.HelpH -gt 0) { Info-PaintHelp $g $tl $ix ($y + [int]$tl.PanelTop) $iw }
+    }
+    # --- the rows: the label at the left; the value at the right, then its dot, then the arrow of a row that opens an explanation
+    $rh = Px $script:InfoRowH
+    foreach ($l in @($e.Lines)) {
+        if ([string]$l.Show -ne 'row' -or $null -eq $l.Top) { continue }
+        $ry = $y + [int]$l.Top
+        $help = [bool]$l.Id
+        $lit = ($help -and $hotId -and $hotId -eq [string]$l.Id)
+        $fill = $Th.Tile
+        if ($lit) { $fill = $Th.TileHot }
+        Ui-FillRound $g $fill $ix $ry $iw $rh (Px 6)
+        if ([int]$l.HelpH -gt 0 -and $null -ne $l.PanelTop) { Info-PaintHelp $g $l $ix ($y + [int]$l.PanelTop) $iw }
+        $px = $ix + (Px 12)
+        $re = $ix + $iw - (Px 12)
+        if ($help) {
+            if ($l.L) {
+                $ac = $Th.Dim
+                if ($lit -or $l.Open) { $ac = $Th.AccentText }
+                Info-Chevron $g $ac ($re - (Px 4)) ($ry + [int]($rh / 2)) ([bool]$l.Open)
+            }
+            $re -= Px 18
+        }
+        $dc = Info-DotColor ([string]$l.K) $false
+        if ($dc) {
+            $dd = Px 8
+            Ui-FillOval $g $dc ($re - $dd) ($ry + [int](($rh - $dd) / 2)) $dd $dd
+            $re -= $dd + (Px 10)
+        }
+        $lab = Get-TitleCase ([string]$l.L)
+        $labW = 0
+        if ($lab) {
+            $lcol = $Th.Sub
+            if ($l.Open) { $lcol = $Th.Text }
+            $labW = [Math]::Min((Ui-Measure $g $lab (Ui-Font 'body')) + (Px 6), [int](($re - $px) / 2))
+            Ui-Text $g $lab (Ui-Font 'body') $lcol $px $ry $labW $rh $TF.L
+        }
+        # the value at the right: what it is, then what is said about it (after three spaces) in the quiet colour
+        $v = [string]$l.V
+        $main = $v.Trim()
+        $rest = ''
+        $cut = $v.IndexOf('   ', [System.StringComparison]::Ordinal)
+        if ($cut -ge 0) { $main = $v.Substring(0, $cut).Trim(); $rest = $v.Substring($cut).Trim() }
+        $vx0 = $px + $labW + (Px 12)
+        $avail = $re - $vx0
+        if ($avail -le 0) { continue }
+        $vf = Ui-Font 'uib'
+        $nf = Ui-Font 'small'
+        $vc = Info-ValColor ([string]$l.K)
+        $mw = (Ui-Measure $g $main $vf) + (Px 2)
+        $nw = 0
+        if ($rest) { $nw = (Ui-Measure $g $rest $nf) + (Px 2) }
+        if ($rest -and ($mw + (Px 8) + $nw) -gt $avail) {
+            # not room for both: the note is cut short first, and left out when less than a little of it would show
+            $nw = $avail - $mw - (Px 8)
+            if ($nw -lt (Px 60)) { $rest = ''; $nw = 0 }
+        }
+        if ($rest) {
+            Ui-Text $g $rest $nf $Th.Mute ($re - $nw) $ry $nw $rh $TF.L
+            Ui-Text $g $main $vf $vc ($re - $nw - (Px 8) - $mw) $ry $mw $rh $TF.L
+        } else {
+            Ui-Text $g $main $vf $vc $vx0 $ry $avail $rh $TF.R
+        }
+    }
+    # --- the note
+    if ($null -ne $e.NoteTop) {
+        $ny = $y + [int]$e.NoteTop
+        foreach ($nl in @($e.NoteLines)) {
+            Ui-Text $g ([string]$nl) (Ui-Font 'cardDesc') $Th.Mute $ix $ny $iw (Px 18) $TF.L
+            $ny += Px 18
+        }
     }
 }
 
@@ -14774,20 +15685,38 @@ function Ui-SysTick {
     if ($redo) { Ui-RefreshInfo }
 }
 
-# The line of a Home card at (rx, ry) inside the card that has an explanation, or $null (the line itself and its open explanation count)
+# The line of a Home card at (rx, ry) inside the card that has an explanation, or $null: its row, its tile and its open explanation count
 function Info-HitLine {
     param($e, [int]$rx, [int]$ry)
     $M = $script:M
-    if (-not $e -or $rx -lt ($M.Pad - (Px 8)) -or $rx -ge ([int]$e.W - $M.Pad + (Px 8))) { return $null }
+    if (-not $e) { return $null }
+    foreach ($t in @($e.Tiles)) {
+        $l = $t.Line
+        if (-not $l -or -not $l.Id) { continue }
+        $tx = $M.Pad + [int]$t.X
+        if ($rx -ge $tx -and $rx -lt ($tx + [int]$t.W) -and $ry -ge [int]$t.Y -and $ry -lt ([int]$t.Y + [int]$t.H)) { return $l }
+    }
+    if ($rx -lt $M.Pad -or $rx -ge ([int]$e.W - $M.Pad)) { return $null }
+    $rh = Px $script:InfoRowH
     foreach ($l in @($e.Lines)) {
-        if (-not $l.Id -or $null -eq $l.Top) { continue }
-        $t = [int]$l.Top
-        $b = $t + (Px 22)
-        if ($null -ne $l.Bar) { $b = $t + (Px 32) }
-        if ([int]$l.HelpH -gt 0) { $b += [int]$l.HelpH + (Px 6) }
-        if ($ry -ge ($t - (Px 1)) -and $ry -lt $b) { return $l }
+        if (-not $l.Id) { continue }
+        if ([string]$l.Show -eq 'row' -and $null -ne $l.Top) {
+            $t = [int]$l.Top
+            if ($ry -ge $t -and $ry -lt ($t + $rh)) { return $l }
+        }
+        if ([int]$l.HelpH -gt 0 -and $null -ne $l.PanelTop) {
+            $p = [int]$l.PanelTop
+            if ($ry -ge $p -and $ry -lt ($p + [int]$l.HelpH)) { return $l }
+        }
     }
     return $null
+}
+# $true when (rx, ry) inside the card is on its link ("Copy system info")
+function Info-HitLink {
+    param($e, [int]$rx, [int]$ry)
+    if (-not $e -or -not $e.LinkRect) { return $false }
+    $r = $e.LinkRect
+    return ($rx -ge [int]$r.X -and $rx -lt ([int]$r.X + [int]$r.W) -and $ry -ge [int]$r.Y -and $ry -lt ([int]$r.Y + [int]$r.H))
 }
 # Open or close the explanation of a line, and keep it in view when it opens
 function Ui-ToggleInfoLine {
@@ -14801,11 +15730,50 @@ function Ui-ToggleInfoLine {
     if (-not $opening) { return }
     $card = @($script:View | Where-Object { [string]$_.Key -eq [string]$e.Key })[0]
     if (-not $card) { return }
-    $ln = @(@($card.Lines) | Where-Object { [string]$_.Id -eq $Id -and [int]$_.HelpH -gt 0 })[0]
+    $ln = @(@($card.Lines) | Where-Object { [string]$_.Id -eq $Id -and [int]$_.HelpH -gt 0 -and $null -ne $_.PanelTop })[0]
     if (-not $ln) { return }
-    $bottom = [int]$card.Y + [int]$ln.Top + (Px 22) + [int]$ln.HelpH + (Px 12)
-    $topY = [int]$card.Y + [int]$ln.Top
+    $first = @(@($card.Lines) | Where-Object { [string]$_.Id -eq $Id -and $null -ne $_.HitTop })[0]
+    $top = [int]$ln.PanelTop
+    if ($first) { $top = [int]$first.HitTop }
+    $bottom = [int]$card.Y + [int]$ln.PanelTop + [int]$ln.HelpH + (Px 12)
+    $topY = [int]$card.Y + $top
     if ($bottom -gt ($script:ScrollY + $script:ListH)) { Ui-ScrollTo ([Math]::Min($topY, $bottom - $script:ListH)) }
+}
+
+# ----------------------------------------------------------- copy system info (Home) ----
+# Every card of Home as plain text, line by line as the cards have it ("Copy system info" on the Windows card). It reads nothing new:
+# it is what the background reader has already given the cards. The clipboard is the only thing it writes.
+function Info-CopyText {
+    $out = New-Object System.Collections.ArrayList
+    $when = (Get-Date).ToString('yyyy-MM-dd HH:mm', [Globalization.CultureInfo]::InvariantCulture)
+    [void]$out.Add('System information from Headroom ' + [string]$script:AppBuild + ', ' + $when)
+    foreach ($c in @(Get-PageCards $script:PageHome)) {
+        [void]$out.Add('')
+        $head = [string]$c.Title
+        if ($c.Sub) { $head += ': ' + (([string]$c.Sub) -replace '\s{2,}', ' ') }
+        [void]$out.Add($head)
+        foreach ($l in @($c.Lines)) {
+            $v = ((([string]$l.V) -replace '\s{2,}', ' ')).Trim()
+            if (-not $v) { continue }
+            if ($l.L) { [void]$out.Add('  ' + [string]$l.L + ': ' + $v) } else { [void]$out.Add('    ' + $v) }
+        }
+        # the tiles that are not one of the lines (In use and Available on the memory card)
+        foreach ($t in @($c.Tiles)) { if (-not $t.Line) { [void]$out.Add('  ' + [string]$t.L + ': ' + [string]$t.V) } }
+    }
+    return ((@($out) -join "`r`n") + "`r`n")
+}
+# Tests replace this one
+function Ui-SetClipboard {
+    param([string]$Text)
+    [System.Windows.Forms.Clipboard]::SetText($Text)
+}
+function Ui-CopySysInfo {
+    try {
+        Ui-SetClipboard (Info-CopyText)
+        Ui-Status 'The system information is on the clipboard: paste it anywhere with Ctrl+V.'
+    } catch {
+        Ui-Status ('Could not copy the system information: ' + $_.Exception.Message)
+    }
 }
 
 # Make the cards of the page that is showing again from the newest data
@@ -15333,7 +16301,7 @@ function Ui-PaintWelcomePage {
         return
     }
     $st = $script:Welcome
-    Ui-Text $g 'LIVE SENSORS' (Ui-Font 'stepcap') (Blend-Color $bg $Th.Accent $alpha) 0 ($L.CapY + $dy) $W (Px 18) $TF.C
+    Ui-Text $g 'LIVE SENSORS' (Ui-Font 'stepcap') (Blend-Color $bg $Th.AccentText $alpha) 0 ($L.CapY + $dy) $W (Px 18) $TF.C
     Ui-Text $g 'Start HWiNFO' (Ui-Font 'hero') (Blend-Color $bg $Th.Text $alpha) 0 ($L.TitleY + $dy) $W (Px 52) $TF.C
     Ui-Text $g $script:WelcomeBody (Ui-Font 'wbody') (Blend-Color $bg $Th.Sub $alpha) $x ($L.BodyY + $dy) $bw (Px 96) $TF.CW
     if ([string]$st.Text) {
@@ -16618,7 +17586,7 @@ function Ui-BuildPresetWindow {
     $body.Padding = New-Object System.Windows.Forms.Padding((Px 24), (Px 18), (Px 12), (Px 8))
     $rb = New-Rich $Th.Panel $Th.Text 'body'
     $body.Controls.Add($rb)
-    # three tabs above the text: Overview, Will be changed (purple) and Already enabled (green); a hairline under them
+    # three tabs above the text: Overview, Will be changed (blue) and Already enabled (green); a hairline under them
     $tabsP = New-Object System.Windows.Forms.Panel
     $tabsP.Dock = [System.Windows.Forms.DockStyle]::Top
     $tabsP.Height = (Px 46)
@@ -16629,7 +17597,7 @@ function Ui-BuildPresetWindow {
     $hair.BackColor = $Th.Edge
     $tabsP.Controls.Add($hair)
     $script:TabAccent['pv-over'] = $Th.Sub
-    $script:TabAccent['pv-chg'] = $Th.Accent
+    $script:TabAccent['pv-chg'] = $Th.AccentText
     $script:TabAccent['pv-on'] = $Th.Good
     $tabs = @{ Panel = $tabsP }
     $tabX = 0
@@ -16692,7 +17660,7 @@ function Ui-ShowPresets {
 # ----------------------------------------------------------- Compare Power Plans ----
 # The window behind "Compare Power Plans" on the Power page: the six power plans side by side (Get-PlanCompare). It only reads: a plan
 # that is installed is read from this PC with "powercfg /qh", the others show what they would bring. One painted table that scrolls, and
-# Close. The colour of the dot before a value says what it does: purple = set for speed, orange = saves power, red = blocks something,
+# Close. The colour of the dot before a value says what it does: blue = set for speed, orange = saves power, red = blocks something,
 # a ring = Windows' own default, a dashed square = not set by the plan (Windows uses its default) or not listed by Windows.
 $script:PC = $null
 function Ui-PlanCmpGeom {
@@ -16753,14 +17721,14 @@ function Ui-PaintPlanCmp {
     $TF = $script:TF
     $pc = $script:PC
     if (-not $pc) { return }
-    $G = Ui-PlanCmpGeom
-    $x0 = $G.Pad
-    Ui-Fill $g $Th.Bg 0 0 $G.W $G.H
-    Ui-Text $g 'Compare Power Plans' (Ui-Font 'detTitle') $Th.Text $x0 $G.TitleY $G.TableW (Px 32) $TF.L
+    $geo = Ui-PlanCmpGeom
+    $x0 = $geo.Pad
+    Ui-Fill $g $Th.Bg 0 0 $geo.W $geo.H
+    Ui-Text $g 'Compare Power Plans' (Ui-Font 'detTitle') $Th.Text $x0 $geo.TitleY $geo.TableW (Px 32) $TF.L
     $sub = 'The six plans on the Power page side by side, with the values used when the PC is plugged in. A plan that is installed is read from this PC (powercfg /qh, which only reads); a plan that is not installed shows what it would bring. Nothing here changes anything.'
-    Ui-Text $g $sub (Ui-Font 'body') $Th.Sub $x0 $G.SubY ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
+    Ui-Text $g $sub (Ui-Font 'body') $Th.Sub $x0 $geo.SubY ([Math]::Min($geo.TableW, (Px 900))) (Px 40) $TF.W
     # the legend
-    $lx = $x0; $ly = $G.LegendY + (Px 10)
+    $lx = $x0; $ly = $geo.LegendY + (Px 10)
     foreach ($it in @(@('speed', 'Set for speed'), @('save', 'Saves power'), @('block', 'Blocks something'), @('def', 'Windows default'), @('unset', 'Not set by the plan'))) {
         Ui-PlanCmpMark $g ([string]$it[0]) $lx $ly
         $tw = Ui-TextWidth ([string]$it[1]) (Ui-Font 'small')
@@ -16768,22 +17736,22 @@ function Ui-PaintPlanCmp {
         $lx += (Px 15) + $tw + (Px 22)
     }
     if ($pc.Error) {
-        Ui-Text $g ('The power plans could not be read: ' + [string]$pc.Error) (Ui-Font 'body') $Th.Bad $x0 $G.Top $G.TableW (Px 40) $TF.W
+        Ui-Text $g ('The power plans could not be read: ' + [string]$pc.Error) (Ui-Font 'body') $Th.Bad $x0 $geo.Top $geo.TableW (Px 40) $TF.W
         return
     }
     $plans = @($pc.Plans)
-    $top = $G.Top
-    Ui-FillRound $g $Th.Card $x0 $top $G.TableW $G.TableH $script:M.Radius
+    $top = $geo.Top
+    Ui-FillRound $g $Th.Card $x0 $top $geo.TableW $geo.TableH $script:M.Radius
     # the column of the active plan is tinted from top to bottom
     for ($i = 0; $i -lt $plans.Count; $i++) {
-        if ($plans[$i].Active) { Ui-Fill $g $Th.TintApply ($x0 + $G.SetW + $i * $G.ColW) ($top + (Px 1)) $G.ColW ($G.TableH - (Px 2)) }
+        if ($plans[$i].Active) { Ui-Fill $g $Th.TintApply ($x0 + $geo.SetW + $i * $geo.ColW) ($top + (Px 1)) $geo.ColW ($geo.TableH - (Px 2)) }
     }
     # the head: the name, who made it, where the values come from, and "Active plan"
-    Ui-Text $g 'SETTING' (Ui-Font 'cap') $Th.Mute ($x0 + (Px 16)) ($top + $G.HeadH - (Px 30)) ($G.SetW - (Px 24)) (Px 20) $TF.L
+    Ui-Text $g 'SETTING' (Ui-Font 'cap') $Th.Mute ($x0 + (Px 16)) ($top + $geo.HeadH - (Px 30)) ($geo.SetW - (Px 24)) (Px 20) $TF.L
     for ($i = 0; $i -lt $plans.Count; $i++) {
         $p = $plans[$i]
-        $cx = $x0 + $G.SetW + $i * $G.ColW + (Px 14)
-        $cw = $G.ColW - (Px 24)
+        $cx = $x0 + $geo.SetW + $i * $geo.ColW + (Px 14)
+        $cw = $geo.ColW - (Px 24)
         Ui-Text $g ([string]$p.Name) (Ui-Font 'rowName') $Th.Text $cx ($top + (Px 12)) $cw (Px 22) $TF.L
         Ui-Text $g ([string]$p.By) (Ui-Font 'small') $Th.Mute $cx ($top + (Px 34)) $cw (Px 18) $TF.L
         $sc = $Th.Sub; if ($p.Source -ne 'pc') { $sc = $Th.Dim }
@@ -16796,45 +17764,45 @@ function Ui-PaintPlanCmp {
             Ui-Text $g 'Active plan' (Ui-Font 'smallb') $Th.Good $cx ($top + (Px 92)) $pw (Px 20) $TF.C
         }
     }
-    $y = $top + $G.HeadH
-    Ui-Line $g $Th.Edge 1 $x0 $y ($x0 + $G.TableW) $y
+    $y = $top + $geo.HeadH
+    Ui-Line $g $Th.Edge 1 $x0 $y ($x0 + $geo.TableW) $y
     $last = ''
     $fv = Ui-Font 'row'
-    $vw = $G.ColW - (Px 44)
+    $vw = $geo.ColW - (Px 44)
     foreach ($r in $script:PlanCmpRows) {
         if ([string]$r.Group -ne $last) {
             $last = [string]$r.Group
-            Ui-Fill $g $Th.Hover ($x0 + (Px 1)) $y ($G.TableW - (Px 2)) $G.GroupH
-            Ui-Text $g $last.ToUpper() (Ui-Font 'cap') $Th.Sub ($x0 + (Px 16)) $y ($G.TableW - (Px 32)) $G.GroupH $TF.L
-            $y += $G.GroupH
+            Ui-Fill $g $Th.Hover ($x0 + (Px 1)) $y ($geo.TableW - (Px 2)) $geo.GroupH
+            Ui-Text $g $last.ToUpper() (Ui-Font 'cap') $Th.Sub ($x0 + (Px 16)) $y ($geo.TableW - (Px 32)) $geo.GroupH $TF.L
+            $y += $geo.GroupH
         }
-        Ui-Text $g ([string]$r.Name) (Ui-Font 'uib') $Th.Text ($x0 + (Px 16)) ($y + (Px 9)) ($G.SetW - (Px 28)) (Px 20) $TF.L
-        if ($r.Hint) { Ui-Text $g ([string]$r.Hint) (Ui-Font 'small') $Th.Mute ($x0 + (Px 16)) ($y + (Px 29)) ($G.SetW - (Px 28)) (Px 18) $TF.L }
+        Ui-Text $g ([string]$r.Name) (Ui-Font 'uib') $Th.Text ($x0 + (Px 16)) ($y + (Px 9)) ($geo.SetW - (Px 28)) (Px 20) $TF.L
+        if ($r.Hint) { Ui-Text $g ([string]$r.Hint) (Ui-Font 'small') $Th.Mute ($x0 + (Px 16)) ($y + (Px 29)) ($geo.SetW - (Px 28)) (Px 18) $TF.L }
         for ($i = 0; $i -lt $plans.Count; $i++) {
             $c = $plans[$i].Cells[[string]$r.Id]
             if (-not $c) { continue }
-            $cx = $x0 + $G.SetW + $i * $G.ColW + (Px 14)
+            $cx = $x0 + $geo.SetW + $i * $geo.ColW + (Px 14)
             $t = [string]$c.T
             $col = Ui-PlanCmpTextColor ([string]$c.K)
             if ((Ui-TextWidth $t $fv) -le $vw) {
-                Ui-PlanCmpMark $g ([string]$c.K) $cx ($y + [int]($G.RowH / 2))
-                Ui-Text $g $t $fv $col ($cx + (Px 16)) $y $vw $G.RowH $TF.L
+                Ui-PlanCmpMark $g ([string]$c.K) $cx ($y + [int]($geo.RowH / 2))
+                Ui-Text $g $t $fv $col ($cx + (Px 16)) $y $vw $geo.RowH $TF.L
             } else {
                 # two lines, from the top, the mark level with the first
                 Ui-PlanCmpMark $g ([string]$c.K) $cx ($y + (Px 17))
-                Ui-Text $g $t $fv $col ($cx + (Px 16)) ($y + (Px 8)) $vw ($G.RowH - (Px 10)) $TF.W
+                Ui-Text $g $t $fv $col ($cx + (Px 16)) ($y + (Px 8)) $vw ($geo.RowH - (Px 10)) $TF.W
             }
         }
-        $y += $G.RowH
-        Ui-Line $g $Th.Edge 1 ($x0 + (Px 12)) $y ($x0 + $G.TableW - (Px 12)) $y
+        $y += $geo.RowH
+        Ui-Line $g $Th.Edge 1 ($x0 + (Px 12)) $y ($x0 + $geo.TableW - (Px 12)) $y
     }
     # the column lines
     for ($i = 0; $i -le $plans.Count - 1; $i++) {
-        $lx2 = $x0 + $G.SetW + $i * $G.ColW
-        Ui-Line $g $Th.Edge 1 $lx2 ($top + (Px 1)) $lx2 ($top + $G.TableH - (Px 1))
+        $lx2 = $x0 + $geo.SetW + $i * $geo.ColW
+        Ui-Line $g $Th.Edge 1 $lx2 ($top + (Px 1)) $lx2 ($top + $geo.TableH - (Px 1))
     }
     $foot = 'Windows default: the plan leaves it to Windows. Not set: the plan file does not include it, so Windows uses its own default. Balanced and High Performance are compared with the defaults Windows keeps for them (what Restore plan defaults sets). Exact numbers: powercfg /q <plan ID>.'
-    Ui-Text $g $foot (Ui-Font 'small') $Th.Mute $x0 ($top + $G.TableH + (Px 14)) ([Math]::Min($G.TableW, (Px 900))) (Px 40) $TF.W
+    Ui-Text $g $foot (Ui-Font 'small') $Th.Mute $x0 ($top + $geo.TableH + (Px 14)) ([Math]::Min($geo.TableW, (Px 900))) (Px 40) $TF.W
 }
 # reads the six plans (powercfg /list and /qh only) and sizes the table
 function Ui-PlanCmpRead {
