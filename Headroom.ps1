@@ -1244,14 +1244,6 @@ public static class Win32Ui {
     public static extern bool SpiGetInt(uint action, uint param, ref int vparam, uint flags);
     [DllImport("user32.dll")]
     public static extern bool SetSysColors(int count, int[] elements, int[] colors);
-    [StructLayout(LayoutKind.Sequential)]
-    public struct KEYFLAGS { public uint cbSize; public uint dwFlags; }
-    [StructLayout(LayoutKind.Sequential)]
-    public struct FILTERFLAGS { public uint cbSize; public uint dwFlags; public uint iWaitMSec; public uint iDelayMSec; public uint iRepeatMSec; public uint iBounceMSec; }
-    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
-    public static extern bool SpiKeys(uint action, uint param, ref KEYFLAGS vparam, uint flags);
-    [DllImport("user32.dll", EntryPoint="SystemParametersInfo", SetLastError=true)]
-    public static extern bool SpiFilter(uint action, uint param, ref FILTERFLAGS vparam, uint flags);
 }
 "@
 }
@@ -3792,37 +3784,6 @@ function Custom-MouseLive-Revert { param($p, $mine) Custom-MouseLive-Apply $p $m
 # ------------------------------- Sticky / Filter / Toggle Keys: push to the running session --
 # The registry values are written by the setting's own parts; this makes the running desktop pick them up
 # without signing out. $which = Sticky | Filter | Toggle
-function Live-Access {
-    param([string]$which)
-    if ($DryRun) { Say '  [dry] apply the keyboard shortcut setting to the running session' 'DarkGray'; return }
-    $reg = ''
-    switch ($which) {
-        'Sticky' { $reg = 'HKCU:\Control Panel\Accessibility\StickyKeys' }
-        'Filter' { $reg = 'HKCU:\Control Panel\Accessibility\Keyboard Response' }
-        'Toggle' { $reg = 'HKCU:\Control Panel\Accessibility\ToggleKeys' }
-    }
-    if (-not $reg) { return }
-    $c = Reg-Read $reg 'Flags'
-    $f = [uint32]0
-    if (-not ($c.Exists -and [uint32]::TryParse([string]$c.Value, [ref]$f))) { return }
-    Ensure-Win32Ui
-    if ($which -eq 'Filter') {
-        $k = New-Object Win32Ui+FILTERFLAGS
-        $k.cbSize = 24
-        [void][Win32Ui]::SpiFilter(0x0032, 24, [ref]$k, 0)             # SPI_GETFILTERKEYS: keep the delay / repeat / bounce times
-        $k.cbSize = 24; $k.dwFlags = $f
-        [void][Win32Ui]::SpiFilter(0x0033, 24, [ref]$k, 3)             # SPI_SETFILTERKEYS
-    } else {
-        $action = 0x003B; if ($which -eq 'Toggle') { $action = 0x0035 }   # SPI_SETSTICKYKEYS / SPI_SETTOGGLEKEYS
-        $k = New-Object Win32Ui+KEYFLAGS
-        $k.cbSize = 8; $k.dwFlags = $f
-        [void][Win32Ui]::SpiKeys($action, 8, [ref]$k, 3)
-    }
-    Say '  keyboard shortcut setting updated in the running session' 'DarkGray'
-}
-function Custom-AccessLive-Detect { param($p) return 'Skip' }
-function Custom-AccessLive-Apply  { param($p, $mine) Live-Access ([string]$p.Data) }
-function Custom-AccessLive-Revert { param($p, $mine) Live-Access ([string]$p.Data) }
 
 # ------------------------------------------------ hypervisor launch (bcdedit) --
 # 'off', 'auto', ... or '' when the value is not set; $null when the boot settings cannot be read
@@ -5618,24 +5579,21 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
-    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: the shortcut is turned off, and so is Sticky Keys itself; its other options (the sounds, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (510). It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: the shortcut is turned off, and so is Sticky Keys itself; its other options (the sounds, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (510). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '2' '510' 'String'
-        pCustom 'AccessLive' 'also applied to the running session' 'Sticky'
     )
 
 Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
-    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: the shortcut is turned off, and so is Filter Keys itself; its other options (the beeps, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (126). It takes effect straight away; if the window still shows up once, sign out and back in.' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: the shortcut is turned off, and so is Filter Keys itself; its other options (the beeps, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (126). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '2' '126' 'String'
-        pCustom 'AccessLive' 'also applied to the running session' 'Filter'
     )
 
 Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
-    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: the shortcut is turned off, and so is Toggle Keys itself, so the beeps and the window do not appear; its other options are reset too, because the whole value is set to 34, as gaming guides do. Undo puts back the Windows default (62).' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: the shortcut is turned off, and so is Toggle Keys itself, so the beeps and the window do not appear; its other options are reset too, because the whole value is set to 34, as gaming guides do. Undo puts back the Windows default (62). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '34' '62' 'String'
-        pCustom 'AccessLive' 'also applied to the running session' 'Toggle'
     )
 
 # ------------------------------------------------------------ Display ----------
@@ -13286,7 +13244,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '120'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '121'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
