@@ -10258,6 +10258,7 @@ function Ui-InitTheme {
         Edge      = (Rgb 62 62 66)       # hairlines (under the app name when the menu is scrolled, the track of the progress bar)
         Text      = (Rgb 234 234 235)
         Sub       = (Rgb 189 189 190)
+        NavText   = (Rgb 222 222 224)    # the names of the pages in the side menu and of the filter tabs at rest (near white)
         Mute      = (Rgb 158 158 159)    # descriptions
         Dim       = (Rgb 112 112 115)
         Accent    = (Rgb 2 113 249)      # blue (#0271f9), for fills
@@ -10746,7 +10747,7 @@ function Ui-StyleBtn {
         $back = $Th.SideBox; $fore = $Th.Mute; $hover = $Th.SideHot; $down = $Th.SideHot
         if ($kind -eq 'choiceon') { $back = $Th.SideSel; $fore = $Th.Text }
     } elseif ($kind -eq 'tab') {
-        $back = $Th.Bg; $fore = $Th.Mute; $hover = $Th.Bg; $down = $Th.Bg
+        $back = $Th.Bg; $fore = $Th.NavText; $hover = $Th.Bg; $down = $Th.Bg     # near white, like the names in the side menu
     } elseif ($kind -eq 'tabon') {
         $back = $Th.Bg; $fore = $Th.Text; $hover = $Th.Bg; $down = $Th.Bg
     } else {
@@ -10842,6 +10843,7 @@ function Ui-PaintBtn {
         $gap = Px 7
         $x0 = [int](($w - ($lw + $gap + $cw)) / 2)
         $cc = $Th.Dim
+        if ($kind -eq 'tab') { $cc = $Th.Mute }
         if ($kind -eq 'chipon') { $cc = $Th.AccentText }
         if ($kind -eq 'tabon') { $cc = $Th.AccentText }
         if ($isTab -and $script:TabAccent.ContainsKey([string]$b.Name)) { $cc = $script:TabAccent[[string]$b.Name] }
@@ -13436,10 +13438,11 @@ function Ui-PaintNav {
         # lighter fill. Nothing has an outline.
         if ($sel) { Ui-FillRound $g $Th.SideSel $ix $e.Y $iw $ih (Px 12) }
         elseif ($hot) { Ui-FillRound $g $Th.SideHot $ix $e.Y $iw $ih (Px 12) }
-        $col = $Th.Mute
-        $icol = $Th.Dim
+        # names near white at rest (the open page and the one under the pointer are full white), icons a little quieter
+        $col = $Th.NavText
+        $icol = $Th.Sub
         $font = Ui-Font 'nav'
-        if ($sel) { $col = $Th.Text; $icol = $Th.AccentText; $font = Ui-Font 'navb' } elseif ($hot) { $col = $Th.Text; $icol = $Th.Sub }
+        if ($sel) { $col = $Th.Text; $icol = $Th.AccentText; $font = Ui-Font 'navb' } elseif ($hot) { $col = $Th.Text; $icol = $Th.Text }
         # the icon, then the name; a fixed column for the count at the right edge, the name gets what is left
         $isz = [int][Math]::Min((Px 18), [Math]::Max((Px 12), $ih - (Px 6)))
         $ixx = $ix + (Px 12)
@@ -13455,7 +13458,7 @@ function Ui-PaintNav {
             $ph = Px 20
             $pxx = $right - $pw
             $pyy = $e.Y + [int](($ih - $ph) / 2)
-            $pcol = $Th.Dim
+            $pcol = $Th.Mute
             if ($sel) { $pcol = $Th.AccentText }
             Ui-Text $g ([string]$e.CountText) $cf $pcol $pxx $pyy $pw $ph $TF.R
             $limit = $pxx - (Px 6)
