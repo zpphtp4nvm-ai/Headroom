@@ -1133,7 +1133,19 @@ function Mp-Read {
     $m = $null
     try { $m = Get-MpPreference -ErrorAction Stop } catch { return $null }
     if (-not $m) { return $null }
-    return @{ Idle = [bool]$m.ScanOnlyIfIdleEnabled; LowPri = [bool]$m.EnableLowCpuPriority; Cpu = [int]$m.ScanAvgCPULoadFactor }
+    return @{ Idle = [bool]$m.ScanOnlyIfIdleEnabled; LowPri = [bool]$m.EnableLowCpuPriority; Cpu = [int]$m.ScanAvgCPULoadFactor; Samples = [int]$m.SubmitSamplesConsent }
+}
+# "Automatic sample submission" in Windows Security: Off is AlwaysPrompt (0), On (the Windows default) is SendSafeSamples (1)
+function Mp-WriteSamples {
+    param([ValidateSet('AlwaysPrompt', 'SendSafeSamples')][string]$Name)
+    if ($DryRun) { return $true }
+    try {
+        Set-MpPreference -SubmitSamplesConsent $Name -ErrorAction Stop
+        return $true
+    } catch {
+        Say "  ! Windows Security did not accept the change: $($_.Exception.Message)" 'Yellow'
+        return $false
+    }
 }
 function Mp-Write {
     param([bool]$Idle, [bool]$LowPri, [int]$Cpu)
@@ -1261,6 +1273,40 @@ function pRegSoft { param($Path, $Name, $Value, $Default = $null, [string]$Type 
 function pRegPrev { param($Path, $Name, $Value, [string]$Type = 'DWord', $Default = $null) @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type; Prev = $true } }
 # $Gen is run each time the parts are needed (to check, apply or undo) and gets the part itself, so a part can carry its own data
 function pRegDyn { param([scriptblock]$Gen, [string]$Info) @{ T = 'regdyn'; Gen = $Gen; Info = $Info } }
+# A value an earlier build of Headroom wrote that the setting no longer uses (build 122: the Group Policy values that settings with a switch
+# in Windows Settings used to write; Settings shows such a switch as "managed by your organization"). Apply removes it, or writes $Reset
+# when given, but only while it still has a value Headroom wrote ($Was, one value or a list; $null = any value). Undo leaves it alone.
+# It never makes a setting read as "not applied" on a PC that does not have it: it only counts while the old value is still there.
+function pRegOld { param($Path, $Name, $Was = $null, $Reset = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $null; Default = $null; Type = $Type; Old = $true; Was = $Was; Reset = $Reset } }
+# whether an old value is still there with a value Headroom wrote
+function Old-Left {
+    param($p, $c)
+    if (-not $c.Exists) { return $false }
+    if ($null -eq $p.Was) { return $true }
+    if ([string]$c.Kind -ne [string]$p.Type) { return $false }
+    foreach ($w in @($p.Was)) { if (Reg-Equal $c.Value $w $p.Type) { return $true } }
+    return $false
+}
+# An accessibility keyboard shortcut (the Flags text of Sticky Keys, Filter Keys, Toggle Keys, Mouse Keys or High Contrast), set the way
+# turning that shortcut off in Settings sets it: only the bit that turns the shortcut on (4, the "hot key active" flag of each of them) is
+# taken out of the value this account has, and every other choice in it is kept (the feature itself switched on, its sounds, its options).
+# Undo puts only that bit back, as turning the shortcut on in Settings does. When the value is missing or is not a number, Windows'
+# default ($Def) is the starting point. Only the registry value is written (build 121): Windows reads it at the next sign-in.
+function pAccessFlags {
+    param([string]$Path, [int]$Def, [string]$What)
+    $info = ('{0}\Flags: the bit that turns on the {1} shortcut (4) is taken out, every other choice in it is kept (from Windows'' default {2}: {3})    (undo: that bit is put back, {2})' -f $Path, $What, $Def, ($Def -band (-bnot 4)))
+    $p = pRegDyn -Info $info -Gen { param($d) Access-FlagsPart $d }
+    $p['Path'] = $Path; $p['Def'] = $Def
+    return $p
+}
+function Access-FlagsPart {
+    param($d)
+    $cur = [int64]$d.Def
+    $c = Reg-Read ([string]$d.Path) 'Flags'
+    $n = [int64]0
+    if ($c.Exists -and [string]$c.Kind -eq 'String' -and [int64]::TryParse(([string]$c.Value).Trim(), [ref]$n) -and $n -ge 0 -and $n -le 4294967295L) { $cur = $n }
+    return (pReg ([string]$d.Path) 'Flags' ([string]($cur -band (-bnot [int64]4))) ([string]($cur -bor [int64]4)) 'String')
+}
 function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '') @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy } }
 function pTask   { param([string]$Path) @{ T = 'task'; Path = $Path } }
 # Scheduled tasks whose name starts with $Like inside one folder (for tasks that carry a changing id in their name).
@@ -1461,6 +1507,13 @@ function Get-PartState {
             $script:NowIs = Now-RegText $c
             $script:NowWant = Now-RegText @{ Exists = $true; Value = $p.Value; Kind = [string]$p.Type }
             $script:Now = ('{0}: {1}, wanted {2}' -f $script:NowAt, $script:NowIs, $script:NowWant)
+            if ($p.Old) {
+                $script:NowWant = 'not set'
+                if ($null -ne $p.Reset) { $script:NowWant = Now-RegText @{ Exists = $true; Value = $p.Reset; Kind = [string]$p.Type } }
+                $script:Now = ('{0}: {1}, wanted {2} (left by an earlier Headroom build)' -f $script:NowAt, $script:NowIs, $script:NowWant)
+                if (Old-Left $p $c) { return 'Off' }
+                return 'Skip'
+            }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
             if ($p.Soft) { return 'Skip' }          # a protected switch can show that a setting is on, never that it is off
             return 'Off'
@@ -1728,6 +1781,11 @@ function Apply-Part {
     switch ($p.T) {
         'reg' {
             $c = Reg-Read $p.Path $p.Name
+            if ($p.Old) {
+                if (-not (Old-Left $p $c)) { return }
+                if ($null -ne $p.Reset) { [void](Reg-Write $p.Path $p.Name $p.Reset $p.Type) } else { [void](Reg-Remove $p.Path $p.Name) }
+                return
+            }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return }
             [void](Reg-Write $p.Path $p.Name $p.Value $p.Type -Soft:([bool]$p.Soft))
         }
@@ -1826,6 +1884,7 @@ function Revert-Part {
             # a value that Windows does not set is deleted, one that Windows sets is written with its default.
             # The exception (pRegPrev): a value whose Windows default differs from PC to PC gets back what this PC had, when the record
             # says it was there and was not already this app's value.
+            if ($p.Old) { return }          # a value an earlier build left: undo leaves it alone (it was removed, the Windows default)
             if ($p.Prev) {
                 $w = $null; if ($snap -and $snap.Reg) { $w = $snap.Reg["$($p.Path)|$($p.Name)"] }
                 $wk = ''; if ($w) { $wk = [string]$w.Kind }
@@ -1930,7 +1989,14 @@ function Describe-Tweak {
             continue
         }
         switch ($p.T) {
-            'reg'    { $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
+            'reg'    {
+                if ($p.Old) {
+                    $was = 'any value'; if ($null -ne $p.Was) { $was = (@($p.Was) | ForEach-Object { [string]$_ }) -join ' or ' }
+                    $to = 'removed'; if ($null -ne $p.Reset) { $to = 'set to ' + [string]$p.Reset }
+                    $lines += ("{0}\{1}: {2} while it has {3}, which an earlier Headroom build set    (undo: left as it is)" -f $p.Path, $p.Name, $to, $was)
+                    continue
+                }
+                $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
             'regdyn' { $lines += $p.Info }
             'key'    { $lines += ("registry key {0}: created    (undo: {1} deleted)" -f $p.Path, $p.Root) }
             'svc'    { $lines += ("service {0}: {1}    (undo: {2})" -f $p.Name, $p.Set, $p.Default) }
@@ -3904,6 +3970,35 @@ function Custom-DefenderIdle-Revert {
     if (Mp-Write $idle $low $cpu) { Say ('  Windows Security scans: idle only = {0}, low priority = {1}, CPU limit {2}%' -f $idle, $low, $cpu) 'DarkGray' }
 }
 
+# ------------------------------- Windows Security: automatic sample submission -----
+# The switch in Windows Security > Virus & threat protection settings. Off = "Always prompt" (0): Defender asks before it sends a file;
+# On = "Send safe samples automatically" (1), the Windows default. Any other value (2 never send, 3 send all) reads as not applied.
+function Custom-DefenderSamples-Detect {
+    param($p)
+    $m = Mp-Read
+    if (-not $m) { $script:Why = 'Windows Security (Defender) is not available on this PC'; $script:Now = 'Windows Security sample submission: could not be read'; return 'NA' }
+    $script:Now = ('Windows Security automatic sample submission: SubmitSamplesConsent = {0}, wanted 0 (Always prompt, the switch off)' -f $m.Samples)
+    $script:NowAt = 'Windows Security: SubmitSamplesConsent'; $script:NowIs = [string]$m.Samples; $script:NowWant = '0 (Always prompt)'
+    if ($m.Samples -eq 0) { return 'On' }
+    return 'Off'
+}
+function Custom-DefenderSamples-Snapshot {
+    param($p)
+    $m = Mp-Read
+    if (-not $m) { return $null }
+    return @{ Samples = $m.Samples; Unknown = ($m.Samples -eq 0) }
+}
+function Custom-DefenderSamples-Apply {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] Windows Security: automatic sample submission off (Always prompt)' 'DarkGray'; return }
+    if (Mp-WriteSamples 'AlwaysPrompt') { Say '  Windows Security: automatic sample submission off (Always prompt)' 'DarkGray' }
+}
+function Custom-DefenderSamples-Revert {
+    param($p, $mine)
+    if ($DryRun) { Say '  [dry] Windows Security: automatic sample submission on (Send safe samples, the Windows default)' 'DarkGray'; return }
+    if (Mp-WriteSamples 'SendSafeSamples') { Say '  Windows Security: automatic sample submission on (Send safe samples, the Windows default)' 'DarkGray' }
+}
+
 # ------------------------------- Display: graphics switches that share one text -----
 # Settings > System > Display > Graphics > Default graphics settings keeps its switches in ONE text value, a list of NAME=value;
 # pairs (for example "SwapEffectUpgradeEnable=1;VRROptimizeEnable=1;"). Each switch here changes only its own pair and leaves every
@@ -5069,17 +5164,20 @@ $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
 Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diagnostic data and error reports' `
-    -Desc 'On: Windows sends diagnostic data to Microsoft and reports errors, as it does by default. Off: diagnostic data is set to the minimum Windows allows and error reporting is turned off. That covers the current error-reporting policy, the older error-reporting policy and sending extra data with a report. The Customer Experience program, app inventory collection and remote diagnostic-config downloads are turned off too. The minimum is "Off" (0) on Enterprise and Education; Windows Home and Pro treat 0 as 1 ("Required" only), so there the app sets 1, which also stops the optional diagnostic data from being switched on in Settings.' `
+    -Desc 'On: Windows sends optional diagnostic data to Microsoft and reports errors, as it does by default. Off: "Send optional diagnostic data" is turned off, the same as the switch in Settings > Privacy and security > Diagnostics & feedback (only required diagnostic data is sent), and error reporting is turned off. That covers the current error-reporting policy, the older error-reporting policy and sending extra data with a report. The Customer Experience program, app inventory collection and remote diagnostic-config downloads are turned off too; those have no switch in Settings, so they stay policies. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo puts back what this PC had.' `
     -Parts @(
-        pEd 'Ent' (pReg "$pol\DataCollection" 'AllowTelemetry' 0)
-        pEd 'Home,Pro' (pReg "$pol\DataCollection" 'AllowTelemetry' 1)
-        pReg "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\DataCollection" 'AllowTelemetry' @(0, 1)
+        pRegOld "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1
         pReg "$pol\DataCollection" 'AllowDeviceNameInTelemetry' 0
         pReg "$pol\DataCollection" 'DisableOneSettingsDownloads' 1
         pReg "$pol\DataCollection" 'LimitDiagnosticLogCollection' 1
         pReg "$pol\DataCollection" 'LimitDumpCollection' 1
-        pEd 'Ent' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 0)
-        pEd 'Home,Pro' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1)
+        # "Send optional diagnostic data" off in Settings > Privacy and security > Diagnostics & feedback: the three values that switch writes
+        # (it writes 3 in all three when it is on; undo puts back what this PC had)
+        pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1
+        pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 1
+        pRegPrev 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack' 'ShowedToastAtLevel' 1
         pReg "$pol\AppCompat" 'AITEnable' 0
         pReg "$pol\AppCompat" 'DisableInventory' 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
@@ -5105,14 +5203,15 @@ Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Teleme
     )
 
 Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and tailored experiences' `
-    -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads.' `
+    -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
         # the copy of the same switch that the Settings app keeps in its own store (undo: what the PC had)
         pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\TailoredExperiencesWithDiagnosticDataEnabled' 'Value' 0
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
+        pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
     )
 
 Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity history' `
@@ -5124,34 +5223,38 @@ Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity hist
     )
 
 Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-ups' `
-    -Desc 'On: Windows asks you for feedback now and then. Off: Windows no longer asks you for feedback.' `
+    -Desc 'On: Windows asks you for feedback now and then. Off: "Feedback frequency" in Settings > Privacy and security > Diagnostics & feedback is set to Never, so Windows no longer asks you for feedback. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
+        # "Never" in Settings also removes the period that "Once a day" / "Once a week" / "Always" set
+        pRegOld 'HKCU:\Software\Microsoft\Siuf\Rules' 'PeriodInNanoSeconds' $null $null 'QWord'
     )
 
 Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing and speech data collection' `
-    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft.' `
+    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization\TrainedDataStore' 'HarvestContacts' 0 1
         pReg 'HKCU:\Software\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy' 0
         pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
         pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
         pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
         pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0
         pReg 'HKCU:\Software\Microsoft\Input\TIPC' 'Enabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
     )
 
 Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
-    -Desc 'On: Windows can tell apps where you are (the Location switch in Settings still decides per app). Off: location is turned off for the whole PC, and so is the Geolocation service. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
+    -Desc 'On: Windows can tell apps where you are (the switches in Settings still decide per app). Off: "Location services" in Settings > Privacy and security > Location is off for the whole PC, and so is the Geolocation service. The location provider and location scripting policies, which have no switch in Settings, are set too. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself. The policy that turned the Location services switch off is removed, so that switch is yours again.' `
     -Parts @(
-        pReg "$pol\LocationAndSensors" 'DisableLocation' 1
         pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1
         pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
         pSvc 'lfsvc' 'Disabled' 'Manual'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\LocationAndSensors" 'DisableLocation' 1
     )
 
 # The app permissions under Settings > Privacy and security > App permissions, for every account on this PC (the ConsentStore values the
@@ -5205,15 +5308,21 @@ Add-Tweak -Id 'perm-passkeys' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App
     )
 
 Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name 'Find my device' `
-    -Desc 'On: Find my device is left to Windows. If you switched it on in Settings > Privacy and security > Find my device, this PC and its location are registered with your Microsoft account so you can locate it from account.microsoft.com/devices. Off: it is turned off by policy, the PC is not registered and Find my device stops working. Location services are a separate setting. Microsoft lists this policy for Windows Pro, Enterprise and Education and does not list Home, so Windows Home may ignore it; if the switch in Settings still works there, turn it off by hand.' `
+    -Desc 'On: Find my device is left as it is. When it is on in Settings > Privacy and security > Find my device, this PC and its location are registered with your Microsoft account so you can locate it from account.microsoft.com/devices. Off: that switch is turned off, the same as in Settings, so the PC is no longer registered. Location services are a separate setting. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo turns the switch back on.' `
     -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0
+        # the "Find my device" switch in Settings > Privacy and security > Find my device
+        pReg 'HKLM:\SOFTWARE\Microsoft\MdmCommon\SettingValues' 'LocationSyncEnabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0
     )
 
 Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps from the internet' `
-    -Desc 'On: when you plug in a device, Windows can ask Microsoft for its details (name, picture and the maker''s device app) and download them. Off: Windows does not download device information from the internet, and the policy overrides the "Device Installation Settings" choice. Drivers are not affected, they still come from Windows Update or your own installer. A new device may show with a generic icon and name. "Driver updates through Windows Update" sets that dialog''s own switch too; this one adds the policy.' `
+    -Desc 'On: when you plug in a device, Windows can download its details from Microsoft (name, picture and the makers device app). Off: "No" in System Properties > Hardware > Device Installation Settings, so Windows does not download them. Drivers are not affected; they still come from Windows Update or your own installer. A new device may show with a generic icon and name. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo sets it back to "Yes".' `
     -Parts @(
-        pReg "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
+        # "No" in System Properties > Hardware > Device Installation Settings ("Yes" writes 0)
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1 0
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
     )
 
 Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app tracking' `
@@ -5231,16 +5340,20 @@ Add-Tweak -Id 'bgapps' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'St
     )
 
 Add-Tweak -Id 'defender-samples' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Defender automatic sample submission' `
-    -Desc 'On: Windows Defender may upload suspicious files to Microsoft by itself. Off: Defender keeps scanning as normal; it just never uploads suspicious files by itself.' `
+    -Desc 'On: Windows Defender may upload suspicious files to Microsoft by itself (the Windows default). Off: "Automatic sample submission" is turned off, the same as the switch in Windows Security > Virus & threat protection settings, so Defender asks you before it sends a file. Defender keeps scanning as normal. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo turns the switch back on.' `
     -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' 'SubmitSamplesConsent' 2
+        pCustom 'DefenderSamples' 'Windows Security: automatic sample submission off (Set-MpPreference -SubmitSamplesConsent AlwaysPrompt)    (undo: SendSafeSamples, the Windows default)'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' 'SubmitSamplesConsent' 2
     )
 
-Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Allow clipboard history (Win+V)' `
-    -Desc 'On: clipboard history is allowed. Windows keeps it off until you turn it on in Settings > System > Clipboard, and Win+V then shows your list. Off: Windows stops keeping a list of the things you copied, so Win+V shows no history and the switch in Settings is greyed out. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. This is separate from "Allow cloud clipboard", which only controls sharing the list with your other devices.' `
+Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Clipboard history (Win+V)' `
+    -Desc 'On: the "Clipboard history" switch in Settings > System > Clipboard is left as it is. Windows keeps clipboard history off until you turn it on there, and Win+V then shows your list. Off: the switch is set to off, the same as in Settings, so no list is kept and Win+V shows no history. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. "Clipboard history across your devices" is its own setting. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo removes the value again, so the switch is back as Windows ships it (off until you turn it on).' `
     -Parts @(
-        pReg "$pol\System" 'AllowClipboardHistory' 0
+        # the "Clipboard history" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until it is first changed)
         pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\System" 'AllowClipboardHistory' 0
     )
 
 # -------------------------------------------------------------- Cloud ---------
@@ -5253,29 +5366,35 @@ Add-Tweak -Id 'settingsync' -Cat $cCloud -Inv -Def 'On' -Name 'Settings sync wit
         pTask '\Microsoft\Windows\SettingSync\NetworkStateChangeTask'
     )
 
-Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'On' -Name 'Allow cloud clipboard' `
-    -Desc 'On: you can share your clipboard history with your other devices. Windows keeps this off until you turn it on in Settings. Off: clipboard history (Win+V) still works, but it is not uploaded or shared with other devices.' `
+Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'On' -Name 'Clipboard history across your devices' `
+    -Desc 'On: the "Clipboard history across your devices" switch in Settings > System > Clipboard is left as it is. Windows keeps it off until you turn it on there, and your clipboard history is then shared with your other devices that use the same Microsoft account. Off: the switch is set to off, the same as in Settings, so nothing is shared. Clipboard history (Win+V) itself is not affected. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo removes the value again, so the switch is back as Windows ships it.' `
     -Parts @(
-        pReg "$pol\System" 'AllowCrossDeviceClipboard' 0
-        pReg 'HKCU:\Software\Microsoft\Clipboard' 'CloudClipboardAutomaticUpload' 0
+        # the "Clipboard history across your devices" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until
+        # it is first changed)
+        pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableCloudClipboard' 0
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\System" 'AllowCrossDeviceClipboard' 0
+        pRegOld 'HKCU:\Software\Microsoft\Clipboard' 'CloudClipboardAutomaticUpload' 0
     )
 
 Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing and Share across devices' `
-    -Desc 'On: Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them are available. Off: all three are turned off.' `
+    -Desc 'On: Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them are available. Off: all three are turned off. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg "$pol\System" 'EnableCdp' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
         pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\System" 'EnableCdp' 0
     )
 
 Add-Tweak -Id 'resume' -Cat $cCloud -Inv -Def 'On' -Name 'Resume apps from your phone' `
-    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off, and Resume is turned off for every account on this PC (the value Windows keeps for its DisableCrossDeviceResume policy). Undo puts back what this PC had.' `
+    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off. Build 121 also set the value Windows keeps for its DisableCrossDeviceResume policy; that goes back to 0 (Resume allowed), so only the two switches decide. Undo puts back what this PC had.' `
     -Parts @(
         pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0
         pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsOneDriveResumeAllowed' 0
-        pRegPrev 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 'DWord' 0
+        # build 121 also set Windows' own value for the DisableCrossDeviceResume policy; it goes back to 0 (Resume allowed)
+        pRegOld 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0
     )
 
 Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
@@ -5292,34 +5411,38 @@ Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note'
     )
 
 Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update peer-to-peer sharing' `
-    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: it downloads updates only from Microsoft and never uploads them to other PCs. The "Allow downloads from other PCs" switch in Settings is set to off too (that value belongs to the Delivery Optimization service account; Windows protects it on some builds, and where it does it is left as it is).' `
+    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: the "Allow downloads from other PCs" switch in Settings > Windows Update > Advanced options > Delivery Optimization is off, so updates come only from Microsoft and are not uploaded to other PCs (that value belongs to the Delivery Optimization service account; Windows protects it on some builds, and where it does it is left as it is). The Delivery Optimization service is set to start only when needed. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0
         pRegSoft 'Registry::HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' 'DownloadMode' 0
         pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\DeliveryOptimization" 'DODownloadMode' 0
     )
 
 # -------------------------------------------------------------- Remote --------
 Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Desktop services' `
-    -Desc 'On: the Remote Desktop services and firewall rules are left as Windows has them. Windows blocks Remote Desktop connections until you allow them in Settings, so nobody can connect unless you have done that. Off: Remote Desktop is blocked: the services are disabled and the firewall rules are switched off. A setting also blocks connections, so nobody can connect to this PC with Remote Desktop.' `
+    -Desc 'On: the Remote Desktop services and firewall rules are left as Windows has them. Windows blocks Remote Desktop connections until you allow them in Settings > System > Remote Desktop, so nobody can connect unless you have done that. Off: that switch is off, the Remote Desktop services are disabled and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
         pSvc 'TermService' 'Disabled' 'Manual'
         pSvc 'UmRdpService' 'Disabled' 'Manual'
         pSvc 'SessionEnv' 'Disabled' 'Manual'
         pFw 'Remote Desktop'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
     )
 
 Add-Tweak -Id 'remote-assist' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Assistance' `
-    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: it is turned off and its firewall rules are switched off.' `
+    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: that box is cleared, the same as in System Properties > Remote, which also switches off its firewall rules. Values that earlier Headroom builds also wrote, which that box does not touch, go back to the Windows default, and the policy they wrote is removed. Undo allows it again.' `
     -Parts @(
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowToGetHelp' 0 1
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowFullControl' 0 1
+        # what clearing "Allow Remote Assistance connections to this computer" in System Properties > Remote does: this value and the firewall rules
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0 1
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowFullControl' 0 1
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
         pFw 'Remote Assistance'
+        # build 122: values earlier builds also wrote, which that box does not touch, go back to the Windows default; the policy is removed
+        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowFullControl' 0 1
+        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowToGetHelp' 0 1
+        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowFullControl' 0 1
+        pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
     )
 
 Add-Tweak -Id 'quickassist' -Cat $cRemote -Inv -Def 'On' -OneWay -Name 'Quick Assist app' `
@@ -5473,14 +5596,17 @@ try { Add-StartupTweaks } catch { }
 
 # ---------------------------------------------------------------- Gaming ------
 Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar and background recording' `
-    -Desc 'On: Xbox Game Bar can record clips in the background and the Xbox button on a controller opens it. Its start-up tip shows. Off: it stops recording clips in the background, which can cost frames. The controller button no longer opens it and the start-up tip is hidden. Windows Game Mode is not affected. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. Off also tries to turn off Game Bar''s presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies.' `
+    -Desc 'On: Xbox Game Bar can record clips in the background and the Xbox button on a controller opens it. Its start-up tip shows. Off: "Record what happened" in Settings > Gaming > Captures is off and background recording is turned off, which can cost frames. "Allow your controller to open Game Bar" in Settings > Gaming > Game Bar is off and the start-up tip is hidden. Windows Game Mode is not affected. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. Off also tries to turn off Game Bars presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
-        pReg "$pol\GameDVR" 'AllowGameDVR' 0
+        # "Record what happened" in Settings > Gaming > Captures
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\GameDVR" 'AllowGameDVR' 0
     )
 
 Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-gamebar" pop-up (Game Bar gone)' `
@@ -5490,12 +5616,11 @@ Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-
     )
 
 Add-Tweak -Id 'mouse' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse acceleration (pointer precision)' `
-    -Desc 'On: Windows speeds the pointer up when you move the mouse faster ("Enhance pointer precision"). Off: the pointer moves 1:1 with your hand, with the pointer speed at 10/20.' `
+    -Desc 'On: Windows speeds the pointer up when you move the mouse faster ("Enhance pointer precision"). Off: that option is turned off, the same as in Mouse settings, so the pointer moves 1:1 with your hand. Your pointer speed is left as it is.' `
     -Parts @(
         pReg 'HKCU:\Control Panel\Mouse' 'MouseSpeed' '0' '1' 'String'
         pReg 'HKCU:\Control Panel\Mouse' 'MouseThreshold1' '0' '6' 'String'
         pReg 'HKCU:\Control Panel\Mouse' 'MouseThreshold2' '0' '10' 'String'
-        pReg 'HKCU:\Control Panel\Mouse' 'MouseSensitivity' '10' '10' 'String'
         pCustom 'MouseLive' 'also applied to the running session'
     )
 
@@ -5513,11 +5638,10 @@ Add-Tweak -Id 'input-preload' -Cat $cGame -Inv -Def 'On' -Reboot -Name 'Touch ke
     )
 
 Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver updates through Windows Update' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
-    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. The switches are set in each place Windows keeps them: the Windows Update policy, the driver search policy, the driver search setting, Windows Update''s own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted.' `
+    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU makers installer or your motherboards site). It also no longer searches for a driver when you plug in new hardware. Windows Settings has no switch for this, so it is set the way Windows keeps it: the Windows Update policy, the driver search policy, the driver search setting, Windows Updates own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted. "Device info and apps from the internet" is the Device Installation Settings switch.' `
     -Parts @(
         pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
-        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1
         pReg "$pol\DriverSearching" 'SearchOrderConfig' 0
         pReg "$pol\DriverSearching" 'DontSearchWindowsUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings' 'ExcludeWUDriversInQualityUpdate' 1
@@ -5579,21 +5703,21 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
-    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: the shortcut is turned off, and so is Sticky Keys itself; its other options (the sounds, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (510). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off, the same as turning the Sticky keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Sticky Keys, it stays on with every option you chose (from Windows default 510, the value becomes 506). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\StickyKeys' 'Flags' '2' '510' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\StickyKeys' 510 'Sticky Keys'
     )
 
 Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
-    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: the shortcut is turned off, and so is Filter Keys itself; its other options (the beeps, the confirmation window and the rest) are switched off too, because the whole value is set to 2, as gaming guides do. Undo puts back the Windows default (126). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off, the same as turning the Filter keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Filter Keys, it stays on with every option you chose (from Windows default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\Keyboard Response' 'Flags' '2' '126' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\Keyboard Response' 126 'Filter Keys'
     )
 
 Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
-    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: the shortcut is turned off, and so is Toggle Keys itself, so the beeps and the window do not appear; its other options are reset too, because the whole value is set to 34, as gaming guides do. Undo puts back the Windows default (62). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, the same as turning the Toggle keys keyboard shortcut off in Settings > Accessibility > Keyboard, so the window no longer appears. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose (from Windows default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\ToggleKeys' 'Flags' '34' '62' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\ToggleKeys' 62 'Toggle Keys'
     )
 
 # ------------------------------------------------------------ Display ----------
@@ -6012,12 +6136,13 @@ Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Def 'Off' -Preset -Name 'End task i
     )
 
 Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Widgets and Chat taskbar buttons' `
-    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both buttons are hidden and the Widgets feed is turned off by policy. The Widgets button switch itself is protected on newer Windows 11 builds and may refuse to change; the Widgets policy hides the button anyway, so the setting still counts as off.' `
+    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script, so the Widgets feed is also turned off by policy: that is the only way Headroom can hide it there, and Settings shows the Widgets switch as managed while it is set. The Chat policy that earlier builds wrote is removed (Chat is gone from Windows 11 23H2 and later).' `
     -Parts @(
         pRegSoft $adv 'TaskbarDa' 0 1
         pReg $adv 'TaskbarMn' 0 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
-        pReg "$pol\Windows Chat" 'ChatIcon' 3
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\Windows Chat" 'ChatIcon' 3
     )
 
 Add-Tweak -Id 'taskbar-search' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Taskbar search button' `
@@ -6081,10 +6206,12 @@ Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'V
     )
 
 Add-Tweak -Id 'notifications' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Notifications and notification centre' `
-    -Desc 'On: apps, games and Windows can show toast pop-ups, and the notification centre works. Off: no toast pop-ups, and the notification centre is switched off; the calendar flyout goes with it. Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are.' `
+    -Desc 'On: apps, games and Windows can show toast pop-ups (the Windows default). Off: the "Notifications" switch in Settings > System > Notifications is off, so no toast pop-ups appear. The notification centre and calendar flyout still open, and Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are. Build 122 no longer switches the notification centre off by policy; that policy is removed.' `
     -Parts @(
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
+        # the "Notifications" switch in Settings > System > Notifications
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
     )
 
 # ------------------------------------------------------------ File Explorer ---
@@ -6124,12 +6251,9 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Na
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, suggestions and auto-installed apps' `
-    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. That includes account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders. Off: none of that, and no Spotlight extras. The three policies in it (consumer features, tips and Spotlight) are only obeyed by Enterprise and Education, and the online-tips policy (Settings does not fetch tips and help from Microsoft) only by Pro, Enterprise and Education, so the app leaves out the ones your edition ignores; the per-user switches work on every edition.' `
+    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. That includes account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders. Off: the switches for all of that in Settings (Personalization > Lock screen and Start, System > Notifications > Additional settings, Privacy and security > General) are off, and the values behind them that have no switch are set too. The consumer-features policy has no switch in Settings and stays; Windows only obeys it on Enterprise and Education, so it is left out on other editions. The tips, Spotlight and online-tips policies that earlier builds wrote are removed, so the switches in Settings are yours again.' `
     -Parts @(
         pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
-        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
-        pEd 'Ent' (pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsSpotlightFeatures' 1)
-        pEd 'Pro,Ent' (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0)
         pReg $cdm 'ContentDeliveryAllowed' 0 1
         pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
         pReg $cdm 'PreInstalledAppsEnabled' 0 1
@@ -6155,6 +6279,10 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, sugge
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Mobility' 'OptedIn' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.Suggested' 'Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.BackupReminder' 'Enabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\CloudContent" 'DisableSoftLanding' 1
+        pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsSpotlightFeatures' 1
+        pRegOld 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0
     )
 
 Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and account cards in Settings' `
@@ -6167,11 +6295,10 @@ Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot
 $wsch = "$pol\Windows Search"
 $ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
 Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and cloud results in Start search' `
-    -Desc 'On: Start search also shows Bing results, Microsoft Store suggestions, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC, and under Settings > Privacy & security > Search both "Show suggested search results" switches (Web searches and Microsoft Store) are off.' `
+    -Desc 'On: Start search also shows Bing results, Microsoft Store suggestions, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC, and under Settings > Privacy & security > Search both "Show suggested search results" switches (Web searches and Microsoft Store) are off. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
-        pReg $wsch 'AllowCloudSearch' 0
         pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0)
         pReg $wsch 'AllowSearchToUseLocation' 0
         pReg $wsch 'DisableWebSearch' 1
@@ -6182,6 +6309,8 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and clo
         pReg $ssm 'IsDynamicSearchBoxEnabled' 0 1
         pReg $ssm 'IsWebSuggestionsEnabled' 0 1
         pReg $ssm 'IsStoreSuggestionsEnabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld $wsch 'AllowCloudSearch' 0
     )
 
 Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Snap suggestions and layouts flyout' `
@@ -6241,19 +6370,26 @@ Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI 
         pReg $paintPol 'DisableRemoveBackground' 1
     )
 
-Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Text and image generation (Windows AI)' `
-    -Desc 'On: apps can use Windows'' text and image generation and system AI models. The "Text and image generation" and "System AI models" privacy settings in Settings > Privacy and security are left to you. Off: text and image generation and system AI models are set to Deny for every app, by policy. An app cannot switch them back on. It only concerns Windows'' own AI features; ordinary apps and games are not touched.' `
+Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'App access to generative AI' `
+    -Desc 'On: apps can use Windows generative AI. Off: the "Generative AI" app permission in Settings > Privacy and security is set to Deny for every account on this PC. "Text and image generation" is its own setting ("App access to text and image generation"). Ordinary apps and games are not touched. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
-        pReg "$pol\AppPrivacy" 'LetAppsAccessSystemAIModels' 2
+        # the "Generative AI" app permission in Settings > Privacy and security, for every account on this PC ("Text and image
+        # generation" is its own setting, "App access to text and image generation")
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\generativeAI' 'Value' 'Deny' 'Allow' 'String'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
+        pRegOld "$pol\AppPrivacy" 'LetAppsAccessSystemAIModels' 2
     )
 
 Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activation (wake word)' `
-    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it.' `
+    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2
-        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
+        # "Let apps access voice activation services" in Settings > Privacy and security > Voice activation (it also turns off the
+        # switch for when the device is locked)
         pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps' 'AgentActivationEnabled' 0 1
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2
+        pRegOld "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
     )
 
 Add-Tweak -Id 'ai-core' -Cat $cAi -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Windows AI core package' `
@@ -6529,15 +6665,15 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy featur
 # Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
 # Services page (marked -Untested).
 Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: the shortcut is turned off, and so is Mouse Keys itself; its other options are reset too, because the whole value is set to 130, as gaming guides do. Undo puts back the Windows default (62). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off, the same as turning the Mouse keys keyboard shortcut off in Windows accessibility settings. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse (from Windows default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\MouseKeys' 'Flags' '130' '62' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
     )
 
 Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: the shortcut is turned off and the other High Contrast options are reset, because the whole value is set to 4194, as gaming guides do; if you use a contrast theme, leave this one on. Undo puts back the Windows default (126). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
-        pReg 'HKCU:\Control Panel\Accessibility\HighContrast' 'Flags' '4194' '126' 'String'
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
     )
 
 Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
@@ -13244,7 +13380,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '121'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '122'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
