@@ -6013,9 +6013,11 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'secu
 # the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
 Add-Tweak -Id 'reg-vbs' -Cat $cSec -Under 'vbs' -Def 'Off' -Reboot -Risk 'security' -Name 'Disable VBS / Credential Guard in registry' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Virtualization-Based Security and Credential Guard are turned off (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0), and Memory Integrity''s WasEnabledBy value is set to 0. That can give a few percent more FPS in some games, but it removes protection. Off: those values are as this PC had them, so Windows decides (new Windows 11 installs on capable hardware usually have VBS and Credential Guard on). Windows Settings has no switch for these ("Memory Integrity", the card this sits under, is the switch Windows Security has). Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, so leave this off if you play there - you are asked about it before it is applied. Switching it off, and Reset all, put back the values this PC had before Headroom changed them; a value that was not there is removed again. It needs a restart.' `
+    -Desc 'On: Virtualization-Based Security and Credential Guard are turned off (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0). That can give a few percent more FPS in some games, but it removes protection. Off: those values are as this PC had them, so Windows decides (new Windows 11 installs on capable hardware usually have VBS and Credential Guard on). Windows Settings has no switch for these ("Memory Integrity", the card this sits under, is the switch Windows Security has). Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, so leave this off if you play there - you are asked about it before it is applied. Switching it off, and Reset all, put back the values this PC had before Headroom changed them; a value that was not there is removed again. It needs a restart.' `
     -Parts @(
-        pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
+        # (build 124, Tyler: "Remove it": Memory Integrity's WasEnabledBy is no longer set to 0 here. Microsoft documents it as part of a
+        # safety net that turns Memory Integrity off by itself when the PC fails to boot after it was turned on, not as a VBS switch. A 0
+        # an earlier build wrote is left as it is, like the other non-policy 0s of earlier builds.)
         pRegPrev $dg 'EnableVirtualizationBasedSecurity' 0
         pRegPrev 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
     )
