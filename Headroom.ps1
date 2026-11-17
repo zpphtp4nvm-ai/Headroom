@@ -5583,10 +5583,15 @@ Add-Tweak -Id 'resume' -Cat $cCloud -Inv -Def 'On' -Name 'Resume apps from your 
     )
 
 Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
-    -Desc 'On: OneDrive can sync, and it shows in the File Explorer side bar. Off: a policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. Fully reversible.' `
+    -Desc 'On: OneDrive can sync, and it shows in the File Explorer side bar. Off: a policy stops OneDrive from syncing even if it is installed, and its entry in File Explorer''s side bar is hidden. The side bar entry is only changed while OneDrive has one on this PC. Fully reversible.' `
     -Parts @(
         pReg "$pol\OneDrive" 'DisableFileSyncNGSC' 1
-        pReg 'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}' 'System.IsPinnedToNameSpaceTree' 0 1
+        # build 124 review: only while OneDrive's side bar entry is registered (its CLSID key exists). Without OneDrive, writing through
+        # HKEY_CLASSES_ROOT would create a machine-wide CLSID key for it that holds nothing but this value.
+        pRegDyn -Info 'HKCR\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}\System.IsPinnedToNameSpaceTree = 0, only while OneDrive''s File Explorer entry is registered on this PC    (undo: 1)' -Gen {
+            $k = 'Registry::HKEY_CLASSES_ROOT\CLSID\{018D5C66-4533-4307-9B53-224DE2ED1FE6}'
+            if (Reg-KeyExists $k) { pReg $k 'System.IsPinnedToNameSpaceTree' 0 1 }
+        }
     )
 
 Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note' -Name 'OneDrive app' `
