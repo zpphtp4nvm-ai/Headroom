@@ -4,7 +4,7 @@
     Headroom: a Windows 11 debloat and gaming tune-up tool in which every setting is its own switch.
 
 .DESCRIPTION
-    Opens a window with about 190 settings in 20 groups. Each setting shows what it does and exactly which registry values,
+    Opens a window with about 210 settings in 20 groups. Each setting shows what it does and exactly which registry values,
     services, tasks, features or apps it touches, and reads its current state from this PC. The switch on a card shows the
     feature itself: on means the feature is on (or the service is enabled), off means it is off (or the service is disabled),
     and every card says what Windows has by default. Nothing changes until you move a switch and apply it. Before the first
@@ -1326,6 +1326,12 @@ function pKey    { param([string]$Path, [string]$Root = '') @{ T = 'key'; Path =
 # in the list the part is left out of everything: it is not read, not set and not undone. Use it only where Microsoft documents that
 # an edition ignores the value; a value nobody has documented is left as it is.
 function pEd     { param([string]$Only, $Part) $Part['Ed'] = @(($Only -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }); return $Part }
+# pBack <value> (pReg ...): what Windows Settings writes when its switch is flipped back (build 123, Tyler's rule: a card behaves like the
+# switch in Settings, both ways). Switching the card back writes this value; "Reset all" (and -Undo in the console) still puts the Windows
+# default back (the part's Default, or what the PC had for pRegPrev). For a firewall group, 'Enabled' switches every rule of the group on,
+# which is what Settings does when Remote Desktop is turned on. -NoneApplied: Windows ships this switch OFF, and a missing value means off,
+# so a missing value reads as applied (the card shows the feature off, as Settings does); Reset all then lines that setting up as applied.
+function pBack   { param($Value, $Part, [switch]$NoneApplied) $Part['Back'] = $Value; $Part['HasBack'] = $true; if ($NoneApplied) { $Part['NoneApplied'] = $true }; return $Part }
 
 function Add-Tweak {
     # -Ask: a question the window (and an interactive console) puts to the user before this is turned on; if the answer is no
@@ -1338,7 +1344,8 @@ function Add-Tweak {
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
           [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Cleanup, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
-          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string]$Plan = '')
+          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string]$Plan = '',
+          [string]$Under = '')
     # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
     # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
     #   Undo puts the Windows default back, so the switch is the opposite of "applied".  Without -Inv, Apply turns the feature on (Dark mode,
@@ -1355,9 +1362,15 @@ function Add-Tweak {
     # -Choices: instead of one on/off switch the setting offers options, shown as a selector on the card. The first entry is the
     # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
+    # -Under: the id of the card this one sits under (build 124, Tyler: "move the registry change to another toggle underneath the box it goes
+    #   to, and have a toggle that says disable in registry"). The list draws it as a small box under that card, with the switch "Disable in
+    #   registry": the registry values that card's Windows Settings switch does not write. It is a setting of its own (own state, undo record,
+    #   presets); it is on the same page, comes right after that card (or its other sub-settings) in the catalog, and its switch is on while it
+    #   is applied (not -Inv), so "on" means "disabled in the registry". The card above lists it in Subs.
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
             OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Untested = [bool]$Untested; Risk = $Risk
-            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; Cleanup = [bool]$Cleanup; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; Cleanup = [bool]$Cleanup; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = ''
+            Under = ''; Subs = @() }
     if ($Cleanup -and -not $Once) { throw "setting ${Id}: -Cleanup is for a run-once action" }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
     if ($Untested -and ($Preset -or $Once)) { throw "setting ${Id}: an untested setting is never part of the Recommended preset and is not a run-once action" }
@@ -1415,8 +1428,31 @@ function Add-Tweak {
         if (@($t.Parts).Count -ne 1 -or [string]@($t.Parts)[0].T -ne 'custom' -or [string]@($t.Parts)[0].Name -ne $Plan) { throw "setting ${Id}: a power plan switch has one custom part named after its plan" }
     }
     $t.Plan = $Plan
+    # a switch Windows ships OFF (a part with -NoneApplied): its Windows default is the applied position, so Reset all lines it up applied
+    $t.DefApplied = (@(@($t.Parts) | Where-Object { $_.NoneApplied }).Count -gt 0)
+    if ($t.DefApplied -and (-not $Inv -or $t.Def -ne 'Off')) { throw "setting ${Id}: a switch Windows ships off (-NoneApplied) is an -Inv setting whose Windows default is Off" }
+    foreach ($p in @($t.Parts)) {
+        if (-not $p.HasBack) { continue }
+        if ($t.Choices -or $Once -or $OneWay) { throw "setting ${Id}: a value for switching back (pBack) is for a plain on/off switch" }
+        if ([string]$p.T -eq 'reg' -and ($p.Old -or $null -eq $p.Back)) { throw "setting ${Id}: pBack needs a value and a plain registry part" }
+        if ([string]$p.T -eq 'fw' -and [string]$p.Back -ne 'Enabled') { throw "setting ${Id}: a firewall group can only be switched back to Enabled" }
+        if (@('reg', 'fw') -notcontains [string]$p.T) { throw "setting ${Id}: pBack is for a registry value or a firewall group" }
+    }
+    if ($Under) {
+        $par = $script:ById[$Under]
+        if (-not $par) { throw "setting ${Id}: -Under names a setting that is not defined before it ($Under)" }
+        if ([string]$par.Under) { throw "setting ${Id}: a sub-setting cannot sit under another sub-setting ($Under)" }
+        if ([string]$par.Cat -ne $Cat) { throw "setting ${Id}: a sub-setting is on the page of the card it sits under ($Under)" }
+        if ($Inv -or $Once -or $OneWay -or $Plan -or $Choices.Count -gt 0) { throw "setting ${Id}: a sub-setting is a plain switch that is on while it is applied (not -Inv, one-way, run-once, a power plan or with options)" }
+        if ($par.Once -or $par.Choices -or $par.Plan) { throw "setting ${Id}: a sub-setting sits under a plain on/off switch ($Under)" }
+        $last = $null
+        if ($script:Catalog.Count -gt 0) { $last = $script:Catalog[$script:Catalog.Count - 1] }
+        if ($At -ge 0 -or -not $last -or ([string]$last.Id -ne $Under -and [string]$last.Under -ne $Under)) { throw "setting ${Id}: a sub-setting comes right after the card it sits under, or after that card's other sub-settings ($Under)" }
+        $t.Under = $Under
+    }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
+    if ($Under) { $script:ById[$Under].Subs = @(@($script:ById[$Under].Subs) + $Id) }
 }
 # ---- the edition of Windows ----
 # Home / Pro / Ent (see pEd). Read once from the registry (EditionID: "Core" is Home, "Professional" is Pro).
@@ -1515,6 +1551,8 @@ function Get-PartState {
                 return 'Skip'
             }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
+            # a switch Windows ships off, where a missing value is off (pBack -NoneApplied): no value is the switch off, as Settings shows it
+            if ($p.NoneApplied -and -not $c.Exists) { $script:NowWant += ' (no value is off too)'; return 'On' }
             if ($p.Soft) { return 'Skip' }          # a protected switch can show that a setting is on, never that it is off
             return 'Off'
         }
@@ -1877,14 +1915,28 @@ function Invoke-TweakApply {
 
 # --------------------------------------------------------------- revert ------
 function Revert-Part {
-    param($p, $snap)
+    # $ToDefault: Reset all (and the console's -Undo) put the Windows default back; switching the card back writes what Settings writes (pBack)
+    param($p, $snap, [bool]$ToDefault = $false)
     switch ($p.T) {
         'reg' {
             # Switching a setting off puts the Windows default back, never the value the PC had before this app changed it:
             # a value that Windows does not set is deleted, one that Windows sets is written with its default.
             # The exception (pRegPrev): a value whose Windows default differs from PC to PC gets back what this PC had, when the record
             # says it was there and was not already this app's value.
-            if ($p.Old) { return }          # a value an earlier build left: undo leaves it alone (it was removed, the Windows default)
+            # A value an earlier build left: undo cleans it up the same way apply does (removed, or set to Windows' own value), and only while
+            # it still has the value Headroom wrote. It is never put back: left in place, a policy would keep the feature blocked after undo
+            # (build 123; before, undo left it, so switching a setting back on without applying it first kept the old policy).
+            if ($p.Old) {
+                $c = Reg-Read $p.Path $p.Name
+                if (-not (Old-Left $p $c)) { return }
+                if ($null -ne $p.Reset) { [void](Reg-Write $p.Path $p.Name $p.Reset $p.Type) } else { [void](Reg-Remove $p.Path $p.Name) }
+                return
+            }
+            # switched back on its card: what Windows Settings writes when its switch is flipped back (build 123)
+            if ($p.HasBack -and -not $ToDefault) {
+                [void](Reg-Write $p.Path $p.Name $p.Back $p.Type -Soft:([bool]$p.Soft))
+                return
+            }
             if ($p.Prev) {
                 $w = $null; if ($snap -and $snap.Reg) { $w = $snap.Reg["$($p.Path)|$($p.Name)"] }
                 $wk = ''; if ($w) { $wk = [string]$w.Kind }
@@ -1911,6 +1963,12 @@ function Revert-Part {
             Task-Write $p.Path $true
         }
         'fw' {
+            # switched back on its card, where Settings switches the whole group on (Remote Desktop): every rule of the group is switched on
+            if ($p.HasBack -and -not $ToDefault -and [string]$p.Back -eq 'Enabled') {
+                $all = @(Fw-Rules $p.Group | ForEach-Object { [string]$_.Name } | Where-Object { $_ })
+                if ($all.Count) { Fw-EnableNames $p.Group $all } else { Say "  firewall group '$($p.Group)': no rules found" 'DarkGray' }
+                return
+            }
             # Windows keeps a list of its own firewall rules as they ship (the list "restore defaults" uses). Each built-in rule of the
             # group that ships switched on is switched on again; the ones that ship off stay off. Only when that list cannot be read are
             # the rules that were on when this app first changed the group used instead.
@@ -1949,13 +2007,17 @@ function Revert-Part {
     }
 }
 function Invoke-TweakRevert {
-    param($t)
+    # -ToDefault: Reset all / the console's -Undo (the Windows default); without it the card was switched back (what Settings writes)
+    param($t, [switch]$ToDefault)
     $script:CurTweak = $t
+    $script:RevertToDefault = [bool]$ToDefault          # (read by custom parts whose switch-back differs from the Windows default)
     $store = Get-Store
     $snap = $store[$t.Id]
     # The record is only consulted for what Windows has no fixed default for (see Revert-Part: optional features, Windows capabilities,
     # the firewall fallback) and for what this app created itself (a power plan); every value goes back to the Windows default.
-    foreach ($p in (Expand-Parts $t)) { if ($t.Choices) { Revert-ChoicePart $t $p $snap } else { Revert-Part $p $snap } }
+    try {
+        foreach ($p in (Expand-Parts $t)) { if ($t.Choices) { Revert-ChoicePart $t $p $snap } else { Revert-Part $p $snap ([bool]$ToDefault) } }
+    } finally { $script:RevertToDefault = $false }
 }
 function Remove-Snapshot {
     param([string]$id)
@@ -1993,16 +2055,16 @@ function Describe-Tweak {
                 if ($p.Old) {
                     $was = 'any value'; if ($null -ne $p.Was) { $was = (@($p.Was) | ForEach-Object { [string]$_ }) -join ' or ' }
                     $to = 'removed'; if ($null -ne $p.Reset) { $to = 'set to ' + [string]$p.Reset }
-                    $lines += ("{0}\{1}: {2} while it has {3}, which an earlier Headroom build set    (undo: left as it is)" -f $p.Path, $p.Name, $to, $was)
+                    $lines += ("{0}\{1}: {2} while it has {3}, which an earlier Headroom build set    (undo: the same; it is never put back)" -f $p.Path, $p.Name, $to, $was)
                     continue
                 }
-                $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
+                $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; if ($p.HasBack) { $rd = $d; if ($rd -eq 'delete') { $rd = 'deleted' }; $d = ('{0}, what Windows Settings writes when you switch it there; Reset all: {1}, the Windows default' -f [string]$p.Back, $rd) }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
             'regdyn' { $lines += $p.Info }
             'key'    { $lines += ("registry key {0}: created    (undo: {1} deleted)" -f $p.Path, $p.Root) }
             'svc'    { $lines += ("service {0}: {1}    (undo: {2})" -f $p.Name, $p.Set, $p.Default) }
             'task'   { $lines += ("scheduled task {0}: off" -f $p.Path) }
             'taskdyn' { $lines += $p.Info }
-            'fw'     { $lines += ("firewall rules '{0}': off" -f $p.Group) }
+            'fw'     { if ($p.HasBack) { $lines += ("firewall rules '{0}': off    (switching it back switches every rule of the group on, as Windows Settings does; Reset all: the rules as Windows ships them)" -f $p.Group) } else { $lines += ("firewall rules '{0}': off" -f $p.Group) } }
             'bind'   { $lines += ("network adapter component {0}: unbound" -f $p.Comp) }
             'feat'   { $lines += ("Windows feature {0}: removed" -f $p.Name) }
             'cap'    { $lines += ("Windows capability {0}: removed" -f $p.Pattern) }
@@ -2230,7 +2292,7 @@ function Invoke-Plan {
         } else {
             try {
                 $script:RunResult = ''
-                if ($undo) { Invoke-TweakRevert $t } else { Invoke-TweakApply $t $choiceKey }
+                if ($undo) { Invoke-TweakRevert $t -ToDefault:([bool]$item.Default) } else { Invoke-TweakApply $t $choiceKey }
             } catch { $failed = $_.Exception.Message }
         }
         $errs = @($Error | ForEach-Object { $_.Exception.Message } | Select-Object -Unique | Select-Object -First 5)
@@ -2251,7 +2313,7 @@ function Invoke-Plan {
             if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
             $good++
             Emit 'item' $t.Id 'done' $res '' 'Green' $i $total
-        } elseif ($after.State -eq 'NA' -or ($undo -and $after.State -ne 'On') -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
+        } elseif ($after.State -eq 'NA' -or ($undo -and ($after.State -ne 'On' -or ([bool]$item.Default -and [bool]$t.DefApplied))) -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
             Say '  done' 'Green'; $good++
             if ($undo) { Remove-Snapshot $t.Id }
             if ($t.Reboot) { $reboot += $t.Name }
@@ -3737,9 +3799,20 @@ function Custom-NicSuspend-Revert {
         $props = @(Nic-SuspendProps $n.Name)
         if ($props.Count -eq 0) { continue }
         Say "  $($n.Name) ($($n.Desc))" 'Gray'
+        # what the adapter had before this app first turned these off (the snapshot keeps the ones that were on)
+        $had = @(); if ($mine -and $mine.Nic -and $mine.Nic.ContainsKey([string]$n.Guid)) { $had = @($mine.Nic[[string]$n.Guid]) }
         foreach ($x in $props) {
             Say "    $($x.Key) -> the default" 'DarkGray'
             Nic-PropReset $n.Name $x
+            # build 124: a power-management switch that was on before (sleep on disconnect, say) is switched on again. The reset above only
+            # covers a switch the driver lists as a keyword of its own, so without this, switching the card back on left it off.
+            if ($x.Kind -eq 'pm' -and -not $DryRun) {
+                $was = @($had | Where-Object { $_ -and [string]$_.Kind -eq 'pm' -and [string]$_.Key -eq [string]$x.Key })
+                if ($was.Count -gt 0 -and [string]$was[0].Cur -eq 'Enabled') {
+                    $now = Nic-PmRead $n.Name
+                    if ($now -and [string]$now[[string]$x.Key] -eq 'Disabled') { Nic-PmWrite $n.Name ([string]$x.Key) 'Enabled' }
+                }
+            }
         }
     }
 }
@@ -3836,14 +3909,15 @@ function Custom-MouseLive-Apply {
     Ensure-Win32Ui
     $m = 'HKCU:\Control Panel\Mouse'
     $vals = @{}
-    foreach ($pair in @(@('MouseThreshold1', 6), @('MouseThreshold2', 10), @('MouseSpeed', 1), @('MouseSensitivity', 10))) {
+    # only the three "Enhance pointer precision" values the setting writes; the pointer speed (MouseSensitivity) is not touched, also not
+    # in the running session (pushing it with SPIF_UPDATEINIFILE would write it back to the registry)
+    foreach ($pair in @(@('MouseThreshold1', 6), @('MouseThreshold2', 10), @('MouseSpeed', 1))) {
         $c = Reg-Read $m $pair[0]; $n = $pair[1]
         $parsed = 0; if ($c.Exists -and [int]::TryParse([string]$c.Value, [ref]$parsed)) { $n = $parsed }
         $vals[$pair[0]] = $n
     }
     [void][Win32Ui]::SpiInts(0x0004, 0, [int[]]@($vals['MouseThreshold1'], $vals['MouseThreshold2'], $vals['MouseSpeed']), 3)   # SPI_SETMOUSE
-    [void][Win32Ui]::SpiPtr(0x0071, 0, [IntPtr]([int]$vals['MouseSensitivity']), 3)                                              # SPI_SETMOUSESPEED
-    Say '  mouse settings updated in the running session' 'DarkGray'
+    Say '  "Enhance pointer precision" updated in the running session' 'DarkGray'
 }
 function Custom-MouseLive-Revert { param($p, $mine) Custom-MouseLive-Apply $p $mine }
 
@@ -4267,9 +4341,14 @@ function Custom-DxGlobal-Revert {
     if (-not (Dx-Supported $key)) { return }
     if (Vrr-Missing $key) { return }
     $want = Dx-Want $key
-    $val = $null
-    if ($want -eq '1' -and (Dx-DefaultOn $key)) { $val = '0' }     # removing the entry would leave Windows' default, which is on: switching off needs an explicit 0
-    # otherwise the entry is removed, which leaves the Windows default (off, for variable refresh rate)
+    # switched off on its card: 0, what the switch in Settings writes when it is turned off (build 123)
+    $val = '0'
+    if ($script:RevertToDefault) {
+        # Reset all: the Windows default. Removing the entry leaves it, except where Windows' default is on (the windowed-games switch on
+        # Windows 11 24H2 and newer): there it is already on, so nothing would change, and the explicit 0 keeps the old behaviour
+        $val = $null
+        if ($want -eq '1' -and (Dx-DefaultOn $key)) { $val = '0' }
+    }
     [void](Dx-WriteText (Dx-Set (Dx-ReadText) $key $val))
 }
 
@@ -4825,8 +4904,13 @@ function Custom-Startup-Revert {
     $e = $p.Data
     if ($DryRun) { Say ("  [dry] {0}: switched back on in the Startup apps list" -f $e.Show) 'DarkGray'; return }
     $h = Appr-Hive $e
-    # the Windows default is no off-mark for the entry (it runs): the mark in the entry's own hive is removed
-    [void](Reg-Remove (Appr-Path $h $e.Appr) $e.ApprName -Quiet)
+    if ($script:RevertToDefault) {
+        # Reset all: the Windows default is no mark for the entry (it runs): the mark in the entry's own hive is removed
+        [void](Reg-Remove (Appr-Path $h $e.Appr) $e.ApprName -Quiet)
+    } else {
+        # switched back on on its card: the "on" mark (02), what Task Manager and Settings > Apps > Startup write when you enable it (build 123)
+        [void](Reg-Write (Appr-Path $h $e.Appr) $e.ApprName (Appr-Bytes $false) 'Binary' -Quiet)
+    }
     # an entry for all users: a mark for your account that a build before 118 wrote (Explorer never read it) is removed too
     if ($h -eq 'HKLM') { [void](Reg-Remove (Appr-Path 'HKCU' $e.Appr) $e.ApprName -Quiet) }
     Say ("  {0} starts with Windows again" -f $e.Show) 'DarkGray'
@@ -4862,7 +4946,7 @@ function Add-StartupTweaks {
                 'What it runs: ' + $e.Cmd + $nl + $nl +
                 'If this belongs to a driver or hardware tool (audio, mouse or keyboard software, RGB lighting, a printer, antivirus), its tray icon, shortcuts and profiles will not work until you open it yourself. ' +
                 $(if ((Appr-Hive $e) -eq 'HKLM') { 'This is the same switch as Task Manager > Startup apps. It is an entry for all users, so it is switched off for every account on this PC; the entry itself is not deleted.' } else { 'This is the same switch as Task Manager > Startup apps, for your account only; the entry itself is not deleted.' })
-        $info = 'Startup apps switch for "' + $e.Show + '": ' + (Appr-Hive $e) + '\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (undo: the off-mark is removed, so it starts with Windows again)'
+        $info = 'Startup apps switch for "' + $e.Show + '": ' + (Appr-Hive $e) + '\' + $script:ApprRoot + '\' + $e.Appr + '\' + $e.ApprName + ' = off    (switching it back: the "on" mark, what Task Manager writes; Reset all: the mark is removed. Either way it starts with Windows again)'
         Add-Tweak -Id $id -Cat $script:StartupCat -Inv -Def 'On' -Name ($shown + ' starts with Windows') -Desc $desc -At $at -Parts @(pCustom 'Startup' $info $e)
         $at++
     }
@@ -5154,6 +5238,8 @@ $cEdge   = 'Microsoft Edge'
 $cApps   = 'Remove apps'
 $cLegacy = 'Legacy Windows features'
 $cStore  = 'Storage and clean-up'
+# (build 123 had a "Registry changes" page for the registry values a Windows Settings switch does not write; since build 124 each of them is
+# a "Disable in registry" box under the card it belongs to: Add-Tweak -Under)
 $script:TestingCat = 'Testing'          # always the last page in the menu; "Apply all" on "All settings" leaves it out
 $cTest   = $script:TestingCat
 $script:StartupCat ='Startup apps (switch off = does not start with Windows)'
@@ -5163,21 +5249,27 @@ $pol  = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows'
 $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
-Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diagnostic data and error reports' `
-    -Desc 'On: Windows sends optional diagnostic data to Microsoft and reports errors, as it does by default. Off: "Send optional diagnostic data" is turned off, the same as the switch in Settings > Privacy and security > Diagnostics & feedback (only required diagnostic data is sent), and error reporting is turned off. That covers the current error-reporting policy, the older error-reporting policy and sending extra data with a report. The Customer Experience program, app inventory collection and remote diagnostic-config downloads are turned off too; those have no switch in Settings, so they stay policies. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo puts back what this PC had.' `
+Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Optional diagnostic data' `
+    -Desc 'On: Windows sends optional diagnostic data to Microsoft, as it does by default ("Send optional diagnostic data" in Settings > Privacy and security > Diagnostics & feedback is on). Off: that switch is off, the same as in Settings, so only required diagnostic data is sent. It writes exactly what the switch writes: 1 in its three values when off, 3 when on. Error reporting, app inventory and the other diagnostic policies have no switch in Settings: they are the "Disable in registry" switch under this card. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Reset all puts back what this PC had.' `
     -Parts @(
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\DataCollection" 'AllowTelemetry' @(0, 1)
         pRegOld "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1
+        # "Send optional diagnostic data" off in Settings > Privacy and security > Diagnostics & feedback: the three values that switch writes
+        # (it writes 3 in all three when it is on; undo puts back what this PC had)
+        pBack 3 (pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1)
+        pBack 3 (pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 1)
+        pBack 3 (pRegPrev 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack' 'ShowedToastAtLevel' 1)
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-diag' -Cat $cPriv -Under 'telemetry' -Def 'Off' -Preset -Name 'Disable diagnostic policies in registry' `
+    -Desc 'On: Group Policy values turn off Windows Error Reporting, the Customer Experience Improvement Program, app inventory collection and remote diagnostic-config downloads; they also keep the device name out of diagnostic data, limit diagnostic log and dump collection, and stop extra data being sent with an error report. Off: none of those values is set, so all of that works as Windows has it (the Windows default). Windows Settings has no switch for any of these: "Optional diagnostic data", the card this sits under, is the switch Settings has. Switching it off, and Reset all, remove them again.' `
+    -Parts @(
         pReg "$pol\DataCollection" 'AllowDeviceNameInTelemetry' 0
         pReg "$pol\DataCollection" 'DisableOneSettingsDownloads' 1
         pReg "$pol\DataCollection" 'LimitDiagnosticLogCollection' 1
         pReg "$pol\DataCollection" 'LimitDumpCollection' 1
-        # "Send optional diagnostic data" off in Settings > Privacy and security > Diagnostics & feedback: the three values that switch writes
-        # (it writes 3 in all three when it is on; undo puts back what this PC had)
-        pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1
-        pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 1
-        pRegPrev 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack' 'ShowedToastAtLevel' 1
         pReg "$pol\AppCompat" 'AITEnable' 0
         pReg "$pol\AppCompat" 'DisableInventory' 1
         pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
@@ -5187,7 +5279,7 @@ Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Windows diag
     )
 
 Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry scheduled tasks' `
-    -Desc 'On: the compatibility appraiser, customer-experience, disk-diagnostic data and error-reporting tasks are enabled and run in the background, as Windows has them. Off: those tasks are disabled.' `
+    -Desc 'On: the scheduled tasks that gather data for Microsoft in the background are enabled, as Windows has them. These are the compatibility appraiser and the other Application Experience tasks, the Customer Experience Improvement Program tasks, disk diagnostics, feedback, error reporting and the Autochk proxy. Off: those tasks are disabled. Side effect: one of them (StartupAppTask) is what measures how much each startup app slows down sign-in, so Task Manager''s Startup apps page can show "Not measured" in its Startup impact column. Switching this back on lets Windows measure it again.' `
     -Parts @(
         pTask '\Microsoft\Windows\Application Experience\Microsoft Compatibility Appraiser'
         pTask '\Microsoft\Windows\Application Experience\ProgramDataUpdater'
@@ -5208,7 +5300,7 @@ Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1
         # the copy of the same switch that the Settings app keeps in its own store (undo: what the PC had)
-        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\TailoredExperiencesWithDiagnosticDataEnabled' 'Value' 0
+        pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\TailoredExperiencesWithDiagnosticDataEnabled' 'Value' 0)
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
         pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
@@ -5231,40 +5323,51 @@ Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-
     )
 
 Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing and speech data collection' `
-    -Desc 'On: Windows may collect what you type and write to personalise suggestions. It may also send handwriting data. Off: that collection is stopped and your consent to online speech recognition is withdrawn. Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: Windows may collect what you type and write to personalise suggestions, and online speech recognition is on. Off: that collection is stopped and your consent to online speech recognition is withdrawn (the "Custom inking and typing dictionary" and "Online speech recognition" switches in Settings are off). Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Switching it back on turns those switches on again, the same as in Settings, online speech recognition included; Reset all puts back the Windows defaults. The handwriting data-sharing policies have no switch in Settings: they are the "Disable in registry" switch under this card.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization\TrainedDataStore' 'HarvestContacts' 0 1
-        pReg 'HKCU:\Software\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy' 0
-        pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0
-        pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
-        pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
-        pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Personalization\Settings' 'AcceptedPrivacyPolicy' 0)
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0)
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0)
         pReg 'HKCU:\Software\Microsoft\Input\TIPC' 'Enabled' 0 1
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
     )
 
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-handwriting' -Cat $cPriv -Under 'inking' -Def 'Off' -Preset -Name 'Disable handwriting sharing in registry' `
+    -Desc 'On: two Group Policy values stop Windows from sending handwriting samples and handwriting error reports to Microsoft. Off: neither value is set, so Windows may send them (the Windows default). Windows Settings has no switch for these. Switching it off, and Reset all, remove them again.' `
+    -Parts @(
+        pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
+        pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
+    )
+
 Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
-    -Desc 'On: Windows can tell apps where you are (the switches in Settings still decide per app). Off: "Location services" in Settings > Privacy and security > Location is off for the whole PC, and so is the Geolocation service. The location provider and location scripting policies, which have no switch in Settings, are set too. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself. The policy that turned the Location services switch off is removed, so that switch is yours again.' `
+    -Desc 'On: Windows can tell apps where you are (the switches in Settings still decide per app). Off: "Location services" in Settings > Privacy and security > Location is off for the whole PC, the same as switching it off there. The location provider policies (the "Disable in registry" switch under this card) and the Geolocation service (Services) are separate settings. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself. The policy that turned the Location services switch off is removed, so that switch is yours again.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\LocationAndSensors" 'DisableLocation' 1
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-location' -Cat $cPriv -Under 'location' -Def 'Off' -Name 'Disable location provider in registry' `
+    -Desc 'On: two Group Policy values turn off the Windows location provider and location scripting, so apps cannot get a location from Windows, even with Location services switched on. Off: neither value is set, so both work as Windows has them (the Windows default). Windows Settings has no switch for these. Switching it off, and Reset all, remove them again.' `
     -Parts @(
         pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1
         pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
-        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
-        pSvc 'lfsvc' 'Disabled' 'Manual'
-        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
-        pRegOld "$pol\LocationAndSensors" 'DisableLocation' 1
     )
 
 # The app permissions under Settings > Privacy and security > App permissions, for every account on this PC (the ConsentStore values the
 # switches in Settings write). Each is Deny when applied, and undo sets it back to Allow, the Windows default (like the location switch
 # above). Camera and microphone are left alone: games and voice chat need them.
 Add-Tweak -Id 'location-prompts' -Cat $cPriv -Inv -Def 'On' -Name 'Location prompts and location override' `
-    -Desc 'On: Windows shows a notice when an app asks for your location, and "Allow location override" lets apps use the location of a PC you are connected to through Remote Desktop instead of this one. Off: neither the notice nor the override. Both switches are under Settings > Privacy and security > Location; undo puts back what this PC had.' `
+    -Desc 'On: Windows shows a notice when an app asks for your location, and "Allow location override" lets apps use the location of a PC you are connected to through Remote Desktop instead of this one. Off: neither the notice nor the override. Both switches are under Settings > Privacy and security > Location. Undo (switching it back on) turns both on, the same as in Settings; Reset all puts back what this PC had.' `
     -Parts @(
-        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'ShowGlobalPrompts' 0
-        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\UserLocationOverridePrivacySetting' 'Value' 0
+        pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'ShowGlobalPrompts' 0)
+        pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\UserLocationOverridePrivacySetting' 'Value' 0)
     )
 
 Add-Tweak -Id 'perm-personal' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App access to your personal info' `
@@ -5317,7 +5420,7 @@ Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name '
     )
 
 Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps from the internet' `
-    -Desc 'On: when you plug in a device, Windows can download its details from Microsoft (name, picture and the makers device app). Off: "No" in System Properties > Hardware > Device Installation Settings, so Windows does not download them. Drivers are not affected; they still come from Windows Update or your own installer. A new device may show with a generic icon and name. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo sets it back to "Yes".' `
+    -Desc 'On: when you plug in a device, Windows can download its details from Microsoft (name, picture and the maker''s device app). Off: "No" in System Properties > Hardware > Device Installation Settings, so Windows does not download them. Drivers are not affected; they still come from Windows Update or your own installer. A new device may show with a generic icon and name. The policy that earlier Headroom builds wrote for this is removed, so the choice in that dialog is yours again. Undo sets it back to "Yes".' `
     -Parts @(
         # "No" in System Properties > Hardware > Device Installation Settings ("Yes" writes 0)
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1 0
@@ -5340,18 +5443,19 @@ Add-Tweak -Id 'bgapps' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'St
     )
 
 Add-Tweak -Id 'defender-samples' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Defender automatic sample submission' `
-    -Desc 'On: Windows Defender may upload suspicious files to Microsoft by itself (the Windows default). Off: "Automatic sample submission" is turned off, the same as the switch in Windows Security > Virus & threat protection settings, so Defender asks you before it sends a file. Defender keeps scanning as normal. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo turns the switch back on.' `
+    -Desc 'On: Windows Defender may upload suspicious files to Microsoft by itself (the Windows default). Off: "Automatic sample submission" is turned off, the same as the switch in Windows Security > Virus & threat protection settings, so Defender asks you before it sends a file. Defender keeps scanning as normal. The policy that earlier Headroom builds wrote for this is removed, so the switch in Windows Security is yours again. Undo turns the switch back on.' `
     -Parts @(
-        pCustom 'DefenderSamples' 'Windows Security: automatic sample submission off (Set-MpPreference -SubmitSamplesConsent AlwaysPrompt)    (undo: SendSafeSamples, the Windows default)'
-        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        # build 122: the policy value earlier builds wrote; Windows Security shows the switch as managed while it is there, so it is removed.
+        # It comes first: while the policy is there it, not the switch, decides, so the switch is only set once it is gone.
         pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender\Spynet' 'SubmitSamplesConsent' 2
+        pCustom 'DefenderSamples' 'Windows Security: automatic sample submission off (Set-MpPreference -SubmitSamplesConsent AlwaysPrompt)    (undo: SendSafeSamples, the Windows default)'
     )
 
-Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Clipboard history (Win+V)' `
-    -Desc 'On: the "Clipboard history" switch in Settings > System > Clipboard is left as it is. Windows keeps clipboard history off until you turn it on there, and Win+V then shows your list. Off: the switch is set to off, the same as in Settings, so no list is kept and Win+V shows no history. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. "Clipboard history across your devices" is its own setting. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo removes the value again, so the switch is back as Windows ships it (off until you turn it on).' `
+Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'Off' -Preset -Name 'Clipboard history (Win+V)' `
+    -Desc 'On: clipboard history is on, and Win+V shows your list. Off: it is off, so no list is kept and Win+V shows no history. This is the "Clipboard history" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. "Clipboard history across your devices" is its own setting. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Reset all leaves it off, as Windows ships it.' `
     -Parts @(
         # the "Clipboard history" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until it is first changed)
-        pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0) -NoneApplied
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\System" 'AllowClipboardHistory' 0
     )
@@ -5366,33 +5470,32 @@ Add-Tweak -Id 'settingsync' -Cat $cCloud -Inv -Def 'On' -Name 'Settings sync wit
         pTask '\Microsoft\Windows\SettingSync\NetworkStateChangeTask'
     )
 
-Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'On' -Name 'Clipboard history across your devices' `
-    -Desc 'On: the "Clipboard history across your devices" switch in Settings > System > Clipboard is left as it is. Windows keeps it off until you turn it on there, and your clipboard history is then shared with your other devices that use the same Microsoft account. Off: the switch is set to off, the same as in Settings, so nothing is shared. Clipboard history (Win+V) itself is not affected. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Undo removes the value again, so the switch is back as Windows ships it.' `
+Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'Off' -Name 'Clipboard history across your devices' `
+    -Desc 'On: your clipboard history is shared with your other devices that use the same Microsoft account. Off: nothing is shared. This is the "Clipboard history across your devices" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Clipboard history (Win+V) itself is not affected. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again. Reset all leaves it off, as Windows ships it.' `
     -Parts @(
         # the "Clipboard history across your devices" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until
         # it is first changed)
-        pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableCloudClipboard' 0
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableCloudClipboard' 0) -NoneApplied
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\System" 'AllowCrossDeviceClipboard' 0
-        pRegOld 'HKCU:\Software\Microsoft\Clipboard' 'CloudClipboardAutomaticUpload' 0
+        # (build 123: the CloudClipboardAutomaticUpload = 0 earlier builds wrote is left as it is: it only keeps automatic upload off)
     )
 
 Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing and Share across devices' `
-    -Desc 'On: Nearby Sharing, "Continue on this PC" and the Connected Devices Platform service that powers them are available. Off: all three are turned off. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: Nearby sharing and "Share across devices" are available. Off: both switches are off, the same as in Settings (System > Nearby sharing, and Apps > Advanced app settings > Share across devices). The Connected Devices Platform service that powers them is a separate setting on the Services page. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
-        pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\System" 'EnableCdp' 0
     )
 
 Add-Tweak -Id 'resume' -Cat $cCloud -Inv -Def 'On' -Name 'Resume apps from your phone' `
-    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off. Build 121 also set the value Windows keeps for its DisableCrossDeviceResume policy; that goes back to 0 (Resume allowed), so only the two switches decide. Undo puts back what this PC had.' `
+    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off. Build 121 also set the value Windows keeps for its DisableCrossDeviceResume policy; that goes back to 0 (Resume allowed), so only the two switches decide. Undo (switching it back on) turns both switches on, the same as in Settings; Reset all puts back what this PC had.' `
     -Parts @(
-        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0
-        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsOneDriveResumeAllowed' 0
+        pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0)
+        pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsOneDriveResumeAllowed' 0)
         # build 121 also set Windows' own value for the DisableCrossDeviceResume policy; it goes back to 0 (Resume allowed)
         pRegOld 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0
     )
@@ -5411,38 +5514,35 @@ Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note'
     )
 
 Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update peer-to-peer sharing' `
-    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: the "Allow downloads from other PCs" switch in Settings > Windows Update > Advanced options > Delivery Optimization is off, so updates come only from Microsoft and are not uploaded to other PCs (that value belongs to the Delivery Optimization service account; Windows protects it on some builds, and where it does it is left as it is). The Delivery Optimization service is set to start only when needed. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: the "Allow downloads from other PCs" switch in Settings > Windows Update > Advanced options > Delivery Optimization is off, so updates come only from Microsoft and are not uploaded to other PCs (that value belongs to the Delivery Optimization service account; if Windows refuses the change on this PC, the setting says so and you can switch it off in Settings). The Delivery Optimization service is a separate setting on the Services page. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pRegSoft 'Registry::HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' 'DownloadMode' 0
-        pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
+        pReg 'Registry::HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' 'DownloadMode' 0
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\DeliveryOptimization" 'DODownloadMode' 0
     )
 
 # -------------------------------------------------------------- Remote --------
-Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Desktop services' `
-    -Desc 'On: the Remote Desktop services and firewall rules are left as Windows has them. Windows blocks Remote Desktop connections until you allow them in Settings > System > Remote Desktop, so nobody can connect unless you have done that. Off: that switch is off, the Remote Desktop services are disabled and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'Off' -Name 'Remote Desktop' `
+    -Desc 'On: Remote Desktop is on, the same as turning on the switch in Settings > System > Remote Desktop: other PCs can connect to this one with Remote Desktop (with your account and password), and its firewall rules are on. Off: that switch is off and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Windows ships Remote Desktop off; Reset all puts that back (the switch off, the firewall rules as Windows ships them) and never turns Remote Desktop on. The Remote Desktop services are a separate setting on the Services page: while they are disabled, nobody can connect even with this switch on. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1
-        pSvc 'TermService' 'Disabled' 'Manual'
-        pSvc 'UmRdpService' 'Disabled' 'Manual'
-        pSvc 'SessionEnv' 'Disabled' 'Manual'
-        pFw 'Remote Desktop'
+        # the "Remote Desktop" switch in Settings > System > Remote Desktop (Windows ships it off: 1, and no value is off too)
+        pBack 0 (pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1) -NoneApplied
+        pBack 'Enabled' (pFw 'Remote Desktop')
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
     )
 
 Add-Tweak -Id 'remote-assist' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Assistance' `
-    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: that box is cleared, the same as in System Properties > Remote, which also switches off its firewall rules. Values that earlier Headroom builds also wrote, which that box does not touch, go back to the Windows default, and the policy they wrote is removed. Undo allows it again.' `
+    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: that box is cleared, the same as in System Properties > Remote, which also switches off its firewall rules. The policy that earlier Headroom builds wrote for this is removed, so the box is yours again; Remote Assistance stays off, because the box itself is cleared. The other values earlier builds wrote (fAllowFullControl, and the two old Terminal Server values) are 0, which only keeps things off, so they are left as they are: nothing is ever set to allow. Undo allows it again.' `
     -Parts @(
         # what clearing "Allow Remote Assistance connections to this computer" in System Properties > Remote does: this value and the firewall rules
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0 1
         pFw 'Remote Assistance'
-        # build 122: values earlier builds also wrote, which that box does not touch, go back to the Windows default; the policy is removed
-        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowFullControl' 0 1
-        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowToGetHelp' 0 1
-        pRegOld 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fAllowFullControl' 0 1
+        # build 122: the policy earlier builds wrote; the box shows as managed while it is there, so it is removed
         pRegOld 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
+        # (build 123: the 0s earlier builds wrote to Remote Assistance\fAllowFullControl and Terminal Server\fAllowToGetHelp / fAllowFullControl
+        # are no longer touched. Build 122 set them to 1, which reads as allowing Remote Assistance: Terminal Server\fAllowToGetHelp = 1 is the
+        # old way to turn it on, and security software flags exactly that change. A 0 there only keeps things off.)
     )
 
 Add-Tweak -Id 'quickassist' -Cat $cRemote -Inv -Def 'On' -OneWay -Name 'Quick Assist app' `
@@ -5477,23 +5577,33 @@ Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Inv -Def 'On' -Name 'Other remote man
 # ---------------------------------------------------------------- VPN ---------
 # ------------------------------------------------------------- Sharing --------
 Add-Tweak -Id 'fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -Name 'File and printer sharing' `
-    -Desc 'On: file and printer sharing is left as Windows has it. That covers the Server service, the default C$ and ADMIN$ shares, the File and Printer Sharing firewall rules and the adapter binding. Off: file and printer sharing is switched off, so other PCs cannot reach files or printers on this PC. The Server service is disabled, the default shares are off, the firewall rules are switched off and File and Printer Sharing is unbound from your network adapters. You can still open shares on a NAS or other PCs (Client for Microsoft Networks stays on).' `
+    -Desc 'On: file and printer sharing is as Windows has it: the "File and printer sharing" switches in Settings > Network & internet > Advanced network settings > Advanced sharing settings decide, and their firewall rules are as Windows ships them. Off: those switches are off for every kind of network, the same as switching them off there: the File and Printer Sharing firewall rules are switched off, so other PCs cannot reach files or printers on this PC. You can still open shares on a NAS or other PCs. The Server service, the default C$ and ADMIN$ shares and the adapter binding are separate settings (on the Services page, the "Disable in registry" switch under this card, and "File sharing on network adapters" on this page).' `
     -Parts @(
-        pSvc 'LanmanServer' 'Disabled' 'Automatic'
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
         pFw 'File and Printer Sharing'
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-adminshares' -Cat $cShare -Under 'fileshare' -Def 'Off' -Preset -Name 'Disable C$ and ADMIN$ shares in registry' `
+    -Desc 'On: AutoShareWks = 0, so Windows does not create the hidden administrative shares C$ and ADMIN$. Off: Windows creates them (the Windows default). Windows Settings has no switch for this. It takes effect the next time the Server service starts (after a restart). Switching it off, and Reset all, remove the value again.' `
+    -Parts @(
+        pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
+    )
+
+Add-Tweak -Id 'bind-fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Name 'File sharing on network adapters' `
+    -Desc 'On: "File and Printer Sharing for Microsoft Networks" is bound to every network adapter (the Windows default: its box in each adapter''s properties is selected). Off: it is unbound from every adapter, so they do not offer file and printer sharing. "Client for Microsoft Networks" stays on, so you can still open shares on a NAS or other PCs.' `
+    -Parts @(
         pBind 'ms_server'
     )
 
-Add-Tweak -Id 'discovery' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Network discovery and UPnP hosting' `
-    -Desc 'On: network discovery is left as Windows has it. Off: this PC stops announcing itself and stops looking for devices on the network. The Function Discovery, Link-Layer Topology Discovery, UPnP Device Host and Network Connected Devices services are disabled, and Network Discovery''s firewall rules and adapter bindings are removed. SSDP Discovery is deliberately left alone, so games that use UPnP port mapping keep working. Side effect: Windows may stop finding new network printers and other devices by itself; adding a printer by its IP address still works.' `
+Add-Tweak -Id 'discovery' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Network discovery' `
+    -Desc 'On: network discovery is as Windows has it: the "Network discovery" switches in Settings > Network & internet > Advanced network settings > Advanced sharing settings decide, and their firewall rules are as Windows ships them. Off: those switches are off for every kind of network, the same as switching them off there: the Network Discovery firewall rules are switched off, so this PC is not seen by other PCs and does not look for them. The discovery services and the adapter bindings are separate settings (on the Services page, and "Network discovery on network adapters" on this page).' `
     -Parts @(
-        pSvc 'FDResPub' 'Disabled' 'Manual'
-        pSvc 'fdPHost' 'Disabled' 'Manual'
-        pSvc 'lltdsvc' 'Disabled' 'Manual'
-        pSvc 'upnphost' 'Disabled' 'Manual'
-        pSvc 'NcdAutoSetup' 'Disabled' 'Manual'
         pFw 'Network Discovery'
+    )
+
+Add-Tweak -Id 'bind-discovery' -Cat $cShare -Inv -Def 'On' -Preset -Name 'Network discovery on network adapters' `
+    -Desc 'On: the two Link-Layer Topology Discovery protocols (the mapper and the responder) are bound to every network adapter (the Windows default: their boxes in each adapter''s properties are selected). Off: both are unbound from every adapter, so they take no part in mapping the network.' `
+    -Parts @(
         pBind 'ms_lltdio'
         pBind 'ms_rspndr'
     )
@@ -5595,18 +5705,29 @@ Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast S
 try { Add-StartupTweaks } catch { }
 
 # ---------------------------------------------------------------- Gaming ------
-Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Xbox Game Bar and background recording' `
-    -Desc 'On: Xbox Game Bar can record clips in the background and the Xbox button on a controller opens it. Its start-up tip shows. Off: "Record what happened" in Settings > Gaming > Captures is off and background recording is turned off, which can cost frames. "Allow your controller to open Game Bar" in Settings > Gaming > Game Bar is off and the start-up tip is hidden. Windows Game Mode is not affected. The Game Bar app itself stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely. Off also tries to turn off Game Bars presence writer, a background helper that tells Game Bar which game is running; Windows protects that value on some builds, and where it does it is left as it is and the rest of the setting still applies. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'Off' -Preset -Name '"Record what happened"' `
+    -Desc 'On: Game Bar records the last moments of your games in the background, so you can save a clip of what just happened. Off: it does not, which can save frames. This is the "Record what happened" switch in Settings > Gaming > Captures, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too; Reset all leaves it off. "Allow your controller to open Game Bar" is its own setting, and the Game DVR capture values, the Game Bar start-up tip and Game Bar''s presence writer, which Settings has no switch for, are the "Disable in registry" switch under this card. Windows Game Mode is not affected. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Parts @(
+        # "Record what happened" in Settings > Gaming > Captures (Windows ships it off: no value is off)
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' 0) -NoneApplied
+        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
+        pRegOld "$pol\GameDVR" 'AllowGameDVR' 0
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-gamedvr' -Cat $cGame -Under 'gamedvr' -Def 'Off' -Preset -Name 'Disable Game DVR helpers in registry' `
+    -Desc 'On: GameDVR_Enabled and AppCaptureEnabled are set to 0 (the capture switches of older Windows versions), the Game Bar start-up tip is hidden, and Game Bar''s presence writer, a background helper that tells Game Bar which game is running, is turned off; Windows protects that value on some builds, and where it does it is left as it is. Off: all of that is as Windows has it (the Windows default). Windows 11 Settings has no switch for these. Switching it off, and Reset all, put the Windows defaults back.' `
     -Parts @(
         pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
-        # "Record what happened" in Settings > Gaming > Captures
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' 0
-        pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0
         pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
         pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
-        # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
-        pRegOld "$pol\GameDVR" 'AllowGameDVR' 0
+    )
+
+Add-Tweak -Id 'gamebar-controller' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Controller button opens Game Bar' `
+    -Desc 'On: pressing the Xbox button on a controller opens Game Bar (the Windows default). Off: it does not. This is the "Allow your controller to open Game Bar" switch in Settings > Gaming > Game Bar, and it works the same way. The Game Bar app stays installed and Win+G may still open it; "Game Bar app" under Remove apps takes the app out completely.' `
+    -Parts @(
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\GameBar' 'UseNexusForGameBarEnabled' 0)
     )
 
 Add-Tweak -Id 'gamebar-links' -Cat $cGame -Def 'Off' -Risk 'note' -Name 'No "ms-gamebar" pop-up (Game Bar gone)' `
@@ -5638,7 +5759,7 @@ Add-Tweak -Id 'input-preload' -Cat $cGame -Inv -Def 'On' -Reboot -Name 'Touch ke
     )
 
 Add-Tweak -Id 'wu-drivers' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Driver updates through Windows Update' -NotRec 'It also stops Windows Update drivers for new devices, and the part that blocks driver updates is a policy that Windows Home may ignore.' `
-    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU makers installer or your motherboards site). It also no longer searches for a driver when you plug in new hardware. Windows Settings has no switch for this, so it is set the way Windows keeps it: the Windows Update policy, the driver search policy, the driver search setting, Windows Updates own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted. "Device info and apps from the internet" is the Device Installation Settings switch.' `
+    -Desc 'On: Windows Update can replace drivers you installed yourself. It also searches Windows Update for a driver when you plug in new hardware. Off: Windows Update leaves your drivers alone, so you update them manually (the GPU maker''s installer or your motherboard''s site). It also no longer searches for a driver when you plug in new hardware. Windows Settings has no switch for this, so it is set the way Windows keeps it: the Windows Update policy, the driver search policy, the driver search setting, Windows Update''s own settings key and the copy of the driver exclusion in its update policy state. Windows rewrites that last copy itself, so it is tried but never counted. "Device info and apps from the internet" is the Device Installation Settings switch.' `
     -Parts @(
         pReg "$pol\WindowsUpdate" 'ExcludeWUDriversInQualityUpdate' 1
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DriverSearching' 'SearchOrderConfig' 0 1
@@ -5678,9 +5799,9 @@ Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT
     )
 
 Add-Tweak -Id 'hags' -Cat $cDisplay -Def 'Depends on the graphics card' -Preset -Reboot -Name 'Hardware-accelerated GPU scheduling (HAGS)' `
-    -Desc 'On: the graphics card manages its own memory scheduling, which can lower latency and CPU load in some games. Off: Windows and the driver decide (the Windows default). It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch it off if yours do.' `
+    -Desc 'On: the graphics card manages its own memory scheduling, which can lower latency and CPU load in some games. Off: it is off. This is the "Hardware-accelerated GPU scheduling" switch in Settings > System > Display > Graphics, and it works the same way (2 is on, 1 is off). Reset all removes the value, so Windows and the driver decide again (the Windows default; many newer cards then have it on). With no value this card shows off, because Windows has nothing set: the driver may still have it on. It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch it off if yours do.' `
     -Parts @(
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2
+        pBack 1 (pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2)
     )
 
 $mpoDwm = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'
@@ -5703,19 +5824,19 @@ Add-Tweak -Id 'defender-idle' -Cat $cGame -Def 'Off' -Preset -Name 'Low-impact W
     )
 
 Add-Tweak -Id 'sticky-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Sticky Keys shortcut' `
-    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off, the same as turning the Sticky keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Sticky Keys, it stays on with every option you chose (from Windows default 510, the value becomes 506). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Shift five times in a row opens the "Do you want to turn on Sticky Keys?" window, which can interrupt a game. Off: that shortcut is turned off, the same as turning the Sticky keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Sticky Keys, it stays on with every option you chose (from Windows'' default 510, the value becomes 506). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\StickyKeys' 510 'Sticky Keys'
     )
 
 Add-Tweak -Id 'filter-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Filter Keys shortcut' `
-    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off, the same as turning the Filter keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Filter Keys, it stays on with every option you chose (from Windows default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: holding the right Shift key for eight seconds opens the "Do you want to turn on Filter Keys?" window, with beeps. Off: that shortcut is turned off, the same as turning the Filter keys keyboard shortcut off in Settings > Accessibility > Keyboard. Only the shortcut is affected: if you use Filter Keys, it stays on with every option you chose (from Windows'' default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\Keyboard Response' 126 'Filter Keys'
     )
 
 Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Keys shortcut' `
-    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, the same as turning the Toggle keys keyboard shortcut off in Settings > Accessibility > Keyboard, so the window no longer appears. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose (from Windows default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, the same as turning the Toggle keys keyboard shortcut off in Settings > Accessibility > Keyboard, so the window no longer appears. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose (from Windows'' default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\ToggleKeys' 62 'Toggle Keys'
     )
@@ -5727,15 +5848,15 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Key
 # games" and "Variable refresh rate" switches of Settings > System > Display > Graphics > Default graphics settings, which Windows
 # keeps as two NAME=value; pairs in one text value (see Custom-DxGlobal in e2-custom.ps1).
 Add-Tweak -Id 'windowed-opt' -Cat $cDisplay -Def 'On' -Preset -Name 'Optimizations for windowed games' `
-    -Desc 'On: Windows presents DirectX 10 and 11 games in a window or borderless mode in its newer way (the flip model). That lowers latency and lets those games use Auto HDR and variable refresh rate. Off: the optimization is off, so those games are not presented the newer way. Windows 11 22H2 and newer. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings, so you can also change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Switching it off writes an explicit 0 on those builds (on older builds the entry is removed, which Windows reads as off).' `
+    -Desc 'On: Windows presents DirectX 10 and 11 games in a window or borderless mode in its newer way (the flip model). That lowers latency and lets those games use Auto HDR and variable refresh rate. Off: the optimization is off, so those games are not presented the newer way. Windows 11 22H2 and newer. It does nothing for games in exclusive fullscreen, and nothing for DirectX 12 and Vulkan games, which already present that way. It is the switch "Optimizations for windowed games" under Settings > System > Display > Graphics > Default graphics settings, so you can also change it there. It applies the next time a game starts. On Windows 11 24H2 and newer a clean Windows has no entry for it and Settings shows it as on, so a missing entry is shown as on there (and as off on older builds). Switching it off writes 0, what the switch in Settings writes when you turn it off; Reset all puts the Windows default back.' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, or set to 0 on Windows 11 24H2 and newer where the default is on)' 'SwapEffectUpgradeEnable'
+        pCustom 'DxGlobal' 'sets SwapEffectUpgradeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (switching it off: 0, what Settings writes when you turn it off)' 'SwapEffectUpgradeEnable'
     )
 
 Add-Tweak -Id 'vrr-games' -Cat $cDisplay -Name 'Variable refresh rate (DirectX 11 games)' `
-    -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate of the game. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen, which is how Windows ships. Only turn it on if you have a variable refresh rate screen: on any other screen it does nothing. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off again for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Windows has no entry for this switch out of the box, and a missing entry is shown here as off. Turning it on writes an explicit 1; turning it off removes the entry, which leaves the Windows default. An entry of 1 can come from this app, from a guide or tool used earlier, or from Windows itself when you changed the switch in Settings, and this app cannot tell which.' `
+    -Desc 'On: Windows adds variable refresh rate to full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate of the game. That works with G-SYNC, FreeSync and Adaptive-Sync screens. Off: those games run at the fixed refresh rate of the screen, which is how Windows ships. Only turn it on if you have a variable refresh rate screen: on any other screen it does nothing. Some games flicker or change brightness while the refresh rate varies, and this is the switch to turn off again for them. It is the switch "Variable refresh rate" under Settings > System > Display > Graphics > Advanced graphics settings (on some builds: Change default graphics settings), so you can also change it there. Windows 10 version 2004 and newer. It does not touch G-SYNC or FreeSync in the graphics driver, and it does not change DirectX 10 and 11 games in a window or borderless window: those follow "Optimizations for windowed games". Windows shows the switch in Settings only where the monitor and the graphics driver support variable refresh rate, so this setting is shown as not available (nothing is written) when none of the screens that are connected can do it: a VGA or DVI cable, an HDMI screen that announces neither FreeSync nor HDMI variable refresh rate, or a DisplayPort screen with a fixed refresh rate. Windows has no test for "is the switch shown", so this reads the information each screen reports about itself (its EDID) and only a clear no on every screen counts; when that information cannot be read, or is not clear, the setting stays available. It applies the next time a game starts. Windows has no entry for this switch out of the box, and a missing entry is shown here as off. Turning it on writes 1 and turning it off writes 0, the same as the switch in Settings; Reset all removes the entry, which is how Windows ships (off). An entry of 1 can come from this app, from a guide or tool used earlier, or from Windows itself when you changed the switch in Settings, and this app cannot tell which.' `
     -Parts @(
-        pCustom 'DxGlobal' 'sets VRROptimizeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (undo: the entry is removed, which leaves the Windows default, off)' 'VRROptimizeEnable'
+        pCustom 'DxGlobal' 'sets VRROptimizeEnable=1; inside HKCU\Software\Microsoft\DirectX\UserGpuPreferences\DirectXUserGlobalSettings and leaves every other entry of that text as it is    (switching it off: 0, what Settings writes when you turn it off; Reset all: the entry is removed, the Windows default, off)' 'VRROptimizeEnable'
     )
 
 Add-Tweak -Id 'game-mode' -Cat $cDisplay -Def 'On' -Preset -Name 'Game Mode' `
@@ -5833,11 +5954,18 @@ $acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
     '  - Riot Vanguard (Valorant and other Riot games): can ask you to turn on Memory Integrity before it lets you launch the game.' + "`r`n" + `
     'Applying this setting turns those features off.' + "`r`n" + "`r`n" + `
     'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
-Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity and VBS (HVCI)' `
+Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Memory Integrity and Virtualization-Based Security are left to Windows (new Windows 11 installs on capable hardware usually have them on). Off: both are turned off, and Credential Guard with them. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, and Riot Vanguard can ask for Memory Integrity, so leave this on if you play on those - you are asked about it before it is applied. Switching it back on puts back the values this PC had before Headroom changed them, so Memory Integrity and VBS come back on where Windows had turned them on (Windows does that by itself on a clean Windows 11 install on capable hardware, and does not do it again); a value that was not there is removed again, so Windows decides. Either way it needs a restart.' `
+    -Desc 'On: Memory Integrity (Windows Security > Device security > Core isolation) is left to Windows: new Windows 11 installs on capable hardware usually have it on. Off: it is off, the same as turning that switch off. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: Riot Vanguard can ask for Memory Integrity, so leave this on if you play those games - you are asked about it before it is applied. Switching it back on puts back the value this PC had before Headroom changed it. It does not force Memory Integrity on the way the switch in Windows Security does: Windows Security first checks your drivers, and turning it on from the registry would skip that check, which can stop a PC with a driver that does not support it from starting. To turn it on yourself, use Windows Security > Device security > Core isolation. Virtualization-Based Security and Credential Guard are the "Disable in registry" switch under this card. Either way it needs a restart.' `
     -Parts @(
         pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-vbs' -Cat $cSec -Under 'vbs' -Def 'Off' -Reboot -Risk 'security' -Name 'Disable VBS / Credential Guard in registry' `
+    -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
+    -Desc 'On: Virtualization-Based Security and Credential Guard are turned off (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0), and Memory Integrity''s WasEnabledBy value is set to 0. That can give a few percent more FPS in some games, but it removes protection. Off: those values are as this PC had them, so Windows decides (new Windows 11 installs on capable hardware usually have VBS and Credential Guard on). Windows Settings has no switch for these ("Memory Integrity", the card this sits under, is the switch Windows Security has). Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, so leave this off if you play there - you are asked about it before it is applied. Switching it off, and Reset all, put back the values this PC had before Headroom changed them; a value that was not there is removed again. It needs a restart.' `
+    -Parts @(
         pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'WasEnabledBy' 0
         pRegPrev $dg 'EnableVirtualizationBasedSecurity' 0
         pRegPrev 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
@@ -6081,6 +6209,50 @@ Add-Tweak -Id 'svc-mixedreality' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Wind
         pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
     )
 
+# build 123: the services that used to be part of a Settings switch's card (Location, Nearby sharing, Delivery Optimization, Remote Desktop):
+# the Settings cards now write only what their switch writes, and these are their own settings
+Add-Tweak -Id 'svc-lanman' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Server service (LanmanServer)' `
+    -Desc 'On: the Server service runs (Automatic, as Windows has it), so this PC can share files and printers. Off: it is set to Disabled, so nothing on this PC can be shared, whatever the sharing switches in Settings say. You can still open shares on a NAS or other PCs (the Workstation service is not touched). "File and printer sharing" on the Network sharing page is its own setting.' `
+    -Parts @(
+        pSvc 'LanmanServer' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-discovery' -Cat $cSvc -Inv -Def 'On' -Preset -Name 'Network discovery and UPnP host services' `
+    -Desc 'On: the Function Discovery, Link-Layer Topology Discovery, UPnP Device Host and Network Connected Devices services are enabled (Manual, as Windows has them). Off: they are set to Disabled, so this PC stops announcing itself and stops looking for devices on the network by itself. SSDP Discovery is deliberately left alone, so games that use UPnP port mapping keep working. Side effect: Windows may stop finding new network printers and other devices by itself; adding a printer by its IP address still works. "Network discovery" on the Network sharing page is its own setting.' `
+    -Parts @(
+        pSvc 'FDResPub' 'Disabled' 'Manual'
+        pSvc 'fdPHost' 'Disabled' 'Manual'
+        pSvc 'lltdsvc' 'Disabled' 'Manual'
+        pSvc 'upnphost' 'Disabled' 'Manual'
+        pSvc 'NcdAutoSetup' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-geolocation' -Cat $cSvc -Inv -Def 'On' -Name 'Geolocation service (lfsvc)' `
+    -Desc 'On: the Geolocation service that Windows location features use is enabled (Manual, as Windows has it). Off: it is set to Disabled, so nothing on this PC can get a location, whatever the Location services switch in Settings says. "Location services" on the Privacy page is its own setting.' `
+    -Parts @(
+        pSvc 'lfsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-cdp' -Cat $cSvc -Inv -Def 'On' -Name 'Connected Devices service (CDPSvc)' `
+    -Desc 'On: the Connected Devices Platform service is enabled (Automatic, delayed start, as Windows has it). It powers Nearby sharing, "Share across devices" and Phone Link. Off: it is set to Disabled, so those stop working, whatever their switches in Settings say. "Nearby sharing and Share across devices" on the Cloud page is its own setting.' `
+    -Parts @(
+        pSvc 'CDPSvc' 'Disabled' 'AutomaticDelayed'
+    )
+
+Add-Tweak -Id 'svc-dosvc' -Cat $cSvc -Inv -Def 'On' -Name 'Delivery Optimization service (DoSvc)' `
+    -Desc 'On: the Delivery Optimization service starts with Windows (Automatic, delayed start, as Windows has it). Off: it starts only when Windows Update or the Microsoft Store needs it (Manual). Updates keep working. "Windows Update peer-to-peer sharing" on the Cloud page is its own setting.' `
+    -Parts @(
+        pSvc 'DoSvc' 'Manual' 'AutomaticDelayed'
+    )
+
+Add-Tweak -Id 'svc-rdp' -Cat $cSvc -Inv -Def 'On' -Name 'Remote Desktop services' `
+    -Desc 'On: the Remote Desktop services (TermService, UmRdpService and SessionEnv) are enabled (Manual, as Windows has them), so Remote Desktop works when it is switched on. Off: they are set to Disabled, so nobody can connect to this PC with Remote Desktop, even with Remote Desktop switched on. "Remote Desktop" on the Remote access page is its own setting.' `
+    -Parts @(
+        pSvc 'TermService' 'Disabled' 'Manual'
+        pSvc 'UmRdpService' 'Disabled' 'Manual'
+        pSvc 'SessionEnv' 'Disabled' 'Manual'
+    )
+
 Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -Name 'Defender Core telemetry and experiments' `
     -Desc 'On: the Defender Core Service sends telemetry and uses Microsoft''s experimentation service to deliver fixes. Off: both are turned off. Fixes still arrive through the normal Defender updates, and Windows Security keeps scanning as normal. Microsoft recommends leaving both on, because turning them off can slow how quickly it spots problems such as false alarms. If Tamper Protection is on, Windows may refuse these two values; the log then says so.' `
     -Parts @(
@@ -6090,9 +6262,9 @@ Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -N
 
 # ------------------------------------------------------- Storage and clean-up ---
 Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Depends on the PC' -Name 'Storage Sense' `
-    -Desc 'On: Storage Sense is left as Windows has it. It deletes temporary files and old Recycle Bin files on its own (Settings > System > Storage > Storage Sense), and can be set up to clear your Downloads folder as well. Windows turns it on by itself when disk space runs low, and on many PCs it is off until you switch it on. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. Only that one switch is written; switching it back on removes the value, which is the Windows default.' `
+    -Desc 'On: Storage Sense is on: it deletes temporary files and old Recycle Bin files on its own, and can be set up to clear your Downloads folder as well. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This is the Storage Sense switch in Settings > System > Storage, and it works the same way; only that one switch is written. Reset all removes the value, which is the Windows default: Windows then turns it on by itself when disk space runs low, and on many PCs it is off until then.' `
     -Parts @(
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0)
     )
 
 Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Cleanup -Risk 'note' -Name 'Disk Cleanup (run once)' `
@@ -6130,19 +6302,25 @@ Add-Tweak -Id 'taskbar-left' -Cat $cLook -Def 'Off' -Preset -Explorer -Name 'Tas
     )
 
 Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Def 'Off' -Preset -Name 'End task in the taskbar right-click menu' `
-    -Desc 'On: right-clicking a program on the taskbar shows "End task", so a frozen game or app can be closed in one click without opening Task Manager. Off: the menu has no "End task" (the Windows default). It is the same switch as Settings > System > For developers > End Task, which needs Windows 11 version 23H2 (build 22631.2715) or newer; on an older build the value does nothing.' `
+    -Desc 'On: right-clicking a program on the taskbar shows "End task", so a frozen game or app can be closed in one click without opening Task Manager. Off: the menu has no "End task" (the Windows default; switching it off writes 0, as Settings does, and Reset all removes the value). It is the same switch as Settings > System > For developers > End Task, which needs Windows 11 version 23H2 (build 22631.2715) or newer; on an older build the value does nothing.' `
     -Parts @(
-        pReg "$adv\TaskbarDeveloperSettings" 'TaskbarEndTask' 1
+        pBack 0 (pReg "$adv\TaskbarDeveloperSettings" 'TaskbarEndTask' 1)
     )
 
 Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Widgets and Chat taskbar buttons' `
-    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script, so the Widgets feed is also turned off by policy: that is the only way Headroom can hide it there, and Settings shows the Widgets switch as managed while it is set. The Chat policy that earlier builds wrote is removed (Chat is gone from Windows 11 23H2 and later).' `
+    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off, the same as in Settings. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script: there the Widgets button stays until you switch it off in Settings yourself, or use the "Disable in registry" switch under this card, which turns the Widgets feed off by policy. The Chat policy that earlier builds wrote is removed (Chat is gone from Windows 11 23H2 and later).' `
     -Parts @(
         pRegSoft $adv 'TaskbarDa' 0 1
         pReg $adv 'TaskbarMn' 0 1
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\Windows Chat" 'ChatIcon' 3
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-widgets' -Cat $cLook -Under 'taskbar-clutter' -Def 'Off' -Preset -Explorer -Name 'Disable Widgets in registry' `
+    -Desc 'On: the Widgets feed is turned off by Group Policy (AllowNewsAndInterests = 0), so the Widgets button and board are gone, and Settings shows the Widgets switch as managed while it is set. Off: the policy is not set, so Widgets work as Windows has them (the Windows default). Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script, so this policy is the only way Headroom can hide Widgets there. Switching it off, and Reset all, remove it again.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
     )
 
 Add-Tweak -Id 'taskbar-search' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Taskbar search button' `
@@ -6250,26 +6428,15 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Na
     )
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
-Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, suggestions and auto-installed apps' `
-    -Desc 'On: Windows shows promoted apps in Start, tips and suggestions on the lock screen and in Settings, and may install sponsored apps by itself. That includes account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders. Off: the switches for all of that in Settings (Personalization > Lock screen and Start, System > Notifications > Additional settings, Privacy and security > General) are off, and the values behind them that have no switch are set too. The consumer-features policy has no switch in Settings and stays; Windows only obeys it on Enterprise and Education, so it is left out on other editions. The tips, Spotlight and online-tips policies that earlier builds wrote are removed, so the switches in Settings are yours again.' `
+Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Tips and suggestions from Windows' `
+    -Desc 'On: Windows shows tips and suggestions on the lock screen, in Start and in Settings, the welcome experience after updates, ways to finish setting up the PC, account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders (the Windows default). Off: the switches for all of those are off, the same as in Settings (Personalization > Lock screen and Start, System > Notifications, Privacy and security > General, Bluetooth & devices > Mobile devices), and so is "Show sync provider notifications" in File Explorer''s options. The content-delivery values that have no switch (sponsored and auto-installed apps) are the "Disable in registry" switch under this card. The tips, Spotlight and online-tips policies that earlier builds wrote are removed, so the switches in Settings are yours again.' `
     -Parts @(
-        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
-        pReg $cdm 'ContentDeliveryAllowed' 0 1
-        pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
-        pReg $cdm 'PreInstalledAppsEnabled' 0 1
-        pReg $cdm 'PreInstalledAppsEverEnabled' 0 1
-        pReg $cdm 'SilentInstalledAppsEnabled' 0 1
-        pReg $cdm 'SystemPaneSuggestionsEnabled' 0 1
-        pReg $cdm 'SoftLandingEnabled' 0 1
-        pReg $cdm 'SubscribedContentEnabled' 0 1
         pReg $cdm 'SubscribedContent-310093Enabled' 0 1
         pReg $cdm 'SubscribedContent-338387Enabled' 0 1
-        pReg $cdm 'SubscribedContent-338388Enabled' 0 1
         pReg $cdm 'SubscribedContent-338389Enabled' 0 1
         pReg $cdm 'SubscribedContent-338393Enabled' 0 1
         pReg $cdm 'SubscribedContent-353694Enabled' 0 1
         pReg $cdm 'SubscribedContent-353696Enabled' 0 1
-        pReg $cdm 'SubscribedContent-353698Enabled' 0 1
         pReg $cdm 'RotatingLockScreenOverlayEnabled' 0 1
         pReg $adv 'Start_IrisRecommendations' 0 1
         pReg $adv 'ShowSyncProviderNotifications' 0 1
@@ -6285,6 +6452,23 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Ads, sugge
         pRegOld 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0
     )
 
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-suggestions' -Cat $cLook -Under 'suggestions' -Def 'Off' -Preset -Name 'Disable sponsored apps in registry' `
+    -Desc 'On: the content-delivery values that have no switch in Settings are set to 0, so Windows does not install sponsored and suggested apps by itself or deliver promoted content: content delivery, pre-installed, OEM and silently installed apps, the soft-landing tips, subscribed content, and the Start and timeline suggestions of older builds. On Enterprise and Education the consumer-features policy is set too; other editions ignore that policy, so it is left out there. Off: those values are as Windows has them (the Windows default). Switching it off, and Reset all, put the Windows defaults back.' `
+    -Parts @(
+        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
+        pReg $cdm 'ContentDeliveryAllowed' 0 1
+        pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
+        pReg $cdm 'PreInstalledAppsEnabled' 0 1
+        pReg $cdm 'PreInstalledAppsEverEnabled' 0 1
+        pReg $cdm 'SilentInstalledAppsEnabled' 0 1
+        pReg $cdm 'SystemPaneSuggestionsEnabled' 0 1
+        pReg $cdm 'SoftLandingEnabled' 0 1
+        pReg $cdm 'SubscribedContentEnabled' 0 1
+        pReg $cdm 'SubscribedContent-338388Enabled' 0 1
+        pReg $cdm 'SubscribedContent-353698Enabled' 0 1
+    )
+
 Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and account cards in Settings' `
     -Desc 'On: the Microsoft account and Copilot subscription cards show on the Settings home page, and Windows pulls in cloud-optimized suggestions. Off: both are hidden. Both policies are only obeyed by Enterprise and Education, so on Home and Pro this setting is shown as not available.' `
     -Parts @(
@@ -6294,15 +6478,9 @@ Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot
 
 $wsch = "$pol\Windows Search"
 $ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
-Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and cloud results in Start search' `
-    -Desc 'On: Start search also shows Bing results, Microsoft Store suggestions, cloud account search, search highlights and search history on the device. Off: Start search only looks on this PC, and under Settings > Privacy & security > Search both "Show suggested search results" switches (Web searches and Microsoft Store) are off. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Search history, highlights, cloud search' `
+    -Desc 'On: Start search uses search highlights, the search history on this device, cloud search in your Microsoft and work accounts, and web and Microsoft Store suggestions (the Windows default). Off: those switches under Settings > Privacy & security > Search permissions are off, the same as in Settings: search highlights, search history on this device, cloud content search for both kinds of account, and both "Show suggested search results" switches (Web searches and Microsoft Store). Bing web results in Start have no switch in Settings: the "Disable in registry" switch under this card turns them off. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
-        pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0)
-        pReg $wsch 'AllowSearchToUseLocation' 0
-        pReg $wsch 'DisableWebSearch' 1
-        pReg $wsch 'AllowCortana' 0
         pReg $ssm 'IsDeviceSearchHistoryEnabled' 0 1
         pReg $ssm 'IsMSACloudSearchEnabled' 0 1
         pReg $ssm 'IsAADCloudSearchEnabled' 0 1
@@ -6313,6 +6491,18 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Web and clo
         pRegOld $wsch 'AllowCloudSearch' 0
     )
 
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-search' -Cat $cLook -Under 'search-web' -Def 'Off' -Preset -Name 'Disable web search in registry' `
+    -Desc 'On: Group Policy values turn off Bing web results and search box suggestions in Start, location use and Cortana in search, and on Enterprise and Education connected web search; BingSearchEnabled, an older value with no switch in Windows 11 Settings, is set to 0 too. Off: none of that is set, so Start search can show web results and suggestions, use your location and use Cortana, as Windows has it (the Windows default). Switching it off, and Reset all, put the Windows defaults back.' `
+    -Parts @(
+        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
+        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
+        pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0)
+        pReg $wsch 'AllowSearchToUseLocation' 0
+        pReg $wsch 'DisableWebSearch' 1
+        pReg $wsch 'AllowCortana' 0
+    )
+
 Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Snap suggestions and layouts flyout' `
     -Desc 'On: Windows shows what you can snap next to a window right after you snap it, the snap-layouts box when you point at a window''s maximize button, and the layouts bar when you drag a window to the top of the screen. Off: all three are switched off (the three "Snap windows" options in Settings > System > Multitasking). Snapping itself still works: dragging a window to a screen edge and Win+Arrow keys are not touched. File Explorer restarts when this is changed, so open Explorer windows close for a moment.' `
     -Parts @(
@@ -6321,19 +6511,26 @@ Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Sna
         pReg $adv 'EnableSnapBar' 0 1
     )
 
-Add-Tweak -Id 'window-shake' -Cat $cLook -Def 'Off' -Explorer -Name 'Block title bar window shake' `
-    -Desc 'On: grabbing a window by its title bar and shaking it no longer minimizes all the other windows (DisallowShaking = 1). Off: Windows decides. Windows 11 ships with this shake already switched off ("Title bar window shake" in Settings > System > Multitasking), so on most PCs this changes nothing; it only matters on a PC where the shake was switched on. File Explorer restarts when this is changed, so open Explorer windows close for a moment.' `
+# build 124: the card is the "Title bar window shake" switch itself (before, it was "Block title bar window shake", the other way round)
+Add-Tweak -Id 'window-shake' -Cat $cLook -Inv -Def 'Off' -Explorer -Name 'Title bar window shake' `
+    -Desc 'On: grabbing a window by its title bar and shaking it minimizes all the other windows ("Title bar window shake" in Settings > System > Multitasking is on: DisallowShaking = 0, what that switch writes). Off: it does not (DisallowShaking = 1, the same as switching it off there). Windows 11 ships with it off, and a PC where it was never switched on shows as off here too; Reset all leaves it off. File Explorer restarts when this is changed, so open Explorer windows close for a moment.' `
     -Parts @(
-        pReg $adv 'DisallowShaking' 1
+        pBack 0 (pReg $adv 'DisallowShaking' 1) -NoneApplied
     )
 
 # ------------------------------------------------------------------ AI ---------
-Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilot' `
-    -Desc 'On: the old Windows Copilot side panel and the Copilot button on the taskbar are available. Off: the side panel is turned off by policy and the taskbar button is hidden. Microsoft has marked that policy as deprecated. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
+Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilot taskbar button' `
+    -Desc 'On: the Copilot button shows on the taskbar (on the Windows builds that have it). Off: it is hidden, the same as the Copilot switch in Settings > Personalization > Taskbar. The Copilot policies have no switch in Settings: they are the "Disable in registry" switch under this card. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
+    -Parts @(
+        pReg $adv 'ShowCopilotButton' 0 1
+    )
+
+# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
+Add-Tweak -Id 'reg-copilot' -Cat $cAi -Under 'copilot' -Def 'Off' -Preset -Name 'Disable Copilot in registry' `
+    -Desc 'On: the old Windows Copilot side panel is turned off by policy for the PC and for your account, and the value Windows keeps for whether this account may use Copilot is set to 0. Microsoft has marked that policy as deprecated. Off: the policies are not set and that value is as this PC had it (the Windows default). Windows Settings has no switch for these. Switching it off, and Reset all, remove the policies and put back the value this PC had.' `
     -Parts @(
         pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
-        pReg $adv 'ShowCopilotButton' 0 1
         # the value Windows keeps for whether this account may use Copilot (Windows sets it itself; undo: what the PC had)
         pRegPrev 'HKLM:\Software\Microsoft\Windows\Shell\Copilot\BingChat' 'IsUserEligible' 0
     )
@@ -6371,7 +6568,7 @@ Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI 
     )
 
 Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'App access to generative AI' `
-    -Desc 'On: apps can use Windows generative AI. Off: the "Generative AI" app permission in Settings > Privacy and security is set to Deny for every account on this PC. "Text and image generation" is its own setting ("App access to text and image generation"). Ordinary apps and games are not touched. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: apps can use Windows'' generative AI. Off: the "Generative AI" app permission in Settings > Privacy and security is set to Deny for every account on this PC. "Text and image generation" is its own setting ("App access to text and image generation"). Ordinary apps and games are not touched. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         # the "Generative AI" app permission in Settings > Privacy and security, for every account on this PC ("Text and image
         # generation" is its own setting, "App access to text and image generation")
@@ -6414,14 +6611,15 @@ Add-Tweak -Id 'ai-agentic' -Cat $cAi -Def 'Off' -Reboot -Name 'Keep experimental
 
 $chrome = 'HKLM:\SOFTWARE\Policies\Google\Chrome'
 Add-Tweak -Id 'chrome-ai' -Cat $cAi -Inv -Def 'On' -Name 'Chrome: Gemini and other AI features' `
-    -Desc 'On: Chrome''s AI features are left to Chrome. Off: sixteen Chrome policies turn them off. Among them are Gemini in Chrome, AI Mode, "Help me write", AI themes, AI history search, tab compare, the AI helper in DevTools, third-party AI chat, voice typing and the local AI model (Chrome then stops downloading it). Chrome shows "Managed by your organization" while any policy is set. Chrome only reads the policies for features it has, so an older Chrome ignores some of them. Switching it back on removes the policies.' `
+    -Desc 'On: Chrome''s AI features are left to Chrome. Off: sixteen Chrome policies turn them off. Among them are Gemini in Chrome, AI Mode, "Help me write", AI themes, AI history search, tab compare, the AI helper in DevTools, third-party AI chat, voice typing and the local AI model (Chrome then stops downloading it). Chrome shows "Managed by your organization" while any policy is set. Chrome only reads the policies for features it has, so an older Chrome ignores some of them. Switching it back on removes the policies. A value earlier Headroom builds wrote under a name Chrome does not know (FindAndFillWithGeminiSettings) is removed too; "Find and Fill with Gemini" is now turned off with the policy Chrome really reads.' `
     -Parts @(
         pReg $chrome 'AIModeSettings' 1
+        # "Find and Fill with Gemini" (enhanced autofill from Gemini, Chrome 156 and newer); 0/1/2, where 1 still allows it
+        pReg $chrome 'AutofillGenAiSettings' 2
         pReg $chrome 'AutofillPredictionSettings' 2
         pReg $chrome 'ChromeSuggestionsSettings' 1
         pReg $chrome 'CreateThemesSettings' 2
         pReg $chrome 'DevToolsGenAiSettings' 2
-        pReg $chrome 'FindAndFillWithGeminiSettings' 2
         pReg $chrome 'GeminiSettings' 1
         pReg $chrome 'GeminiSparkSettings' 1
         pReg $chrome 'GenAILocalFoundationalModelSettings' 1
@@ -6432,6 +6630,9 @@ Add-Tweak -Id 'chrome-ai' -Cat $cAi -Inv -Def 'On' -Name 'Chrome: Gemini and oth
         pReg $chrome 'TabCompareSettings' 2
         pReg $chrome 'ThirdPartyAiChatSettings' 1
         pReg $chrome 'VoiceTypingSettings' 2
+        # build 123: FindAndFillWithGeminiSettings, which earlier builds wrote (since build 77), is not a Chrome policy (Chrome ignored it and listed it
+        # as unknown); AutofillGenAiSettings above is the real one. The old value is removed.
+        pRegOld $chrome 'FindAndFillWithGeminiSettings' 2
     )
 
 # ----------------------------------------------------------------- Edge --------
@@ -6665,21 +6866,21 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy featur
 # Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
 # Services page (marked -Untested).
 Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off, the same as turning the Mouse keys keyboard shortcut off in Windows accessibility settings. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse (from Windows default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off, the same as turning the Mouse keys keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse (from Windows'' default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
     )
 
 Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows'' default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
     )
 
 Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
-    -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
+    -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. Switching it back on picks "Reduce the volume of other sounds by 80%" (1), as the Sound dialog does; Reset all removes the value, which Windows reads the same way. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
     -Parts @(
-        pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3)
     )
 
 Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
@@ -8371,8 +8572,10 @@ function Sync-StartupRows {
             $old.T = $t
             $fresh[$t.Id] = $old
         } else {
+            # ToDefault: the row was lined up by Reset all (or Use default), which puts the Windows default back; a row switched on its own
+            # card writes what Windows Settings writes (pBack, build 123)
             $fresh[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
-                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = '' }
+                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = ''; ToDefault = $false }
         }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
@@ -8446,6 +8649,7 @@ function Try-SetWant {
     }
     $row.Want = $want
     $row.Force = ''
+    $row.ToDefault = $false
     $row.Note = ''
     $row.NoteDetail = ''
     return ''
@@ -8465,6 +8669,7 @@ function Try-SetPick {
     $row.Pick = $key
     $row.Want = ($key -ne 'default')
     $row.Force = ''
+    $row.ToDefault = $false
     $row.Note = ''
     $row.NoteDetail = ''
     return ''
@@ -8482,6 +8687,7 @@ function Try-ForceUndo {
     $row.Want = $false
     if ($row.T.Choices) { $row.Pick = 'default' }
     $row.Force = 'Undo'
+    $row.ToDefault = $false
     $row.Note = ''
     $row.NoteDetail = ''
     return ''
@@ -8490,8 +8696,9 @@ function Try-ForceUndo {
 # A setting whose Windows default is the position the app applies (Game Mode on): switching it off turns the feature off for real
 # (an explicit value is written) instead of putting the Windows default back.
 function Test-OffIsExplicit {
+    # also a switch Windows ships OFF where a missing value is off (clipboard history): there the applied position is the Windows default
     param($t)
-    return ((-not [bool]$t.Inv) -and [string]$t.Def -eq 'On')
+    return (((-not [bool]$t.Inv) -and [string]$t.Def -eq 'On') -or [bool]$t.DefApplied)
 }
 
 # Tick or untick everything in one group that the filter is showing. Returns how many rows changed.
@@ -8512,10 +8719,84 @@ function Set-GroupWant {
         if ((-not $want) -and (Test-OffIsExplicit $row.T)) { $w = $true }
         $before = Get-Action $row
         if ((Try-SetWant $id $w) -eq '') {
+            # Reset all: an undo puts the Windows default back (not what Settings writes when its switch is flipped)
+            if (-not $want) { $row.ToDefault = $true }
             if ((Get-Action $row) -ne $before) { $changed++ }
         }
     }
     return $changed
+}
+
+# ------------------------------------------------------------ Sync Registry Changes ----
+# build 124 (Tyler: "add a button at the top of the filters section ... that says 'Sync Registry Changes' that will allow you to keep the
+# settings/tweak and registry change in sync with being enabled or disabled"). While it is on, a card and its "Disable in registry" boxes
+# (T.Subs) move together: the card's switch off = its box on (disabled in the registry), the card's switch on = its box off. A click on either
+# switch moves the other (and the card's other boxes); turning Sync on lines every box up with its card (the card is what counts).
+# Tweak all, Apply all and the presets already take a card and its box together, and Reset all always puts the Windows defaults back,
+# so those are left as they are. Nothing is changed on the PC until Apply changes. The choice is kept beside the undo record.
+$script:SyncReg = $false
+function Get-SyncPath {
+    if ($StorePath) { return (Join-Path ([IO.Path]::GetDirectoryName([string]$StorePath)) 'sync-registry.txt') }
+    return ''
+}
+function Read-SyncPref {
+    $p = Get-SyncPath
+    if (-not $p) { return $false }
+    try { if (Test-Path -LiteralPath $p) { return ([string](Get-Content -LiteralPath $p -Raw)).Trim() -eq 'on' } } catch { }
+    return $false
+}
+function Save-SyncPref {
+    param([bool]$on)
+    $p = Get-SyncPath
+    if (-not $p) { return }
+    $v = 'off'; if ($on) { $v = 'on' }
+    try { Set-Content -LiteralPath $p -Value $v -Encoding ASCII } catch { }
+}
+# Line up the boxes under one card with the card's switch. Returns the ids that were changed.
+function Sync-SubsOf {
+    param([string]$id)
+    $row = $script:Rows[$id]
+    if (-not $row) { return @() }
+    $done = @()
+    $cardOn = [bool](Get-SwitchOn $row.T ([bool]$row.Want))
+    foreach ($sid in @($row.T.Subs)) {
+        $sr = $script:Rows[[string]$sid]
+        if (-not $sr -or (Test-CanChange $sr)) { continue }
+        $want = (-not $cardOn)                              # a box's switch is the disabling: on while it is applied
+        if ([bool]$sr.Want -eq $want) { continue }
+        if ((Try-SetWant ([string]$sid) $want) -eq '') { $done += [string]$sid }
+    }
+    return $done
+}
+# A box was switched: its card follows (box on = card off), then the card's other boxes. Returns the ids that were changed.
+function Sync-CardOf {
+    param([string]$sid)
+    $sr = $script:Rows[$sid]
+    if (-not $sr -or -not [string]$sr.T.Under) { return @() }
+    $cid = [string]$sr.T.Under
+    $cr = $script:Rows[$cid]
+    if (-not $cr -or (Test-CanChange $cr)) { return @() }
+    $done = @()
+    $want = ((-not [bool]$sr.Want) -ne [bool]$cr.T.Inv)      # the Want that puts the card's switch on exactly when the box is off
+    if ([bool]$cr.Want -ne $want) { if ((Try-SetWant $cid $want) -eq '') { $done += $cid } }
+    $done += @(Sync-SubsOf $cid)
+    return $done
+}
+# After a click on one switch: the ones that move with it (none while Sync is off)
+function Sync-Linked {
+    param([string]$id)
+    if (-not $script:SyncReg) { return @() }
+    $row = $script:Rows[$id]
+    if (-not $row) { return @() }
+    if ([string]$row.T.Under) { return @(Sync-CardOf $id) }
+    if (@($row.T.Subs).Count -gt 0) { return @(Sync-SubsOf $id) }
+    return @()
+}
+# Turning Sync on: every box follows its card
+function Sync-AllSubs {
+    $done = @()
+    foreach ($id in @($script:Rows.Keys)) { if (@($script:Rows[$id].T.Subs).Count -gt 0) { $done += @(Sync-SubsOf ([string]$id)) } }
+    return $done
 }
 
 # The settings "Turn all on" leaves out on this page ($cat = '' for all of them): the ones "Apply all" leaves out, that are not on yet
@@ -8542,8 +8823,10 @@ $script:PresetNames = @{ recommended = 'Recommended Debloat'; advanced = 'Advanc
 $script:AdvancedExtra = @(
     # Cloud, sync and OneDrive (all)
     'settingsync', 'clipboard', 'crossdevice', 'syncsvc', 'offlinefiles', 'onedrive-policy', 'onedrive-remove', 'deliveryopt',
+    # their services, on the Services page since build 123 (they were part of those cards before)
+    'svc-cdp', 'svc-dosvc',
     # Remote access and VPN (all)
-    'rdp', 'remote-assist', 'quickassist', 'winrm', 'remote-mgmt', 'vpn',
+    'rdp', 'remote-assist', 'quickassist', 'winrm', 'remote-mgmt', 'vpn', 'svc-rdp',
     # Network adapters and USB power: the one Recommended leaves out
     'nic-turnoff',
     # Power plan and startup: Fast Startup and hibernation (the power plan switches are in no preset)
@@ -8552,6 +8835,8 @@ $script:AdvancedExtra = @(
     'wu-drivers',
     # Security prompts (all but BitLocker and automatic device encryption)
     'uac', 'uac-lua', 'vbs', 'hypervisor',
+    # VBS and Credential Guard: the "Disable in registry" box under Memory Integrity (since build 124; its own page in build 123)
+    'reg-vbs',
     # Services (all that are in the Advanced preset; Recommended has the other six)
     'svc-search', 'svc-smartcard', 'printing', 'xbox-svc',
     # File Explorer opens to This PC
@@ -8615,7 +8900,7 @@ function Select-PresetKey {
             if ($act -eq 'Apply') { $r = Try-SetWant $id $true }
             elseif ([string]$row.State -eq 'Partial') { $r = Try-ForceUndo $id }
             else { $r = Try-SetWant $id $false }
-            if ($r -eq '') { $n++ }
+            if ($r -eq '') { $n++; if ($act -ne 'Apply') { $row.ToDefault = $true } }       # Use default: the Windows default, as Reset all
         }
     }
     return $n
@@ -8874,7 +9159,7 @@ function Set-RowState {
     $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
     $row.Diff = $diff          # the values that are not the way the setting sets them (see Get-DiffItems), '' when it is applied
     $row.Force = ''
-    if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row }
+    if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row; $row.ToDefault = $false }
 }
 
 # The changes the user has queued, in catalog order:  @{ Id; Action = 'Apply'|'Undo' }  (+ Choice = the option to set, for a setting with options)
@@ -8885,6 +9170,7 @@ function Get-Pending {
         $a = Get-Action $row
         if (-not $a) { continue }
         if ($row.T.Choices -and $a -eq 'Apply') { $out += ,@{ Id = $id; Action = $a; Choice = [string]$row.Pick } }
+        elseif ($a -eq 'Undo') { $out += ,@{ Id = $id; Action = $a; Default = [bool]$row.ToDefault } }
         else { $out += ,@{ Id = $id; Action = $a } }
     }
     return $out
@@ -9235,7 +9521,9 @@ function Get-DetailParts {
     elseif ($a) {
         $dir = 'OFF'; if (Get-SwitchGoesOn $t ($a -eq 'Undo')) { $dir = 'ON' }
         $tail = ''
-        if ($a -eq 'Undo' -and -not $explicit) { $tail = ' (the Windows default is put back)' }
+        $back = (@(@($t.Parts) | Where-Object { $_.HasBack }).Count -gt 0)
+        if ($a -eq 'Undo' -and $back -and -not $row.ToDefault) { $tail = ' (the same as switching it in Windows Settings)' }
+        elseif ($a -eq 'Undo' -and -not $explicit) { $tail = ' (the Windows default is put back)' }
         [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be turned ' + $dir + $tail + ' when you press the button' + $nl) })
     }
     # the status lines stay at the top (where the setting is now, the switch and the Windows default, what is waiting), and the
@@ -9260,6 +9548,11 @@ function Get-DetailParts {
     elseif ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
     else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (change it yourself if you want it).' + $nl }) }
+    # build 124: a "Disable in registry" box and the card it sits under say so
+    $up = $null; if ([string]$t.Under) { $up = $script:ById[[string]$t.Under] }
+    if ($up) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('The "Disable in registry" switch under "' + [string]$up.Name + '": registry values that card''s Windows Settings switch does not write. It is a setting of its own; switching the card does not change it.' + $nl) }) }
+    $subN = @(@($t.Subs) | Where-Object { $script:ById.ContainsKey([string]$_) } | ForEach-Object { '"' + [string]$script:ById[[string]$_].Name + '"' })
+    if ($subN.Count -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Under this card: the "Disable in registry" switch (' + ($subN -join ', ') + '), for the registry values this switch does not write. It is a setting of its own.' + $nl) }) }
     if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') {
         $back = ' Switching it back puts the Windows default back.'
         if ($explicit) { $back = ' Switching it off turns it off.' }
@@ -9293,6 +9586,7 @@ function Test-RowVisible {
     if ($risk -and $risk -ne 'Any risk' -and (Get-RiskLevel $row.T) -ne $risk) { return $false }
     if ($text) {
         $hay = $row.T.Name + ' ' + $row.T.Desc + ' ' + $row.T.Id + ' ' + $row.T.Cat
+        if ($row.T.Under) { $hay += ' Disable in registry' }                       # the title of its box under the card
         if (Get-NotRecReason $row.T) { $hay += ' ' + $script:NotRecText }        # a search for "not recommended" finds the marked ones
         if ($row.T.Unproven) { $hay += ' May do nothing' }                       # ... and "may do nothing" and "untested" find the cards that carry those tags
         if ($row.T.Untested) { $hay += ' Untested' }
@@ -9732,25 +10026,25 @@ Add-GQ -Id 'shooters' -Group 'Your PC' -Gate 'gaming' `
     -Yes @('mouse')
 Add-GQ -Id 'riot' -Group 'Your PC' -Gate 'gaming,advanced+' `
     -Q 'Do you play Riot games (Valorant, League of Legends) or use FACEIT?' `
-    -Help 'Riot Vanguard and FACEIT Anti-Cheat can refuse to start, or refuse to let you play, when Memory Integrity (virtualization-based security) is off. Yes or Not sure means the two settings that turn those off are never applied, whatever else you answer. Valve games (Counter-Strike 2, Dota 2) and VAC do not need them.' `
-    -Keep @('vbs', 'hypervisor')
+    -Help 'Riot Vanguard and FACEIT Anti-Cheat can refuse to start, or refuse to let you play, when Memory Integrity or virtualization-based security is off. Yes or Not sure means the settings that turn those off are never applied, whatever else you answer. Valve games (Counter-Strike 2, Dota 2) and VAC do not need them.' `
+    -Keep @('vbs', 'reg-vbs', 'hypervisor')
 Add-GQ -Id 'perfsec' -Group 'Your PC' -Gate 'gaming,advanced+' `
     -Q 'Do you want a few percent more FPS even if it lowers some of the protection in Windows?' `
-    -Help 'Memory Integrity and the Windows hypervisor are security features that protect against malicious drivers. Switching them off can give a few percent more FPS in some games, and removes that protection. Yes lines both up (each one asks once more before it is switched on). A Yes to Riot / FACEIT or to virtual machines overrules it.' `
-    -Yes @('vbs', 'hypervisor')
+    -Help 'Memory Integrity, virtualization-based security and the Windows hypervisor are security features that protect against malicious drivers. Switching them off can give a few percent more FPS in some games, and removes that protection. Yes lines them up (each one asks once more before it is switched on). A Yes to Riot / FACEIT or to virtual machines overrules it.' `
+    -Yes @('vbs', 'reg-vbs', 'hypervisor')
 Add-GQ -Id 'vrr' -Group 'Your PC' -Gate 'gaming' `
     -Q 'Do you have a variable refresh rate monitor (G-SYNC, FreeSync or Adaptive-Sync)?' `
     -Help 'Yes turns on variable refresh rate for full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate. Windows ships with this off. Some games flicker or change brightness while the refresh rate varies; this is the switch to turn off again for them. No or Not sure leaves it off, as Windows has it, and it does nothing on a screen without variable refresh rate.' `
     -Yes @('vrr-games')
 Add-GQ -Id 'vm' -Group 'Your PC' `
     -Q 'Do you use virtual machines, WSL, Docker, Windows Sandbox or Android emulators?' `
-    -Help 'Hyper-V, WSL2, Docker Desktop, Windows Sandbox and many emulators need the Windows hypervisor, and their network uses Internet Connection Sharing. Yes or Not sure leaves the hypervisor, Memory Integrity and connection sharing as Windows has them.' `
-    -Keep @('hypervisor', 'vbs', 'ics')
+    -Help 'Hyper-V, WSL2, Docker Desktop, Windows Sandbox and many emulators need the Windows hypervisor, and their network uses Internet Connection Sharing. Yes or Not sure leaves the hypervisor, Memory Integrity, virtualization-based security and connection sharing as Windows has them.' `
+    -Keep @('hypervisor', 'vbs', 'reg-vbs', 'ics')
 Add-GQ -Id 'xbox' -Group 'Your PC' `
     -Q 'Do you use Game Pass, the Xbox app, Microsoft Store games or Game Bar clips?' `
     -Help 'Without the Xbox services, Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG games are not affected. Game Bar (Win+G) records clips in the background, which can cost frames. No switches off the Xbox services, Game Bar recording and its save-sync task, and (if you allowed uninstalling) removes the Game Bar app and the Xbox app with its sign-in. Yes also keeps the Microsoft Store and merged service hosts off the advanced list, because Game Pass and Xbox need them.' `
-    -No @('xbox-svc', 'gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave') `
-    -Keep @('xbox-svc', 'gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave', 'svchost-merge', 'apps-store', 'store-policy')
+    -No @('xbox-svc', 'gamedvr', 'gamebar-controller', 'reg-gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave') `
+    -Keep @('xbox-svc', 'gamedvr', 'gamebar-controller', 'reg-gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave', 'svchost-merge', 'apps-store', 'store-policy')
 Add-GQ -Id 'rgb' -Group 'Your PC' `
     -Q 'Do you control RGB lighting with Windows Dynamic Lighting?' `
     -Help 'That is the Dynamic Lighting page in Settings > Personalization. RGB software from your hardware maker (iCUE, G HUB, Armoury Crate, OpenRGB and so on) is not affected. No stops Windows from controlling the lights, so only that software does, and Windows cannot fight with it.' `
@@ -9778,7 +10072,7 @@ Add-GQ -Id 'work' -Group 'Work and network' `
 Add-GQ -Id 'remote' -Group 'Work and network' `
     -Q 'Do you use Remote Desktop, Remote Assistance or Quick Assist to reach this PC or to get help?' `
     -Help 'No blocks Remote Desktop, turns off Remote Assistance and removes the Quick Assist app (it cannot be put back from this app). Remote play and streaming apps such as Steam Remote Play and Parsec are separate and are not affected by these three.' `
-    -No @('rdp', 'remote-assist', 'quickassist')
+    -No @('rdp', 'svc-rdp', 'remote-assist', 'quickassist')
 Add-GQ -Id 'vpn' -Group 'Work and network' `
     -Q 'Do you use a VPN (a work VPN, or an app such as NordVPN, ProtonVPN or WireGuard)?' `
     -Help 'Windows has its own VPN client (IKEv2, SSTP, L2TP). VPN apps that bring their own driver, such as WireGuard, usually keep working without it, but some VPN clients need it. No switches the Windows VPN services off, which also breaks PPPoE broadband dial-ups. Yes or Not sure leaves them on.' `
@@ -9786,7 +10080,7 @@ Add-GQ -Id 'vpn' -Group 'Work and network' `
 Add-GQ -Id 'lan' -Group 'Work and network' `
     -Q 'Do you share files, printers or media with other PCs, a NAS or a TV on your home network?' `
     -Help 'No turns off file and printer sharing, network discovery, UPnP hosting, the old name lookups (LLMNR, mDNS, NetBIOS) and SMB1. This PC can still open shared folders and printers on other devices; what stops is other devices reaching this one. A few old NAS boxes or printers that are only found by NetBIOS name may stop showing up by name.' `
-    -No @('fileshare', 'discovery', 'legacy-names', 'svc-netbios', 'smb1')
+    -No @('fileshare', 'bind-fileshare', 'svc-lanman', 'reg-adminshares', 'discovery', 'bind-discovery', 'svc-discovery', 'legacy-names', 'svc-netbios', 'smb1')
 Add-GQ -Id 'hotspot' -Group 'Work and network' `
     -Q 'Do you share this PC''s internet connection with other devices (Mobile Hotspot, Internet Connection Sharing)?' `
     -Help 'No turns off Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing. WSL2, Hyper-V and Windows Sandbox use connection sharing too, and the virtual machine question above protects it for them.' `
@@ -9810,7 +10104,7 @@ Add-GQ -Id 'onedrive' -Group 'Accounts and cloud' `
 Add-GQ -Id 'phone' -Group 'Accounts and cloud' `
     -Q 'Do you use Phone Link, Nearby Sharing or text messages on this PC?' `
     -Help 'No turns off Nearby Sharing and Continue on this PC, the text message (SMS) router, and removes the Phone Link and Cross Device apps.' `
-    -No @('crossdevice', 'svc-smsrouter', 'apps-phone')
+    -No @('crossdevice', 'svc-cdp', 'svc-smsrouter', 'apps-phone')
 Add-GQ -Id 'settingsync' -Group 'Accounts and cloud' `
     -Q 'Do you want your theme, Wi-Fi passwords and other Windows settings to sync with your Microsoft account?' `
     -Help 'No blocks settings sync and disables its two background tasks. Your files and apps are not affected.' `
@@ -9826,15 +10120,15 @@ Add-GQ -Id 'clip' -Group 'Accounts and cloud' `
 Add-GQ -Id 'diag' -Group 'Privacy' `
     -Q 'Do you want to stop Windows sending diagnostic data and error reports to Microsoft, and update sharing with other PCs?' `
     -Help 'Yes sets diagnostic data to the least Windows allows, turns off error reporting, the telemetry services and scheduled tasks, the data usage meter, Defender sample sending, Defender Core telemetry, inking and typing data collection, the data usage and Office telemetry tasks, and Windows Update sharing with other PCs. Windows Security keeps scanning and updating as normal.' `
-    -Yes @('telemetry', 'telemetry-tasks', 'telemetry-svc', 'svc-telemetry2', 'task-sqm', 'svc-datausage', 'defender-samples', 'defender-core', 'inking', 'deliveryopt', 'task-dusm', 'task-officetelemetry')
+    -Yes @('telemetry', 'reg-diag', 'telemetry-tasks', 'telemetry-svc', 'svc-telemetry2', 'task-sqm', 'svc-datausage', 'defender-samples', 'defender-core', 'inking', 'reg-handwriting', 'deliveryopt', 'svc-dosvc', 'task-dusm', 'task-officetelemetry')
 Add-GQ -Id 'ads' -Group 'Privacy' `
     -Q 'Do you want to stop ads, suggestions and tracking in Windows?' `
     -Help 'Yes turns off the advertising ID, tailored tips, suggested and auto-installed apps, promo cards in Settings, feedback pop-ups, activity history, app-launch tracking and web results in Start search.' `
-    -Yes @('ads', 'tracking', 'suggestions', 'settings-promo', 'feedback', 'activity', 'search-web')
+    -Yes @('ads', 'tracking', 'suggestions', 'reg-suggestions', 'settings-promo', 'feedback', 'activity', 'search-web', 'reg-search')
 Add-GQ -Id 'location' -Group 'Privacy' `
     -Q 'Do you use location (Weather, Maps, automatic time zone) or Find my device?' `
     -Help 'No turns location off for the whole PC and turns Find my device off, so the PC is not registered with your Microsoft account. Weather and Maps no longer know where you are, and Set time zone automatically stops working, so the clock will not follow you to a new time zone by itself. Yes or Not sure leaves both as Windows has them.' `
-    -No @('location', 'find-my-device')
+    -No @('location', 'reg-location', 'svc-geolocation', 'find-my-device')
 Add-GQ -Id 'devmeta' -Group 'Privacy' `
     -Q 'Do you want Windows to look up device names, pictures and maker apps online when you plug in hardware?' `
     -Help 'No stops Windows from downloading device information from the internet. Drivers are not affected: they still come from Windows Update or your own installer. A new device may show with a generic icon and name.' `
@@ -9850,7 +10144,7 @@ Add-GQ -Id 'rare' -Group 'Privacy' `
 Add-GQ -Id 'ai' -Group 'AI and Edge' `
     -Q 'Do you use Copilot or other AI features in Windows, Edge or Chrome?' `
     -Help 'No switches off Copilot, Recall, Click to Do, AI in Notepad and Paint, text and image generation for apps, voice activation, the AI page in Settings, experimental agentic features and AI in Edge and Chrome. If you allowed uninstalling, it also removes the Copilot app and the Windows AI package.' `
-    -No @('copilot', 'recall', 'ai-apps', 'ai-generative', 'ai-voice', 'ai-page', 'ai-agentic', 'ai-core', 'apps-ai', 'edge-ai', 'edge-ai-more', 'chrome-ai')
+    -No @('copilot', 'reg-copilot', 'recall', 'ai-apps', 'ai-generative', 'ai-voice', 'ai-page', 'ai-agentic', 'ai-core', 'apps-ai', 'edge-ai', 'edge-ai-more', 'chrome-ai')
 Add-GQ -Id 'edge' -Group 'AI and Edge' `
     -Q 'Do you use Microsoft Edge as a browser?' `
     -Help 'Yes still hides the first-run page, rewards and nags and stops Edge from running in the background when it is closed, but leaves Edge''s telemetry and profile sync, its update tasks and its update services as they are. No switches all of that off. The update tasks also keep the WebView2 component up to date, which many apps use: they are only switched off when you answer No.' `
@@ -9868,7 +10162,7 @@ Add-GQ -Id 'taskbar' -Group 'Look and feel' `
 Add-GQ -Id 'widgets' -Group 'Look and feel' `
     -Q 'Do you use Widgets (the weather, news and stocks panel) or Chat on the taskbar?' `
     -Help 'No hides the Widgets and Chat buttons, turns the Widgets feed off by policy and, if you allowed uninstalling, removes the Widgets panel.' `
-    -No @('taskbar-clutter', 'apps-widgets')
+    -No @('taskbar-clutter', 'reg-widgets', 'apps-widgets')
 Add-GQ -Id 'effects' -Group 'Look and feel' `
     -Q 'Do you want Windows without animations, shadows and transparency?' `
     -Help 'Yes turns off window animations and shadows and the transparency effects: a plainer, snappier look.' `
@@ -10239,7 +10533,7 @@ function Build-ConsolePlan {
             if ($States.ContainsKey($t.Id)) { $nowKey = [string]$States[$t.Id].Choice }
             if ([string]$opt.Key -eq 'default') {
                 if ($st -eq 'Off') { $warn += ("{0}: already the Windows default, skipped" -f $t.Id); continue }
-                $plan += ,@{ Id = $t.Id; Action = 'Undo' }
+                $plan += ,@{ Id = $t.Id; Action = 'Undo'; Default = $true }
                 $seen[$t.Id] = 'Undo'
                 continue
             }
@@ -10267,7 +10561,7 @@ function Build-ConsolePlan {
         $st = Get-ConsoleState $States $t.Id
         if ($st -eq 'NA') { $warn += ("{0}: not available on this PC, skipped" -f $t.Id); continue }
         if ($st -eq 'Off') { $warn += ("{0}: not applied, nothing to undo" -f $t.Id); continue }
-        $plan += ,@{ Id = $t.Id; Action = 'Undo' }
+        $plan += ,@{ Id = $t.Id; Action = 'Undo'; Default = $true }          # -Undo puts the Windows default back
         $seen[$t.Id] = 'Undo'
     }
     return [pscustomobject]@{ Plan = $plan; Warn = $warn; Unknown = $unknown }
@@ -10465,6 +10759,7 @@ function Ui-InitMetrics {
         Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 14); BtnR = (Px 10)
         ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
         CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 18); Wheel = (Px 168)
+        SubRow = (Px 54); SubIndent = (Px 40); SubLine = (Px 22)          # the "Disable in registry" box under a card: its line height, how far it is moved in, where the joining line runs
         Side = (Px 244); Gutter = (Px 28); Details = (Px 340); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
         NavTop = (Px 132); SearchY = (Px 80); SearchH = (Px 40); NavRow = (Px 40); NavGap = (Px 4); NavLabel = (Px 40); NavSb = (Px 12); NavWheel = (Px 80)
     }
@@ -11214,6 +11509,10 @@ function Ui-Ask {
 #         StateKey NextKey HeadKey ChipText ChipKey Failed   Choices Pick Now
 #         (Choices = $null, or for a setting with options the list of @{ Key; Short; Label }; Pick = the key that is picked on the card,
 #          Now = the key of the option that is in force, '' when not known. Such a card has a row of option buttons instead of a switch.)
+#         Sub Indent Subs More (build 124: a sub-setting, T.Under, is drawn as a small box under the card it belongs to, with the switch
+#          "Disable in registry". Its entry has Sub = $true, Name = that label and Indent = how far it is moved in; it is not in the
+#          group's rows but in Subs of the card above it, and Ui-Layout puts it on a line of its own right under that card, in its column.
+#          More = another box follows under this one, so the line that joins them goes on down.)
 #   head: Kind='head' Key Cat Title CountText Y H Idx Open
 #   info: Kind='info' Key Cat Title Sub Lines Note Chip ChipKey Span Y H Idx  (a read-out card, see u6-sys.ps1; it has no switch and cannot be
 #         selected. Its height depends on what it says, so a line of the list is as tall as its tallest card.)
@@ -11242,6 +11541,7 @@ $script:MY = -1
 $script:Col = @{}
 $script:CursorIs = ''
 $script:FirstSel = -1                                        # index of the first entry that can be selected (-1 = none: a page of read-outs only)
+$script:SubLabel = 'Disable in registry'                     # the title of the small box under a card (a sub-setting, T.Under)
 
 # ----------------------------------------------------------- sizes and scrolling ----
 function Ui-ListSize {
@@ -11407,6 +11707,36 @@ function Ui-FillHeads {
     }
 }
 
+# The "Disable in registry" boxes of the cards on one line (build 124): each goes right under its card, in the same column, moved in by
+# SubIndent; a card with two of them gets two lines of boxes. The boxes of one line all get the height of the tallest. Returns the new y.
+function Ui-PlaceSubs {
+    param($line, [int]$y, $view)
+    $M = $script:M
+    $k = 0
+    while ($true) {
+        $here = @()
+        foreach ($p in @($line)) {
+            $subs = $p.Subs                                          # (an ArrayList, or $null for a card with no box under it)
+            if ($null -eq $subs -or $k -ge $subs.Count) { continue }
+            $s = $subs[$k]
+            $s.X = [int]$p.X + $M.SubIndent
+            $s.W = [Math]::Max((Px 120), [int]$p.W - $M.SubIndent)
+            $s.Y = $y
+            $s.Idx = $view.Count
+            $s.More = [bool](($k + 1) -lt $subs.Count)
+            [void]$view.Add($s)
+            $here += $s
+        }
+        if ($here.Count -eq 0) { break }
+        $h = 0
+        foreach ($s in $here) { $nh = (Ui-RowGeom $s).NatH; if ($nh -gt $h) { $h = $nh } }
+        foreach ($s in $here) { $s.H = $h }
+        $y += $h
+        $k++
+    }
+    return $y
+}
+
 # Put the entries in order, top to bottom, and work out where each one is (X and W too: a line holds one card, or two in a grid).
 # A group has Info (read-out cards, on top) and Rows (settings). A read-out may take the whole width (Span 2); the cards of one line
 # all get the height of the tallest of them.
@@ -11450,6 +11780,7 @@ function Ui-Layout {
             if (-not $open) {
                 $r.Y = -1
                 $r.Idx = -1
+                if ($null -ne $r.Subs) { foreach ($s in $r.Subs) { $s.Y = -1; $s.Idx = -1 } }
                 continue
             }
             # a line ends when the next entry is a read-out that wants the whole width, or the first settings card after read-outs
@@ -11457,6 +11788,7 @@ function Ui-Layout {
             if (($wide -or ($prev -eq 'info' -and $r.Kind -ne 'info')) -and $c -gt 0) {
                 foreach ($e in $line) { $e.H = $lineH }
                 $y += $lineH
+                $y = Ui-PlaceSubs $line $y $view
                 $c = 0; $line = @(); $lineH = 0
             }
             if ($r.Kind -eq 'info') {
@@ -11474,6 +11806,7 @@ function Ui-Layout {
                 $r.Idx = $view.Count
                 [void]$view.Add($r)
                 $y += $r.H
+                $y = Ui-PlaceSubs @(, $r) $y $view
             } else {
                 $r.X = $c * ($cw + $M.ColGap)
                 $r.Y = $y
@@ -11485,6 +11818,7 @@ function Ui-Layout {
                 if ($c -ge $cols) {
                     foreach ($e in $line) { $e.H = $lineH }
                     $y += $lineH
+                    $y = Ui-PlaceSubs $line $y $view
                     $c = 0; $line = @(); $lineH = 0
                 }
             }
@@ -11493,6 +11827,7 @@ function Ui-Layout {
         if ($c -gt 0) {                               # the last line of the group is only part full
             foreach ($e in $line) { $e.H = $lineH }
             $y += $lineH
+            $y = Ui-PlaceSubs $line $y $view
         }
     }
     $script:View = $view
@@ -11531,11 +11866,25 @@ function Ui-RebuildList {
                 StateKey = 'Sub'; NextKey = 'Sub'; HeadKey = 'Sub'; ChipText = ''; ChipKey = 'Sub'; Failed = $false
                 Risk = [string]$rb.Text; RiskKey = [string]$rb.Key; Tags = @(Get-CardTags $row.T)
                 NotRec = [bool]$nrWhy; NotRecWhy = [string]$nrWhy
-                Choices = $null; Pick = ''; Now = '' }
+                Choices = $null; Pick = ''; Now = ''; Sub = $false; Indent = 0; Subs = $null; More = $false }
         if ($row.T.Choices) { $e.Choices = @($row.T.Choices | ForEach-Object { @{ Key = [string]$_.Key; Short = [string]$_.Short; Label = [string]$_.Label } }) }
         $row.Item = $e
         $row.Visible = $true
         Ui-FillEntry $row
+        # a sub-setting goes into the box under its card (the card comes first in the catalog, so its entry is there already). Each row is
+        # shown or hidden by the search and the filters on its own, so the numbers on the filter buttons stay right: a box whose card is
+        # hidden is shown as a card of its own, with its full name ("Disable diagnostic policies in registry").
+        $u = [string]$row.T.Under
+        $pe = $null
+        if ($u -and $script:Rows.Contains($u)) { $pe = $script:Rows[$u].Item }
+        if ($pe) {
+            $e.Sub = $true
+            $e.Name = [string]$script:SubLabel
+            $e.Indent = [int]$script:M.SubIndent
+            if ($null -eq $pe.Subs) { $pe.Subs = New-Object System.Collections.ArrayList }
+            [void]$pe.Subs.Add($e)
+            continue
+        }
         [void]$byCat[$cat].Add($e)
     }
     $groups = New-Object System.Collections.ArrayList
@@ -11710,9 +12059,12 @@ function Ui-RowGeom {
     $o.ChipH = Px 22
     if ($e.ChipText) {
         $cw = (Ui-TextWidth ([string]$e.ChipText) $f) + (Px 22)
-        $need = [Math]::Max((Px 280), (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) (Ui-Font 'cardName')) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
+        $nf = Ui-Font 'cardName'
+        $minT = Px 280
+        if ($e.Sub) { $nf = Ui-Font 'rowName'; $minT = Px 120 }                  # the box under a card: a short title in a smaller font
+        $need = [Math]::Max($minT, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) $nf) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
         # the "Not recommended" mark matters more than a status chip: the chip only takes room the title and the mark can spare (except "Not on this PC": a setting that is not there cannot be switched, so its reason comes first)
-        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) (Ui-Font 'cardName')) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
+        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) $nf) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
         if ($e.Failed -or (($x - $cw - $o.TextX) -ge $need)) { $o.ChipW = $cw; $o.ChipX = $x - $cw; $x = $o.ChipX - (Px 10) }
     }
     $o.TextEnd = $x
@@ -11720,6 +12072,8 @@ function Ui-RowGeom {
     # the title: one line (names are kept short; the details panel has the rest). A name that is still too long ends with "..."
     $o.TitleH = Px 24
     $tfont = Ui-Font 'cardName'
+    if ($e.Sub) { $o.TitleH = Px 22; $tfont = Ui-Font 'rowName' }
+    $o.TFont = $tfont
     $shownName = Get-TitleCase ([string]$e.Name)
     $tw = Ui-TextWidth $shownName $tfont
     $o.Lines = @($shownName)
@@ -11731,7 +12085,9 @@ function Ui-RowGeom {
     $o.LastW = [Math]::Min($o.TextW, ($lastW + (Px 4)))
     # the height: the lines of the title with room above and below (a line holds the tallest card of its row, so the card may be taller than this)
     $padV = Px 16
-    $o.NatTop = [Math]::Max(($M.Row - $M.Gap), ($nl * $o.TitleH + 2 * $padV))
+    $minH = $M.Row
+    if ($e.Sub) { $padV = Px 10; $minH = $M.SubRow }                   # the box under a card is lower than a card
+    $o.NatTop = [Math]::Max(($minH - $M.Gap), ($nl * $o.TitleH + 2 * $padV))
     $o.NatH = $o.NatTop + $M.Gap
     if ($e.Choices) { $o.NatH += $M.ChoiceExtra }
     $o.CardH = [int]$e.H - $M.Gap
@@ -11806,20 +12162,33 @@ function Ui-PaintRow {
     } elseif ($hot -and -not $e.Tint) {
         $fill = $Th.CardHot
     }
-    Ui-FillRound $g $fill $x $y $cw $ch $M.Radius
-    if ($sel) { Ui-StrokeRound $g $Th.Accent 1 $x $y $cw $ch $M.Radius }
+    # the line that joins a card to the "Disable in registry" box under it: the card draws the part in the gap below it, the box the
+    # part beside it (down from its top to its middle, then across to its left edge), and on down when another box follows
+    if ($null -ne $e.Subs -and $e.Subs.Count -gt 0) { Ui-Line $g $Th.Border 1.5 ($x + $M.SubLine) ($y + $ch) ($x + $M.SubLine) ($y + [int]$e.H) }
+    $rad = $M.Radius
+    if ($e.Sub) {
+        $rad = Px 10
+        $lx = $x - [int]$e.Indent + $M.SubLine
+        $my = $y + [int]($ch / 2)
+        $ly2 = $my; if ($e.More) { $ly2 = $y + [int]$e.H }
+        Ui-Line $g $Th.Border 1.5 $lx $y $lx $ly2
+        Ui-Line $g $Th.Border 1.5 $lx $my $x $my
+    }
+    Ui-FillRound $g $fill $x $y $cw $ch $rad
+    if ($sel) { Ui-StrokeRound $g $Th.Accent 1 $x $y $cw $ch $rad }
     if ($e.Tint) {
         # a change waiting to be made: a short bar at the left edge (blue: the switch will go on, orange: it will go off)
         $bar = $Th.Accent
         if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
-        Ui-FillRound $g $bar ($x + (Px 1)) ($y + (Px 14)) (Px 3) ($o.TopH - (Px 28)) (Px 1)
+        $bi = Px 14; if ($e.Sub) { $bi = Px 10 }
+        Ui-FillRound $g $bar ($x + (Px 1)) ($y + $bi) (Px 3) ($o.TopH - 2 * $bi) (Px 1)
     }
     $on = [bool]$e.Enabled
     $nameCol = $Th.Text
     if (-not $on) { $nameCol = $Th.Dim }
     # the title, then the marks after it
     $textX = $x + $o.TextX
-    for ($li = 0; $li -lt @($o.Lines).Count; $li++) { Ui-Text $g ([string]$o.Lines[$li]) (Ui-Font 'cardName') $nameCol $textX ($y + $o.TitleY + $li * $o.TitleH) $o.TitleW $o.TitleH $TF.L }
+    for ($li = 0; $li -lt @($o.Lines).Count; $li++) { Ui-Text $g ([string]$o.Lines[$li]) $o.TFont $nameCol $textX ($y + $o.TitleY + $li * $o.TitleH) $o.TitleW $o.TitleH $TF.L }
     $tagFont = Ui-Font 'smallb'
     foreach ($p in @($o.Pills)) {
         if ($p.Kind -eq 'notrec') {
@@ -12198,12 +12567,18 @@ function Ui-StepLine {
     $cur = $v[$i]
     $sp = Ui-LineSpan $i
     if ($dir -gt 0) { $k = $sp.Last + 1 } else { $k = $sp.First - 1 }
-    if ($k -lt 0 -or $k -ge $v.Count) { return $i }
-    if ($v[$k].Kind -eq 'head') { return $k }
-    $s2 = Ui-LineSpan $k
-    $pick = $s2.Last
-    for ($j = $s2.First; $j -le $s2.Last; $j++) { if ($v[$j].X -eq $cur.X) { $pick = $j; break } }
-    return $pick
+    while ($true) {
+        if ($k -lt 0 -or $k -ge $v.Count) { return $i }
+        if ($v[$k].Kind -eq 'head') { return $k }
+        $s2 = Ui-LineSpan $k
+        # the same column (a "Disable in registry" box is moved in from its card's column)
+        for ($j = $s2.First; $j -le $s2.Last; $j++) { if (([int]$v[$j].X - [int]$v[$j].Indent) -eq ([int]$cur.X - [int]$cur.Indent)) { return $j } }
+        # a line of boxes with none in this column belongs to the card beside this one: step over it
+        $boxes = $true
+        for ($j = $s2.First; $j -le $s2.Last; $j++) { if (-not $v[$j].Sub) { $boxes = $false } }
+        if (-not $boxes) { return $s2.Last }
+        if ($dir -gt 0) { $k = $s2.Last + 1 } else { $k = $s2.First - 1 }
+    }
 }
 
 function Test-ListKey {
@@ -12288,7 +12663,7 @@ function Ui-Buttons {
     $busy = ($script:Scanning -or $script:Applying -or ($c.Checking -gt 0))
     Ui-SetEnabled $script:UI.apply ((-not $busy) -and (($c.Apply + $c.Undo) -gt 0))
     Ui-SetEnabled $script:UI.stop ([bool]$script:Applying)
-    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
+    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll', 'sync') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
 }
 
 function Ui-Counts {
@@ -12440,6 +12815,8 @@ function Ui-ToggleRow {
         $msg = Try-SetPick $id $next
     } else {
         $msg = Try-SetWant $id (-not [bool]$row.Want)
+        # Sync Registry Changes: the card's "Disable in registry" box (or the box's card) moves with it
+        if (-not $msg) { foreach ($x in @(Sync-Linked $id)) { Ui-RefreshRow ([string]$x) } }
     }
     Ui-RefreshRow $id          # also puts the switch back if the change was refused
     if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
@@ -12479,10 +12856,34 @@ function Ui-GroupTick {
 }
 
 # "Put this one fully back (undo)" for the selected setting
+# The "Sync Registry Changes" switch at the top of the filters was clicked (the CheckBox has already changed Checked)
+function Ui-ToggleSync {
+    $b = $script:UI.sync
+    if (-not $b) { return }
+    $why = Get-BusyReason
+    if ($why) { $b.Checked = [bool]$script:SyncReg; Ui-Status $why; $b.Invalidate(); return }
+    $on = [bool]$b.Checked
+    $script:SyncReg = $on
+    Save-SyncPref $on
+    if ($on) {
+        $done = @(Sync-AllSubs)
+        foreach ($x in $done) { Ui-RefreshRow ([string]$x) }
+        $msg = 'Sync Registry Changes is on: each "Disable in registry" switch now moves with the card above it (card off = Disable in registry on).'
+        if ($done.Count -gt 0) { $msg += (' {0} switch(es) lined up to match; nothing is changed until you press Apply changes.' -f $done.Count) }
+        else { $msg += ' They already match.' }
+        Ui-Status $msg
+    } else {
+        Ui-Status 'Sync Registry Changes is off: a card and its "Disable in registry" switch are switched on their own again.'
+    }
+    $b.Invalidate()
+    Ui-Flush
+}
+
 function Ui-ForceUndo {
     $id = [string]$script:SelKey
     if (-not $id -or -not $script:Rows.Contains($id)) { Ui-Status 'Click a setting first.'; return }
     $msg = Try-ForceUndo $id
+    if (-not $msg) { foreach ($x in @(Sync-Linked $id)) { Ui-RefreshRow ([string]$x) } }
     Ui-RefreshRow $id
     if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
     Ui-Flush
@@ -13380,7 +13781,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '122'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '124'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -13888,7 +14289,7 @@ function Ui-UpdatePage {
     $b = $ui.applyAll
     if ($b -and [bool]$b.Visible -ne $showApplyAll) { $b.Visible = $showApplyAll }
     # a page of read-outs has no filter buttons, no details card (the list takes the whole width) and no settings to turn on
-    foreach ($k in 'segBox', 'detCard', 'gap') {
+    foreach ($k in 'segBox', 'detCard', 'gap', 'sync') {
         $c = $ui[$k]
         if ($c -and [bool]$c.Visible -eq $isInfo) { $c.Visible = (-not $isInfo) }
     }
@@ -13983,6 +14384,7 @@ function Ui-PlaceBars {
     $ui.allOff.Left = $mw - $g - $ui.allOff.Width
     $ui.allOn.Left = $ui.allOff.Left - (Px 4) - $ui.allOn.Width
     $ui.applyAll.Left = $ui.allOn.Left - (Px 8) - $ui.applyAll.Width         # the three page buttons are one group on the tab row
+    if ($ui.sync) { $ui.sync.Left = $mw - $g - $ui.sync.Width }               # Sync Registry Changes: right-aligned with them, at the top of the filters
     Ui-PlacePageBtn
     $ui.barTrack.Width = $mw
     $ui.status.Width = $mw - 2 * $g
@@ -14011,7 +14413,9 @@ function Ui-PlacePageBtn {
         if ([bool]$pb.Visible) { $limit = $pb.Left }
     }
     $ui.title.Width = [Math]::Max((Px 100), ($limit - $M.Gutter - (Px 16)))
-    $ui.sub.Width = [Math]::Max((Px 100), ($edge - $M.Gutter - (Px 16)))
+    $subEdge = $edge
+    if ($ui.sync -and [bool]$ui.sync.Visible) { $subEdge = [int]$ui.sync.Left - (Px 8) }        # the line under the title stops before Sync Registry Changes
+    $ui.sub.Width = [Math]::Max((Px 100), ($subEdge - $M.Gutter - (Px 16)))
     Ui-FitTitle
 }
 
@@ -14180,7 +14584,31 @@ function Ui-Build {
     $btnAllOff.Top = (Px 141)
     $btnAllOn.Visible = $false
     $btnAllOff.Visible = $false
-    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
+    # "Sync Registry Changes" (build 124): a switch at the top of the filters, at the right above the page buttons. While it is on a card and
+    # its "Disable in registry" box move together (see Sync-Linked).
+    $script:SyncReg = [bool](Read-SyncPref)
+    $sync = New-Object System.Windows.Forms.CheckBox
+    $sync.Appearance = [System.Windows.Forms.Appearance]::Button
+    $sync.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+    $sync.UseVisualStyleBackColor = $false
+    $sync.Text = 'Sync Registry Changes'
+    $sync.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
+    $sync.Font = (Ui-Font 'btn')
+    $sync.Cursor = [System.Windows.Forms.Cursors]::Hand
+    $sync.Size = New-Object System.Drawing.Size((Px 236), (Px 34))
+    $sync.Location = New-Object System.Drawing.Point((Px 600), (Px 58))
+    $sync.FlatAppearance.BorderSize = 0
+    $sync.FlatAppearance.CheckedBackColor = $Th.Card
+    $sync.FlatAppearance.MouseOverBackColor = $Th.Card
+    $sync.FlatAppearance.MouseDownBackColor = $Th.Card
+    $sync.Checked = [bool]$script:SyncReg
+    $sync.Visible = $false
+    Ui-DoubleBuffer $sync
+    Ui-WireBtn $sync 'switch'
+    $script:UI.tip.SetToolTip($sync, 'When on, a card and its "Disable in registry" switch move together: switching a card off switches its "Disable in registry" on, and switching the card on switches it off (a click on the box moves the card the same way). Turning it on lines up every "Disable in registry" switch with its card. Nothing is changed until you press Apply changes; Reset all still puts the Windows defaults back.')
+    $sync.Add_Click({ param($s, $e) try { Ui-ToggleSync } catch { Ui-Fail $_ } })
+    $script:UI.sync = $sync
+    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff, $sync) { $header.Controls.Add($hc) }
     $script:UI.header = $header
     $script:UI.title = $title
     $script:UI.sub = $sub
