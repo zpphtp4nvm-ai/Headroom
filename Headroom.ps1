@@ -353,6 +353,18 @@ function Reg-KeyRemove {
         return $false
     }
 }
+# A per-user class key (HKCU:\Software\Classes\CLSID\{...}) that is left with nothing in it once a value is taken out is deleted too
+# (build 124). While it is there, HKEY_CLASSES_ROOT shows that key in place of the one Windows registered for every account (Microsoft:
+# "The merged view does not include the HKEY_LOCAL_MACHINE contents of duplicate subkeys"), so an empty one can keep hiding what it was
+# meant to bring back (File Explorer's Home and Gallery entries). A key that still holds anything (a value, its default, a subkey) stays.
+function Reg-DropEmptyClassKey {
+    param([string]$Path)
+    if ($Path -notmatch '^(?i)HKCU:\\Software\\Classes\\CLSID\\\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}$') { return }
+    if (-not (Reg-KeyExists $Path)) { return }
+    if (@(Reg-Values $Path).Count -gt 0 -or @(Reg-SubKeys $Path).Count -gt 0 -or (Reg-Read $Path '').Exists) { return }
+    if ($DryRun) { Say "  [dry] delete the empty registry key $Path" 'DarkGray'; return }
+    [void](Reg-KeyRemove $Path)
+}
 # Every named value in a key:  @{ Name; Value; Kind }  (the unnamed default value is left out)
 function Reg-Values {
     param([string]$Path)
@@ -1931,7 +1943,7 @@ function Revert-Part {
             if ($p.Old) {
                 $c = Reg-Read $p.Path $p.Name
                 if (-not (Old-Left $p $c)) { return }
-                if ($null -ne $p.Reset) { [void](Reg-Write $p.Path $p.Name $p.Reset $p.Type) } else { [void](Reg-Remove $p.Path $p.Name) }
+                if ($null -ne $p.Reset) { [void](Reg-Write $p.Path $p.Name $p.Reset $p.Type) } else { [void](Reg-Remove $p.Path $p.Name); Reg-DropEmptyClassKey $p.Path }
                 return
             }
             # switched back on its card: what Windows Settings writes when its switch is flipped back (build 123)
@@ -1949,6 +1961,7 @@ function Revert-Part {
             }
             if ($null -eq $p.Default) {
                 [void](Reg-Remove $p.Path $p.Name -Soft:([bool]$p.Soft))
+                Reg-DropEmptyClassKey $p.Path
             } else {
                 [void](Reg-Write $p.Path $p.Name $p.Default $p.Type -Soft:([bool]$p.Soft))
             }
@@ -2404,6 +2417,31 @@ function Od-Uninstaller {
     }
     return $null
 }
+# The folders of your account that OneDrive is backing up (Desktop, Documents, ...: "Manage back up" in OneDrive's settings moves them into
+# the OneDrive folder). Files there that are kept online only cannot be opened once OneDrive is uninstalled, and the folders stay where
+# OneDrive put them, so the app is not removed while any of them is there (build 124). @() when none.
+function Od-BackedUpFolders {
+    $roots = @()
+    foreach ($v in @([string]$env:OneDrive, [string]$env:OneDriveConsumer, [string]$env:OneDriveCommercial)) {
+        $v = $v.Trim().TrimEnd('\')
+        if ($v.Length -ge 3 -and $roots -notcontains $v) { $roots += $v }
+    }
+    $up = ([string]$env:USERPROFILE).Trim().TrimEnd('\')
+    $usf = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders'
+    $o = @()
+    foreach ($f in @(@('Desktop', 'Desktop'), @('Personal', 'Documents'), @('My Pictures', 'Pictures'), @('My Music', 'Music'), @('My Video', 'Videos'))) {
+        $c = Reg-Read $usf ([string]$f[0])
+        if (-not $c.Exists) { continue }
+        $p = ([Environment]::ExpandEnvironmentVariables([string]$c.Value)).Trim().TrimEnd('\')
+        if (-not $p) { continue }
+        $in = $false
+        foreach ($r in $roots) { if ($p.StartsWith($r + '\', [StringComparison]::OrdinalIgnoreCase)) { $in = $true } }
+        # (the folder OneDrive makes in the profile: "OneDrive", or "OneDrive - <organization>" for a work or school account)
+        if (-not $in -and $up.Length -ge 3 -and $p -match ('^(?i)' + [regex]::Escape($up) + '\\OneDrive( - [^\\]+)?\\')) { $in = $true }
+        if ($in) { $o += [string]$f[1] }
+    }
+    return $o
+}
 function Custom-OneDrive-Detect {
     param($p)
     $f = Od-Program
@@ -2413,6 +2451,13 @@ function Custom-OneDrive-Detect {
 }
 function Custom-OneDrive-Apply {
     param($p, $mine)
+    # before anything is stopped or run: the folders OneDrive backs up live inside the OneDrive folder (see Od-BackedUpFolders)
+    if (Od-Program) {
+        $kfm = @(Od-BackedUpFolders)
+        if ($kfm.Count) {
+            throw ('OneDrive is backing up your {0}, so those folders are inside the OneDrive folder and files there that are kept online only could not be opened after OneDrive is removed. Nothing was changed. Stop the backup first (OneDrive > Settings > Sync and backup > Manage back up), then switch this off again' -f ($kfm -join ', '))
+        }
+    }
     if ($DryRun) { Say '  [dry] stop OneDrive, run its uninstaller, then delete leftovers' 'DarkGray'; return }
     Say '  stopping and uninstalling OneDrive...' 'Gray'
     Stop-Process -Name OneDrive -Force -ErrorAction Ignore
@@ -5512,7 +5557,7 @@ Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync
     )
 
 Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note' -Name 'OneDrive app' `
-    -Desc 'On: OneDrive is installed. Off: runs the OneDrive uninstaller and removes leftovers (a OneDrive folder that still has files in it is left alone). It cannot be switched back on from here; reinstall it later with  winget install Microsoft.OneDrive.' `
+    -Desc 'On: OneDrive is installed. Off: runs the OneDrive uninstaller and removes leftovers (a OneDrive folder that still has files in it is left alone). While OneDrive is backing up your Desktop, Documents, Pictures, Music or Videos (they are then inside the OneDrive folder) it is not removed: stop that backup in OneDrive''s settings first, so no file is left that only exists online. It cannot be switched back on from here; reinstall it later with  winget install Microsoft.OneDrive.' `
     -Parts @(
         pCustom 'OneDrive' 'OneDrive is stopped and uninstalled, leftover folders and its startup entry are removed'
     )
