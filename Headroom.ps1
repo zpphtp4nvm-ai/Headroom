@@ -648,7 +648,7 @@ function Svc-Label {
 }
 function Svc-IsApplied {
     param($cur, $p)
-    if ($p.Set -eq 'Manual') { return ($cur.Start -eq 3 -or $cur.Start -eq 4) }
+    if ($p.Set -eq 'Manual') { if ($p.Exact) { return ($cur.Start -eq 3) }; return ($cur.Start -eq 3 -or $cur.Start -eq 4) }
     return ($cur.Start -eq 4)
 }
 function Svc-Write {
@@ -1307,7 +1307,9 @@ function Access-FlagsPart {
     if ($c.Exists -and [string]$c.Kind -eq 'String' -and [int64]::TryParse(([string]$c.Value).Trim(), [ref]$n) -and $n -ge 0 -and $n -le 4294967295L) { $cur = $n }
     return (pReg ([string]$d.Path) 'Flags' ([string]($cur -band (-bnot [int64]4))) ([string]($cur -bor [int64]4)) 'String')
 }
-function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '') @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy } }
+# -Exact (build 124): Manual means Manual. Without it a service that is Disabled also counts as applied for a Manual part (it is off either
+# way); with it, Disabled reads as not applied and applying sets Manual (the Windows AI Components Host: disabled, it can take the tray icons with it).
+function pSvc    { param([string]$Name, [string]$Set, [string]$Default, [string]$SkipIf = '', [string]$SkipWhy = '', [switch]$Exact) @{ T = 'svc'; Name = $Name; Set = $Set; Default = $Default; SkipIf = $SkipIf; SkipWhy = $SkipWhy; Exact = [bool]$Exact } }
 function pTask   { param([string]$Path) @{ T = 'task'; Path = $Path } }
 # Scheduled tasks whose name starts with $Like inside one folder (for tasks that carry a changing id in their name).
 # Turns into one pTask per task found, so it is a no-op on a PC that has none.
@@ -5482,10 +5484,12 @@ Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'Off' -Name 'Clipboard history 
     )
 
 Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing and Share across devices' `
-    -Desc 'On: Nearby sharing and "Share across devices" are available. Off: both switches are off, the same as in Settings (System > Nearby sharing, and Apps > Advanced app settings > Share across devices). The Connected Devices Platform service that powers them is a separate setting on the Services page. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: "Share across devices" is on for your own devices ("My devices only", the Windows default), and Nearby sharing is the way this PC had it (Windows ships Nearby sharing off). Off: both switches are off, the same as in Settings (System > Nearby sharing, and Apps > Advanced app settings > Share across devices). Switching it back on, and Reset all, never turn Nearby sharing on by themselves: it goes back to what this PC had before Headroom changed it, or off. The Connected Devices Platform service that powers them is a separate setting on the Services page. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 1
+        # Nearby sharing: 0 off (the Windows default), 1 my devices only, 2 everyone nearby. Build 124: undo puts back what the PC had, else 0;
+        # before, it wrote 1, so switching the card back on (and Reset all) turned Nearby sharing on, which Windows ships off
+        pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 'DWord' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
         # build 122: the policy values earlier builds wrote; Settings shows a switch as managed while they are there, so they are removed
         pRegOld "$pol\System" 'EnableCdp' 0
@@ -6209,6 +6213,96 @@ Add-Tweak -Id 'svc-mixedreality' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Wind
         pSvc 'MixedRealityOpenXRSvc' 'Disabled' 'Manual'
     )
 
+# build 124 (Tyler: "For the ones missing from headroom add them in"): the services another tool had switched off on his PC that Headroom did
+# not cover. They are untested ideas like the ones above (left out of Apply all and Tweak all, in no preset). Defaults: Windows 11's own start
+# types (smartpcutilities' Windows 11 Pro list, ElevenForum's default services list, revertservice for the two print services). Left out on
+# purpose: OpenSSH Authentication Agent and Shared PC Account Manager (Windows ships them disabled), Auto Time Zone Updater (its start type
+# is the "Set time zone automatically" switch in Settings) and WLAN AutoConfig (its default differs between lists).
+Add-Tweak -Id 'svc-bluetooth' -Cat $cSvc -Untested -Inv -Def 'On' -NotRec 'Bluetooth controllers, headsets, mice, keyboards and phones stop working.' -Name 'Bluetooth services' `
+    -Desc 'On: the Bluetooth services are enabled (Manual, started when needed, as Windows has them): Bluetooth Support, Bluetooth User Support, Bluetooth Audio Gateway and AVCTP (media buttons and audio control). Off: all four are set to Disabled, so Bluetooth does not work at all. Only for a PC that never uses Bluetooth; wired and 2.4 GHz USB-dongle devices are not affected. The user service changes from the next sign-in.' `
+    -Parts @(
+        pSvc 'bthserv' 'Disabled' 'Manual'
+        pSvc 'BluetoothUserService' 'Disabled' 'Manual'
+        pSvc 'BTAGService' 'Disabled' 'Manual'
+        pSvc 'BthAvctpSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-pushnotify' -Cat $cSvc -Untested -Inv -Def 'On' -NotRec 'Windows notifications stop, and the Store, Xbox, Teams and other apps that use push notifications can stop working properly.' -Name 'Windows Push Notifications service' `
+    -Desc 'On: the Windows Push Notifications System Service (WpnService) is enabled (Automatic, as Windows has it): it delivers notifications and live updates to apps. Off: it is set to Disabled. The "Notifications and notification centre" card on Look and feel turns notifications off the way Settings does; this switches off the service behind them.' `
+    -Parts @(
+        pSvc 'WpnService' 'Disabled' 'Automatic'
+    )
+
+Add-Tweak -Id 'svc-wia' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Scanner and camera import service (WIA)' `
+    -Desc 'On: Windows Image Acquisition (StiSvc) is enabled (Manual, started when needed, as Windows has it): it lets apps get pictures from scanners and digital cameras. Off: it is set to Disabled, so scanning and importing photos that way stop working. Webcams for video calls and games do not use it.' `
+    -Parts @(
+        pSvc 'StiSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-efs' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Encrypting File System service (EFS)' `
+    -Desc 'On: the Encrypting File System service is enabled (Manual, started when needed, as Windows has it). Off: it is set to Disabled, so files and folders encrypted with EFS (Properties > Advanced > Encrypt contents) cannot be opened or encrypted. BitLocker does not use it.' `
+    -Parts @(
+        pSvc 'EFS' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-filehistory' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'File History service (fhsvc)' `
+    -Desc 'On: the File History service is enabled (Manual, started when needed, as Windows has it). Off: it is set to Disabled, so File History backups stop. Windows Backup and OneDrive do not use it.' `
+    -Parts @(
+        pSvc 'fhsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-eventcollector' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Windows Event Collector service' `
+    -Desc 'On: the Windows Event Collector (Wecsvc) is enabled (Manual, as Windows has it): it collects event logs from other PCs for event subscriptions. Off: it is set to Disabled. A home PC does not use it; the Event Viewer still works.' `
+    -Parts @(
+        pSvc 'Wecsvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-appid' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'Application Identity service (AppLocker)' `
+    -Desc 'On: the Application Identity service (AppIDSvc) is enabled (Manual, started when needed, as Windows has it): AppLocker uses it to check apps against its rules. Off: it is set to Disabled, so AppLocker rules are not enforced. A home PC without AppLocker rules does not use it. Some Windows builds protect this service; there a change is refused and the setting reads as not applied.' `
+    -Parts @(
+        pSvc 'AppIDSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-agentactivation' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Agent Activation Runtime service' `
+    -Desc 'On: the Agent Activation Runtime (AarSvc) is enabled (Manual, as Windows has it): it lets voice assistants be started by voice or by a button. Off: it is set to Disabled. "Voice activation (wake word)" on the AI features page turns voice activation off the way Settings does. This is a per-user service: the change applies from the next sign-in.' `
+    -Parts @(
+        pSvc 'AarSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-bcastdvr' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'GameDVR and Broadcast User Service' `
+    -Desc 'On: the GameDVR and Broadcast User Service (BcastDVRUserService) is enabled (Manual, as Windows has it): Game Bar uses it to record clips and broadcast. Off: it is set to Disabled, so Game Bar recording does not work. Recording with NVIDIA, AMD or OBS is not affected. This is a per-user service: the change applies from the next sign-in.' `
+    -Parts @(
+        pSvc 'BcastDVRUserService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-messaging' -Cat $cSvc -Untested -Inv -Def 'On' -Name 'Messaging service (MessagingService)' `
+    -Desc 'On: MessagingService is enabled (Manual, started when needed, as Windows has it): it supports text messaging for apps. Off: it is set to Disabled. It is only used with a mobile-broadband modem or a phone link that carries texts. This is a per-user service: the change applies from the next sign-in.' `
+    -Parts @(
+        pSvc 'MessagingService' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-devquery' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'DevQuery Background Discovery Broker' `
+    -Desc 'On: the DevQuery Background Discovery Broker (DevQueryBroker) is enabled (Manual, started when needed, as Windows has it): it lets apps find devices such as printers, Bluetooth and network devices in the background. Off: it is set to Disabled, so some apps only notice new devices while they are open.' `
+    -Parts @(
+        pSvc 'DevQueryBroker' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-printmore' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'More printing services' `
+    -Desc 'On: the Print Device Configuration Service, PrintScanBrokerService and PrintWorkflow are enabled (Manual, as Windows has them): they install network printers and support the print queue and print apps. Off: they are set to Disabled. Only for a PC that never prints; "Printing (Print Spooler)" on this page switches off the print queue itself. The PrintWorkflow user service changes from the next sign-in.' `
+    -Parts @(
+        pSvc 'PrintDeviceConfigurationService' 'Disabled' 'Manual'
+        pSvc 'PrintScanBrokerService' 'Disabled' 'Manual'
+        pSvc 'PrintWorkflowUserSvc' 'Disabled' 'Manual'
+    )
+
+Add-Tweak -Id 'svc-troubleshoot' -Cat $cSvc -Untested -Inv -Def 'On' -Risk 'note' -Name 'More troubleshooting services' `
+    -Desc 'On: the Diagnostic Execution Service, Recommended Troubleshooting Service and Problem Reports Control Panel Support are enabled (Manual, as Windows has them): they run troubleshooters, apply recommended fixes and show the list of problem reports. Off: they are set to Disabled, so troubleshooters and recommended troubleshooting do not run. "Troubleshooting and diagnostics services" on this page are the other three.' `
+    -Parts @(
+        pSvc 'diagsvc' 'Disabled' 'Manual'
+        pSvc 'TroubleshootingSvc' 'Disabled' 'Manual'
+        pSvc 'wercplsupport' 'Disabled' 'Manual'
+    )
+
 # build 123: the services that used to be part of a Settings switch's card (Location, Nearby sharing, Delivery Optimization, Remote Desktop):
 # the Settings cards now write only what their switch writes, and these are their own settings
 Add-Tweak -Id 'svc-lanman' -Cat $cSvc -Inv -Def 'On' -Preset -Risk 'note' -Name 'Server service (LanmanServer)' `
@@ -6542,7 +6636,7 @@ Add-Tweak -Id 'perm-ai' -Cat $cAi -Inv -Def 'On' -Name 'App access to text and i
     )
 
 Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, Click to Do and Settings AI search' `
-    -Desc 'On: Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings are left to Windows. Off: all of them are turned off by policy. A second snapshot value, TurnOffSavingSnapshots, is set as well; Microsoft does not list it, so Windows may ignore it; it does no harm. On Copilot+ PCs the Recall optional feature is also removed and the Windows AI Fabric service is switched off. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
+    -Desc 'On: Recall snapshots, Click to Do, AI analysis of your data and the AI search in Settings are left to Windows. Off: all of them are turned off by policy. A second snapshot value, TurnOffSavingSnapshots, is set as well; Microsoft does not list it, so Windows may ignore it; it does no harm. On Copilot+ PCs the Recall optional feature is also removed, and the Windows AI Components Host service (WSAIFabricSvc) no longer starts with Windows: it is set to Manual, so Windows can still start it when something needs it. It is not disabled: since the July 2026 updates, a disabled AI Components Host has been reported to leave the taskbar and tray icons missing. A PC where something else disabled it reads as partly applied, and finishing it sets Manual. Switching this back on sets the service back to Automatic, how Windows 11 25H2 and later ship it. The Settings AI search policy is only obeyed by Enterprise and Education and is left out on Home and Pro; the others need a recent build of Windows 11 and do no harm on an older one.' `
     -Parts @(
         pReg "$pol\WindowsAI" 'DisableAIDataAnalysis' 1
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableAIDataAnalysis' 1
@@ -6552,7 +6646,9 @@ Add-Tweak -Id 'recall' -Cat $cAi -Inv -Def 'On' -Preset -Reboot -Name 'Recall, C
         pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsAI' 'DisableClickToDo' 1
         pEd 'Ent' (pReg "$pol\WindowsAI" 'DisableSettingsAgent' 1)
         pFeat 'Recall'
-        pSvc 'WSAIFabricSvc' 'Disabled' 'Manual'
+        # build 124: Manual, not Disabled (a disabled AI Components Host has been reported to leave the taskbar and tray icons missing since the
+        # July 2026 updates); undo: Automatic, how 25H2 and later ship it (24H2 had Manual)
+        pSvc 'WSAIFabricSvc' 'Manual' 'Automatic' -Exact
     )
 
 $paintPol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Paint'
@@ -6579,7 +6675,7 @@ Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'App access
     )
 
 Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activation (wake word)' `
-    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
+    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it (it has a card of its own on the Services page). Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
         # "Let apps access voice activation services" in Settings > Privacy and security > Voice activation (it also turns off the
         # switch for when the device is locked)
