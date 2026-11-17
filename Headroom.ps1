@@ -5341,6 +5341,39 @@ Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Teleme
         pTask '\Microsoft\Windows\Autochk\Proxy'
     )
 
+# build 124: from the Testing page, next to the telemetry tasks; ordinary cards
+Add-Tweak -Id 'task-sqm' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics' `
+    -Desc 'On: the scheduled task that gathers software-quality and reliability data for Microsoft is enabled. Off: the task is disabled. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\PI\Sqm-Tasks'
+    )
+
+Add-Tweak -Id 'task-officetelemetry' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled task: Office telemetry' `
+    -Desc 'On: the four Office telemetry agent tasks (OfficeTelemetryAgentLogOn and OfficeTelemetryAgentFallBack, each with a 2016 version) that collect and upload Office usage data are enabled. Off: all four are disabled. Office itself keeps working. A PC without Microsoft Office does not have the tasks; the setting then reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack2016'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn'
+        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn2016'
+    )
+Add-Tweak -Id 'task-pca' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled task: Compatibility Assistant' `
+    -Desc 'On: the Program Compatibility Assistant task (PcaPatchDbTask) that keeps its list of known program-compatibility fixes up to date is enabled. Off: the task is disabled. The list stays as it is; the "this program might not have installed correctly" prompts for old software can then be out of date. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Application Experience\PcaPatchDbTask'
+    )
+
+Add-Tweak -Id 'task-dusm' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled task: Data usage' `
+    -Desc 'On: the Data Usage task (DUSM), which belongs with the data usage meter shown in Settings > Network & internet > Data usage, is enabled. Off: the task is disabled. "Data usage meter service" under Services is a separate setting. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\DUSM\dusmtask'
+    )
+
+Add-Tweak -Id 'task-familysafety' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled task: Family Safety monitor' `
+    -Desc 'On: the Microsoft Family Safety task (parental controls and screen-time limits) is enabled. Off: the task is disabled. It only matters if this PC is used by a child account in a Microsoft family group. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Shell\FamilySafetyMonitor'
+    )
+
 Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and tailored experiences' `
     -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
     -Parts @(
@@ -5570,6 +5603,13 @@ Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update pe
         pRegOld "$pol\DeliveryOptimization" 'DODownloadMode' 0
     )
 
+# build 124: from the Testing page (map downloads in the background, like Delivery Optimization); an ordinary card
+Add-Tweak -Id 'task-maps' -Cat $cCloud -Inv -Def 'On' -Name 'Scheduled task: Maps update' `
+    -Desc 'On: the task that downloads updates for offline maps used by the Maps app is enabled. Off: the task is disabled. It only matters if you use downloaded maps. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
+    )
+
 # -------------------------------------------------------------- Remote --------
 Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'Off' -Name 'Remote Desktop' `
     -Desc 'On: Remote Desktop is on, the same as turning on the switch in Settings > System > Remote Desktop: other PCs can connect to this one with Remote Desktop (with your account and password), and its firewall rules are on. Off: that switch is off and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Windows ships Remote Desktop off; Reset all puts that back (the switch off, the firewall rules as Windows ships them) and never turns Remote Desktop on. The Remote Desktop services are a separate setting on the Services page: while they are disabled, nobody can connect even with this switch on. Policy values that earlier Headroom builds wrote for this are removed, so the switch in Settings is yours again.' `
@@ -5748,6 +5788,13 @@ Add-Tweak -Id 'hibernate' -Cat $cPower -Inv -Def 'On' -Risk 'note' -Name 'Fast S
         pCustom 'Hibernate' 'powercfg /h off   (undo: powercfg /h on)'
     )
 
+# build 124: from the Testing page; an ordinary card
+Add-Tweak -Id 'task-powerdiag' -Cat $cPower -Inv -Def 'On' -Name 'Scheduled task: Power diagnostics' `
+    -Desc 'On: the task that looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report, is enabled. Off: the task is disabled. Nothing else depends on it. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
+    )
+
 # ------------------------------------------------------- Startup apps ---------
 # One switch per program on Task Manager's Startup apps list (built from this PC, so it can differ each run).
 # If the PC cannot be read for some reason, the group is simply missing; the rest of the app is not affected.
@@ -5888,6 +5935,46 @@ Add-Tweak -Id 'toggle-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Toggle Key
     -Desc 'On: holding Num Lock for five seconds opens the Toggle Keys window. Toggle Keys beeps whenever Caps Lock, Num Lock or Scroll Lock is pressed. Off: that shortcut is turned off, the same as turning the Toggle keys keyboard shortcut off in Settings > Accessibility > Keyboard, so the window no longer appears. Only the shortcut is affected: if you use Toggle Keys, it stays on with every option you chose (from Windows'' default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\ToggleKeys' 62 'Toggle Keys'
+    )
+
+# build 124 (Tyler: "move the tweaks in testing category to their correct categories"): the two keyboard shortcuts that were on the
+# Testing page sit with the other three; they were already in the Recommended preset, so they are not marked -Untested
+Add-Tweak -Id 'mouse-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
+    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off, the same as turning the Mouse keys keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse (from Windows'' default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Parts @(
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
+    )
+
+Add-Tweak -Id 'contrast-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
+    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows'' default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
+    -Parts @(
+        pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
+    )
+
+# build 124: from the Testing page; ordinary cards (Tyler: "Make them ordinary cards"), so Apply all and Tweak all take them
+Add-Tweak -Id 'audio-ducking' -Cat $cGame -Inv -Def 'On' -Name 'Windows volume ducking' `
+    -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. Switching it back on picks "Reduce the volume of other sounds by 80%" (1), as the Sound dialog does; Reset all removes the value, which Windows reads the same way. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
+    -Parts @(
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3)
+    )
+
+Add-Tweak -Id 'auto-maintenance' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
+    -Desc 'On: Windows Automatic Maintenance runs background tasks while the PC is idle. These are Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up. Off: those tasks do not start on their own schedule. You can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update, so look again after one.' `
+    -Parts @(
+        pReg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
+    )
+
+Add-Tweak -Id 'task-winsat' -Cat $cGame -Inv -Def 'On' -Name 'Scheduled task: WinSAT benchmark' `
+    -Desc 'On: the task that runs the Windows System Assessment Tool (WinSAT) in the background during automatic maintenance, to refresh the Windows performance score, is enabled. Off: the task is disabled, so no benchmark runs while the PC is idle. The score stays as last measured, and a few old programs read it. If this PC does not have the task the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\Windows\Maintenance\WinSAT'
+    )
+
+Add-Tweak -Id 'task-xblsave' -Cat $cGame -Inv -Def 'On' -Risk 'note' -Name 'Scheduled task: Xbox game save sync' `
+    -Desc 'On: the two Xbox game save tasks (XblGameSaveTask and XblGameSaveTaskLogon) that help sync cloud saves of Game Pass and Microsoft Store games are enabled. Off: both tasks are disabled, so those saves may not sync until you start the game or the Xbox app. Steam, Epic and GOG saves are not affected. If this PC does not have the tasks the setting reads as not available.' `
+    -Parts @(
+        pTask '\Microsoft\XblGameSave\XblGameSaveTask'
+        pTask '\Microsoft\XblGameSave\XblGameSaveTaskLogon'
     )
 
 # ------------------------------------------------------------ Display ----------
@@ -6553,6 +6640,16 @@ Add-Tweak -Id 'classic-menu' -Cat $cExplorer -Def 'Off' -Preset -Explorer -Name 
         pKey "$clsidMenu\InprocServer32" $clsidMenu
     )
 
+# build 124: from the Testing page; an ordinary card
+$clsidCmdA = 'HKCU:\Software\Classes\CLSID\{2aa9162e-c906-4dd9-ad0b-3d24a8eef5a0}'
+$clsidCmdB = 'HKCU:\Software\Classes\CLSID\{6480100b-5a83-4d1e-9f69-8ae5a88e9a33}'
+Add-Tweak -Id 'classic-ribbon' -Cat $cExplorer -Def 'Off' -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar' `
+    -Desc 'On: tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Off: the Windows 11 command bar (the default). Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is changed; if it still looks the same, sign out and in. Treat it as an experiment for that reason.' `
+    -Parts @(
+        pKey "$clsidCmdA\InprocServer32" $clsidCmdA
+        pKey "$clsidCmdB\InprocServer32" $clsidCmdB
+    )
+
 # The side pane entries are per-user switches (System.IsPinnedToNameSpaceTree = 0 in the entry's own class key); 0 hides, no value = Windows default.
 $clsidHome    = 'HKCU:\Software\Classes\CLSID\{f874310e-b6b7-47dc-bc84-b9e6b38f5903}'
 $clsidGallery = 'HKCU:\Software\Classes\CLSID\{e88865ea-0e1c-4e20-9aa6-edcd0212c87c}'
@@ -7002,101 +7099,6 @@ Add-Tweak -Id 'legacy' -Cat $cLegacy -Inv -Def 'On' -Reboot -Name 'Legacy featur
         pCap 'App.StepsRecorder*'
         pFeat 'WorkFolders-Client'
         pFeat 'FaxServicesClientPackage'
-    )
-# --------------------------------------------------------------- Testing -------
-# Settings taken from other debloat scripts that have not been proven to matter for gaming. They live on their own page, are not part
-# of the Recommended preset and are left out of "Apply all" and "Turn all on" on "All settings" (the Testing page's own buttons take them).
-# Every scheduled task is its own card, so any one of them can be turned back on without touching the others. The untested services are on the
-# Services page (marked -Untested).
-Add-Tweak -Id 'mouse-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'Mouse Keys shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Num Lock together opens the "Do you want to turn on Mouse Keys?" window with beeps, which is easy to hit in a game. Off: that shortcut is turned off, the same as turning the Mouse keys keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: if you use Mouse Keys, it stays on with every option you chose, and the switch for it is still there under Settings > Accessibility > Mouse (from Windows'' default 62, the value becomes 58). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
-    -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\MouseKeys' 62 'Mouse Keys'
-    )
-
-Add-Tweak -Id 'contrast-keys' -Cat $cTest -Inv -Def 'On' -Preset -Name 'High Contrast shortcut' `
-    -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows'' default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
-    -Parts @(
-        pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
-    )
-
-Add-Tweak -Id 'audio-ducking' -Cat $cTest -Inv -Def 'On' -Name 'Windows volume ducking' `
-    -Desc 'On: Windows turns other sounds down by 80% when it sees a call or voice chat start (the Windows default). That is Sound > Communications: reduce by 80%. Off: Sound > Communications is set to "Do nothing". A game keeps its full volume while you talk. Switching it back on picks "Reduce the volume of other sounds by 80%" (1), as the Sound dialog does; Reset all removes the value, which Windows reads the same way. It only matters for programs that tell Windows their stream is a call; for most game voice chat that is the case, and for the rest nothing changes. It takes effect the next time a program opens its audio.' `
-    -Parts @(
-        pBack 1 (pReg 'HKCU:\Software\Microsoft\Multimedia\Audio' 'UserDuckingPreference' 3)
-    )
-
-Add-Tweak -Id 'auto-maintenance' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Automatic Maintenance' -NotRec 'Little to gain: maintenance only runs while the PC is idle, and turning it off stops updates, scans and clean-up.' `
-    -Desc 'On: Windows Automatic Maintenance runs background tasks while the PC is idle. These are Store app updates, drive optimisation (TRIM on an SSD), Windows Security scans, system diagnostics and some clean-up. Off: those tasks do not start on their own schedule. You can still update from Windows Update and run Optimize Drives by hand. Windows can switch it back on after a large update, so look again after one.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Schedule\Maintenance' 'MaintenanceDisabled' 1
-    )
-
-$clsidCmdA = 'HKCU:\Software\Classes\CLSID\{2aa9162e-c906-4dd9-ad0b-3d24a8eef5a0}'
-$clsidCmdB = 'HKCU:\Software\Classes\CLSID\{6480100b-5a83-4d1e-9f69-8ae5a88e9a33}'
-Add-Tweak -Id 'classic-ribbon' -Cat $cTest -Def 'Off' -Explorer -Risk 'note' -Name 'Classic File Explorer toolbar' `
-    -Desc 'On: tries to bring back the older File Explorer toolbar instead of the slim Windows 11 command bar (Copy, Paste, Sort, View). It switches off the two components that draw the new command bar, for your account, so File Explorer falls back to its older interface. Off: the Windows 11 command bar (the default). Microsoft does not document this and removed the real ribbon in Windows 11 22H2. Sources disagree on whether it still works: some say it does on 23H2 and newer, others that it no longer works on 24H2 and 25H2, and it has not been tried on build 26300. It may change nothing, or show an incomplete toolbar. File Explorer restarts when this is changed; if it still looks the same, sign out and in. It is on the Testing page for that reason.' `
-    -Parts @(
-        pKey "$clsidCmdA\InprocServer32" $clsidCmdA
-        pKey "$clsidCmdB\InprocServer32" $clsidCmdB
-    )
-
-Add-Tweak -Id 'task-sqm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Software Quality Metrics' `
-    -Desc 'On: the scheduled task that gathers software-quality and reliability data for Microsoft is enabled. Off: the task is disabled. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\PI\Sqm-Tasks'
-    )
-
-Add-Tweak -Id 'task-maps' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Maps update' `
-    -Desc 'On: the task that downloads updates for offline maps used by the Maps app is enabled. Off: the task is disabled. It only matters if you use downloaded maps. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
-    )
-
-Add-Tweak -Id 'task-familysafety' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Family Safety monitor' `
-    -Desc 'On: the Microsoft Family Safety task (parental controls and screen-time limits) is enabled. Off: the task is disabled. It only matters if this PC is used by a child account in a Microsoft family group. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\Shell\FamilySafetyMonitor'
-    )
-
-Add-Tweak -Id 'task-powerdiag' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Power diagnostics' `
-    -Desc 'On: the task that looks at how the PC uses power while it is idle, to feed the Windows power-efficiency diagnostics report, is enabled. Off: the task is disabled. Nothing else depends on it. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\Power Efficiency Diagnostics\AnalyzeSystem'
-    )
-
-Add-Tweak -Id 'task-winsat' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: WinSAT benchmark' `
-    -Desc 'On: the task that runs the Windows System Assessment Tool (WinSAT) in the background during automatic maintenance, to refresh the Windows performance score, is enabled. Off: the task is disabled, so no benchmark runs while the PC is idle. The score stays as last measured, and a few old programs read it. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\Maintenance\WinSAT'
-    )
-
-Add-Tweak -Id 'task-pca' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Compatibility Assistant' `
-    -Desc 'On: the Program Compatibility Assistant task (PcaPatchDbTask) that keeps its list of known program-compatibility fixes up to date is enabled. Off: the task is disabled. The list stays as it is; the "this program might not have installed correctly" prompts for old software can then be out of date. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\Application Experience\PcaPatchDbTask'
-    )
-
-Add-Tweak -Id 'task-dusm' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Data usage' `
-    -Desc 'On: the Data Usage task (DUSM), which belongs with the data usage meter shown in Settings > Network & internet > Data usage, is enabled. Off: the task is disabled. "Data usage meter service" under Services is a separate setting. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Windows\DUSM\dusmtask'
-    )
-
-Add-Tweak -Id 'task-xblsave' -Cat $cTest -Inv -Def 'On' -Risk 'note' -Name 'Scheduled task: Xbox game save sync' `
-    -Desc 'On: the two Xbox game save tasks (XblGameSaveTask and XblGameSaveTaskLogon) that help sync cloud saves of Game Pass and Microsoft Store games are enabled. Off: both tasks are disabled, so those saves may not sync until you start the game or the Xbox app. Steam, Epic and GOG saves are not affected. If this PC does not have the tasks the setting reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\XblGameSave\XblGameSaveTask'
-        pTask '\Microsoft\XblGameSave\XblGameSaveTaskLogon'
-    )
-
-Add-Tweak -Id 'task-officetelemetry' -Cat $cTest -Inv -Def 'On' -Name 'Scheduled task: Office telemetry' `
-    -Desc 'On: the four Office telemetry agent tasks (OfficeTelemetryAgentLogOn and OfficeTelemetryAgentFallBack, each with a 2016 version) that collect and upload Office usage data are enabled. Off: all four are disabled. Office itself keeps working. A PC without Microsoft Office does not have the tasks; the setting then reads as not available.' `
-    -Parts @(
-        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack'
-        pTask '\Microsoft\Office\OfficeTelemetryAgentFallBack2016'
-        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn'
-        pTask '\Microsoft\Office\OfficeTelemetryAgentLogOn2016'
     )
 }   # ---- end of $engine ----
 
@@ -8700,6 +8702,19 @@ function New-Rows {
                                  Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = '' }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
+    Add-KeptPages
+}
+# The Testing page stays in the menu, last, also when no setting is on it (build 124, Tyler: "Leave testing category there at 0/0": every
+# idea that was on it now sits on its own page, marked Untested where it still is one)
+function Add-KeptPages {
+    if ($script:TestingCat -and $script:Cats -notcontains $script:TestingCat) { $script:Cats += [string]$script:TestingCat }
+}
+# A page of the menu that holds no settings at all (the Testing page since build 124)
+function Test-EmptyPage {
+    param([string]$cat)
+    if (-not $cat -or (Test-InfoPage $cat)) { return $false }
+    foreach ($id in @($script:Rows.Keys)) { if ([string]$script:Rows[$id].T.Cat -eq $cat) { return $false } }
+    return $true
 }
 
 # Programs come and go on the startup list. Before a new check, look at the PC again and bring the
@@ -8722,6 +8737,7 @@ function Sync-StartupRows {
         }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
+    Add-KeptPages
     $script:Rows = $fresh
 }
 
@@ -9215,6 +9231,7 @@ $script:ApplyAllSkip = @{ 'uac-lua' = 'it can stop Settings, Calculator and othe
 # '' when "Apply all" takes this setting, otherwise why it does not. $cat is the page ('' = All settings).
 # The Startup apps and the Testing settings are left out of "All settings" only: which programs start with Windows is your own
 # choice and the Testing page holds untested ideas, so they are switched on in bulk only when you press Apply all on their own page.
+# (Since build 124 the Testing page is empty: its ideas moved to their own pages as -Untested settings. The rule stays for any that come back.)
 # The untested services (-Untested) are on the Services page next to the others, so they are left out wherever they are listed.
 function Get-ApplyAllSkip {
     param($row, [string]$cat = '')
@@ -12445,7 +12462,9 @@ function Ui-PaintList {
     $sy = $script:ScrollY
     Ui-Fill $g $script:Th.Bg 0 $clipTop $script:ListW ($clipBottom - $clipTop)
     if ($n -eq 0) {
-        Ui-Text $g 'No settings match.' (Ui-Font 'row') $script:Th.Sub 0 (Px 40) $script:ListW (Px 30) $script:TF.C
+        $none = 'No settings match.'
+        if ($script:Single -and (Test-EmptyPage ([string]$script:NavCat))) { $none = 'No settings on this page.' }
+        Ui-Text $g $none (Ui-Font 'row') $script:Th.Sub 0 (Px 40) $script:ListW (Px 30) $script:TF.C
         return
     }
     $i = Ui-FirstAt ($sy + $clipTop)
@@ -13090,6 +13109,7 @@ function Ui-DoApplyAll {
     Ui-RefreshAll
     $plan = @(Get-Pending)
     if ($plan.Count -eq 0) {
+        if ($cat -and (Test-EmptyPage $cat)) { Ui-Status ('There are no settings on "{0}".' -f $where); Ui-Flush; return }
         Ui-Status ('Everything on "{0}" is already on (or not available on this PC).' -f $where)
         Ui-Flush
         return
@@ -13956,6 +13976,7 @@ function Ui-FillNav {
         $g = $gc[[string]$cat]
         $ct = ''
         if ($g -and $g.Checking -eq 0 -and $g.Total -gt 0) { $ct = ('{0}/{1}' -f $g.On, $g.Total) }
+        elseif (-not $g -and $allCk -eq 0) { $ct = '0/0' }          # a page with no settings at all (Testing, build 124), once the check is done
         [void]$items.Add(@{ Kind = 'item'; Key = ('nav:' + $cat); Cat = [string]$cat; Title = (Get-NavTitle $cat); CountText = $ct; Pending = [bool]$pend[[string]$cat]; CY = 0; Y = 0; H = 0 })
     }
     $script:NavItems = $items
