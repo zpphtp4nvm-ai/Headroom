@@ -124,9 +124,10 @@ function Emit {
     # Read:   what the check actually read from this PC, one line per value (see Get-PartState)
     # Mine:   'yes' = this app has an undo record for the setting (it changed it), 'no' = it was already like this, '' = not known / not applied
     # Diff:   the values that are not the way the setting sets them, one line each (see Get-DiffLine); '' when the setting is applied
-    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '')
+    # Vals:   every value of the setting, one line each: kind, where, now, what the setting sets, and the part's state (build 126: "</>")
+    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '', [string]$Vals = '')
     if ($null -eq $Q) { return }
-    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff })
+    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff; Vals = $Vals })
 }
 
 # --------------------------------------------------- the undo record (store) --
@@ -143,6 +144,7 @@ function Get-Store {
         }
     } catch { }
     try { Import-SplitRecords $s } catch { }
+    try { Import-MergedRecords $s } catch { }
     return $s
 }
 # A setting that was later split into smaller ones keeps its old undo record under the old id. Each new setting is handed the part
@@ -150,6 +152,44 @@ function Get-Store {
 # were there before the old setting changed them. Nothing is written here; the next Save-Store keeps the result.
 #   new id -> old id
 $script:SplitFrom = @{ 'sysresp' = 'netthrottle'; 'gamesched' = 'netthrottle' }
+# The other way round (build 126): the "Disable in registry" boxes of builds 124 and 125 are part of their cards again. Old id -> card id.
+# Their undo records join the card's record (Import-MergedRecords); a Custom Preset, a configuration file or the console that names an
+# old id means the card (Resolve-OldId).
+$script:MergedInto = @{
+    'reg-diag' = 'telemetry'; 'reg-ads' = 'ads'; 'reg-feedback' = 'feedback'; 'reg-handwriting' = 'inking'; 'reg-inputpers' = 'inking'
+    'reg-location' = 'location'; 'reg-findmydevice' = 'find-my-device'; 'reg-devicemetadata' = 'device-metadata'
+    'reg-clipboardhistory' = 'clipboard-history'; 'reg-cloudclipboard' = 'clipboard'; 'reg-cdp' = 'crossdevice'; 'reg-resume' = 'resume'
+    'reg-deliveryopt' = 'deliveryopt'; 'reg-rdp' = 'rdp'; 'reg-remoteassist' = 'remote-assist'; 'reg-adminshares' = 'fileshare'
+    'reg-gamedvr' = 'gamedvr'; 'reg-vbs' = 'vbs'; 'reg-widgets' = 'taskbar-clutter'; 'reg-notifications' = 'notifications'
+    'reg-suggestions' = 'suggestions'; 'reg-tips' = 'suggestions'; 'reg-search' = 'search-web'; 'reg-copilot' = 'copilot'
+    'reg-genai' = 'ai-generative'; 'reg-voice' = 'ai-voice'
+}
+function Resolve-OldId {
+    param([string]$id)
+    if ($id -and $script:MergedInto.ContainsKey($id)) { return [string]$script:MergedInto[$id] }
+    return $id
+}
+# An old box's undo record joins its card's record: what the card's record does not hold yet is taken over (the card's own entry wins),
+# and the old record goes. Nothing is written here; the next Save-Store keeps the result.
+function Import-MergedRecords {
+    param($s)
+    foreach ($old in @($script:MergedInto.Keys)) {
+        if (-not $s.ContainsKey($old)) { continue }
+        $rec = $s[$old]
+        $card = [string]$script:MergedInto[$old]
+        if (-not $s.ContainsKey($card) -or -not $s[$card]) { $s[$card] = $rec }
+        elseif ($rec -is [hashtable]) {
+            $dst = $s[$card]
+            foreach ($kind in @($rec.Keys)) {
+                $src = $rec[$kind]
+                if ($src -isnot [hashtable]) { continue }
+                if (-not ($dst[$kind] -is [hashtable])) { $dst[$kind] = @{} }
+                foreach ($k in @($src.Keys)) { if (-not $dst[$kind].ContainsKey($k)) { $dst[$kind][$k] = $src[$k] } }
+            }
+        }
+        $s.Remove($old)
+    }
+}
 function Import-SplitRecords {
     param($s)
     foreach ($newId in @($script:SplitFrom.Keys)) {
@@ -1346,6 +1386,14 @@ function pEd     { param([string]$Only, $Part) $Part['Ed'] = @(($Only -split ','
 # which is what Settings does when Remote Desktop is turned on. -NoneApplied: Windows ships this switch OFF, and a missing value means off,
 # so a missing value reads as applied (the card shows the feature off, as Settings does); Reset all then lines that setting up as applied.
 function pBack   { param($Value, $Part, [switch]$NoneApplied) $Part['Back'] = $Value; $Part['HasBack'] = $true; if ($NoneApplied) { $Part['NoneApplied'] = $true }; return $Part }
+# pLock (pReg ...): a registry value that goes with the card's switch but that the Windows Settings switch itself does not write: its Group
+# Policy (which locks the switch in Settings) and the related values that have no switch. Build 126 (Tyler: "move our disable in registry
+# into the box it belongs to and combine them again"; "One switch per card"): these were the "Disable in registry" boxes of builds 124
+# and 125. Switching the card off writes them with the switch values, switching it back on (and Reset all) takes them away again.
+# The switch values decide where the switch stands: while those are applied the card reads applied, and a value of this kind that is not
+# written yet only means Apply all, Tweak all and the presets still write it (Test-Unwritten); while the switch values are not applied,
+# a value of this kind that is still set makes the card "partly applied" (the policy still holds the feature off).
+function pLock   { param($Part) $Part['Lock'] = $true; return $Part }
 
 function Add-Tweak {
     # -Ask: a question the window (and an interactive console) puts to the user before this is turned on; if the answer is no
@@ -1358,8 +1406,7 @@ function Add-Tweak {
     # to its risk badge and the reason on hover and in the details. Every -Unproven setting counts as not recommended without it.
     param([string]$Id, [string]$Cat, [string]$Name, [string]$Desc, $Parts,
           [switch]$Preset, [switch]$OneWay, [switch]$Reboot, [switch]$Explorer, [switch]$Unproven, [switch]$Untested, [switch]$Once, [switch]$Cleanup, [switch]$Inv, [string]$Def = '', [string]$Risk = '', [int]$At = -1,
-          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string]$Plan = '',
-          [string]$Under = '')
+          [string]$Ask = '', [string]$AskTitle = '', [string]$AskGroup = '', [object[]]$Choices = @(), [string]$NotRec = '', [string]$Plan = '')
     # What the switch on the card shows is the state of the FEATURE: on = the feature is on, off = it is off (or, for a service, disabled).
     # -Inv: this setting's Apply turns the feature OFF (a debloat: "Windows diagnostic data" on = Windows default, Apply puts it off) and its
     #   Undo puts the Windows default back, so the switch is the opposite of "applied".  Without -Inv, Apply turns the feature on (Dark mode,
@@ -1376,15 +1423,11 @@ function Add-Tweak {
     # -Choices: instead of one on/off switch the setting offers options, shown as a selector on the card. The first entry is the
     # Windows default (Key 'default', no parts); each further entry is @{ Key; Label; Short; Parts } where Parts are pReg values.
     # The setting's own Parts are all the registry values of all options (one definition per value), so undo puts every one of them back.
-    # -Under: the id of the card this one sits under (build 124, Tyler: "move the registry change to another toggle underneath the box it goes
-    #   to, and have a toggle that says disable in registry"). The list draws it as a small box under that card, with the switch "Disable in
-    #   registry": the registry values that card's Windows Settings switch does not write. It is a setting of its own (own state, undo record,
-    #   presets); it is on the same page, comes right after that card (or its other sub-settings) in the catalog, and its switch is on while it
-    #   is applied (not -Inv), so "on" means "disabled in the registry". The card above lists it in Subs.
+    # (Builds 124 and 125 had -Under: a "Disable in registry" box under a card, a setting of its own. Build 126 put those values back into
+    #   their cards, as pLock parts; see pLock.)
     $t = @{ Id = $Id; Cat = $Cat; Name = $Name; Desc = $Desc; Parts = @($Parts); Preset = [bool]$Preset
             OneWay = [bool]$OneWay; Reboot = [bool]$Reboot; Explorer = [bool]$Explorer; Unproven = [bool]$Unproven; Untested = [bool]$Untested; Risk = $Risk
-            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; Cleanup = [bool]$Cleanup; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = ''
-            Under = ''; Subs = @() }
+            Ask = $Ask; AskTitle = $AskTitle; AskGroup = $AskGroup; Choices = $null; Once = [bool]$Once; Cleanup = [bool]$Cleanup; NotRec = $NotRec.Trim(); Inv = [bool]$Inv; Def = '' }
     if ($Cleanup -and -not $Once) { throw "setting ${Id}: -Cleanup is for a run-once action" }
     if ($Ask -and -not $AskTitle) { throw "setting $Id has a question but no title for it" }
     if ($Untested -and ($Preset -or $Once)) { throw "setting ${Id}: an untested setting is never part of the Recommended preset and is not a run-once action" }
@@ -1452,21 +1495,8 @@ function Add-Tweak {
         if ([string]$p.T -eq 'fw' -and [string]$p.Back -ne 'Enabled') { throw "setting ${Id}: a firewall group can only be switched back to Enabled" }
         if (@('reg', 'fw') -notcontains [string]$p.T) { throw "setting ${Id}: pBack is for a registry value or a firewall group" }
     }
-    if ($Under) {
-        $par = $script:ById[$Under]
-        if (-not $par) { throw "setting ${Id}: -Under names a setting that is not defined before it ($Under)" }
-        if ([string]$par.Under) { throw "setting ${Id}: a sub-setting cannot sit under another sub-setting ($Under)" }
-        if ([string]$par.Cat -ne $Cat) { throw "setting ${Id}: a sub-setting is on the page of the card it sits under ($Under)" }
-        if ($Inv -or $Once -or $OneWay -or $Plan -or $Choices.Count -gt 0) { throw "setting ${Id}: a sub-setting is a plain switch that is on while it is applied (not -Inv, one-way, run-once, a power plan or with options)" }
-        if ($par.Once -or $par.Choices -or $par.Plan) { throw "setting ${Id}: a sub-setting sits under a plain on/off switch ($Under)" }
-        $last = $null
-        if ($script:Catalog.Count -gt 0) { $last = $script:Catalog[$script:Catalog.Count - 1] }
-        if ($At -ge 0 -or -not $last -or ([string]$last.Id -ne $Under -and [string]$last.Under -ne $Under)) { throw "setting ${Id}: a sub-setting comes right after the card it sits under, or after that card's other sub-settings ($Under)" }
-        $t.Under = $Under
-    }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
-    if ($Under) { $script:ById[$Under].Subs = @(@($script:ById[$Under].Subs) + $Id) }
 }
 # ---- the edition of Windows ----
 # Home / Pro / Ent (see pEd). Read once from the registry (EditionID: "Core" is Home, "Professional" is Pro).
@@ -1567,6 +1597,11 @@ function Get-PartState {
                 return 'Off'
             }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
+            # build 126: a value that goes with the switch (pLock) and is not there yet: written with the switch, so say that, not "not set"
+            if ($p.Lock -and -not $c.Exists) {
+                $script:NowIs = 'no value yet'
+                $script:Now = ('{0}: no value yet, wanted {1} (written with the switch)' -f $script:NowAt, $script:NowWant)
+            }
             # a switch Windows ships off, where a missing value is off (pBack -NoneApplied): no value is the switch off, as Settings shows it.
             # Build 125: the reading says so in words ("not set" there read as if the switch had not been turned off)
             if ($p.NoneApplied -and -not $c.Exists) {
@@ -1685,15 +1720,24 @@ function Get-ChoiceState {
     $script:CurTweak = $t
     $st = @{}
     $reads = New-Object System.Collections.ArrayList
+    $vals = New-Object System.Collections.ArrayList          # (build 126, the "</>" button: what each option sets this value to)
     foreach ($p in (Expand-Parts $t)) {
         $script:Why = ''
-        $st[(Get-PartId $p)] = (Get-PartState $p)
+        $pid0 = Get-PartId $p
+        $st[$pid0] = (Get-PartState $p)
         if ($script:Now) { [void]$reads.Add([string]$script:Now) }
+        if ($script:NowAt) {
+            $by = @()
+            foreach ($c in @($t.Choices)) { foreach ($cp in @($c.Parts)) { if ((Get-PartId $cp) -eq $pid0) { $by += ('{0}: {1}' -f [string]$c.Label, (Now-RegText @{ Exists = $true; Value = $cp.Value; Kind = [string]$cp.Type })) } } }
+            $script:NowWant = ($by -join '; ')
+            [void]$vals.Add((Get-DiffLine $p) + "`t" + [string]$st[$pid0])
+        }
     }
     $rd = Join-Reads $reads
+    $vl = (@($vals) -join "`n")
     $anyOn = $false
     foreach ($k in @($st.Keys)) { if ($st[$k] -eq 'On') { $anyOn = $true } }
-    if (-not $anyOn) { return @{ State = 'Off'; Choice = 'default'; Read = $rd; Detail = 'Not applied (' + (Get-ChoiceLabel $t 'default') + ')' } }
+    if (-not $anyOn) { return @{ State = 'Off'; Choice = 'default'; Read = $rd; Detail = 'Not applied (' + (Get-ChoiceLabel $t 'default') + ')'; Vals = $vl } }
     foreach ($c in @($t.Choices)) {
         if ([string]$c.Key -eq 'default') { continue }
         $mine = @{}
@@ -1703,10 +1747,10 @@ function Get-ChoiceState {
             $on = ($st[$k] -eq 'On')
             if ($mine.ContainsKey($k)) { if (-not $on) { $ok = $false } } elseif ($on) { $ok = $false }
         }
-        if ($ok) { return @{ State = 'On'; Choice = [string]$c.Key; Read = $rd; Detail = 'Applied: ' + [string]$c.Label } }
+        if ($ok) { return @{ State = 'On'; Choice = [string]$c.Key; Read = $rd; Detail = 'Applied: ' + [string]$c.Label; Vals = $vl } }
     }
     $n = 0; foreach ($k in @($st.Keys)) { if ($st[$k] -eq 'On') { $n++ } }
-    return @{ State = 'Partial'; Choice = ''; Read = $rd; Detail = "Partly applied: $n of $($st.Count) values (they match none of the options)" }
+    return @{ State = 'Partial'; Choice = ''; Read = $rd; Detail = "Partly applied: $n of $($st.Count) values (they match none of the options)"; Vals = $vl }
 }
 # The lines a check read, as one text (one line per value; a long list is cut after 14 lines and says how many were left out)
 function Join-Reads {
@@ -1745,13 +1789,24 @@ function Get-TweakState {
 function Get-PartsState {
     param($t)
     $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
+    $lOn = 0; $lOff = 0; $lOnI = 0                  # the values that go with the switch (pLock, build 126), counted on their own
     $reads = New-Object System.Collections.ArrayList
     $diff = New-Object System.Collections.ArrayList
+    $vals = New-Object System.Collections.ArrayList          # every value as it is now and what the setting sets (build 126: the "</>" button)
     foreach ($p in (Expand-Parts $t)) {
         $script:Why = ''
         $r = Get-PartState $p
         if ($script:Now) { [void]$reads.Add([string]$script:Now) }
         if ($r -eq 'Off' -or $r -eq 'Partial') { [void]$diff.Add((Get-DiffLine $p)) }
+        if ($r -ne 'Skip' -and ($script:NowAt -or $script:Now)) { [void]$vals.Add((Get-DiffLine $p) + "`t" + $r) }
+        if ($p.Lock -and $r -ne 'NA') {
+            switch ($r) {
+                'On'      { $lOn++; if (Test-Informative $p) { $lOnI++ } }
+                'Off'     { $lOff++ }
+                'Partial' { $lOn++; $lOff++; $lOnI++ }
+            }
+            continue
+        }
         switch ($r) {
             'On'      { $on++; if (Test-Informative $p) { $onI++ } }
             'Off'     { $off++ }
@@ -1759,15 +1814,18 @@ function Get-PartsState {
             'NA'      { $na++; if ($script:Why) { $why += $script:Why } }
         }
     }
+    # none of the switch's own values is on this PC: the values that go with it decide on their own
+    if ($on + $off -eq 0 -and $lOn + $lOff -gt 0) { $on = $lOn; $off = $lOff; $onI = $lOnI; $lOn = 0; $lOff = 0; $lOnI = 0 }
     $note = ''; if ($why.Count) { $note = ' (' + (($why | Select-Object -Unique) -join '; ') + ')' }
     $gated = @(Get-GatedParts $t)
     $rd = Join-Reads $reads
     $df = Join-Diff $diff
+    $vl = (@($vals) -join "`n")
     if ($on + $off -eq 0) {
         $d = 'Nothing to change on this PC'; if ($why.Count) { $d = ($why | Select-Object -First 1) }
         elseif ($gated.Count) { $d = (Ed-ClassName (Get-WinEdition).Class) + ' ignores this setting: ' + (Ed-Reason $gated[0].Ed) }
         if (-not $rd) { $rd = $d }          # nothing was read (every value is one this edition ignores): the reason is the reading
-        return @{ State = 'NA'; Read = $rd; Detail = $d }
+        return @{ State = 'NA'; Read = $rd; Detail = $d; Vals = $vl }
     }
     if ($gated.Count) {
         # one reason when every left-out value has the same one; otherwise the details window gives each value its own
@@ -1775,9 +1833,13 @@ function Get-PartsState {
         $gWhyText = 'the details give the reason for each'; if ($gWhy.Count -eq 1) { $gWhyText = [string]$gWhy[0] }
         $note += (' ({0} value{1} left out on {2}: {3})' -f $gated.Count, $(if ($gated.Count -gt 1) { 's' } else { '' }), (Ed-ClassName (Get-WinEdition).Class), $gWhyText)
     }
-    if ($off -eq 0)  { return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note } }
-    if ($onI -eq 0)  { return @{ State = 'Off'; Read = $rd; Diff = $df; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note } }
-    return @{ State = 'Partial'; Read = $rd; Diff = $df; Detail = "Partly applied: $on of $($on + $off) parts" + $note }
+    if ($off -eq 0)  {
+        # the switch is applied; a value that goes with it and is not written yet is written by Apply all, Tweak all and the presets
+        if ($lOff -gt 0) { $note = (' ({0} registry value{1} that go{2} with it not written yet; Apply all writes {3})' -f $lOff, $(if ($lOff -gt 1) { 's' } else { '' }), $(if ($lOff -gt 1) { '' } else { 'es' }), $(if ($lOff -gt 1) { 'them' } else { 'it' })) + $note }
+        return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note; Vals = $vl }
+    }
+    if ($onI -eq 0 -and $lOnI -eq 0)  { return @{ State = 'Off'; Read = $rd; Diff = $df; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note; Vals = $vl } }
+    return @{ State = 'Partial'; Read = $rd; Diff = $df; Detail = ("Partly applied: {0} of {1} parts" -f ($on + $lOn), ($on + $off + $lOn + $lOff)) + $note; Vals = $vl }
 }
 # One value of a setting that is not the way the setting sets it, as one line for the window: what it is (the part's kind), where, what
 # it is now and what the setting sets, separated by tabs; a custom part, which has no such pieces, gives its whole reading instead
@@ -2218,7 +2280,7 @@ function Invoke-Scan {
             $i++
             $r = $null
             try { $r = Get-TweakState $t } catch { $r = @{ State = 'Unknown'; Detail = "Could not check: $($_.Exception.Message)" } }
-            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id) ([string]$r.Diff)
+            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id) ([string]$r.Diff) ([string]$r.Vals)
             $moved = $clock.Elapsed.TotalSeconds
         }
         [void](Pre-Note)
@@ -2238,11 +2300,15 @@ function Invoke-Scan {
 # value means off (pBack -NoneApplied: clipboard history, cloud clipboard, "Record what happened", title bar shake), reads as off while
 # it has no value at all. True when such a value is still missing: Apply all, Tweak all and the presets then still write the value
 # Settings writes when the switch is turned off, so the setting is turned off for real and its reading shows the value.
+# Build 126: also true while a value that goes with the switch (pLock) is not written yet, on a card whose switch values are applied.
 function Test-Unwritten {
     param($t)
-    if (-not $t -or -not $t.DefApplied -or $t.Choices -or $t.Once) { return $false }
+    if (-not $t -or $t.Choices -or $t.Once) { return $false }
+    $script:CurTweak = $t
     foreach ($p in (Expand-Parts $t)) {
-        if ([string]$p.T -eq 'reg' -and $p.NoneApplied -and -not (Reg-Read $p.Path $p.Name).Exists) { return $true }
+        if ([string]$p.T -ne 'reg') { continue }
+        if ($t.DefApplied -and $p.NoneApplied -and -not (Reg-Read $p.Path $p.Name).Exists) { return $true }
+        if ($p.Lock -and -not $p.Old) { $r = Get-PartState $p; if ($r -eq 'Off' -or $r -eq 'Partial') { return $true } }
     }
     return $false
 }
@@ -2359,13 +2425,13 @@ function Invoke-Plan {
             if ($t.Reboot) { $reboot += $t.Name }
             Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
         }
-        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id) ([string]$after.Diff)
+        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id) ([string]$after.Diff) ([string]$after.Vals)
         # a power plan was installed, deleted or made active: which plan is active may have changed, so every plan switch is read again
         if ($t.Plan) {
             foreach ($o in @($script:Catalog | Where-Object { $_.Plan -and $_.Id -ne $t.Id })) {
                 Clear-CacheFor $o
                 $oa = Get-TweakState $o
-                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id) ([string]$oa.Diff)
+                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id) ([string]$oa.Diff) ([string]$oa.Vals)
             }
         }
     }
@@ -3988,6 +4054,30 @@ function Custom-MouseLive-Apply {
 }
 function Custom-MouseLive-Revert { param($p, $mine) Custom-MouseLive-Apply $p $mine }
 
+# A plain number the running session also keeps (build 126: the keyboard repeat delay and the menu delay). The setting's own pReg part
+# writes the registry first; this pushes that same value to the running session, the way the Keyboard control panel does, so it works
+# at once instead of from the next sign-in. SPIF_UPDATEINIFILE writes the value back to the same registry value, which already has it.
+# $p.Data: @{ Path; Name; Spi (the SPI_SET... action); Min; Max; What (for the log) }. Nothing is pushed when the value is missing or
+# is not a number in Min..Max.
+function Custom-SpiLive-Detect { param($p) return 'Skip' }
+function Custom-SpiLive-Apply {
+    param($p, $mine)
+    $d = $p.Data
+    if (-not $d) { return }
+    if ($DryRun) { Say ('  [dry] apply ' + [string]$d.What + ' to the running session') 'DarkGray'; return }
+    $c = Reg-Read ([string]$d.Path) ([string]$d.Name)
+    $n = 0
+    if (-not $c.Exists -or -not [int]::TryParse(([string]$c.Value).Trim(), [ref]$n) -or $n -lt [int]$d.Min -or $n -gt [int]$d.Max) {
+        Say ('  ' + [string]$d.What + ': no usable value to push, it works from the next sign-in') 'DarkGray'
+        return
+    }
+    Ensure-Win32Ui
+    $ok = [Win32Ui]::SpiPtr([uint32]$d.Spi, [uint32]$n, [IntPtr]::Zero, 3)     # SPIF_UPDATEINIFILE | SPIF_SENDCHANGE
+    if ($ok) { Say ('  ' + [string]$d.What + ' updated in the running session (' + $n + ')') 'DarkGray' }
+    else { Say ('  ' + [string]$d.What + ': the running session did not take it, it works from the next sign-in') 'DarkGray' }
+}
+function Custom-SpiLive-Revert { param($p, $mine) Custom-SpiLive-Apply $p $mine }
+
 # ------------------------------- Sticky / Filter / Toggle Keys: push to the running session --
 # The registry values are written by the setting's own parts; this makes the running desktop pick them up
 # without signing out. $which = Sticky | Filter | Toggle
@@ -5305,8 +5395,8 @@ $cEdge   = 'Microsoft Edge'
 $cApps   = 'Remove apps'
 $cLegacy = 'Legacy Windows features'
 $cStore  = 'Storage and clean-up'
-# (build 123 had a "Registry changes" page for the registry values a Windows Settings switch does not write; since build 124 each of them is
-# a "Disable in registry" box under the card it belongs to: Add-Tweak -Under)
+# (build 123 had a "Registry changes" page for the registry values a Windows Settings switch does not write; builds 124 and 125 had each of
+# them as a "Disable in registry" box under the card it belongs to; since build 126 they are part of that card again, marked pLock)
 $script:TestingCat = 'Testing'          # always the last page in the menu; "Apply all" on "All settings" leaves it out
 $cTest   = $script:TestingCat
 $script:StartupCat ='Startup apps (switch off = does not start with Windows)'
@@ -5317,31 +5407,26 @@ $adv  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
 
 # ------------------------------------------------------------ Privacy ---------
 Add-Tweak -Id 'telemetry' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Optional diagnostic data' `
-    -Desc 'On: Windows sends optional diagnostic data to Microsoft, as it does by default ("Send optional diagnostic data" in Settings > Privacy and security > Diagnostics & feedback is on). Off: that switch is off, the same as in Settings, so only required diagnostic data is sent. It writes exactly what the switch writes: 1 in its three values when off, 3 when on. The diagnostic data policy, which locks this switch in Settings, and error reporting, app inventory and the other diagnostic policies, which have no switch in Settings, are the "Disable in registry" switch under this card. Reset all puts back what this PC had.' `
+    -Desc 'On: Windows sends optional diagnostic data to Microsoft, as it does by default ("Send optional diagnostic data" in Settings > Privacy and security > Diagnostics & feedback is on). Off: that switch is off, the same as in Settings, so only required diagnostic data is sent. The switch writes 1 in its three values when off, 3 when on. Off also sets the diagnostic data Group Policy to Required (AllowTelemetry = 1), so Settings shows the switch as managed by your organization and it cannot be turned back on there (Windows Insider builds need optional diagnostic data, so they stop coming while this is off), and the diagnostic policies that have no switch in Settings: Windows Error Reporting, the Customer Experience Improvement Program, app inventory collection and remote diagnostic-config downloads are turned off, the device name is kept out of diagnostic data, diagnostic log and dump collection are limited and no extra data is sent with an error report. Switching it back on turns the switch on and removes those policies; Reset all removes them and puts back the switch values this PC had.' `
     -Parts @(
         # "Send optional diagnostic data" off in Settings > Privacy and security > Diagnostics & feedback: the three values that switch writes
         # (it writes 3 in all three when it is on; undo puts back what this PC had)
         pBack 3 (pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'AllowTelemetry' 1)
         pBack 3 (pRegPrev 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection' 'MaxTelemetryAllowed' 1)
         pBack 3 (pRegPrev 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Diagnostics\DiagTrack' 'ShowedToastAtLevel' 1)
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-diag' -Cat $cPriv -Under 'telemetry' -Def 'Off' -Preset -Name 'Disable diagnostic policies in registry' `
-    -Desc 'On: Group Policy values limit diagnostic data to the required level (AllowTelemetry = 1), so "Send optional diagnostic data" in Settings shows as managed by your organization and cannot be turned back on there (Windows Insider builds need optional diagnostic data, so they stop coming while this is on). They turn off Windows Error Reporting, the Customer Experience Improvement Program, app inventory collection and remote diagnostic-config downloads; they also keep the device name out of diagnostic data, limit diagnostic log and dump collection, and stop extra data being sent with an error report. Off: none of those values is set, so all of that works as Windows has it (the Windows default). Apart from the diagnostic data level, Windows Settings has no switch for any of these: "Optional diagnostic data", the card this sits under, is the switch Settings has. Switching it off, and Reset all, remove them again.' `
-    -Parts @(
+        # (build 126: was the "reg-diag" box, "Disable in registry")
         # the "Allow Diagnostic Data" policy at Required (1); 0 (Security) only works on Enterprise and Education, so 1 is used everywhere
-        pReg "$pol\DataCollection" 'AllowTelemetry' 1
-        pReg "$pol\DataCollection" 'AllowDeviceNameInTelemetry' 0
-        pReg "$pol\DataCollection" 'DisableOneSettingsDownloads' 1
-        pReg "$pol\DataCollection" 'LimitDiagnosticLogCollection' 1
-        pReg "$pol\DataCollection" 'LimitDumpCollection' 1
-        pReg "$pol\AppCompat" 'AITEnable' 0
-        pReg "$pol\AppCompat" 'DisableInventory' 1
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0
-        pReg "$pol\Windows Error Reporting" 'Disabled' 1
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting' 'DoReport' 0
-        pReg 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1
+        pLock (pReg "$pol\DataCollection" 'AllowTelemetry' 1)
+        pLock (pReg "$pol\DataCollection" 'AllowDeviceNameInTelemetry' 0)
+        pLock (pReg "$pol\DataCollection" 'DisableOneSettingsDownloads' 1)
+        pLock (pReg "$pol\DataCollection" 'LimitDiagnosticLogCollection' 1)
+        pLock (pReg "$pol\DataCollection" 'LimitDumpCollection' 1)
+        pLock (pReg "$pol\AppCompat" 'AITEnable' 0)
+        pLock (pReg "$pol\AppCompat" 'DisableInventory' 1)
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows' 'CEIPEnable' 0)
+        pLock (pReg "$pol\Windows Error Reporting" 'Disabled' 1)
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\PCHealth\ErrorReporting' 'DoReport' 0)
+        pLock (pReg 'HKCU:\Software\Microsoft\Windows\Windows Error Reporting' 'DontSendAdditionalData' 1)
     )
 
 Add-Tweak -Id 'telemetry-tasks' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Telemetry scheduled tasks' `
@@ -5394,20 +5479,15 @@ Add-Tweak -Id 'task-familysafety' -Cat $cPriv -Inv -Def 'On' -Name 'Scheduled ta
     )
 
 Add-Tweak -Id 'ads' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Advertising ID and tailored experiences' `
-    -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads. The Group Policy values for these switches are the "Disable in registry" switch under this card.' `
+    -Desc 'On: apps can use your advertising ID and Microsoft can tailor tips and ads (the Windows default). Off: apps can no longer use your advertising ID and tips and ads are not tailored. Microsoft no longer uses your diagnostic data to tailor tips and ads. Off also sets two Group Policy values that turn off the advertising ID for every account on this PC and stop Microsoft from using your diagnostic data to tailor tips and ads, so Settings shows those switches as managed by your organization. Switching it back on, and Reset all, remove them again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo' 'Enabled' 0 1
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy' 'TailoredExperiencesWithDiagnosticDataEnabled' 0 1
         # the copy of the same switch that the Settings app keeps in its own store (undo: what the PC had)
         pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CPSS\Store\TailoredExperiencesWithDiagnosticDataEnabled' 'Value' 0)
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-ads' -Cat $cPriv -Under 'ads' -Def 'Off' -Preset -Name 'Disable advertising policies in registry' `
-    -Desc 'On: two Group Policy values turn off the advertising ID for every account on this PC and stop Microsoft from using your diagnostic data to tailor tips and ads, and Settings shows those switches as managed by your organization. Off: neither value is set, so the switches in Settings decide (the Windows default). Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1
+        # (build 126: was the "reg-ads" box, "Disable in registry")
+        pLock (pReg "$pol\AdvertisingInfo" 'DisabledByGroupPolicy' 1)
+        pLock (pReg 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableTailoredExperiencesWithDiagnosticData' 1)
     )
 
 Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity history' `
@@ -5419,22 +5499,17 @@ Add-Tweak -Id 'activity' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Activity hist
     )
 
 Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-ups' `
-    -Desc 'On: Windows asks you for feedback now and then. Off: "Feedback frequency" in Settings > Privacy and security > Diagnostics & feedback is set to Never, so Windows no longer asks you for feedback. The "Do not show feedback notifications" policy is the "Disable in registry" switch under this card.' `
+    -Desc 'On: Windows asks you for feedback now and then. Off: "Feedback frequency" in Settings > Privacy and security > Diagnostics & feedback is set to Never, so Windows no longer asks you for feedback. Off also sets the "Do not show feedback notifications" Group Policy (DoNotShowFeedbackNotifications = 1), so "Feedback frequency" in Settings shows as managed by your organization. Switching it back on, and Reset all, remove it again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
         # "Never" in Settings also removes the period that "Once a day" / "Once a week" / "Always" set
         pRegOld 'HKCU:\Software\Microsoft\Siuf\Rules' 'PeriodInNanoSeconds' $null $null 'QWord'
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-feedback' -Cat $cPriv -Under 'feedback' -Def 'Off' -Preset -Name 'Disable feedback requests in registry' `
-    -Desc 'On: the "Do not show feedback notifications" Group Policy is set (DoNotShowFeedbackNotifications = 1), so Windows never asks you for feedback, and "Feedback frequency" in Settings shows as managed by your organization. Off: the policy is not set, so "Feedback frequency" in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1
+        # (build 126: was the "reg-feedback" box, "Disable in registry")
+        pLock (pReg "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1)
     )
 
 Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing and speech data collection' `
-    -Desc 'On: Windows may collect what you type and write to personalise suggestions, and online speech recognition is on. Off: that collection is stopped and your consent to online speech recognition is withdrawn (the "Custom inking and typing dictionary" and "Online speech recognition" switches in Settings are off). Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft. Switching it back on turns those switches on again, the same as in Settings, online speech recognition included; Reset all puts back the Windows defaults. The online speech recognition policy, which locks those switches in Settings, and the handwriting data-sharing policies, which have no switch in Settings, are the two "Disable in registry" switches under this card.' `
+    -Desc 'On: Windows may collect what you type and write to personalise suggestions, and online speech recognition is on. Off: that collection is stopped and your consent to online speech recognition is withdrawn (the "Custom inking and typing dictionary" and "Online speech recognition" switches in Settings are off). Typing insights (the statistics Windows keeps about your typing) are turned off as well, and so is the "Improve inking and typing" switch that sends your inking and typing samples to Microsoft. Switching it back on turns those switches on again, the same as in Settings, online speech recognition included; Reset all puts back the Windows defaults. Off also sets the "Allow users to enable online speech recognition services" Group Policy to off (AllowInputPersonalization = 0), which keeps online speech recognition and input personalization off for every account on this PC and shows those switches as managed by your organization; voice typing (Win+H) uses online speech recognition, so it does not work while this is off. It also sets the two policies that stop handwriting samples and handwriting error reports from being sent to Microsoft (Settings has no switch for those). Switching it back on, and Reset all, remove those policies again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitInkCollection' 1 0
         pReg 'HKCU:\Software\Microsoft\InputPersonalization' 'RestrictImplicitTextCollection' 1 0
@@ -5443,36 +5518,21 @@ Add-Tweak -Id 'inking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Inking, typing 
         pBack 1 (pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\OnlineSpeechPrivacy' 'HasAccepted' 0)
         pBack 1 (pReg 'HKCU:\Software\Microsoft\input\Settings' 'InsightsEnabled' 0)
         pReg 'HKCU:\Software\Microsoft\Input\TIPC' 'Enabled' 0 1
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-handwriting' -Cat $cPriv -Under 'inking' -Def 'Off' -Preset -Name 'Disable handwriting sharing in registry' `
-    -Desc 'On: two Group Policy values stop Windows from sending handwriting samples and handwriting error reports to Microsoft. Off: neither value is set, so Windows may send them (the Windows default). Windows Settings has no switch for these. Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1
-        pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-inputpers' -Cat $cPriv -Under 'inking' -Def 'Off' -Preset -Name 'Disable input personalization in registry' `
-    -Desc 'On: the "Allow users to enable online speech recognition services" Group Policy is set to off (AllowInputPersonalization = 0), so online speech recognition and input personalization stay off for every account on this PC, and Settings shows those switches as managed by your organization. Voice typing (Win+H) uses online speech recognition, so it does not work while this is on. Off: the policy is not set, so the switches in Settings decide (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0
+        # (build 126: was the "reg-handwriting" box, "Disable in registry")
+        pLock (pReg "$pol\TabletPC" 'PreventHandwritingDataSharing' 1)
+        pLock (pReg "$pol\HandwritingErrorReports" 'PreventHandwritingErrorReports' 1)
+        # (build 126: was the "reg-inputpers" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\InputPersonalization' 'AllowInputPersonalization' 0)
     )
 
 Add-Tweak -Id 'location' -Cat $cPriv -Inv -Def 'On' -Name 'Location services' `
-    -Desc 'On: Windows can tell apps where you are (the switches in Settings still decide per app). Off: "Location services" in Settings > Privacy and security > Location is off for the whole PC, the same as switching it off there. The location policies (the "Disable in registry" switch under this card, which can also lock this switch off) and the Geolocation service (Services) are separate settings. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
+    -Desc 'On: Windows can tell apps where you are (the switches in Settings still decide per app). Off: "Location services" in Settings > Privacy and security > Location is off for the whole PC, the same as switching it off there. Off also sets three Group Policy values: "Turn off location" (Location services in Settings stays off and shows as managed by your organization), the Windows location provider and location scripting, so apps cannot get a location from Windows. Switching it back on, and Reset all, remove them again. The Geolocation service (Services) is a separate setting. Weather, Maps and "find my device" no longer know where you are. "Set time zone automatically" in Settings also stops working (it is greyed out while location is off), so the clock will not follow you to a new time zone by itself.' `
     -Parts @(
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location' 'Value' 'Deny' 'Allow' 'String'
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-location' -Cat $cPriv -Under 'location' -Def 'Off' -Name 'Disable location in registry' `
-    -Desc 'On: three Group Policy values turn off location for the whole PC ("Turn off location": Location services in Settings stays off and shows as managed by your organization), the Windows location provider and location scripting, so apps cannot get a location from Windows. Weather, Maps, "find my device" and "Set time zone automatically" stop knowing where you are while it is on. Off: none of them is set, so all of that works as Windows has it (the Windows default). Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg "$pol\LocationAndSensors" 'DisableLocation' 1
-        pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1
-        pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1
+        # (build 126: was the "reg-location" box, "Disable in registry")
+        pLock (pReg "$pol\LocationAndSensors" 'DisableLocation' 1)
+        pLock (pReg "$pol\LocationAndSensors" 'DisableWindowsLocationProvider' 1)
+        pLock (pReg "$pol\LocationAndSensors" 'DisableLocationScripting' 1)
     )
 
 # The app permissions under Settings > Privacy and security > App permissions, for every account on this PC (the ConsentStore values the
@@ -5526,31 +5586,21 @@ Add-Tweak -Id 'perm-passkeys' -Cat $cPriv -Inv -Def 'On' -Risk 'note' -Name 'App
     )
 
 Add-Tweak -Id 'find-my-device' -Cat $cPriv -Inv -Def 'Depends on the PC' -Name 'Find my device' `
-    -Desc 'On: Find my device is left as it is. When it is on in Settings > Privacy and security > Find my device, this PC and its location are registered with your Microsoft account so you can locate it from account.microsoft.com/devices. Off: that switch is turned off, the same as in Settings, so the PC is no longer registered. Location services are a separate setting. The Find my device policy is the "Disable in registry" switch under this card. Undo turns the switch back on.' `
+    -Desc 'On: Find my device is left as it is. When it is on in Settings > Privacy and security > Find my device, this PC and its location are registered with your Microsoft account so you can locate it from account.microsoft.com/devices. Off: that switch is turned off, the same as in Settings, so the PC is no longer registered. Location services are a separate setting. Off also sets the "Turn On/Off Find My Device" Group Policy to off (AllowFindMyDevice = 0), so Settings shows the switch as managed by your organization. Switching it back on turns the switch on and removes the policy; Reset all removes it too.' `
     -Parts @(
         # the "Find my device" switch in Settings > Privacy and security > Find my device
         pReg 'HKLM:\SOFTWARE\Microsoft\MdmCommon\SettingValues' 'LocationSyncEnabled' 0 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-findmydevice' -Cat $cPriv -Under 'find-my-device' -Def 'Off' -Name 'Disable Find my device in registry' `
-    -Desc 'On: the "Turn On/Off Find My Device" Group Policy is set to off (AllowFindMyDevice = 0), so this PC is not registered for Find my device, and Settings shows the switch as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0
+        # (build 126: was the "reg-findmydevice" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\FindMyDevice' 'AllowFindMyDevice' 0)
     )
 
 Add-Tweak -Id 'device-metadata' -Cat $cPriv -Inv -Def 'On' -Name 'Device info and apps from the internet' `
-    -Desc 'On: when you plug in a device, Windows can download its details from Microsoft (name, picture and the maker''s device app). Off: "No" in System Properties > Hardware > Device Installation Settings, so Windows does not download them. Drivers are not affected; they still come from Windows Update or your own installer. A new device may show with a generic icon and name. The device metadata policy is the "Disable in registry" switch under this card. Undo sets it back to "Yes".' `
+    -Desc 'On: when you plug in a device, Windows can download its details from Microsoft (name, picture and the maker''s device app). Off: "No" in System Properties > Hardware > Device Installation Settings, so Windows does not download them. Drivers are not affected; they still come from Windows Update or your own installer. A new device may show with a generic icon and name. Off also sets the "Prevent device metadata retrieval from the Internet" Group Policy (called "Prevent automatic download of applications associated with device metadata" since the Windows 11 25H2 templates; PreventDeviceMetadataFromNetwork = 1), so that choice is locked. Switching it back on sets it back to "Yes" and removes the policy.' `
     -Parts @(
         # "No" in System Properties > Hardware > Device Installation Settings ("Yes" writes 0)
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Device Metadata' 'PreventDeviceMetadataFromNetwork' 1 0
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-devicemetadata' -Cat $cPriv -Under 'device-metadata' -Def 'Off' -Name 'Disable device info downloads in registry' `
-    -Desc 'On: the "Prevent device metadata retrieval from the Internet" Group Policy is set (PreventDeviceMetadataFromNetwork = 1), so Windows never downloads the name, picture and maker app of a device you plug in, whatever Device Installation Settings says. Off: the policy is not set, so that choice decides (the Windows default). Drivers are not affected. Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1
+        # (build 126: was the "reg-devicemetadata" box, "Disable in registry")
+        pLock (pReg "$pol\Device Metadata" 'PreventDeviceMetadataFromNetwork' 1)
     )
 
 Add-Tweak -Id 'tracking' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Language list sharing and app tracking' `
@@ -5577,17 +5627,12 @@ Add-Tweak -Id 'defender-samples' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Defen
     )
 
 Add-Tweak -Id 'clipboard-history' -Cat $cPriv -Inv -Def 'Off' -Preset -Name 'Clipboard history (Win+V)' `
-    -Desc 'On: clipboard history is on, and Win+V shows your list. Off: it is off, so no list is kept and Win+V shows no history. This is the "Clipboard history" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. "Clipboard history across your devices" is its own setting. The clipboard history policy is the "Disable in registry" switch under this card. Reset all leaves it off, as Windows ships it.' `
+    -Desc 'On: clipboard history is on, and Win+V shows your list. Off: it is off, so no list is kept and Win+V shows no history. This is the "Clipboard history" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. "Clipboard history across your devices" is its own setting. Off also sets the "Allow Clipboard History" Group Policy to off (AllowClipboardHistory = 0), so clipboard history cannot be turned on and Settings shows the switch as managed by your organization; where the switch is off but the policy is not set yet, the card shows off and Apply all sets it. Switching it back on turns the switch on and removes the policy. Reset all removes the policy and leaves the switch off, as Windows ships it.' `
     -Parts @(
         # the "Clipboard history" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until it is first changed)
         pBack 1 (pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableClipboardHistory' 0) -NoneApplied
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-clipboardhistory' -Cat $cPriv -Under 'clipboard-history' -Def 'Off' -Preset -Name 'Disable clipboard history in registry' `
-    -Desc 'On: the "Allow Clipboard History" Group Policy is set to off (AllowClipboardHistory = 0), so clipboard history cannot be turned on, and Settings shows the switch as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Normal copy and paste (Ctrl+C, Ctrl+V) is not affected. Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\System" 'AllowClipboardHistory' 0
+        # (build 126: was the "reg-clipboardhistory" box, "Disable in registry")
+        pLock (pReg "$pol\System" 'AllowClipboardHistory' 0)
     )
 
 # -------------------------------------------------------------- Cloud ---------
@@ -5601,51 +5646,40 @@ Add-Tweak -Id 'settingsync' -Cat $cCloud -Inv -Def 'On' -Name 'Settings sync wit
     )
 
 Add-Tweak -Id 'clipboard' -Cat $cCloud -Inv -Def 'Off' -Name 'Clipboard history across your devices' `
-    -Desc 'On: your clipboard history is shared with your other devices that use the same Microsoft account. Off: nothing is shared. This is the "Clipboard history across your devices" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Clipboard history (Win+V) itself is not affected. The clipboard sync policy is the "Disable in registry" switch under this card. Reset all leaves it off, as Windows ships it.' `
+    -Desc 'On: your clipboard history is shared with your other devices that use the same Microsoft account. Off: nothing is shared. This is the "Clipboard history across your devices" switch in Settings > System > Clipboard, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too. Clipboard history (Win+V) itself is not affected. Off also sets the "Allow Clipboard synchronization across devices" Group Policy to off (AllowCrossDeviceClipboard = 0), so the clipboard is never shared and Settings shows the switch as managed by your organization; where the switch is off but the policy is not set yet, the card shows off and Apply all sets it. Switching it back on turns the switch on and removes the policy. Reset all removes the policy and leaves the switch off, as Windows ships it.' `
     -Parts @(
         # the "Clipboard history across your devices" switch in Settings > System > Clipboard (off writes 0; Windows sets no value until
         # it is first changed)
         pBack 1 (pReg 'HKCU:\Software\Microsoft\Clipboard' 'EnableCloudClipboard' 0) -NoneApplied
         # (build 123: the CloudClipboardAutomaticUpload = 0 earlier builds wrote is left as it is: it only keeps automatic upload off)
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-cloudclipboard' -Cat $cCloud -Under 'clipboard' -Def 'Off' -Name 'Disable clipboard sync in registry' `
-    -Desc 'On: the "Allow Clipboard synchronization across devices" Group Policy is set to off (AllowCrossDeviceClipboard = 0), so the clipboard is never shared with your other devices, and Settings shows the switch as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\System" 'AllowCrossDeviceClipboard' 0
+        # (build 126: was the "reg-cloudclipboard" box, "Disable in registry")
+        pLock (pReg "$pol\System" 'AllowCrossDeviceClipboard' 0)
     )
 
 Add-Tweak -Id 'crossdevice' -Cat $cCloud -Inv -Def 'On' -Name 'Nearby sharing and Share across devices' `
-    -Desc 'On: "Share across devices" is on for your own devices ("My devices only", the Windows default), and Nearby sharing is the way this PC had it (Windows ships Nearby sharing off). Off: both switches are off, the same as in Settings (System > Nearby sharing, and Apps > Advanced app settings > Share across devices). Switching it back on, and Reset all, never turn Nearby sharing on by themselves: it goes back to what this PC had before Headroom changed it, or off. The Connected Devices Platform service that powers them is a separate setting on the Services page. The "Continue experiences on this device" policy is the "Disable in registry" switch under this card.' `
+    -Desc 'On: "Share across devices" is on for your own devices ("My devices only", the Windows default), and Nearby sharing is the way this PC had it (Windows ships Nearby sharing off). Off: both switches are off, the same as in Settings (System > Nearby sharing, and Apps > Advanced app settings > Share across devices). Switching it back on, and Reset all, never turn Nearby sharing on by themselves: it goes back to what this PC had before Headroom changed it, or off. The Connected Devices Platform service that powers them is a separate setting on the Services page. Off also sets the "Continue experiences on this device" Group Policy to off (EnableCdp = 0), so this PC cannot be found by your other devices and takes no part in cross-device experiences, and Settings shows those switches as managed by your organization. Switching it back on, and Reset all, remove it again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'CdpSessionUserAuthzPolicy' 0 1
         # Nearby sharing: 0 off (the Windows default), 1 my devices only, 2 everyone nearby. Build 124: undo puts back what the PC had, else 0;
         # before, it wrote 1, so switching the card back on (and Reset all) turned Nearby sharing on, which Windows ships off
         pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'NearShareChannelUserAuthzPolicy' 0 'DWord' 0
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CDP' 'RomeSdkChannelUserAuthzPolicy' 0 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-cdp' -Cat $cCloud -Under 'crossdevice' -Def 'Off' -Name 'Disable cross-device features in registry' `
-    -Desc 'On: the "Continue experiences on this device" Group Policy is set to off (EnableCdp = 0), so this PC takes no part in cross-device experiences: Nearby sharing, Share across devices and carrying on on this PC with what you were doing on your phone stop working, and Settings shows those switches as managed by your organization. Off: the policy is not set, so the switches in Settings decide (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\System" 'EnableCdp' 0
+        # (build 126: was the "reg-cdp" box, "Disable in registry")
+        pLock (pReg "$pol\System" 'EnableCdp' 0)
     )
 
 Add-Tweak -Id 'resume' -Cat $cCloud -Inv -Def 'On' -Name 'Resume apps from your phone' `
-    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off. The value Windows keeps for its DisableCrossDeviceResume policy is the "Disable in registry" switch under this card. Undo (switching it back on) turns both switches on, the same as in Settings; Reset all puts back what this PC had.' `
+    -Desc 'On: when you use an app on your phone (OneDrive files, Spotify and others), Windows can offer to carry on with it on this PC, with a notice. Off: the two Resume switches under Settings > Apps > Resume are off. Off also sets the value Windows keeps for its DisableCrossDeviceResume policy to 1, so Resume is off for every account on this PC (only where Windows has that policy; on a PC without it nothing is written). Undo (switching it back on) turns both switches on, the same as in Settings, and sets that value back to 0 (Resume allowed, the Windows default); Reset all puts back the switch values this PC had and sets it to 0.' `
     -Parts @(
         pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsResumeAllowed' 0)
         pBack 1 (pRegPrev 'HKCU:\Software\Microsoft\Windows\CurrentVersion\CrossDeviceResume\Configuration' 'IsOneDriveResumeAllowed' 0)
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-resume' -Cat $cCloud -Under 'resume' -Def 'Off' -Name 'Disable Resume in registry' `
-    -Desc 'On: the value Windows keeps for its DisableCrossDeviceResume policy is set to 1, so Resume is off for every account on this PC, whatever the two switches under Settings > Apps > Resume say. Off: it is set back to 0 (Resume allowed, the Windows default), so those switches decide. Switching it off, and Reset all, set it back to 0.' `
-    -Parts @(
-        # (an MDM policy with no Group Policy template: Windows reads its value from its own PolicyManager store)
-        pReg 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume' 'value' 1 0
+        # (build 126: was the "reg-resume" box, "Disable in registry")
+        # (an MDM policy with no Group Policy template: Windows reads its value from its own PolicyManager store). Only where Windows
+        # has that policy: on a PC without the key nothing is written, so no key of Windows' own policy store is made up
+        pLock (pRegDyn -Info 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume\value = 1, only where Windows has this policy    (undo: 0)' -Gen {
+            $k = 'HKLM:\SOFTWARE\Microsoft\PolicyManager\default\Connectivity\DisableCrossDeviceResume'
+            if (Reg-KeyExists $k) { pLock (pReg $k 'value' 1 0) }
+        })
     )
 
 Add-Tweak -Id 'onedrive-policy' -Cat $cCloud -Inv -Def 'On' -Name 'OneDrive sync and its File Explorer entry' `
@@ -5667,43 +5701,38 @@ Add-Tweak -Id 'onedrive-remove' -Cat $cCloud -Inv -Def 'On' -OneWay -Risk 'note'
     )
 
 Add-Tweak -Id 'deliveryopt' -Cat $cCloud -Inv -Def 'On' -Name 'Windows Update peer-to-peer sharing' `
-    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: the "Allow downloads from other PCs" switch in Settings > Windows Update > Advanced options > Delivery Optimization is off, so updates come only from Microsoft and are not uploaded to other PCs (that value belongs to the Delivery Optimization service account; if Windows refuses the change on this PC, the setting says so and you can switch it off in Settings). The Delivery Optimization service is a separate setting on the Services page. The Delivery Optimization policy is the "Disable in registry" switch under this card.' `
+    -Desc 'On: Windows can fetch updates from other PCs and share them with other PCs (the Windows default). That is Delivery Optimization; the sharing can reach PCs on your network or on the internet. Off: the "Allow downloads from other PCs" switch in Settings > Windows Update > Advanced options > Delivery Optimization is off, so updates come only from Microsoft and are not uploaded to other PCs (that value belongs to the Delivery Optimization service account; if Windows refuses the change on this PC, the setting says so and you can switch it off in Settings). The Delivery Optimization service is a separate setting on the Services page. Off also sets the Delivery Optimization "Download Mode" Group Policy to HTTP only (DODownloadMode = 0), so updates are never shared with other PCs and Settings shows the switch as managed by your organization. Switching it back on, and Reset all, remove it again.' `
     -Parts @(
         pReg 'Registry::HKEY_USERS\S-1-5-20\Software\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Settings' 'DownloadMode' 0
+        # (build 126: was the "reg-deliveryopt" box, "Disable in registry")
+        pLock (pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0)
     )
 
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-deliveryopt' -Cat $cCloud -Under 'deliveryopt' -Def 'Off' -Name 'Disable update sharing in registry' `
-    -Desc 'On: the Delivery Optimization "Download Mode" Group Policy is set to HTTP only (DODownloadMode = 0), so updates come only from Microsoft and are never shared with other PCs, and Settings shows "Allow downloads from other PCs" as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
+# build 124: from the Testing page (map downloads in the background, like Delivery Optimization); an ordinary card.
+# build 126 (Tyler: "Add Automatic offline map updates into our map updates box"): the Settings switch too, so the card is named after it.
+# AutoUpdateEnabled is what "Update automatically when plugged in and on Wi-Fi" (Settings > Apps > Offline maps) writes: 1 on (the
+# default), 0 off (ElevenForum and Winaero tutorials). Microsoft is taking Offline maps out of Windows 11 (Insider Beta build 26320.10003
+# removes the Settings page), where the value is simply not read. The Group Policy (AutoDownloadAndUpdateMapData) is not set here.
+Add-Tweak -Id 'task-maps' -Cat $cCloud -Inv -Def 'On' -Name 'Automatic offline map updates' `
+    -Desc 'On: Windows updates downloaded offline maps by itself (the Windows default). Off: the switch "Update automatically when plugged in and on Wi-Fi" in Settings > Apps > Offline maps (under Map updates) is off, the same as switching it off there, and the Maps update scheduled task that downloads the updates is disabled. It only matters if you use downloaded maps: the Windows Maps app no longer works (Microsoft retired it in 2025), and newer Windows 11 builds are removing Offline maps from Settings, so on many PCs nothing uses them any more. If this PC does not have the task, only the switch is set. Switching it back on turns the switch on and enables the task again.' `
     -Parts @(
-        pReg "$pol\DeliveryOptimization" 'DODownloadMode' 0
-    )
-
-# build 124: from the Testing page (map downloads in the background, like Delivery Optimization); an ordinary card
-Add-Tweak -Id 'task-maps' -Cat $cCloud -Inv -Def 'On' -Name 'Scheduled task: Maps update' `
-    -Desc 'On: the task that downloads updates for offline maps used by the Maps app is enabled. Off: the task is disabled. It only matters if you use downloaded maps. If this PC does not have the task the setting reads as not available.' `
-    -Parts @(
+        pReg 'HKLM:\SYSTEM\Maps' 'AutoUpdateEnabled' 0 1
         pTask '\Microsoft\Windows\Maps\MapsUpdateTask'
     )
 
 # -------------------------------------------------------------- Remote --------
 Add-Tweak -Id 'rdp' -Cat $cRemote -Inv -Def 'Off' -Name 'Remote Desktop' `
-    -Desc 'On: Remote Desktop is on, the same as turning on the switch in Settings > System > Remote Desktop: other PCs can connect to this one with Remote Desktop (with your account and password), and its firewall rules are on. Off: that switch is off and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Windows ships Remote Desktop off; Reset all puts that back (the switch off, the firewall rules as Windows ships them) and never turns Remote Desktop on. The Remote Desktop services are a separate setting on the Services page: while they are disabled, nobody can connect even with this switch on. The Remote Desktop policy is the "Disable in registry" switch under this card.' `
+    -Desc 'On: Remote Desktop is on, the same as turning on the switch in Settings > System > Remote Desktop: other PCs can connect to this one with Remote Desktop (with your account and password), and its firewall rules are on. Off: that switch is off and the firewall rules are switched off, so nobody can connect to this PC with Remote Desktop. Windows ships Remote Desktop off; Reset all puts that back (the switch off, the firewall rules as Windows ships them) and never turns Remote Desktop on. The Remote Desktop services are a separate setting on the Services page: while they are disabled, nobody can connect even with this switch on. Off also sets the "Allow users to connect remotely by using Remote Desktop Services" Group Policy to off (fDenyTSConnections = 1), so nobody can connect whatever the switch in Settings says, and Settings shows the switch as managed by your organization; where the switch is off but the policy is not set yet, the card shows off and Apply all sets it. Switching it back on, and Reset all, remove it again.' `
     -Parts @(
         # the "Remote Desktop" switch in Settings > System > Remote Desktop (Windows ships it off: 1, and no value is off too)
         pBack 0 (pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' 1 1) -NoneApplied
         pBack 'Enabled' (pFw 'Remote Desktop')
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-rdp' -Cat $cRemote -Under 'rdp' -Def 'Off' -Name 'Disable Remote Desktop in registry' `
-    -Desc 'On: the "Allow users to connect remotely by using Remote Desktop Services" Group Policy is set to off (fDenyTSConnections = 1), so nobody can connect to this PC with Remote Desktop, whatever the switch in Settings says, and Settings shows that switch as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1
+        # (build 126: was the "reg-rdp" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fDenyTSConnections' 1)
     )
 
 Add-Tweak -Id 'remote-assist' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Assistance' `
-    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: that box is cleared, the same as in System Properties > Remote, which also switches off its firewall rules. The Remote Assistance policy is the "Disable in registry" switch under this card. The other values earlier builds wrote (fAllowFullControl, and the two old Terminal Server values) are 0, which only keeps things off, so they are left as they are: nothing is ever set to allow. Undo allows it again.' `
+    -Desc 'On: "Allow Remote Assistance connections to this computer" is left as Windows has it (allowed). Off: that box is cleared, the same as in System Properties > Remote, which also switches off its firewall rules. Off also sets the "Configure Solicited Remote Assistance" Group Policy to off (fAllowToGetHelp = 0), so nobody can be invited to help with Remote Assistance and that box shows as managed; switching it back on, and Reset all, remove it again. Quick Assist is a separate app and is not affected. The other values earlier builds wrote (fAllowFullControl, and the two old Terminal Server values) are 0, which only keeps things off, so they are left as they are: nothing is ever set to allow. Switching it back on allows it again.' `
     -Parts @(
         # what clearing "Allow Remote Assistance connections to this computer" in System Properties > Remote does: this value and the firewall rules
         pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' 'fAllowToGetHelp' 0 1
@@ -5711,13 +5740,8 @@ Add-Tweak -Id 'remote-assist' -Cat $cRemote -Inv -Def 'On' -Name 'Remote Assista
         # (build 123: the 0s earlier builds wrote to Remote Assistance\fAllowFullControl and Terminal Server\fAllowToGetHelp / fAllowFullControl
         # are no longer touched. Build 122 set them to 1, which reads as allowing Remote Assistance: Terminal Server\fAllowToGetHelp = 1 is the
         # old way to turn it on, and security software flags exactly that change. A 0 there only keeps things off.)
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-remoteassist' -Cat $cRemote -Under 'remote-assist' -Def 'Off' -Name 'Disable Remote Assistance in registry' `
-    -Desc 'On: the "Configure Solicited Remote Assistance" Group Policy is set to off (fAllowToGetHelp = 0), so nobody can be invited to help with Remote Assistance, whatever the box in System Properties > Remote says, and that box shows as managed. Off: the policy is not set, so the box decides (the Windows default). Quick Assist is a separate app and is not affected. Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0
+        # (build 126: was the "reg-remoteassist" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' 'fAllowToGetHelp' 0)
     )
 
 Add-Tweak -Id 'quickassist' -Cat $cRemote -Inv -Def 'On' -OneWay -Name 'Quick Assist app' `
@@ -5752,16 +5776,11 @@ Add-Tweak -Id 'remote-mgmt' -Cat $cRemote -Inv -Def 'On' -Name 'Other remote man
 # ---------------------------------------------------------------- VPN ---------
 # ------------------------------------------------------------- Sharing --------
 Add-Tweak -Id 'fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Risk 'note' -Name 'File and printer sharing' `
-    -Desc 'On: file and printer sharing is as Windows has it: the "File and printer sharing" switches in Settings > Network & internet > Advanced network settings > Advanced sharing settings decide, and their firewall rules are as Windows ships them. Off: those switches are off for every kind of network, the same as switching them off there: the File and Printer Sharing firewall rules are switched off, so other PCs cannot reach files or printers on this PC. You can still open shares on a NAS or other PCs. The Server service, the default C$ and ADMIN$ shares and the adapter binding are separate settings (on the Services page, the "Disable in registry" switch under this card, and "File sharing on network adapters" on this page).' `
+    -Desc 'On: file and printer sharing is as Windows has it: the "File and printer sharing" switches in Settings > Network & internet > Advanced network settings > Advanced sharing settings decide, and their firewall rules are as Windows ships them. Off: those switches are off for every kind of network, the same as switching them off there: the File and Printer Sharing firewall rules are switched off, so other PCs cannot reach files or printers on this PC. You can still open shares on a NAS or other PCs. Off also sets AutoShareWks = 0, so Windows no longer creates the hidden administrative shares C$ and ADMIN$ (from the next time the Server service starts, after a restart); switching it back on, and Reset all, remove that value again. The Server service and the adapter binding are separate settings (on the Services page, and "File sharing on network adapters" on this page).' `
     -Parts @(
         pFw 'File and Printer Sharing'
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-adminshares' -Cat $cShare -Under 'fileshare' -Def 'Off' -Preset -Name 'Disable C$ and ADMIN$ shares in registry' `
-    -Desc 'On: AutoShareWks = 0, so Windows does not create the hidden administrative shares C$ and ADMIN$. Off: Windows creates them (the Windows default). Windows Settings has no switch for this. It takes effect the next time the Server service starts (after a restart). Switching it off, and Reset all, remove the value again.' `
-    -Parts @(
-        pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0
+        # (build 126: was the "reg-adminshares" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters' 'AutoShareWks' 0)
     )
 
 Add-Tweak -Id 'bind-fileshare' -Cat $cShare -Inv -Def 'On' -Preset -Name 'File sharing on network adapters' `
@@ -5888,21 +5907,16 @@ try { Add-StartupTweaks } catch { }
 
 # ---------------------------------------------------------------- Gaming ------
 Add-Tweak -Id 'gamedvr' -Cat $cGame -Inv -Def 'Off' -Preset -Name '"Record what happened"' `
-    -Desc 'On: Game Bar records the last moments of your games in the background, so you can save a clip of what just happened. Off: it does not, which can save frames. This is the "Record what happened" switch in Settings > Gaming > Captures, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too; Reset all leaves it off. "Allow your controller to open Game Bar" is its own setting, and the Game Recording and Broadcasting policy, the Game DVR capture values, the Game Bar start-up tip and Game Bar''s presence writer are the "Disable in registry" switch under this card. Windows Game Mode is not affected.' `
+    -Desc 'On: Game Bar records the last moments of your games in the background, so you can save a clip of what just happened. Off: it does not, which can save frames. This is the "Record what happened" switch in Settings > Gaming > Captures, and it works the same way. Windows ships it off, and a PC where it was never switched on shows as off here too; Reset all leaves it off. "Allow your controller to open Game Bar" is its own setting, Off also sets the "Enables or disables Windows Game Recording and Broadcasting" Group Policy to off (AllowGameDVR = 0), so Game Bar cannot record or broadcast your games, sets GameDVR_Enabled and AppCaptureEnabled to 0 (the capture switches of older Windows versions), hides the Game Bar start-up tip and turns off Game Bar''s presence writer, a background helper that tells Game Bar which game is running (Windows protects that value on some builds; there it is left as it is). Where the switch is off but those are not written yet, the card shows off and Apply all writes them. Switching it back on, and Reset all, put all of that back as Windows has it. Windows Game Mode is not affected.' `
     -Parts @(
         # "Record what happened" in Settings > Gaming > Captures (Windows ships it off: no value is off)
         pBack 1 (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'HistoricalCaptureEnabled' 0) -NoneApplied
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-gamedvr' -Cat $cGame -Under 'gamedvr' -Def 'Off' -Preset -Name 'Disable Game DVR helpers in registry' `
-    -Desc 'On: the "Enables or disables Windows Game Recording and Broadcasting" Group Policy is set to off (AllowGameDVR = 0), so Game Bar cannot record or broadcast your games; GameDVR_Enabled and AppCaptureEnabled are set to 0 (the capture switches of older Windows versions), the Game Bar start-up tip is hidden, and Game Bar''s presence writer, a background helper that tells Game Bar which game is running, is turned off; Windows protects that value on some builds, and where it does it is left as it is. Off: all of that is as Windows has it (the Windows default). Game Mode is not affected. Switching it off, and Reset all, put the Windows defaults back.' `
-    -Parts @(
-        pReg "$pol\GameDVR" 'AllowGameDVR' 0
-        pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1
-        pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0
-        pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1
+        # (build 126: was the "reg-gamedvr" box, "Disable in registry")
+        pLock (pReg "$pol\GameDVR" 'AllowGameDVR' 0)
+        pLock (pReg 'HKCU:\System\GameConfigStore' 'GameDVR_Enabled' 0 1)
+        pLock (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\GameDVR' 'AppCaptureEnabled' 0 1)
+        pLock (pReg 'HKCU:\Software\Microsoft\GameBar' 'ShowStartupPanel' 0)
+        pLock (pRegSoft 'HKLM:\SOFTWARE\Microsoft\WindowsRuntime\ActivatableClassId\Windows.Gaming.GameBar.PresenceServer.Internal.PresenceWriter' 'ActivationType' 0 1)
     )
 
 Add-Tweak -Id 'gamebar-controller' -Cat $cGame -Inv -Def 'On' -Preset -Name 'Controller button opens Game Bar' `
@@ -6034,6 +6048,16 @@ Add-Tweak -Id 'contrast-keys' -Cat $cGame -Inv -Def 'On' -Preset -Name 'High Con
     -Desc 'On: pressing Left Alt, Left Shift and Print Screen together opens the "Do you want to turn on High Contrast?" window. Off: that shortcut is turned off, the same as turning the contrast themes keyboard shortcut off in Windows'' accessibility settings. Only the shortcut is affected: a contrast theme you use stays on, and contrast themes are still there under Settings > Accessibility > Contrast themes (from Windows'' default 126, the value becomes 122). This one is saved for your account and Windows reads it when you sign in, so a change works from your next sign-in, not in the session that is open now.' `
     -Parts @(
         pAccessFlags 'HKCU:\Control Panel\Accessibility\HighContrast' 126 'High Contrast'
+    )
+
+# build 126 (Tyler: "Add MenuShowDelay and KeyboardDelay"): the Repeat delay slider of the Keyboard control panel. KeyboardDelay is 0..3
+# (about 250 ms, 500 ms, 750 ms, 1 s; Microsoft: "0 (approximately 250 ms delay) through 3 (approximately 1 second delay)"), a string,
+# Windows ships 1. SPI_SETKEYBOARDDELAY is 0x0017.
+Add-Tweak -Id 'key-delay' -Cat $cGame -Inv -Def 'On' -Name 'Keyboard repeat delay' `
+    -Desc 'On: when you hold a key down, Windows waits about half a second before the key starts repeating (Repeat delay one step from Short in the Keyboard control panel, the Windows default). Off: Repeat delay is set to Short, the same as dragging the slider all the way to Short, so a held key starts repeating after about a quarter of a second (KeyboardDelay 0). It only changes when repeating starts while a key is held, in text and in menus; the first key press reaches a game just as fast either way, and games that read held keys themselves are not affected. The repeat rate is left as it is. It is applied at once.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Keyboard' 'KeyboardDelay' '0' '1' 'String'
+        pCustom 'SpiLive' 'also applied to the running session' @{ Path = 'HKCU:\Control Panel\Keyboard'; Name = 'KeyboardDelay'; Spi = 0x0017; Min = 0; Max = 3; What = 'the keyboard repeat delay' }
     )
 
 # build 124: from the Testing page; ordinary cards (Tyler: "Make them ordinary cards"), so Apply all and Tweak all take them
@@ -6177,21 +6201,15 @@ $acAsk = 'Do you play FACEIT or Valorant?' + "`r`n" + "`r`n" + `
     'If you play on either, answer No: the setting stays off and nothing is changed. You can apply it later from the window.'
 Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Memory Integrity' `
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Memory Integrity (Windows Security > Device security > Core isolation) is left to Windows: new Windows 11 installs on capable hardware usually have it on. Off: it is off, the same as turning that switch off. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Anti-cheat warning: Riot Vanguard can ask for Memory Integrity, so leave this on if you play those games - you are asked about it before it is applied. Switching it back on puts back the value this PC had before Headroom changed it. It does not force Memory Integrity on the way the switch in Windows Security does: Windows Security first checks your drivers, and turning it on from the registry would skip that check, which can stop a PC with a driver that does not support it from starting. To turn it on yourself, use Windows Security > Device security > Core isolation. Virtualization-Based Security and Credential Guard are the "Disable in registry" switch under this card. Either way it needs a restart.' `
+    -Desc 'On: Memory Integrity (Windows Security > Device security > Core isolation) is left to Windows: new Windows 11 installs on capable hardware usually have it on. Off: it is off, the same as turning that switch off. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Off also turns off Virtualization-Based Security and Credential Guard (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0; Windows Security has no switch for these). Anti-cheat warning: Riot Vanguard can ask for Memory Integrity and FACEIT requires Virtualization-Based Security, so leave this on if you play those games - you are asked about it before it is applied. Switching it back on puts back the value this PC had before Headroom changed it. It does not force Memory Integrity on the way the switch in Windows Security does: Windows Security first checks your drivers, and turning it on from the registry would skip that check, which can stop a PC with a driver that does not support it from starting. To turn it on yourself, use Windows Security > Device security > Core isolation. Switching it back on, and Reset all, put back the VBS and Credential Guard values this PC had before Headroom changed them; a value that was not there is removed again. Either way it needs a restart.' `
     -Parts @(
         pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-vbs' -Cat $cSec -Under 'vbs' -Def 'Off' -Reboot -Risk 'security' -Name 'Disable VBS / Credential Guard in registry' `
-    -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
-    -Desc 'On: Virtualization-Based Security and Credential Guard are turned off (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0). That can give a few percent more FPS in some games, but it removes protection. Off: those values are as this PC had them, so Windows decides (new Windows 11 installs on capable hardware usually have VBS and Credential Guard on). Windows Settings has no switch for these ("Memory Integrity", the card this sits under, is the switch Windows Security has). Anti-cheat warning: FACEIT requires Virtualization-Based Security to be on, so leave this off if you play there - you are asked about it before it is applied. Switching it off, and Reset all, put back the values this PC had before Headroom changed them; a value that was not there is removed again. It needs a restart.' `
-    -Parts @(
+        # (build 126: was the "reg-vbs" box, "Disable in registry")
         # (build 124, Tyler: "Remove it": Memory Integrity's WasEnabledBy is no longer set to 0 here. Microsoft documents it as part of a
         # safety net that turns Memory Integrity off by itself when the PC fails to boot after it was turned on, not as a VBS switch. A 0
         # an earlier build wrote is left as it is, like the other non-policy 0s of earlier builds.)
-        pRegPrev $dg 'EnableVirtualizationBasedSecurity' 0
-        pRegPrev 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0
+        pLock (pRegPrev $dg 'EnableVirtualizationBasedSecurity' 0)
+        pLock (pRegPrev 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa' 'LsaCfgFlags' 0)
     )
 
 Add-Tweak -Id 'hypervisor' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'security' -Name 'Windows hypervisor at startup' `
@@ -6621,19 +6639,14 @@ Add-Tweak -Id 'taskbar-endtask' -Cat $cLook -Def 'Off' -Preset -Name 'End task i
     )
 
 Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Widgets and Chat taskbar buttons' `
-    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off, the same as in Settings. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script: there the Widgets button stays until you switch it off in Settings yourself, or use the "Disable in registry" switch under this card, which turns the Widgets feed off by policy. The Chat icon policy is part of that switch too (Chat is gone from Windows 11 23H2 and later).' `
+    -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off, the same as in Settings. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script: so off also turns the Widgets feed off by Group Policy (AllowNewsAndInterests = 0): the Widgets button and board are gone even there, and Settings shows the Widgets switch as managed. It also sets the Chat icon policy to off (ChatIcon = 3; Chat is gone from Windows 11 23H2 and later, where it does nothing). Switching it back on, and Reset all, remove both policies.' `
     -Parts @(
         pRegSoft $adv 'TaskbarDa' 0 1
         pReg $adv 'TaskbarMn' 0 1
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-widgets' -Cat $cLook -Under 'taskbar-clutter' -Def 'Off' -Preset -Explorer -Name 'Disable Widgets and Chat in registry' `
-    -Desc 'On: the Widgets feed is turned off by Group Policy (AllowNewsAndInterests = 0), so the Widgets button and board are gone, and Settings shows the Widgets switch as managed while it is set; the Chat icon policy is set to off (ChatIcon = 3; Chat is gone from Windows 11 23H2 and later, where it does nothing). Off: neither policy is set, so Widgets and Chat work as Windows has them (the Windows default). Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script, so this policy is the only way Headroom can hide Widgets there. Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0
+        # (build 126: was the "reg-widgets" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0)
         # the "Configure the Chat icon on the taskbar" policy: 3 = off (1 shows the icon, 2 hides it but lets you change that)
-        pReg "$pol\Windows Chat" 'ChatIcon' 3
+        pLock (pReg "$pol\Windows Chat" 'ChatIcon' 3)
     )
 
 Add-Tweak -Id 'taskbar-search' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'Taskbar search button' `
@@ -6696,20 +6709,24 @@ Add-Tweak -Id 'animations' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Name 'V
         pCustom 'AnimLive' 'also applied to the running session'
     )
 
+# build 126 (Tyler: "Add MenuShowDelay"): how long a menu waits before it opens a submenu under the pointer. MenuShowDelay is in
+# milliseconds, a string, Windows ships 400. SPI_SETMENUSHOWDELAY is 0x006B.
+Add-Tweak -Id 'menu-delay' -Cat $cLook -Inv -Def 'On' -Name 'Menu open delay' `
+    -Desc 'On: when the pointer rests on a menu item that has a submenu, Windows waits 400 ms before opening it (the Windows default). Off: the wait is 0 (MenuShowDelay 0), so submenus open as soon as the pointer is on them. It applies to the classic menus: the submenus of right-click menus (Send to, Open with, the full menu under "Show more options") and the menus of desktop programs. With no wait, a submenu can also open while you only move the pointer past it on the way to another item. It is applied at once.' `
+    -Parts @(
+        pReg 'HKCU:\Control Panel\Desktop' 'MenuShowDelay' '0' '400' 'String'
+        pCustom 'SpiLive' 'also applied to the running session' @{ Path = 'HKCU:\Control Panel\Desktop'; Name = 'MenuShowDelay'; Spi = 0x006B; Min = 0; Max = 4000; What = 'the menu delay' }
+    )
+
 Add-Tweak -Id 'notifications' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Risk 'note' -Name 'Notifications and notification centre' `
-    -Desc 'On: apps, games and Windows can show toast pop-ups (the Windows default). Off: the "Notifications" switch in Settings > System > Notifications is off, so no toast pop-ups appear. The notification centre and calendar flyout still open, and Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are. The "Turn off toast notifications" policy is the "Disable in registry" switch under this card. Build 122 no longer switches the notification centre off by policy; that policy is removed.' `
+    -Desc 'On: apps, games and Windows can show toast pop-ups (the Windows default). Off: the "Notifications" switch in Settings > System > Notifications is off, so no toast pop-ups appear. The notification centre and calendar flyout still open, and Windows Security pop-ups may be hidden too, so look at its status page now and then. The push notification services stay as they are. Off also sets the "Turn off toast notifications" Group Policy for your account (NoToastApplicationNotification = 1), so no app can show toast pop-ups whatever the switch in Settings says; switching it back on, and Reset all, remove it again. Build 122 no longer switches the notification centre off by policy; that policy is removed.' `
     -Parts @(
         # the "Notifications" switch in Settings > System > Notifications
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications' 'ToastEnabled' 0 1
         # build 122: the notification-centre policy earlier builds wrote (it removes the notification centre, which no Settings switch does)
         pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableNotificationCenter' 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-notifications' -Cat $cLook -Under 'notifications' -Def 'Off' -Preset -Explorer -Risk 'note' -Name 'Disable toast notifications in registry' `
-    -Desc 'On: the "Turn off toast notifications" Group Policy is set for your account (NoToastApplicationNotification = 1), so no app can show toast pop-ups, whatever the "Notifications" switch in Settings says. Off: the policy is not set, so that switch decides (the Windows default). Windows Security pop-ups may be hidden too, so look at its status page now and then. The notification centre and calendar flyout still open. Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\CurrentVersion\PushNotifications' 'NoToastApplicationNotification' 1
+        # (build 126: was the "reg-notifications" box, "Disable in registry")
+        pLock (pReg 'HKCU:\Software\Policies\Microsoft\Windows\CurrentVersion\PushNotifications' 'NoToastApplicationNotification' 1)
     )
 
 # ------------------------------------------------------------ File Explorer ---
@@ -6759,7 +6776,7 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Na
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Tips and suggestions from Windows' `
-    -Desc 'On: Windows shows tips and suggestions on the lock screen, in Start and in Settings, the welcome experience after updates, ways to finish setting up the PC, account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders (the Windows default). Off: the switches for all of those are off, the same as in Settings (Personalization > Lock screen and Start, System > Notifications, Privacy and security > General, Bluetooth & devices > Mobile devices), and so is "Show sync provider notifications" in File Explorer''s options. The content-delivery values that have no switch (sponsored and auto-installed apps) and the tips policies are the two "Disable in registry" switches under this card. The Spotlight policy that earlier builds wrote is removed, because it also turned off Windows Spotlight pictures.' `
+    -Desc 'On: Windows shows tips and suggestions on the lock screen, in Start and in Settings, the welcome experience after updates, ways to finish setting up the PC, account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders (the Windows default). Off: the switches for all of those are off, the same as in Settings (Personalization > Lock screen and Start, System > Notifications, Privacy and security > General, Bluetooth & devices > Mobile devices), and so is "Show sync provider notifications" in File Explorer''s options. Off also sets the content-delivery values that have no switch in Settings to 0, so Windows does not install sponsored and suggested apps by itself or deliver promoted content (content delivery, pre-installed, OEM and silently installed apps, the soft-landing tips, subscribed content, and the Start and timeline suggestions of older builds), and sets the "Allow Online Tips" Group Policy to off (AllowOnlineTips = 0), so the Settings app does not fetch online tips. On Enterprise and Education the consumer-features and "Do not show Windows tips" policies are set too; other editions ignore them, so they are left out there. Switching it back on, and Reset all, put all of that back as Windows has it. The Spotlight policy that earlier builds wrote is removed, because it also turned off Windows Spotlight pictures.' `
     -Parts @(
         pReg $cdm 'SubscribedContent-310093Enabled' 0 1
         pReg $cdm 'SubscribedContent-338387Enabled' 0 1
@@ -6778,31 +6795,21 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Tips and s
         pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Notifications\Settings\Windows.SystemToast.BackupReminder' 'Enabled' 0 1
         # build 122: the Spotlight policy earlier builds wrote; it also turned Windows Spotlight pictures off, which no switch here does, so it is removed
         pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsSpotlightFeatures' 1
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-suggestions' -Cat $cLook -Under 'suggestions' -Def 'Off' -Preset -Name 'Disable sponsored apps in registry' `
-    -Desc 'On: the content-delivery values that have no switch in Settings are set to 0, so Windows does not install sponsored and suggested apps by itself or deliver promoted content: content delivery, pre-installed, OEM and silently installed apps, the soft-landing tips, subscribed content, and the Start and timeline suggestions of older builds. On Enterprise and Education the consumer-features policy is set too; other editions ignore that policy, so it is left out there. Off: those values are as Windows has them (the Windows default). Switching it off, and Reset all, put the Windows defaults back.' `
-    -Parts @(
-        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1)
-        pReg $cdm 'ContentDeliveryAllowed' 0 1
-        pReg $cdm 'OemPreInstalledAppsEnabled' 0 1
-        pReg $cdm 'PreInstalledAppsEnabled' 0 1
-        pReg $cdm 'PreInstalledAppsEverEnabled' 0 1
-        pReg $cdm 'SilentInstalledAppsEnabled' 0 1
-        pReg $cdm 'SystemPaneSuggestionsEnabled' 0 1
-        pReg $cdm 'SoftLandingEnabled' 0 1
-        pReg $cdm 'SubscribedContentEnabled' 0 1
-        pReg $cdm 'SubscribedContent-338388Enabled' 0 1
-        pReg $cdm 'SubscribedContent-353698Enabled' 0 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-tips' -Cat $cLook -Under 'suggestions' -Def 'Off' -Preset -Name 'Disable Windows tips in registry' `
-    -Desc 'On: the "Allow Online Tips" Group Policy is set to off (AllowOnlineTips = 0), so the Settings app does not fetch online tips and help, and on Enterprise and Education the "Do not show Windows tips" policy is set too (DisableSoftLanding = 1; other editions ignore it, so it is left out there). Off: neither policy is set (the Windows default). Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0
-        pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1)
+        # (build 126: was the "reg-suggestions" box, "Disable in registry")
+        pLock (pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1))
+        pLock (pReg $cdm 'ContentDeliveryAllowed' 0 1)
+        pLock (pReg $cdm 'OemPreInstalledAppsEnabled' 0 1)
+        pLock (pReg $cdm 'PreInstalledAppsEnabled' 0 1)
+        pLock (pReg $cdm 'PreInstalledAppsEverEnabled' 0 1)
+        pLock (pReg $cdm 'SilentInstalledAppsEnabled' 0 1)
+        pLock (pReg $cdm 'SystemPaneSuggestionsEnabled' 0 1)
+        pLock (pReg $cdm 'SoftLandingEnabled' 0 1)
+        pLock (pReg $cdm 'SubscribedContentEnabled' 0 1)
+        pLock (pReg $cdm 'SubscribedContent-338388Enabled' 0 1)
+        pLock (pReg $cdm 'SubscribedContent-353698Enabled' 0 1)
+        # (build 126: was the "reg-tips" box, "Disable in registry")
+        pLock (pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer' 'AllowOnlineTips' 0)
+        pLock (pEd 'Ent' (pReg "$pol\CloudContent" 'DisableSoftLanding' 1))
     )
 
 Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot and account cards in Settings' `
@@ -6815,7 +6822,7 @@ Add-Tweak -Id 'settings-promo' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Copilot
 $wsch = "$pol\Windows Search"
 $ssm  = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\SearchSettings'
 Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Search history, highlights, cloud search' `
-    -Desc 'On: Start search uses search highlights, the search history on this device, cloud search in your Microsoft and work accounts, and web and Microsoft Store suggestions (the Windows default). Off: those switches under Settings > Privacy & security > Search permissions are off, the same as in Settings: search highlights, search history on this device, cloud content search for both kinds of account, and both "Show suggested search results" switches (Web searches and Microsoft Store). Bing web results in Start, which have no switch in Settings, and the cloud search policy are the "Disable in registry" switch under this card.' `
+    -Desc 'On: Start search uses search highlights, the search history on this device, cloud search in your Microsoft and work accounts, and web and Microsoft Store suggestions (the Windows default). Off: those switches under Settings > Privacy & security > Search permissions are off, the same as in Settings: search highlights, search history on this device, cloud content search for both kinds of account, and both "Show suggested search results" switches (Web searches and Microsoft Store). Off also turns off, by Group Policy, Bing web results and search box suggestions in Start, cloud search of your Microsoft and work accounts (the "Cloud content search" switches in Settings then show as managed by your organization), location use and Cortana in search, and on Enterprise and Education connected web search; BingSearchEnabled, an older value with no switch in Windows 11 Settings, is set to 0 too. Switching it back on, and Reset all, put all of that back as Windows has it.' `
     -Parts @(
         pReg $ssm 'IsDeviceSearchHistoryEnabled' 0 1
         pReg $ssm 'IsMSACloudSearchEnabled' 0 1
@@ -6823,19 +6830,14 @@ Add-Tweak -Id 'search-web' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Search hist
         pReg $ssm 'IsDynamicSearchBoxEnabled' 0 1
         pReg $ssm 'IsWebSuggestionsEnabled' 0 1
         pReg $ssm 'IsStoreSuggestionsEnabled' 0 1
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-search' -Cat $cLook -Under 'search-web' -Def 'Off' -Preset -Name 'Disable web and cloud search in registry' `
-    -Desc 'On: Group Policy values turn off Bing web results and search box suggestions in Start, cloud search of your Microsoft and work accounts (the "Cloud content search" switches in Settings show as managed by your organization), location use and Cortana in search, and on Enterprise and Education connected web search; BingSearchEnabled, an older value with no switch in Windows 11 Settings, is set to 0 too. Off: none of that is set, so Start search can show web results and suggestions, search your accounts, use your location and use Cortana, as Windows has it (the Windows default). Switching it off, and Reset all, put the Windows defaults back.' `
-    -Parts @(
-        pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1
-        pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0)
-        pReg $wsch 'AllowSearchToUseLocation' 0
-        pReg $wsch 'DisableWebSearch' 1
-        pReg $wsch 'AllowCortana' 0
-        pReg $wsch 'AllowCloudSearch' 0
+        # (build 126: was the "reg-search" box, "Disable in registry")
+        pLock (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Search' 'BingSearchEnabled' 0 1)
+        pLock (pReg 'HKCU:\Software\Policies\Microsoft\Windows\Explorer' 'DisableSearchBoxSuggestions' 1)
+        pLock (pEd 'Ent' (pReg $wsch 'ConnectedSearchUseWeb' 0))
+        pLock (pReg $wsch 'AllowSearchToUseLocation' 0)
+        pLock (pReg $wsch 'DisableWebSearch' 1)
+        pLock (pReg $wsch 'AllowCortana' 0)
+        pLock (pReg $wsch 'AllowCloudSearch' 0)
     )
 
 Add-Tweak -Id 'snap-suggestions' -Cat $cLook -Inv -Def 'On' -Explorer -Name 'Snap suggestions and layouts flyout' `
@@ -6855,19 +6857,14 @@ Add-Tweak -Id 'window-shake' -Cat $cLook -Inv -Def 'Off' -Explorer -Name 'Title 
 
 # ------------------------------------------------------------------ AI ---------
 Add-Tweak -Id 'copilot' -Cat $cAi -Inv -Def 'On' -Preset -Explorer -Name 'Copilot taskbar button' `
-    -Desc 'On: the Copilot button shows on the taskbar (on the Windows builds that have it). Off: it is hidden, the same as the Copilot switch in Settings > Personalization > Taskbar. The Copilot policies have no switch in Settings: they are the "Disable in registry" switch under this card. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
+    -Desc 'On: the Copilot button shows on the taskbar (on the Windows builds that have it). Off: it is hidden, the same as the Copilot switch in Settings > Personalization > Taskbar. Off also turns the old Windows Copilot side panel off by policy for the PC and for your account (Microsoft has marked that policy as deprecated) and sets the value Windows keeps for whether this account may use Copilot to 0; Settings has no switch for these. Switching it back on, and Reset all, remove the policies and put back the value this PC had. The newer Copilot is an app: "Copilot and Cortana apps" under Remove apps takes that out.' `
     -Parts @(
         pReg $adv 'ShowCopilotButton' 0 1
-    )
-
-# the registry values this card's switch does not write: the "Disable in registry" box under it (build 124)
-Add-Tweak -Id 'reg-copilot' -Cat $cAi -Under 'copilot' -Def 'Off' -Preset -Name 'Disable Copilot in registry' `
-    -Desc 'On: the old Windows Copilot side panel is turned off by policy for the PC and for your account, and the value Windows keeps for whether this account may use Copilot is set to 0. Microsoft has marked that policy as deprecated. Off: the policies are not set and that value is as this PC had it (the Windows default). Windows Settings has no switch for these. Switching it off, and Reset all, remove the policies and put back the value this PC had.' `
-    -Parts @(
-        pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1
-        pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1
+        # (build 126: was the "reg-copilot" box, "Disable in registry")
+        pLock (pReg "$pol\WindowsCopilot" 'TurnOffWindowsCopilot' 1)
+        pLock (pReg 'HKCU:\Software\Policies\Microsoft\Windows\WindowsCopilot' 'TurnOffWindowsCopilot' 1)
         # the value Windows keeps for whether this account may use Copilot (Windows sets it itself; undo: what the PC had)
-        pRegPrev 'HKLM:\Software\Microsoft\Windows\Shell\Copilot\BingChat' 'IsUserEligible' 0
+        pLock (pRegPrev 'HKLM:\Software\Microsoft\Windows\Shell\Copilot\BingChat' 'IsUserEligible' 0)
     )
 
 Add-Tweak -Id 'perm-ai' -Cat $cAi -Inv -Def 'On' -Name 'App access to text and image generation' `
@@ -6905,36 +6902,26 @@ Add-Tweak -Id 'ai-apps' -Cat $cAi -Inv -Def 'On' -Preset -Risk 'note' -Name 'AI 
     )
 
 Add-Tweak -Id 'ai-generative' -Cat $cAi -Inv -Def 'On' -Preset -Name 'App access to generative AI' `
-    -Desc 'On: apps can use Windows'' generative AI. Off: the "Generative AI" app permission in Settings > Privacy and security is set to Deny for every account on this PC. "Text and image generation" is its own setting ("App access to text and image generation"). Ordinary apps and games are not touched. The generative AI policy is the "Disable in registry" switch under this card. LetAppsAccessSystemAIModels, a value earlier builds wrote that Microsoft documents no policy for, is removed.' `
+    -Desc 'On: apps can use Windows'' generative AI. Off: the "Generative AI" app permission in Settings > Privacy and security is set to Deny for every account on this PC. "Text and image generation" is its own setting ("App access to text and image generation"). Ordinary apps and games are not touched. Off also sets the "Let Windows apps make use of generative AI features of Windows" Group Policy to Force Deny (LetAppsAccessGenerativeAI = 2), so Settings shows the switch as managed by your organization. Switching it back on, and Reset all, remove it again. LetAppsAccessSystemAIModels, a value earlier builds wrote that Microsoft documents no policy for, is removed.' `
     -Parts @(
         # the "Generative AI" app permission in Settings > Privacy and security, for every account on this PC ("Text and image
         # generation" is its own setting, "App access to text and image generation")
         pReg 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\generativeAI' 'Value' 'Deny' 'Allow' 'String'
         # build 122: a value earlier builds wrote under a name Microsoft documents no policy for; it is removed
         pRegOld "$pol\AppPrivacy" 'LetAppsAccessSystemAIModels' 2
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-genai' -Cat $cAi -Under 'ai-generative' -Def 'Off' -Preset -Name 'Disable generative AI access in registry' `
-    -Desc 'On: the "Let Windows apps make use of generative AI features of Windows" Group Policy is set to Force Deny (LetAppsAccessGenerativeAI = 2), so no app can use them, and Settings shows the switch as managed by your organization. Off: the policy is not set, so the switch in Settings decides (the Windows default). Switching it off, and Reset all, remove it again.' `
-    -Parts @(
-        pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2
+        # (build 126: was the "reg-genai" box, "Disable in registry")
+        pLock (pReg "$pol\AppPrivacy" 'LetAppsAccessGenerativeAI' 2)
     )
 
 Add-Tweak -Id 'ai-voice' -Cat $cAi -Inv -Def 'On' -Preset -Name 'Voice activation (wake word)' `
-    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it (it has a card of its own on the Services page). The voice activation policies are the "Disable in registry" switch under this card.' `
+    -Desc 'On: apps can be started by a spoken wake word ("Hey Copilot", the old "Hey Cortana"), also from the lock screen. Off: they cannot. Voice typing and the microphone in games or chat programs are not meant to be affected. The Agent Activation Runtime service is left alone: it only starts when something asks for it (it has a card of its own on the Services page). Off also sets the "Let Windows apps activate with voice" Group Policies to Force Deny (LetAppsActivateWithVoice and LetAppsActivateWithVoiceAboveLock = 2), so no app can be started by a wake word, also not from the lock screen, and Settings shows those switches as managed by your organization. Switching it back on, and Reset all, remove them again.' `
     -Parts @(
         # "Let apps access voice activation services" in Settings > Privacy and security > Voice activation (it also turns off the
         # switch for when the device is locked)
         pReg 'HKCU:\Software\Microsoft\Speech_OneCore\Settings\VoiceActivation\UserPreferenceForAllApps' 'AgentActivationEnabled' 0 1
-    )
-
-# the Group Policy for this card's switch: the "Disable in registry" box under it (build 125, Tyler: "Set the policies too")
-Add-Tweak -Id 'reg-voice' -Cat $cAi -Under 'ai-voice' -Def 'Off' -Preset -Name 'Disable voice activation in registry' `
-    -Desc 'On: the "Let Windows apps activate with voice" Group Policies are set to Force Deny (LetAppsActivateWithVoice and LetAppsActivateWithVoiceAboveLock = 2), so no app can be started by a wake word, also not from the lock screen, and Settings shows those switches as managed by your organization. Off: neither policy is set, so the switches in Settings decide (the Windows default). Switching it off, and Reset all, remove them again.' `
-    -Parts @(
-        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2
-        pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2
+        # (build 126: was the "reg-voice" box, "Disable in registry")
+        pLock (pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoice' 2)
+        pLock (pReg "$pol\AppPrivacy" 'LetAppsActivateWithVoiceAboveLock' 2)
     )
 
 Add-Tweak -Id 'ai-core' -Cat $cAi -Inv -Def 'On' -OneWay -Risk 'note' -Name 'Windows AI core package' `
@@ -9012,78 +8999,6 @@ function Set-GroupWant {
     return $changed
 }
 
-# ------------------------------------------------------------ Sync Registry Changes ----
-# build 124 (Tyler: "add a button at the top of the filters section ... that says 'Sync Registry Changes' that will allow you to keep the
-# settings/tweak and registry change in sync with being enabled or disabled"). While it is on, a card and its "Disable in registry" boxes
-# (T.Subs) move together: the card's switch off = its box on (disabled in the registry), the card's switch on = its box off. A click on either
-# switch moves the other (and the card's other boxes); turning Sync on lines every box up with its card (the card is what counts).
-# Tweak all, Apply all and the presets already take a card and its box together, and Reset all always puts the Windows defaults back,
-# so those are left as they are. Nothing is changed on the PC until Apply changes. The choice is kept beside the undo record.
-$script:SyncReg = $false
-function Get-SyncPath {
-    if ($StorePath) { return (Join-Path ([IO.Path]::GetDirectoryName([string]$StorePath)) 'sync-registry.txt') }
-    return ''
-}
-function Read-SyncPref {
-    $p = Get-SyncPath
-    if (-not $p) { return $false }
-    try { if (Test-Path -LiteralPath $p) { return ([string](Get-Content -LiteralPath $p -Raw)).Trim() -eq 'on' } } catch { }
-    return $false
-}
-function Save-SyncPref {
-    param([bool]$on)
-    $p = Get-SyncPath
-    if (-not $p) { return }
-    $v = 'off'; if ($on) { $v = 'on' }
-    try { Set-Content -LiteralPath $p -Value $v -Encoding ASCII } catch { }
-}
-# Line up the boxes under one card with the card's switch. Returns the ids that were changed.
-function Sync-SubsOf {
-    param([string]$id)
-    $row = $script:Rows[$id]
-    if (-not $row) { return @() }
-    $done = @()
-    $cardOn = [bool](Get-SwitchOn $row.T ([bool]$row.Want))
-    foreach ($sid in @($row.T.Subs)) {
-        $sr = $script:Rows[[string]$sid]
-        if (-not $sr -or (Test-CanChange $sr)) { continue }
-        $want = (-not $cardOn)                              # a box's switch is the disabling: on while it is applied
-        if ([bool]$sr.Want -eq $want) { continue }
-        if ((Try-SetWant ([string]$sid) $want) -eq '') { $done += [string]$sid }
-    }
-    return $done
-}
-# A box was switched: its card follows (box on = card off), then the card's other boxes. Returns the ids that were changed.
-function Sync-CardOf {
-    param([string]$sid)
-    $sr = $script:Rows[$sid]
-    if (-not $sr -or -not [string]$sr.T.Under) { return @() }
-    $cid = [string]$sr.T.Under
-    $cr = $script:Rows[$cid]
-    if (-not $cr -or (Test-CanChange $cr)) { return @() }
-    $done = @()
-    $want = ((-not [bool]$sr.Want) -ne [bool]$cr.T.Inv)      # the Want that puts the card's switch on exactly when the box is off
-    if ([bool]$cr.Want -ne $want) { if ((Try-SetWant $cid $want) -eq '') { $done += $cid } }
-    $done += @(Sync-SubsOf $cid)
-    return $done
-}
-# After a click on one switch: the ones that move with it (none while Sync is off)
-function Sync-Linked {
-    param([string]$id)
-    if (-not $script:SyncReg) { return @() }
-    $row = $script:Rows[$id]
-    if (-not $row) { return @() }
-    if ([string]$row.T.Under) { return @(Sync-CardOf $id) }
-    if (@($row.T.Subs).Count -gt 0) { return @(Sync-SubsOf $id) }
-    return @()
-}
-# Turning Sync on: every box follows its card
-function Sync-AllSubs {
-    $done = @()
-    foreach ($id in @($script:Rows.Keys)) { if (@($script:Rows[$id].T.Subs).Count -gt 0) { $done += @(Sync-SubsOf ([string]$id)) } }
-    return $done
-}
-
 # The settings "Turn all on" leaves out on this page ($cat = '' for all of them): the ones "Apply all" leaves out, that are not on yet
 function Get-GroupLeftOut {
     param([string]$cat)
@@ -9108,14 +9023,10 @@ $script:PresetNames = @{ recommended = 'Recommended Debloat'; advanced = 'Advanc
 $script:AdvancedExtra = @(
     # Cloud, sync and OneDrive (all)
     'settingsync', 'clipboard', 'crossdevice', 'syncsvc', 'offlinefiles', 'onedrive-policy', 'onedrive-remove', 'deliveryopt',
-    # their Group Policy boxes (build 125: a "Disable in registry" box is in a preset exactly when its card is)
-    'reg-cloudclipboard', 'reg-cdp', 'reg-deliveryopt',
     # their services, on the Services page since build 123 (they were part of those cards before)
     'svc-cdp', 'svc-dosvc',
     # Remote access and VPN (all)
     'rdp', 'remote-assist', 'quickassist', 'winrm', 'remote-mgmt', 'vpn', 'svc-rdp',
-    # and their Group Policy boxes (build 125)
-    'reg-rdp', 'reg-remoteassist',
     # Network adapters and USB power: the one Recommended leaves out
     'nic-turnoff',
     # Power plan and startup: Fast Startup and hibernation (the power plan switches are in no preset)
@@ -9124,8 +9035,6 @@ $script:AdvancedExtra = @(
     'wu-drivers',
     # Security prompts (all but BitLocker and automatic device encryption)
     'uac', 'uac-lua', 'vbs', 'hypervisor',
-    # VBS and Credential Guard: the "Disable in registry" box under Memory Integrity (since build 124; its own page in build 123)
-    'reg-vbs',
     # Services (all that are in the Advanced preset; Recommended has the other six)
     'svc-search', 'svc-smartcard', 'printing', 'xbox-svc',
     # File Explorer opens to This PC
@@ -9261,7 +9170,9 @@ function Load-Personal {
         for ($i = 0; $i -lt $ids.Count; $i++) {
             $k = ''
             if ($i -lt $keys.Count) { $k = [string]$keys[$i] }
-            if ([string]$ids[$i]) { $picks[[string]$ids[$i]] = $k }
+            # (build 126: an old "Disable in registry" box means its card; the card's own pick wins)
+            $cid = Resolve-OldId ([string]$ids[$i])
+            if ($cid -and ($cid -eq [string]$ids[$i] -or -not $picks.ContainsKey($cid))) { $picks[$cid] = $k }
         }
         $script:Personal = @{ Saved = [string]$x.Saved; Picks = $picks; Source = [string]$x.Source }
     } catch { $script:Personal = @{ Saved = ''; Picks = @{}; Source = '' } }
@@ -9313,9 +9224,10 @@ function Read-Configuration {
     if ($ver -lt 1) { $r.Error = 'This is not a Headroom configuration file.'; return $r }
     if ($ver -gt $script:ConfigVersion) { $r.Error = 'This file was saved by a newer version of Headroom. Update the app, then open it again.'; return $r }
     foreach ($it in @($doc.Settings)) {
-        $id = [string]$it.Id
-        if (-not $id) { continue }
-        if ($script:ById[$id]) { $r.Picks[$id] = [string]$it.Option } else { $r.Skipped++ }
+        $raw = [string]$it.Id
+        if (-not $raw) { continue }
+        $id = Resolve-OldId $raw          # (build 126: an old "Disable in registry" box means its card; the card's own pick wins)
+        if ($script:ById[$id]) { if ($id -eq $raw -or -not $r.Picks.ContainsKey($id)) { $r.Picks[$id] = [string]$it.Option } } else { $r.Skipped++ }
     }
     if ($r.Picks.Count -eq 0) { $r.Error = 'The file has no settings that this version of Headroom knows.'; return $r }
     $r.Ok = $true
@@ -9440,7 +9352,7 @@ function Get-RealPick {
 
 # The state of a row was (re)checked. During the first check the tick follows the real state.
 function Set-RowState {
-    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '', [string]$diff = '')
+    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '', [string]$diff = '', [string]$vals = '')
     $row = $script:Rows[$id]
     if (-not $row) { return }
     $row.State = $state
@@ -9449,6 +9361,7 @@ function Set-RowState {
     $row.Read = $read          # what the check read from the PC (one line per value)
     $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
     $row.Diff = $diff          # the values that are not the way the setting sets them (see Get-DiffItems), '' when it is applied
+    $row.Vals = $vals          # every value: kind, where, now, what the setting sets, state (build 126: the "</>" button; see Get-ValueItems)
     $row.Force = ''
     if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row; $row.ToDefault = $false }
 }
@@ -9815,7 +9728,7 @@ function Get-DetailParts {
         $back = (@(@($t.Parts) | Where-Object { $_.HasBack }).Count -gt 0)
         if ($a -eq 'Undo' -and $back -and -not $row.ToDefault) { $tail = ' (the same as switching it in Windows Settings)' }
         elseif ($a -eq 'Undo' -and -not $explicit) { $tail = ' (the Windows default is put back)' }
-        elseif ($a -eq 'Apply' -and [string]$row.Force -eq 'Apply' -and [string]$row.State -eq 'On') { $tail = ' (it is off but has no value yet: the value Windows Settings writes is written)' }
+        elseif ($a -eq 'Apply' -and [string]$row.Force -eq 'Apply' -and [string]$row.State -eq 'On') { $tail = ' (it is off, but not every value that goes with it is written yet: they are written now)' }
         [void]$p.Add(@{ S = 'wait'; C = ''; T = ('Waiting: will be turned ' + $dir + $tail + ' when you press the button' + $nl) })
     }
     # the status lines stay at the top (where the setting is now, the switch and the Windows default, what is waiting), and the
@@ -9840,11 +9753,10 @@ function Get-DetailParts {
     elseif ($t.Once)   { [void]$p.Add(@{ S = 'note'; C = ''; T = 'One-time action: it runs when you press the button, deletes files for good and has nothing to undo. It is never part of Apply all, Tweak all or any preset.' + $nl }) }
     elseif ($t.Preset) { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Part of the Recommended preset (and so of Advanced Debloat).' + $nl }) }
     else           { [void]$p.Add(@{ S = 'note'; C = ''; T = 'Not part of the Recommended preset (change it yourself if you want it).' + $nl }) }
-    # build 124: a "Disable in registry" box and the card it sits under say so
-    $up = $null; if ([string]$t.Under) { $up = $script:ById[[string]$t.Under] }
-    if ($up) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('The "Disable in registry" switch under "' + [string]$up.Name + '": registry values that card''s Windows Settings switch does not write. It is a setting of its own; switching the card does not change it.' + $nl) }) }
-    $subN = @(@($t.Subs) | Where-Object { $script:ById.ContainsKey([string]$_) } | ForEach-Object { '"' + [string]$script:ById[[string]$_].Name + '"' })
-    if ($subN.Count -gt 0) { [void]$p.Add(@{ S = 'note'; C = ''; T = ('Under this card: the "Disable in registry" switch (' + ($subN -join ', ') + '), for the registry values this switch does not write. It is a setting of its own.' + $nl) }) }
+    # build 126: a card that also writes registry values its Windows Settings switch does not write (they were the "Disable in registry" boxes)
+    if (@(@($t.Parts) | Where-Object { $_.Lock }).Count -gt 0) {
+        [void]$p.Add(@{ S = 'note'; C = ''; T = ('Switching it off also writes the registry values that go with it (its Group Policy and the values Windows Settings has no switch for; they were the "Disable in registry" box under this card); switching it on, and Reset all, take them away again.' + $nl) })
+    }
     if ([string]$row.State -eq 'On' -and $row.Mine -eq 'no') {
         $back = ' Switching it back puts the Windows default back.'
         if ($explicit) { $back = ' Switching it off turns it off.' }
@@ -9878,7 +9790,6 @@ function Test-RowVisible {
     if ($risk -and $risk -ne 'Any risk' -and (Get-RiskLevel $row.T) -ne $risk) { return $false }
     if ($text) {
         $hay = $row.T.Name + ' ' + $row.T.Desc + ' ' + $row.T.Id + ' ' + $row.T.Cat
-        if ($row.T.Under) { $hay += ' Disable in registry' }                       # the title of its box under the card
         if (Get-NotRecReason $row.T) { $hay += ' ' + $script:NotRecText }        # a search for "not recommended" finds the marked ones
         if ($row.T.Unproven) { $hay += ' May do nothing' }                       # ... and "may do nothing" and "untested" find the cards that carry those tags
         if ($row.T.Untested) { $hay += ' Untested' }
@@ -10131,6 +10042,55 @@ function Get-DiffItems {
     }
     return $out
 }
+# Build 126, the "</>" button of a card (Tyler: "The </> should be the current registry value followed by what headroom changes it to"):
+# every value of the setting as the last check read it, and what Headroom sets it to. @{ What; At; Now; Want; Same } per value
+# (Same = the value is already the way Headroom sets it). Empty until the setting has been checked.
+function Get-ValueItems {
+    param($row)
+    $out = @()
+    if (-not $row) { return $out }
+    foreach ($ln in @(([string]$row.Vals) -split "`n")) {
+        if (-not $ln) { continue }
+        $f = @($ln -split "`t")
+        while ($f.Count -lt 5) { $f += '' }
+        $k = [string]$f[0]
+        $w = [string]$script:DiffKinds[$k]
+        if (-not $w) { $w = 'Windows setting' }
+        $at = [string]$f[1]
+        if ($k -eq 'reg' -or $k -eq 'key') { $at = $at -replace '^(HK[A-Z_]+):\\', '$1\' -replace '^Registry::', '' }
+        $out += , @{ What = $w; At = $at; Now = [string]$f[2]; Want = [string]$f[3]; Same = ([string]$f[4] -eq 'On') }
+    }
+    return $out
+}
+# The text of the "</>" window for a row, in the pieces Ui-FillRich puts together (S = the style of the piece)
+function Get-ValueParts {
+    param($row)
+    $p = New-Object System.Collections.ArrayList
+    $nl = "`r`n"
+    if (-not $row) { return $p }
+    [void]$p.Add(@{ S = 'title'; C = ''; T = [string]$row.T.Name + $nl })
+    [void]$p.Add(@{ S = 'sub'; C = ''; T = 'Each value as the last check read it, and what Headroom changes it to when the setting is applied.' + $nl })
+    $items = @(Get-ValueItems $row)
+    if ($items.Count -eq 0) {
+        $why = 'Not read yet: the values show here once the check has looked at this setting.'
+        if ([string]$row.State -eq 'NA') { $why = 'Nothing to read on this PC: ' + [string]$row.Detail }
+        [void]$p.Add(@{ S = 'body'; C = ''; T = $nl + $why + $nl })
+        return $p
+    }
+    foreach ($it in $items) {
+        $where = [string]$it.At
+        $head = [string]$it.What
+        if ($where) { $head += ': ' + $where }
+        [void]$p.Add(@{ S = 'head'; C = ''; T = $nl + $head + $nl })
+        [void]$p.Add(@{ S = 'mono'; C = ''; T = ('  Now:      {0}' -f $(if ([string]$it.Now) { [string]$it.Now } else { '-' })) + $nl })
+        if ([string]$it.Want) {
+            $st = 'mono'; $tail = ''
+            if ($it.Same) { $st = 'monogood'; $tail = '   (already set)' }
+            [void]$p.Add(@{ S = $st; C = ''; T = ('  Headroom: {0}{1}' -f [string]$it.Want, $tail) + $nl })
+        }
+    }
+    return $p
+}
 # The settings of a plan to apply again, for the window: @{ Id; Name; Kind = 'partial' | 'back'; Detail; Changes; Open; Pick (ticked) }
 function Get-ReapplyItems {
     param($Plan)
@@ -10228,7 +10188,7 @@ function Handle-Event {
     switch ([string]$ev.Kind) {
         'log' { Ui-Log ([string]$ev.Text) ([string]$ev.Color) }
         'state' {
-            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine) ([string]$ev.Diff)
+            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine) ([string]$ev.Diff) ([string]$ev.Vals)
             if ($script:Scanning) { Ui-Progress ([int]$ev.A) ([int]$ev.B) }
             Ui-RefreshRow ([string]$ev.Id)
         }
@@ -10319,11 +10279,11 @@ Add-GQ -Id 'shooters' -Group 'Your PC' -Gate 'gaming' `
 Add-GQ -Id 'riot' -Group 'Your PC' -Gate 'gaming,advanced+' `
     -Q 'Do you play Riot games (Valorant, League of Legends) or use FACEIT?' `
     -Help 'Riot Vanguard and FACEIT Anti-Cheat can refuse to start, or refuse to let you play, when Memory Integrity or virtualization-based security is off. Yes or Not sure means the settings that turn those off are never applied, whatever else you answer. Valve games (Counter-Strike 2, Dota 2) and VAC do not need them.' `
-    -Keep @('vbs', 'reg-vbs', 'hypervisor')
+    -Keep @('vbs', 'hypervisor')
 Add-GQ -Id 'perfsec' -Group 'Your PC' -Gate 'gaming,advanced+' `
     -Q 'Do you want a few percent more FPS even if it lowers some of the protection in Windows?' `
     -Help 'Memory Integrity, virtualization-based security and the Windows hypervisor are security features that protect against malicious drivers. Switching them off can give a few percent more FPS in some games, and removes that protection. Yes lines them up (each one asks once more before it is switched on). A Yes to Riot / FACEIT or to virtual machines overrules it.' `
-    -Yes @('vbs', 'reg-vbs', 'hypervisor')
+    -Yes @('vbs', 'hypervisor')
 Add-GQ -Id 'vrr' -Group 'Your PC' -Gate 'gaming' `
     -Q 'Do you have a variable refresh rate monitor (G-SYNC, FreeSync or Adaptive-Sync)?' `
     -Help 'Yes turns on variable refresh rate for full-screen DirectX 11 games that were not written for it, so the screen follows the frame rate. Windows ships with this off. Some games flicker or change brightness while the refresh rate varies; this is the switch to turn off again for them. No or Not sure leaves it off, as Windows has it, and it does nothing on a screen without variable refresh rate.' `
@@ -10331,12 +10291,12 @@ Add-GQ -Id 'vrr' -Group 'Your PC' -Gate 'gaming' `
 Add-GQ -Id 'vm' -Group 'Your PC' `
     -Q 'Do you use virtual machines, WSL, Docker, Windows Sandbox or Android emulators?' `
     -Help 'Hyper-V, WSL2, Docker Desktop, Windows Sandbox and many emulators need the Windows hypervisor, and their network uses Internet Connection Sharing. Yes or Not sure leaves the hypervisor, Memory Integrity, virtualization-based security and connection sharing as Windows has them.' `
-    -Keep @('hypervisor', 'vbs', 'reg-vbs', 'ics')
+    -Keep @('hypervisor', 'vbs', 'ics')
 Add-GQ -Id 'xbox' -Group 'Your PC' `
     -Q 'Do you use Game Pass, the Xbox app, Microsoft Store games or Game Bar clips?' `
     -Help 'Without the Xbox services, Game Pass, the Xbox app and Microsoft Store games stop working. Steam, Epic and GOG games are not affected. Game Bar (Win+G) records clips in the background, which can cost frames. No switches off the Xbox services, Game Bar recording and its save-sync task, and (if you allowed uninstalling) removes the Game Bar app and the Xbox app with its sign-in. Yes also keeps the Microsoft Store and merged service hosts off the advanced list, because Game Pass and Xbox need them.' `
-    -No @('xbox-svc', 'gamedvr', 'gamebar-controller', 'reg-gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave') `
-    -Keep @('xbox-svc', 'gamedvr', 'gamebar-controller', 'reg-gamedvr', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave', 'svchost-merge', 'apps-store', 'store-policy')
+    -No @('xbox-svc', 'gamedvr', 'gamebar-controller', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave') `
+    -Keep @('xbox-svc', 'gamedvr', 'gamebar-controller', 'gamebar-links', 'apps-gamebar', 'apps-xbox', 'task-xblsave', 'svchost-merge', 'apps-store', 'store-policy')
 Add-GQ -Id 'rgb' -Group 'Your PC' `
     -Q 'Do you control RGB lighting with Windows Dynamic Lighting?' `
     -Help 'That is the Dynamic Lighting page in Settings > Personalization. RGB software from your hardware maker (iCUE, G HUB, Armoury Crate, OpenRGB and so on) is not affected. No stops Windows from controlling the lights, so only that software does, and Windows cannot fight with it.' `
@@ -10364,7 +10324,7 @@ Add-GQ -Id 'work' -Group 'Work and network' `
 Add-GQ -Id 'remote' -Group 'Work and network' `
     -Q 'Do you use Remote Desktop, Remote Assistance or Quick Assist to reach this PC or to get help?' `
     -Help 'No blocks Remote Desktop, turns off Remote Assistance and removes the Quick Assist app (it cannot be put back from this app). Remote play and streaming apps such as Steam Remote Play and Parsec are separate and are not affected by these three.' `
-    -No @('rdp', 'reg-rdp', 'svc-rdp', 'remote-assist', 'reg-remoteassist', 'quickassist')
+    -No @('rdp', 'svc-rdp', 'remote-assist', 'quickassist')
 Add-GQ -Id 'vpn' -Group 'Work and network' `
     -Q 'Do you use a VPN (a work VPN, or an app such as NordVPN, ProtonVPN or WireGuard)?' `
     -Help 'Windows has its own VPN client (IKEv2, SSTP, L2TP). VPN apps that bring their own driver, such as WireGuard, usually keep working without it, but some VPN clients need it. No switches the Windows VPN services off, which also breaks PPPoE broadband dial-ups. Yes or Not sure leaves them on.' `
@@ -10372,7 +10332,7 @@ Add-GQ -Id 'vpn' -Group 'Work and network' `
 Add-GQ -Id 'lan' -Group 'Work and network' `
     -Q 'Do you share files, printers or media with other PCs, a NAS or a TV on your home network?' `
     -Help 'No turns off file and printer sharing, network discovery, UPnP hosting, the old name lookups (LLMNR, mDNS, NetBIOS) and SMB1. This PC can still open shared folders and printers on other devices; what stops is other devices reaching this one. A few old NAS boxes or printers that are only found by NetBIOS name may stop showing up by name.' `
-    -No @('fileshare', 'bind-fileshare', 'svc-lanman', 'reg-adminshares', 'discovery', 'bind-discovery', 'svc-discovery', 'legacy-names', 'svc-netbios', 'smb1')
+    -No @('fileshare', 'bind-fileshare', 'svc-lanman', 'discovery', 'bind-discovery', 'svc-discovery', 'legacy-names', 'svc-netbios', 'smb1')
 Add-GQ -Id 'hotspot' -Group 'Work and network' `
     -Q 'Do you share this PC''s internet connection with other devices (Mobile Hotspot, Internet Connection Sharing)?' `
     -Help 'No turns off Internet Connection Sharing, the Mobile Hotspot service and Windows Media Player library sharing. WSL2, Hyper-V and Windows Sandbox use connection sharing too, and the virtual machine question above protects it for them.' `
@@ -10396,7 +10356,7 @@ Add-GQ -Id 'onedrive' -Group 'Accounts and cloud' `
 Add-GQ -Id 'phone' -Group 'Accounts and cloud' `
     -Q 'Do you use Phone Link, Nearby Sharing or text messages on this PC?' `
     -Help 'No turns off Nearby Sharing and Continue on this PC, the text message (SMS) router, and removes the Phone Link and Cross Device apps.' `
-    -No @('crossdevice', 'reg-cdp', 'svc-cdp', 'svc-smsrouter', 'apps-phone')
+    -No @('crossdevice', 'svc-cdp', 'svc-smsrouter', 'apps-phone')
 Add-GQ -Id 'settingsync' -Group 'Accounts and cloud' `
     -Q 'Do you want your theme, Wi-Fi passwords and other Windows settings to sync with your Microsoft account?' `
     -Help 'No blocks settings sync and disables its two background tasks. Your files and apps are not affected.' `
@@ -10408,35 +10368,35 @@ Add-GQ -Id 'mail' -Group 'Accounts and cloud' `
 Add-GQ -Id 'clip' -Group 'Accounts and cloud' `
     -Q 'Do you use clipboard history (Win+V) or the cloud clipboard?' `
     -Help 'No stops Windows from keeping a list of what you copied and from syncing the clipboard between your devices. Normal copy and paste (Ctrl+C, Ctrl+V) is not affected.' `
-    -No @('clipboard-history', 'reg-clipboardhistory', 'clipboard', 'reg-cloudclipboard')
+    -No @('clipboard-history', 'clipboard')
 Add-GQ -Id 'diag' -Group 'Privacy' `
     -Q 'Do you want to stop Windows sending diagnostic data and error reports to Microsoft, and update sharing with other PCs?' `
     -Help 'Yes sets diagnostic data to the least Windows allows, turns off error reporting, the telemetry services and scheduled tasks, the data usage meter, Defender sample sending, Defender Core telemetry, inking and typing data collection, the data usage and Office telemetry tasks, and Windows Update sharing with other PCs. Windows Security keeps scanning and updating as normal.' `
-    -Yes @('telemetry', 'reg-diag', 'telemetry-tasks', 'telemetry-svc', 'svc-telemetry2', 'task-sqm', 'svc-datausage', 'defender-samples', 'defender-core', 'inking', 'reg-handwriting', 'reg-inputpers', 'deliveryopt', 'reg-deliveryopt', 'svc-dosvc', 'task-dusm', 'task-officetelemetry')
+    -Yes @('telemetry', 'telemetry-tasks', 'telemetry-svc', 'svc-telemetry2', 'task-sqm', 'svc-datausage', 'defender-samples', 'defender-core', 'inking', 'deliveryopt', 'svc-dosvc', 'task-dusm', 'task-officetelemetry')
 Add-GQ -Id 'ads' -Group 'Privacy' `
     -Q 'Do you want to stop ads, suggestions and tracking in Windows?' `
     -Help 'Yes turns off the advertising ID, tailored tips, suggested and auto-installed apps, promo cards in Settings, feedback pop-ups, activity history, app-launch tracking and web results in Start search.' `
-    -Yes @('ads', 'reg-ads', 'tracking', 'suggestions', 'reg-suggestions', 'reg-tips', 'settings-promo', 'feedback', 'reg-feedback', 'activity', 'search-web', 'reg-search')
+    -Yes @('ads', 'tracking', 'suggestions', 'settings-promo', 'feedback', 'activity', 'search-web')
 Add-GQ -Id 'location' -Group 'Privacy' `
     -Q 'Do you use location (Weather, Maps, automatic time zone) or Find my device?' `
     -Help 'No turns location off for the whole PC and turns Find my device off, so the PC is not registered with your Microsoft account. Weather and Maps no longer know where you are, and Set time zone automatically stops working, so the clock will not follow you to a new time zone by itself. Yes or Not sure leaves both as Windows has them.' `
-    -No @('location', 'reg-location', 'svc-geolocation', 'find-my-device', 'reg-findmydevice')
+    -No @('location', 'svc-geolocation', 'find-my-device')
 Add-GQ -Id 'devmeta' -Group 'Privacy' `
     -Q 'Do you want Windows to look up device names, pictures and maker apps online when you plug in hardware?' `
     -Help 'No stops Windows from downloading device information from the internet. Drivers are not affected: they still come from Windows Update or your own installer. A new device may show with a generic icon and name.' `
-    -No @('device-metadata', 'reg-devicemetadata')
+    -No @('device-metadata')
 Add-GQ -Id 'trouble' -Group 'Privacy' `
     -Q 'Do you run old games or programs and rely on the compatibility prompts that Windows shows?' `
     -Help 'That is the Program Compatibility Assistant ("this program might not have installed correctly"), its update task and the power diagnostics task. Compatibility settings you choose yourself in a program''s Properties still apply without it. No switches the assistant off.' `
     -No @('svc-pca', 'task-pca', 'task-powerdiag')
 Add-GQ -Id 'rare' -Group 'Privacy' `
     -Q 'Do you use Fax, NFC or tap-to-pay, Parental Controls or Family Safety, Windows Insider builds or offline maps?' `
-    -Help 'No switches off the rarely used services for those (Retail Demo, Fax, Parental Controls, NFC and payments, Wallet, Phone service, Windows Insider, Downloaded Maps Manager, Distributed Link Tracking) and the Family Safety and Maps update tasks.' `
+    -Help 'No switches off the rarely used services for those (Retail Demo, Fax, Parental Controls, NFC and payments, Wallet, Phone service, Windows Insider, Downloaded Maps Manager, Distributed Link Tracking), the Family Safety task and automatic offline map updates.' `
     -No @('svc-misc', 'svc-wallet', 'task-familysafety', 'task-maps')
 Add-GQ -Id 'ai' -Group 'AI and Edge' `
     -Q 'Do you use Copilot or other AI features in Windows, Edge or Chrome?' `
     -Help 'No switches off Copilot, Recall, Click to Do, AI in Notepad and Paint, text and image generation for apps, voice activation, the AI page in Settings, experimental agentic features and AI in Edge and Chrome. If you allowed uninstalling, it also removes the Copilot app and the Windows AI package.' `
-    -No @('copilot', 'reg-copilot', 'recall', 'ai-apps', 'ai-generative', 'reg-genai', 'ai-voice', 'reg-voice', 'ai-page', 'ai-agentic', 'ai-core', 'apps-ai', 'edge-ai', 'edge-ai-more', 'chrome-ai')
+    -No @('copilot', 'recall', 'ai-apps', 'ai-generative', 'ai-voice', 'ai-page', 'ai-agentic', 'ai-core', 'apps-ai', 'edge-ai', 'edge-ai-more', 'chrome-ai')
 Add-GQ -Id 'edge' -Group 'AI and Edge' `
     -Q 'Do you use Microsoft Edge as a browser?' `
     -Help 'Yes still hides the first-run page, rewards and nags and stops Edge from running in the background when it is closed, but leaves Edge''s telemetry and profile sync, its update tasks and its update services as they are. No switches all of that off. The update tasks also keep the WebView2 component up to date, which many apps use: they are only switched off when you answer No.' `
@@ -10454,7 +10414,7 @@ Add-GQ -Id 'taskbar' -Group 'Look and feel' `
 Add-GQ -Id 'widgets' -Group 'Look and feel' `
     -Q 'Do you use Widgets (the weather, news and stocks panel) or Chat on the taskbar?' `
     -Help 'No hides the Widgets and Chat buttons, turns the Widgets feed off by policy and, if you allowed uninstalling, removes the Widgets panel.' `
-    -No @('taskbar-clutter', 'reg-widgets', 'apps-widgets')
+    -No @('taskbar-clutter', 'apps-widgets')
 Add-GQ -Id 'effects' -Group 'Look and feel' `
     -Q 'Do you want Windows without animations, shadows and transparency?' `
     -Help 'Yes turns off window animations and shadows and the transparency effects: a plainer, snappier look.' `
@@ -10462,7 +10422,7 @@ Add-GQ -Id 'effects' -Group 'Look and feel' `
 Add-GQ -Id 'notif' -Group 'Look and feel' `
     -Q 'Do you want Windows notifications (pop-ups from apps, games, the calendar)?' `
     -Help 'No turns off all pop-up notifications and the notification centre. Windows Security pop-ups may be hidden too, so look at its status page now and then.' `
-    -No @('notifications', 'reg-notifications')
+    -No @('notifications')
 Add-GQ -Id 'startrec' -Group 'Look and feel' `
     -Q 'Do you want the Recommended section (recent files and suggested apps) in the Start menu?' `
     -Help 'No hides the Recommended section of the Start menu.' `
@@ -10718,9 +10678,10 @@ function Split-Ids {
 # Returns @{ Id; Choice } ('' when no option was given).
 function Split-IdChoice {
     param([string]$raw)
+    # (build 126: the id of an old "Disable in registry" box means its card)
     $i = $raw.IndexOf('=')
-    if ($i -lt 0) { return @{ Id = $raw.Trim(); Choice = '' } }
-    return @{ Id = $raw.Substring(0, $i).Trim(); Choice = $raw.Substring($i + 1).Trim() }
+    if ($i -lt 0) { return @{ Id = (Resolve-OldId $raw.Trim()); Choice = '' } }
+    return @{ Id = (Resolve-OldId $raw.Substring(0, $i).Trim()); Choice = $raw.Substring($i + 1).Trim() }
 }
 
 function Invoke-ConsoleScan {
@@ -10947,7 +10908,9 @@ $script:DList = $false            # the list needs repainting
 $script:DHead = $false            # group counts need recomputing
 $script:DNav = $false             # the side menu, the page title and the numbers on the filter buttons need recomputing
 $script:DCounts = $false          # the button / change count needs recomputing
-$script:DDetail = $false          # the details panel needs refilling
+$script:DDetail = $false          # the description window needs refilling
+$script:DVals = $false            # the values window ("</>") needs refilling
+$script:ValsKey = ''              # the setting the values window shows
 $script:DProg = $false            # the progress bar needs updating
 $script:ProgA = 0
 $script:WaitText = ''          # what the check is still waiting for Windows to answer (shown in the status line)
@@ -11014,6 +10977,7 @@ function Ui-InitTheme {
         PrimaryHot = (Rgb 35 133 255)    # the main button under the pointer
         PrimaryDown = (Rgb 0 94 210)     # the main button while it is pressed
         Good      = (Rgb 76 175 80)      # green (#4caf50)
+        BadgeText = (Rgb 22 24 22)       # the words and icon on a filled green or orange risk badge (build 126)
         GoodSoft  = (Rgb 51 71 54)
         Warn      = (Rgb 255 167 38)
         WarnSoft  = (Rgb 87 69 46)
@@ -11048,12 +11012,14 @@ function Ui-InitTheme {
 
 function Ui-InitMetrics {
     $script:M = @{
-        Row = (Px 66); Gap = (Px 10); Head = (Px 46); Pad = (Px 20); TogW = (Px 46); TogH = (Px 24); IconD = (Px 44); IconGap = (Px 14); RiskDot = (Px 10); ChoiceY = (Px 52); ChoiceH = (Px 30); ChoiceExtra = (Px 40)
-        Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 14); BtnR = (Px 10)
-        ChipW = (Px 112); ChipH = (Px 24); CountW = (Px 112)
-        CardMin = (Px 380); RowMin = (Px 560); ColGap = (Px 18); Wheel = (Px 168)
-        SubRow = (Px 54); SubIndent = (Px 40); SubLine = (Px 22)          # the "Disable in registry" box under a card: its line height, how far it is moved in, where the joining line runs
-        Side = (Px 244); Gutter = (Px 28); Details = (Px 340); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
+        # a setting card (build 126): Row is about the height of one line of cards (paging with the keys), the rest are the parts of a card
+        Row = (Px 220); Gap = (Px 16); Head = (Px 46); Pad = (Px 22); TogW = (Px 46); TogH = (Px 24); ChoiceH = (Px 30)
+        CardTop = (Px 16); CardBottom = (Px 16); IdH = (Px 18); TitleH = (Px 30); TagH = (Px 26); TagIcon = (Px 15); DescLH = (Px 20); DescN = 2
+        BotH = (Px 32); BtnH = (Px 30); CodeW = (Px 40)
+        Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 14); BtnR = (Px 8)
+        ChipH = (Px 24); CountW = (Px 112)
+        CardMin = (Px 470); RowMin = (Px 470); ColGap = (Px 18); Wheel = (Px 168)
+        Side = (Px 244); Gutter = (Px 28); HeaderH = (Px 190); HeaderInfoH = (Px 108); FooterH = (Px 88)
         NavTop = (Px 132); SearchY = (Px 80); SearchH = (Px 40); NavRow = (Px 40); NavGap = (Px 4); NavLabel = (Px 40); NavSb = (Px 12); NavWheel = (Px 80)
     }
 }
@@ -11097,8 +11063,10 @@ function Ui-Font {
         'badge'    { $f = Ui-NewFont 'Segoe UI' 10.5 'Bold' }        # a maker's name on its box (Home)
         'meter'    { $f = Ui-NewFont 'Segoe UI Light' 21 }           # the big percentage of a meter (Home)
         'tileVal'  { $f = Ui-NewFont 'Segoe UI Semibold' 11 }        # the value on a tile (Home)
-        'cardId'   { $f = Ui-NewFont 'Segoe UI' 8 }
-        'cardDesc' { $f = Ui-NewFont 'Segoe UI' 9.5 }
+        'cardId'   { $f = Ui-NewFont 'Segoe UI' 8.5 }
+        'cardDesc' { $f = Ui-NewFont 'Segoe UI' 10 }
+        'cardTitle' { $f = Ui-NewFont 'Segoe UI Semibold' 14 }       # the title of a setting card (build 126)
+        'tag'      { $f = Ui-NewFont 'Segoe UI' 9 }                  # the tags on a setting card
         'sub'      { $f = Ui-NewFont 'Segoe UI' 10 }
         'brand'    { $f = Ui-NewFont 'Segoe UI Semibold' 11.5 }
         'hero'     { $f = Ui-NewFont 'Segoe UI Semibold' 34 }        # the welcome screen
@@ -11799,18 +11767,16 @@ function Ui-Ask {
 # It is one custom-drawn control instead of a ListView. Only the rows that are on screen are ever drawn and a
 # change repaints once, which is what makes it fast. A "view entry" is a small hashtable per line:
 #   row:  Kind='row'  Id Key Cat Name Desc Y H Idx Checked Enabled State Action StateText NextText HeadText Tint
-#         StateKey NextKey HeadKey ChipText ChipKey Failed   Choices Pick Now
+#         StateKey NextKey HeadKey ChipText ChipKey Failed   Choices Pick Now DescCache
 #         (Choices = $null, or for a setting with options the list of @{ Key; Short; Label }; Pick = the key that is picked on the card,
-#          Now = the key of the option that is in force, '' when not known. Such a card has a row of option buttons instead of a switch.)
-#         Sub Indent Subs More (build 124: a sub-setting, T.Under, is drawn as a small box under the card it belongs to, with the switch
-#          "Disable in registry". Its entry has Sub = $true, Name = that label and Indent = how far it is moved in; it is not in the
-#          group's rows but in Subs of the card above it, and Ui-Layout puts it on a line of its own right under that card, in its column.
-#          More = another box follows under this one, so the line that joins them goes on down.)
+#          Now = the key of the option that is in force, '' when not known. Such a card has a row of option buttons instead of a switch.
+#          Desc = the setting's description, of which the card shows two lines; DescCache = those lines for the card's width.)
 #   head: Kind='head' Key Cat Title CountText Y H Idx Open
 #   info: Kind='info' Key Cat Title Sub Lines Note Chip ChipKey Span Y H Idx  (a read-out card, see u6-sys.ps1; it has no switch and cannot be
 #         selected. Its height depends on what it says, so a line of the list is as tall as its tallest card.)
-# Each row is drawn as a card: its id in small grey letters, the title, a few tags, the description (two lines), then a risk badge,
-# a small status chip and the switch. Cards sit in one column, or in two when the list is wide enough (X and W of an entry say where).
+# Each row is drawn as a card (build 126): its id in small grey letters (with the status chip at the right), the title, a row of tags,
+# two lines of the description, then the risk badge and "View Description" at the left and the switch and "</>" at the right. Cards
+# sit in one column, or in two when the list is wide enough (X and W of an entry say where).
 # A head is a section title across the whole width; it is only in the list on the "All settings" page (a category page has no heads).
 # Names used for local variables in this file: $Th = colours, $M = sizes, $Cl = column positions.
 # =============================================================================
@@ -11834,7 +11800,6 @@ $script:MY = -1
 $script:Col = @{}
 $script:CursorIs = ''
 $script:FirstSel = -1                                        # index of the first entry that can be selected (-1 = none: a page of read-outs only)
-$script:SubLabel = 'Disable in registry'                     # the title of the small box under a card (a sub-setting, T.Under)
 
 # ----------------------------------------------------------- sizes and scrolling ----
 function Ui-ListSize {
@@ -12000,36 +11965,6 @@ function Ui-FillHeads {
     }
 }
 
-# The "Disable in registry" boxes of the cards on one line (build 124): each goes right under its card, in the same column, moved in by
-# SubIndent; a card with two of them gets two lines of boxes. The boxes of one line all get the height of the tallest. Returns the new y.
-function Ui-PlaceSubs {
-    param($line, [int]$y, $view)
-    $M = $script:M
-    $k = 0
-    while ($true) {
-        $here = @()
-        foreach ($p in @($line)) {
-            $subs = $p.Subs                                          # (an ArrayList, or $null for a card with no box under it)
-            if ($null -eq $subs -or $k -ge $subs.Count) { continue }
-            $s = $subs[$k]
-            $s.X = [int]$p.X + $M.SubIndent
-            $s.W = [Math]::Max((Px 120), [int]$p.W - $M.SubIndent)
-            $s.Y = $y
-            $s.Idx = $view.Count
-            $s.More = [bool](($k + 1) -lt $subs.Count)
-            [void]$view.Add($s)
-            $here += $s
-        }
-        if ($here.Count -eq 0) { break }
-        $h = 0
-        foreach ($s in $here) { $nh = (Ui-RowGeom $s).NatH; if ($nh -gt $h) { $h = $nh } }
-        foreach ($s in $here) { $s.H = $h }
-        $y += $h
-        $k++
-    }
-    return $y
-}
-
 # Put the entries in order, top to bottom, and work out where each one is (X and W too: a line holds one card, or two in a grid).
 # A group has Info (read-out cards, on top) and Rows (settings). A read-out may take the whole width (Span 2); the cards of one line
 # all get the height of the tallest of them.
@@ -12073,7 +12008,6 @@ function Ui-Layout {
             if (-not $open) {
                 $r.Y = -1
                 $r.Idx = -1
-                if ($null -ne $r.Subs) { foreach ($s in $r.Subs) { $s.Y = -1; $s.Idx = -1 } }
                 continue
             }
             # a line ends when the next entry is a read-out that wants the whole width, or the first settings card after read-outs
@@ -12081,7 +12015,6 @@ function Ui-Layout {
             if (($wide -or ($prev -eq 'info' -and $r.Kind -ne 'info')) -and $c -gt 0) {
                 foreach ($e in $line) { $e.H = $lineH }
                 $y += $lineH
-                $y = Ui-PlaceSubs $line $y $view
                 $c = 0; $line = @(); $lineH = 0
             }
             if ($r.Kind -eq 'info') {
@@ -12091,7 +12024,7 @@ function Ui-Layout {
             } else {
                 $r.W = $cw
                 if ($rowWide) { $r.W = $full }
-                $r.H = (Ui-RowGeom $r).NatH                       # as tall as its title needs (one line: the usual height)
+                $r.H = (Ui-RowGeom $r).NatH                       # as tall as a card needs (one with options is taller)
             }
             if ($wide) {
                 $r.X = 0
@@ -12099,7 +12032,6 @@ function Ui-Layout {
                 $r.Idx = $view.Count
                 [void]$view.Add($r)
                 $y += $r.H
-                $y = Ui-PlaceSubs @(, $r) $y $view
             } else {
                 $r.X = $c * ($cw + $M.ColGap)
                 $r.Y = $y
@@ -12111,7 +12043,6 @@ function Ui-Layout {
                 if ($c -ge $cols) {
                     foreach ($e in $line) { $e.H = $lineH }
                     $y += $lineH
-                    $y = Ui-PlaceSubs $line $y $view
                     $c = 0; $line = @(); $lineH = 0
                 }
             }
@@ -12120,7 +12051,6 @@ function Ui-Layout {
         if ($c -gt 0) {                               # the last line of the group is only part full
             foreach ($e in $line) { $e.H = $lineH }
             $y += $lineH
-            $y = Ui-PlaceSubs $line $y $view
         }
     }
     $script:View = $view
@@ -12159,25 +12089,11 @@ function Ui-RebuildList {
                 StateKey = 'Sub'; NextKey = 'Sub'; HeadKey = 'Sub'; ChipText = ''; ChipKey = 'Sub'; Failed = $false
                 Risk = [string]$rb.Text; RiskKey = [string]$rb.Key; Tags = @(Get-CardTags $row.T)
                 NotRec = [bool]$nrWhy; NotRecWhy = [string]$nrWhy
-                Choices = $null; Pick = ''; Now = ''; Sub = $false; Indent = 0; Subs = $null; More = $false }
+                Choices = $null; Pick = ''; Now = ''; Desc = [string]$row.T.Desc; DescCache = $null }
         if ($row.T.Choices) { $e.Choices = @($row.T.Choices | ForEach-Object { @{ Key = [string]$_.Key; Short = [string]$_.Short; Label = [string]$_.Label } }) }
         $row.Item = $e
         $row.Visible = $true
         Ui-FillEntry $row
-        # a sub-setting goes into the box under its card (the card comes first in the catalog, so its entry is there already). Each row is
-        # shown or hidden by the search and the filters on its own, so the numbers on the filter buttons stay right: a box whose card is
-        # hidden is shown as a card of its own, with its full name ("Disable diagnostic policies in registry").
-        $u = [string]$row.T.Under
-        $pe = $null
-        if ($u -and $script:Rows.Contains($u)) { $pe = $script:Rows[$u].Item }
-        if ($pe) {
-            $e.Sub = $true
-            $e.Name = [string]$script:SubLabel
-            $e.Indent = [int]$script:M.SubIndent
-            if ($null -eq $pe.Subs) { $pe.Subs = New-Object System.Collections.ArrayList }
-            [void]$pe.Subs.Add($e)
-            continue
-        }
         [void]$byCat[$cat].Add($e)
     }
     $groups = New-Object System.Collections.ArrayList
@@ -12308,110 +12224,183 @@ function Ui-SoftKey {
     return 'Raised'
 }
 
-# ---- the compact settings row --------------------------------------------------------------------------------------
-# One row is: the title (with small marks after it, level with the middle of the card) and at the right a status chip, the risk
-# pill and the switch. There is no description line: the details panel has the whole text. A row with options has the option pill
-# on a second line under the title instead of the switch.
-# Ui-RowGeom works out where each part goes (offsets from the row's top-left corner); the painter and the hit test both
-# use it, so they cannot disagree.
+# ---- the setting card (build 126) ---------------------------------------------------------------------------------------------
+# Tyler: "Make our boxes that aren't on the Home Screen look like this" (a card from another debloat tool). A card is, top to bottom:
+#   the setting's id in small grey letters, with the status chip ("Will turn on", "Already off", ...) at the right of that line;
+#   the title; a row of tags with small icons (its page, then Not recommended / Needs restart / Recommended ...); two lines of the
+#   description (cut with "..."; "View Description" has all of it); for a setting with options, the option buttons; and the bottom
+#   line: the risk badge and the "View Description" button at the left, the switch and the "</>" button at the right ("</>" shows
+#   each registry value as it is now and what Headroom changes it to). A power plan's "Make active" and "Reinstall" buttons go after
+#   "View Description" when there is room, else into the row of tags.
+# Ui-RowGeom works out where each part goes (offsets from the card's top-left corner); the painter and the hit test both use it, so
+# they cannot disagree.
 
-# The tags that become small marks after the title: not the Windows default or the preset (the details say them) and not the category (the page says it)
-function Ui-RowTags {
+# The tags of a card, in order: @{ Kind; Text; Icon } (Kind: notrec | active | tag). Its page comes first, with that page's icon, then
+# the other tags (not "Windows default ...": the details say it).
+function Ui-CardTags {
     param($e)
+    $out = @()
+    if ($e.PlanActive) { $out += , @{ Kind = 'active'; Text = 'Active plan'; Icon = 'power' } }
+    if ($e.NotRec) { $out += , @{ Kind = 'notrec'; Text = [string]$script:NotRecText; Icon = 'warn' } }
     $own = ''
     try { $own = [string](Get-NavTitle ([string]$e.Cat)) } catch { }
-    $list = @()
+    if ($own) { $out += , @{ Kind = 'tag'; Text = $own; Icon = $own } }
     foreach ($tg in @($e.Tags)) {
         $s = [string]$tg
-        if (-not $s -or $s.StartsWith('Windows default') -or $s -eq $own -or $s -eq 'Recommended preset') { continue }
-        $list += $s
+        if (-not $s -or $s.StartsWith('Windows default') -or $s -eq $own) { continue }
+        $ic = ''
+        switch ($s) {
+            'Needs restart'      { $ic = 'restart' }
+            'One-way'            { $ic = 'oneway' }
+            'Runs once'          { $ic = 'once' }
+            'Asks first'         { $ic = 'ask' }
+            'Untested'           { $ic = 'Placebo Tweaks' }
+            'May do nothing'     { $ic = 'Placebo Tweaks' }
+            'Recommended preset' { $ic = 'star'; $s = 'Recommended' }
+        }
+        $out += , @{ Kind = 'tag'; Text = $s; Icon = $ic }
     }
-    return $list
+    return $out
+}
+# (the tags of a card as plain words, the way the list had them before build 126: kept for the search and the tests)
+function Ui-RowTags {
+    param($e)
+    return @(@(Ui-CardTags $e) | Where-Object { $_.Kind -eq 'tag' } | ForEach-Object { [string]$_.Text })
+}
+
+# The description on a card: as many words as fit on $n lines of $w pixels; the last line ends with "..." when the text goes on.
+# Kept on the entry for its width, so a card that is painted again does not measure its words again.
+function Ui-DescLines {
+    param($e, [int]$w, [int]$n)
+    $c = $e.DescCache
+    if ($c -and [int]$c.W -eq $w -and [int]$c.N -eq $n) { return @($c.Lines) }
+    $font = Ui-Font 'cardDesc'
+    $words = @(([string]$e.Desc) -split '\s+' | Where-Object { $_ })
+    $lines = @()
+    $cur = ''
+    $i = 0
+    while ($i -lt $words.Count -and $lines.Count -lt $n) {
+        $try = $words[$i]; if ($cur) { $try = $cur + ' ' + $words[$i] }
+        if (-not $cur -or (Ui-TextWidth $try $font) -le $w) { $cur = $try; $i++; continue }
+        $lines += $cur
+        $cur = ''
+    }
+    if ($cur -and $lines.Count -lt $n) { $lines += $cur }
+    if ($i -lt $words.Count -and $lines.Count -gt 0) {
+        # the text goes on: the last line ends with "...", shortened word by word until it fits
+        $last = [string]$lines[$lines.Count - 1]
+        while ($last -and (Ui-TextWidth ($last + '...') $font) -gt $w) {
+            $k = $last.LastIndexOf(' ')
+            if ($k -le 0) { break }
+            $last = $last.Substring(0, $k)
+        }
+        $lines[$lines.Count - 1] = $last.TrimEnd(',', ';', ':', '.') + '...'
+    }
+    $e.DescCache = @{ W = $w; N = $n; Lines = $lines }
+    return $lines
 }
 
 function Ui-RowGeom {
     param($e)
     $M = $script:M
-    $f = Ui-Font 'smallb'
     $w = [int]$e.W
     $o = @{}
-    $o.TextX = $M.Pad                                   # no icon tile: the title starts at the left padding
-    # from the right edge inwards: the switch (not on a row with options), the risk pill, the status chip (left to right here, up and down below)
-    $x = $w - $M.Pad
-    $o.TogX = -1
-    if (-not $e.Choices) { $x -= $M.TogW; $o.TogX = $x; $x -= (Px 12) }
-    $rw = (Ui-TextWidth 'Medium risk' $f) + (Px 20)                    # one width for all three, so the pills line up in a column
-    $o.RiskDot = $false
-    $o.RiskH = Px 22
-    if (($x - $rw - $o.TextX) -lt (Px 200)) { $o.RiskDot = $true; $rw = $M.RiskDot; $o.RiskH = $M.RiskDot }       # a narrow row: the risk is a coloured dot
-    $o.RiskW = $rw
-    $o.RiskX = $x - $rw
-    $x = $o.RiskX - (Px 10)
-    $o.ChipX = -1
-    $o.ChipW = 0
-    $o.ChipH = Px 22
+    $pad = $M.Pad
+    $o.TextX = $pad
+    $o.TextEnd = $w - $pad
+    $o.TextW = [Math]::Max(0, $o.TextEnd - $o.TextX)
+    $tagFont = Ui-Font 'tag'
+    $btnFont = Ui-Font 'btn'
+    # line 1: the id (small, grey), and the status chip at the right
+    $o.IdY = $M.CardTop
+    $o.IdH = $M.IdH
+    $o.ChipX = -1; $o.ChipW = 0; $o.ChipH = Px 22
+    $o.ChipY = $o.IdY + [int](($o.IdH - $o.ChipH) / 2)
     if ($e.ChipText) {
-        $cw = (Ui-TextWidth ([string]$e.ChipText) $f) + (Px 22)
-        $nf = Ui-Font 'cardName'
-        $minT = Px 280
-        if ($e.Sub) { $nf = Ui-Font 'rowName'; $minT = Px 120 }                  # the box under a card: a short title in a smaller font
-        $need = [Math]::Max($minT, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) $nf) + (Px 4))        # the chip only takes room the whole title can spare: a name is not cut for a chip
-        # the "Not recommended" mark matters more than a status chip: the chip only takes room the title and the mark can spare (except "Not on this PC": a setting that is not there cannot be switched, so its reason comes first)
-        if ($e.NotRec -and [string]$e.State -ne 'NA') { $need = [Math]::Max($need, (Ui-TextWidth (Get-TitleCase ([string]$e.Name)) $nf) + (Px 4) + (Px 8) + (Ui-TextWidth ([string]$script:NotRecText) $f) + (Px 16)) }
-        if ($e.Failed -or (($x - $cw - $o.TextX) -ge $need)) { $o.ChipW = $cw; $o.ChipX = $x - $cw; $x = $o.ChipX - (Px 10) }
+        $o.ChipW = (Ui-TextWidth ([string]$e.ChipText) (Ui-Font 'smallb')) + (Px 22)
+        $o.ChipX = $o.TextEnd - $o.ChipW
     }
-    $o.TextEnd = $x
-    $o.TextW = [Math]::Max(0, $x - $o.TextX)
-    # the title: one line (names are kept short; the details panel has the rest). A name that is still too long ends with "..."
-    $o.TitleH = Px 24
-    $tfont = Ui-Font 'cardName'
-    if ($e.Sub) { $o.TitleH = Px 22; $tfont = Ui-Font 'rowName' }
-    $o.TFont = $tfont
+    $o.IdW = $o.TextW; if ($o.ChipX -ge 0) { $o.IdW = [Math]::Max(0, $o.ChipX - (Px 10) - $o.TextX) }
+    # line 2: the title, one line (names are kept short); one that is still too long ends with "..."
+    $o.TitleY = $o.IdY + $o.IdH + (Px 2)
+    $o.TitleH = $M.TitleH
+    $o.TFont = Ui-Font 'cardTitle'
     $shownName = Get-TitleCase ([string]$e.Name)
-    $tw = Ui-TextWidth $shownName $tfont
     $o.Lines = @($shownName)
-    $nl = @($o.Lines).Count
-    $lastW = Ui-TextWidth ([string]$o.Lines[$nl - 1]) $tfont
-    $o.TitleCut = [bool]($lastW -gt $o.TextW)                          # still too long after all that: the last line ends with "..."
-    $o.TitleW = [Math]::Min($o.TextW, ($tw + (Px 4)))                  # (one line) as wide as the text
-    if ($nl -gt 1) { $o.TitleW = $o.TextW }
-    $o.LastW = [Math]::Min($o.TextW, ($lastW + (Px 4)))
-    # the height: the lines of the title with room above and below (a line holds the tallest card of its row, so the card may be taller than this)
-    $padV = Px 16
-    $minH = $M.Row
-    if ($e.Sub) { $padV = Px 10; $minH = $M.SubRow }                   # the box under a card is lower than a card
-    $o.NatTop = [Math]::Max(($minH - $M.Gap), ($nl * $o.TitleH + 2 * $padV))
-    $o.NatH = $o.NatTop + $M.Gap
-    if ($e.Choices) { $o.NatH += $M.ChoiceExtra }
+    $tw = Ui-TextWidth $shownName $o.TFont
+    $o.TitleCut = [bool]($tw -gt $o.TextW)
+    $o.TitleW = [Math]::Min($o.TextW, ($tw + (Px 4)))
+    $o.LastW = $o.TitleW
+    # line 3: the tags
+    $o.TagY = $o.TitleY + $o.TitleH + (Px 8)
+    $o.TagH = $M.TagH
+    # the description, then (a setting with options) the option buttons, then the bottom line
+    $o.DescY = $o.TagY + $o.TagH + (Px 12)
+    $o.DescLH = $M.DescLH
+    $o.DescN = $M.DescN
+    $o.ChoiceH = $M.ChoiceH
+    $o.BotH = $M.BotH
+    $natH = $o.DescY + $o.DescN * $o.DescLH + (Px 14) + $o.BotH + $M.CardBottom
+    if ($e.Choices) { $natH += $M.ChoiceH + (Px 12) }
+    $o.NatTop = $natH
+    $o.NatH = $natH + $M.Gap
     $o.CardH = [int]$e.H - $M.Gap
-    if ([int]$e.H -le 0) { $o.CardH = $o.NatH - $M.Gap }
+    if ([int]$e.H -le 0) { $o.CardH = $natH }
     $o.TopH = $o.CardH
-    if ($e.Choices) { $o.TopH = $o.CardH - $M.ChoiceExtra }
-    $o.ChoiceY = $o.TopH - (Px 4)                                      # the option buttons: on a line of their own, under the title
-    $o.TogY = [int](($o.TopH - $M.TogH) / 2)
-    $o.RiskY = [int](($o.TopH - $o.RiskH) / 2)
-    $o.ChipY = [int](($o.TopH - $o.ChipH) / 2)
-    $o.TitleY = [int](($o.TopH - $nl * $o.TitleH) / 2)                 # the lines are level with the middle of the card, like the pills and the switch
-    # the small marks after the last line of the title (the "Not recommended" mark first), as many as fit
-    $px = $o.TextX + $o.LastW + (Px 8)
-    $ph = Px 20
-    $py = $o.TitleY + ($nl - 1) * $o.TitleH + [int](($o.TitleH - $ph) / 2)
+    $o.BotY = $o.CardH - $M.CardBottom - $o.BotH                       # the bottom line sits at the bottom of the card
+    $o.ChoiceY = $o.BotY - (Px 12) - $o.ChoiceH
+    # the right end of the bottom line: "</>", then the switch to its left
+    $o.CodeW = $M.CodeW; $o.CodeH = $M.BtnH
+    $o.CodeX = $o.TextEnd - $o.CodeW
+    $o.CodeY = $o.BotY + [int](($o.BotH - $o.CodeH) / 2)
+    $right = $o.CodeX - (Px 12)
+    $o.TogX = -1
+    if (-not $e.Choices) { $o.TogX = $right - $M.TogW; $right = $o.TogX - (Px 12) }
+    $o.TogY = $o.BotY + [int](($o.BotH - $M.TogH) / 2)
+    # the left end: the risk badge and "View Description"
+    $o.RiskDot = $false
+    $o.RiskH = $M.BtnH
+    $o.RiskW = (Ui-TextWidth ([string]$e.Risk) $btnFont) + (Px 40)
+    $o.RiskX = $o.TextX
+    $o.RiskY = $o.BotY + [int](($o.BotH - $o.RiskH) / 2)
+    $o.ViewW = (Ui-TextWidth 'View Description' $btnFont) + (Px 26)
+    $o.ViewX = $o.RiskX + $o.RiskW + (Px 8)
+    $o.ViewY = $o.RiskY; $o.ViewH = $M.BtnH
+    $bx = $o.ViewX + $o.ViewW + (Px 8)
+    # a power plan's buttons: after "View Description" when they fit, else in the row of tags
+    $o.MakeAct = $null
+    $o.Reinst = $null
+    $extra = @()
+    if ($e.CanActivate) { $extra += , @('makeact', 'Make active') }
+    if ($e.CanReinstall) { $extra += , @('reinst', 'Reinstall') }
+    # (both go to the same place: after "View Description" when both fit there, else both into the row of tags)
+    $tagExtra = @()
+    $need = 0
+    foreach ($it in $extra) { $need += (Ui-TextWidth ([string]$it[1]) $btnFont) + (Px 24) + (Px 8) }
+    if (($bx + $need - (Px 8)) -le $right) {
+        foreach ($it in $extra) {
+            $bw = (Ui-TextWidth ([string]$it[1]) $btnFont) + (Px 24)
+            $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $bx; Y = $o.RiskY; W = $bw; H = $M.BtnH }
+            if ($p.Kind -eq 'makeact') { $o.MakeAct = $p } else { $o.Reinst = $p }
+            $bx += $bw + (Px 8)
+        }
+    } else { $tagExtra = $extra }
+    # the tags, left to right, as many as fit (a power plan's buttons that did not fit below come first)
+    $px = $o.TextX
     $o.Pills = @()
     $o.Hidden = 0
     $o.NotRec = $null
-    $o.MakeAct = $null
-    $o.Reinst = $null
     $items = @()
-    if ($e.PlanActive) { $items += , @('active', 'Active plan') }
-    elseif ($e.CanActivate) { $items += , @('makeact', 'Make active') }
-    if ($e.CanReinstall) { $items += , @('reinst', 'Reinstall') }
-    if ($e.NotRec) { $items += , @('notrec', [string]$script:NotRecText) }
-    foreach ($t in @(Ui-RowTags $e)) { $items += , @('tag', [string]$t) }
+    foreach ($it in $tagExtra) { $items += , @{ Kind = [string]$it[0]; Text = [string]$it[1]; Icon = '' } }
+    $items += @(Ui-CardTags $e)
     $room = $true
     foreach ($it in $items) {
-        $pw = (Ui-TextWidth ([string]$it[1]) $f) + (Px 16)
-        if ($room -and -not $o.TitleCut -and (($px + $pw) -le $o.TextEnd)) {
-            $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $px; Y = $py; W = $pw; H = $ph }
+        $isBtn = ($it.Kind -eq 'makeact' -or $it.Kind -eq 'reinst')
+        $f = $tagFont; if ($isBtn) { $f = $btnFont }
+        $pw = (Ui-TextWidth ([string]$it.Text) $f) + (Px 20)
+        if ($it.Icon) { $pw += $M.TagIcon + (Px 6) }
+        if ($room -and (($px + $pw) -le $o.TextEnd)) {
+            $p = @{ Kind = [string]$it.Kind; Text = [string]$it.Text; Icon = [string]$it.Icon; X = $px; Y = $o.TagY; W = $pw; H = $o.TagH }
             $o.Pills += , $p
             if ($p.Kind -eq 'notrec') { $o.NotRec = $p }
             if ($p.Kind -eq 'makeact') { $o.MakeAct = $p }
@@ -12425,8 +12414,8 @@ function Ui-RowGeom {
     return $o
 }
 
-# Where the "Not recommended" mark sits on a row (right after the title), or $null when the row has no mark or no room for it
-# (the details panel still says it). X is in the list's own coordinates; Y is the offset from the row's top.
+# Where the "Not recommended" tag sits on a card, or $null when the card has no such tag or no room for it (the details still say it).
+# X is in the list's own coordinates; Y is the offset from the card's top.
 function Ui-NotRecRect {
     param($e)
     if (-not $e -or -not $e.NotRec) { return $null }
@@ -12434,6 +12423,23 @@ function Ui-NotRecRect {
     $p = $o.NotRec
     if (-not $p) { return $null }
     return @{ X = ([int]$e.X + [int]$p.X); W = [int]$p.W; Y = [int]$p.Y; H = [int]$p.H; Top = $false }
+}
+
+# A small flat button on a card (View Description, </>, Make active, Reinstall): lighter under the pointer, dim while it cannot be used
+function Ui-CardBtn {
+    param($g, [int]$x, [int]$y, [int]$w, [int]$h, [string]$text, [string]$icon, [bool]$hot, [bool]$enabled)
+    $Th = $script:Th
+    $fill = $Th.Raised
+    if ($hot -and $enabled) { $fill = $Th.RaisedHot }
+    Ui-FillRound $g $fill $x $y $w $h $script:M.BtnR
+    $col = $Th.Text
+    if (-not $enabled) { $col = $Th.Dim }
+    if ($icon) {
+        $s = $script:M.TagIcon + (Px 2)
+        Ui-PaintIcon $g $icon ($x + ($w - $s) / 2.0) ($y + ($h - $s) / 2.0) $s $col
+    } else {
+        Ui-Text $g $text (Ui-Font 'btn') $col $x $y $w $h $script:TF.C
+    }
 }
 
 function Ui-PaintRow {
@@ -12455,76 +12461,72 @@ function Ui-PaintRow {
     } elseif ($hot -and -not $e.Tint) {
         $fill = $Th.CardHot
     }
-    # the line that joins a card to the "Disable in registry" box under it: the card draws the part in the gap below it, the box the
-    # part beside it (down from its top to its middle, then across to its left edge), and on down when another box follows
-    if ($null -ne $e.Subs -and $e.Subs.Count -gt 0) { Ui-Line $g $Th.Border 1.5 ($x + $M.SubLine) ($y + $ch) ($x + $M.SubLine) ($y + [int]$e.H) }
     $rad = $M.Radius
-    if ($e.Sub) {
-        $rad = Px 10
-        $lx = $x - [int]$e.Indent + $M.SubLine
-        $my = $y + [int]($ch / 2)
-        $ly2 = $my; if ($e.More) { $ly2 = $y + [int]$e.H }
-        Ui-Line $g $Th.Border 1.5 $lx $y $lx $ly2
-        Ui-Line $g $Th.Border 1.5 $lx $my $x $my
-    }
     Ui-FillRound $g $fill $x $y $cw $ch $rad
     if ($sel) { Ui-StrokeRound $g $Th.Accent 1 $x $y $cw $ch $rad }
     if ($e.Tint) {
         # a change waiting to be made: a short bar at the left edge (blue: the switch will go on, orange: it will go off)
         $bar = $Th.Accent
         if (([string]$e.Tint) -like '*Undo*') { $bar = $Th.Warn }
-        $bi = Px 14; if ($e.Sub) { $bi = Px 10 }
-        Ui-FillRound $g $bar ($x + (Px 1)) ($y + $bi) (Px 3) ($o.TopH - 2 * $bi) (Px 1)
+        $bi = Px 18
+        Ui-FillRound $g $bar ($x + (Px 1)) ($y + $bi) (Px 3) ($ch - 2 * $bi) (Px 1)
     }
     $on = [bool]$e.Enabled
-    $nameCol = $Th.Text
-    if (-not $on) { $nameCol = $Th.Dim }
-    # the title, then the marks after it
-    $textX = $x + $o.TextX
-    for ($li = 0; $li -lt @($o.Lines).Count; $li++) { Ui-Text $g ([string]$o.Lines[$li]) $o.TFont $nameCol $textX ($y + $o.TitleY + $li * $o.TitleH) $o.TitleW $o.TitleH $TF.L }
-    $tagFont = Ui-Font 'smallb'
-    foreach ($p in @($o.Pills)) {
-        if ($p.Kind -eq 'notrec') {
-            $nc = $Th.Bad
-            if (-not $on) { $nc = $Th.Dim }
-            Ui-StrokeRound $g $nc 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
-            Ui-Text $g $p.Text $tagFont $nc ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
-        } elseif ($p.Kind -eq 'active') {
-            Ui-FillRound $g $Th[(Ui-SoftKey 'Good')] ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
-            Ui-Text $g $p.Text $tagFont $Th.Good ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
-        } elseif ($p.Kind -eq 'makeact' -or $p.Kind -eq 'reinst') {
-            # a small button: it makes this plan the active one, or makes it again
-            $busy = [bool]($script:Scanning -or $script:Applying)
-            $bf = $Th.Raised
-            if (-not $busy -and $hot -and $script:HotZone -eq [string]$p.Kind) { $bf = $Th.RaisedHot }
-            Ui-FillRound $g $bf ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
-            Ui-StrokeRound $g $Th.Border 1 ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
-            $bc = $Th.Text; if ($busy -or -not $on) { $bc = $Th.Dim }
-            Ui-Text $g $p.Text $tagFont $bc ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
-        } else {
-            Ui-FillRound $g $Th.Tag ($x + $p.X) ($y + $p.Y) $p.W $p.H (Px 6)
-            Ui-Text $g $p.Text $tagFont $Th.TagText ($x + $p.X) ($y + $p.Y) $p.W $p.H $TF.C
-        }
-    }
-    # a row with options has its option pill on a second line, under the text
-    if ($e.Choices) { Ui-DrawChoices $g $e $textX ($y + $o.ChoiceY) ($cw - $M.Pad - $o.TextX) $M.ChoiceH }
-    # the right side: status chip, the risk (a coloured dot and its name in a quiet colour; on a narrow row only the dot), switch
+    $busy = [bool]($script:Scanning -or $script:Applying)
+    $tx = $x + $o.TextX
+    # the id, and the status chip at the right of its line
+    Ui-Text $g ([string]$e.Id) (Ui-Font 'cardId') $Th.Dim $tx ($y + $o.IdY) $o.IdW $o.IdH $TF.L
     if ($o.ChipX -ge 0) {
         Ui-FillRound $g $Th[(Ui-SoftKey $e.ChipKey)] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH (Px 6)
-        Ui-Text $g ([string]$e.ChipText) $tagFont $Th[$e.ChipKey] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH $TF.C
+        Ui-Text $g ([string]$e.ChipText) (Ui-Font 'smallb') $Th[$e.ChipKey] ($x + $o.ChipX) ($y + $o.ChipY) $o.ChipW $o.ChipH $TF.C
     }
-    $tk = $e.RiskKey + 'Text'
-    if (-not $on) { $tk = 'Dim' }
-    if ($o.RiskDot) {
-        Ui-FillOval $g $Th[$tk] ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH
-    } else {
-        $rd = Px 8
-        Ui-FillOval $g $Th[$tk] ($x + $o.RiskX + (Px 6)) ($y + $o.RiskY + [int](($o.RiskH - $rd) / 2)) $rd $rd
-        $rcol = $Th.Mute
-        if (-not $on) { $rcol = $Th.Dim }
-        Ui-Text $g ([string]$e.Risk) (Ui-Font 'small') $rcol ($x + $o.RiskX + (Px 6) + $rd + (Px 8)) ($y + $o.RiskY) ($o.RiskW - $rd - (Px 14)) $o.RiskH $TF.L
+    # the title
+    $nameCol = $Th.Text
+    if (-not $on) { $nameCol = $Th.Dim }
+    Ui-Text $g ([string]$o.Lines[0]) $o.TFont $nameCol $tx ($y + $o.TitleY) $o.TextW $o.TitleH $TF.L
+    # the tags
+    $tagFont = Ui-Font 'tag'
+    foreach ($p in @($o.Pills)) {
+        $px = $x + $p.X; $py = $y + $p.Y
+        if ($p.Kind -eq 'makeact' -or $p.Kind -eq 'reinst') {
+            Ui-CardBtn $g $px $py $p.W $p.H $p.Text '' ($hot -and $script:HotZone -eq [string]$p.Kind) ($on -and -not $busy)
+            continue
+        }
+        $tc = $Th.TagText; $tagFill = $Th.Tag
+        if ($p.Kind -eq 'notrec') { $tc = $Th.Bad; $tagFill = $Th.BadSoft }
+        elseif ($p.Kind -eq 'active') { $tc = $Th.Good; $tagFill = $Th[(Ui-SoftKey 'Good')] }
+        if (-not $on) { $tc = $Th.Dim }
+        Ui-FillRound $g $tagFill $px $py $p.W $p.H (Px 6)
+        $lx = $px + (Px 10)
+        if ($p.Icon) {
+            Ui-PaintIcon $g ([string]$p.Icon) $lx ($py + ($p.H - $M.TagIcon) / 2.0) $M.TagIcon $tc
+            $lx += $M.TagIcon + (Px 6)
+        }
+        Ui-Text $g ([string]$p.Text) $tagFont $tc $lx $py ($px + $p.W - $lx) $p.H $TF.L
+    }
+    # the description: two lines, cut with "..."
+    $dl = @(Ui-DescLines $e $o.TextW $o.DescN)
+    $dc = $Th.Mute
+    if (-not $on) { $dc = $Th.Dim }
+    for ($li = 0; $li -lt $dl.Count; $li++) { Ui-Text $g ([string]$dl[$li]) (Ui-Font 'cardDesc') $dc $tx ($y + $o.DescY + $li * $o.DescLH) $o.TextW $o.DescLH $TF.L }
+    # a setting with options: the option buttons, on a line of their own above the bottom line
+    if ($e.Choices) { Ui-DrawChoices $g $e $tx ($y + $o.ChoiceY) $o.TextW $o.ChoiceH }
+    # the bottom line: the risk badge (filled, with its icon) and View Description at the left; the switch and </> at the right
+    $rk = [string]$e.RiskKey
+    $rf = $Th[$rk]; if (-not $on -or -not $rf) { $rf = $Th.Raised }
+    $rt = $Th.BadgeText; if ($rk -eq 'Bad') { $rt = $Th.KnobOn }
+    if (-not $on) { $rt = $Th.Dim }
+    $ricon = 'shieldok'; if ($rk -ne 'Good') { $ricon = 'warn' }
+    Ui-FillRound $g $rf ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH $M.BtnR
+    Ui-PaintIcon $g $ricon ($x + $o.RiskX + (Px 9)) ($y + $o.RiskY + ($o.RiskH - $M.TagIcon) / 2.0) $M.TagIcon $rt
+    Ui-Text $g ([string]$e.Risk) (Ui-Font 'btn') $rt ($x + $o.RiskX + (Px 9) + $M.TagIcon + (Px 6)) ($y + $o.RiskY) ($o.RiskW - (Px 15) - $M.TagIcon) $o.RiskH $TF.L
+    Ui-CardBtn $g ($x + $o.ViewX) ($y + $o.ViewY) $o.ViewW $o.ViewH 'View Description' '' ($hot -and $script:HotZone -eq 'viewdesc') $true
+    foreach ($b in @($o.MakeAct, $o.Reinst)) {
+        if (-not $b -or [int]$b.Y -ne [int]$o.RiskY) { continue }                # (one that went into the row of tags is drawn there)
+        Ui-CardBtn $g ($x + $b.X) ($y + $b.Y) $b.W $b.H $b.Text '' ($hot -and $script:HotZone -eq [string]$b.Kind) ($on -and -not $busy)
     }
     if (-not $e.Choices) { Ui-DrawToggle $g ($x + $o.TogX) ($y + $o.TogY) ([bool]$e.Checked) $on }
+    Ui-CardBtn $g ($x + $o.CodeX) ($y + $o.CodeY) $o.CodeW $o.CodeH '</>' 'code' ($hot -and $script:HotZone -eq 'code') $true
 }
 
 # The option buttons of a row with options: one pill split in equal parts. The picked part is filled, the option that is in force
@@ -12622,7 +12624,7 @@ function Ui-OnPaint {
 }
 
 # ----------------------------------------------------------- the mouse ----------------
-# What is at (x, y) of the control?  Zone: sb | toggle | view | notrec | makeact | reinst | row | head | info | infolink | ''
+# What is at (x, y) of the control?  Zone: sb | toggle | seg<n> | code | viewdesc | notrec | makeact | reinst | row | head | info | infolink | ''
 function Ui-Zone {
     param([int]$x, [int]$y)
     $M = $script:M
@@ -12644,31 +12646,27 @@ function Ui-Zone {
         $rx = $x - [int]$e.X
         $ry = $ly - [int]$e.Y
         if ($ry -ge $o.CardH) { return @{ Zone = 'row'; Entry = $e } }
+        $inR = { param($r) return ($r -and $rx -ge [int]$r.X -and $rx -lt ([int]$r.X + [int]$r.W) -and $ry -ge [int]$r.Y -and $ry -lt ([int]$r.Y + [int]$r.H)) }
         if ($e.Choices) {
             # the option buttons: seg0, seg1, ... from the left
-            $cl = [int]$e.X + $o.TextX
-            $cwid = [int]$e.W - $M.Pad - $o.TextX
-            $ctop = $o.ChoiceY
-            if ($ry -ge $ctop -and $ry -lt ($ctop + $M.ChoiceH) -and $x -ge $cl -and $x -lt ($cl + $cwid)) {
+            $cwid = $o.TextW
+            if ($ry -ge $o.ChoiceY -and $ry -lt ($o.ChoiceY + $o.ChoiceH) -and $rx -ge $o.TextX -and $rx -lt ($o.TextX + $cwid)) {
                 $cn = @($e.Choices).Count
                 $segw = [Math]::Max(1, [int][Math]::Floor($cwid / $cn))          # the same split as Ui-DrawChoices: equal parts, the last takes the remainder
-                $k = [int][Math]::Floor(($x - $cl) / $segw)
+                $k = [int][Math]::Floor(($rx - $o.TextX) / $segw)
                 if ($k -ge $cn) { $k = $cn - 1 }
                 return @{ Zone = ('seg' + $k); Entry = $e }
             }
         }
-        # "Make active" on an installed power plan that is not the active one
-        $ma = $o.MakeAct
-        if ($ma -and $ry -ge $ma.Y -and $ry -lt ($ma.Y + $ma.H) -and $rx -ge $ma.X -and $rx -lt ($ma.X + $ma.W)) { return @{ Zone = 'makeact'; Entry = $e } }
-        # "Reinstall" on an installed power plan
-        $rb = $o.Reinst
-        if ($rb -and $ry -ge $rb.Y -and $ry -lt ($rb.Y + $rb.H) -and $rx -ge $rb.X -and $rx -lt ($rb.X + $rb.W)) { return @{ Zone = 'reinst'; Entry = $e } }
-        # the "Not recommended" mark after the title
-        $nrr = Ui-NotRecRect $e
-        if ($nrr -and $ry -ge $nrr.Y -and $ry -lt ($nrr.Y + $nrr.H) -and $x -ge $nrr.X -and $x -lt ($nrr.X + $nrr.W)) { return @{ Zone = 'notrec'; Entry = $e } }
+        # the buttons of the bottom line: "</>", "View Description", and a power plan's "Make active" / "Reinstall"
+        if (& $inR @{ X = $o.CodeX; Y = $o.CodeY; W = $o.CodeW; H = $o.CodeH }) { return @{ Zone = 'code'; Entry = $e } }
+        if (& $inR @{ X = $o.ViewX; Y = $o.ViewY; W = $o.ViewW; H = $o.ViewH }) { return @{ Zone = 'viewdesc'; Entry = $e } }
+        if (& $inR $o.MakeAct) { return @{ Zone = 'makeact'; Entry = $e } }
+        if (& $inR $o.Reinst) { return @{ Zone = 'reinst'; Entry = $e } }
+        # the "Not recommended" tag
+        if (& $inR $o.NotRec) { return @{ Zone = 'notrec'; Entry = $e } }
         # the switch (a little more than the switch itself) turns the setting on or off
-        if (-not $e.Choices -and $rx -ge ($o.TogX - (Px 6)) -and $rx -lt [int]$e.W) { return @{ Zone = 'toggle'; Entry = $e } }
-        if ($o.RiskDot -and $ry -lt $o.TopH -and $rx -ge ($o.RiskX - (Px 4)) -and $rx -lt ($o.RiskX + $o.RiskW + (Px 4))) { return @{ Zone = 'risk'; Entry = $e } }
+        if (-not $e.Choices -and (& $inR @{ X = ($o.TogX - (Px 6)); Y = ($o.TogY - (Px 6)); W = ($M.TogW + (Px 12)); H = ($M.TogH + (Px 12)) })) { return @{ Zone = 'toggle'; Entry = $e } }
         return @{ Zone = 'row'; Entry = $e }
     }
     return @{ Zone = 'head'; Entry = $e }
@@ -12700,7 +12698,7 @@ function Ui-UpdateHot {
     if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'infolink' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'infolink' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst' -or $z.Zone -eq 'viewdesc' -or $z.Zone -eq 'code') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -12768,6 +12766,8 @@ function Ui-OnMouseDown {
     elseif ($zone.StartsWith('seg')) { Ui-Select $z.Entry; Ui-PickRow $z.Entry ([int]$zone.Substring(3)) }
     elseif ($zone -eq 'makeact') { Ui-Select $z.Entry; Ui-MakeActive $z.Entry }
     elseif ($zone -eq 'reinst') { Ui-Select $z.Entry; Ui-Reinstall $z.Entry }
+    elseif ($zone -eq 'viewdesc') { Ui-Select $z.Entry; Ui-OpenDescription $z.Entry }
+    elseif ($zone -eq 'code') { Ui-Select $z.Entry; Ui-OpenValues $z.Entry }
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
     elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
@@ -12866,13 +12866,9 @@ function Ui-StepLine {
         if ($k -lt 0 -or $k -ge $v.Count) { return $i }
         if ($v[$k].Kind -eq 'head') { return $k }
         $s2 = Ui-LineSpan $k
-        # the same column (a "Disable in registry" box is moved in from its card's column)
-        for ($j = $s2.First; $j -le $s2.Last; $j++) { if (([int]$v[$j].X - [int]$v[$j].Indent) -eq ([int]$cur.X - [int]$cur.Indent)) { return $j } }
-        # a line of boxes with none in this column belongs to the card beside this one: step over it
-        $boxes = $true
-        for ($j = $s2.First; $j -le $s2.Last; $j++) { if (-not $v[$j].Sub) { $boxes = $false } }
-        if (-not $boxes) { return $s2.Last }
-        if ($dir -gt 0) { $k = $s2.Last + 1 } else { $k = $s2.First - 1 }
+        # the same column, else the last card of that line
+        for ($j = $s2.First; $j -le $s2.Last; $j++) { if ([int]$v[$j].X -eq [int]$cur.X) { return $j } }
+        return $s2.Last
     }
 }
 
@@ -12946,7 +12942,7 @@ function Ui-OnKey {
 }
 
 # =============================================================================
-# THE WINDOW, part 3: buttons, the details panel, what the user can do, and the background job.
+# THE WINDOW, part 3: buttons, the description and values windows, what the user can do, and the background job.
 # Things that change on screen only set a "needs updating" flag (Ui-RefreshRow, Handle-Event); Ui-Flush then
 # brings the screen up to date once. User actions end with Ui-Flush, the timer calls it after every batch of events.
 # =============================================================================
@@ -12958,7 +12954,7 @@ function Ui-Buttons {
     $busy = ($script:Scanning -or $script:Applying -or ($c.Checking -gt 0))
     Ui-SetEnabled $script:UI.apply ((-not $busy) -and (($c.Apply + $c.Undo) -gt 0))
     Ui-SetEnabled $script:UI.stop ([bool]$script:Applying)
-    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll', 'sync') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
+    foreach ($k in 'presetBtn', 'discard', 'rescan', 'allOn', 'allOff', 'applyAll') { Ui-SetEnabled $script:UI[$k] (-not $busy) }
 }
 
 function Ui-Counts {
@@ -12973,8 +12969,13 @@ function Ui-Counts {
     Ui-Buttons
 }
 
-# ----------------------------------------------------------- details panel -----------
-$script:DetailHint = "Click a setting to read what it does and exactly what it changes.`r`n`r`nUse the switch on the right of a setting to turn the feature on or off: on means the feature is on, off means it is off (or the service is disabled). Every card says what Windows has by default. Nothing is changed until you press the Apply button at the bottom."
+# ----------------------------------------------------------- the description window -----------
+# Build 126 (Tyler: "instead of the ... put 'View Description' next to the risk icon that will give the detailed description of the
+# setting"): the details are no longer a panel beside the list but a window of their own, opened by a card's "View Description". It is
+# made once with the main window (Ui-BuildDescWindow) and only hidden when it is closed; while it is open it follows the setting that is
+# selected, so a click on another card shows that one. Its text box ($script:UI.detail) is filled by Ui-ShowDetails, as the panel was.
+# The "</>" button opens the values window: every value as the last check read it and what Headroom changes it to (Get-ValueParts).
+$script:DetailHint = "Press View Description on a card to read what it does and exactly what it changes, and </> to see each registry value as it is now and what Headroom changes it to.`r`n`r`nUse the switch on a card to turn the feature on or off: on means the feature is on, off means it is off (or the service is disabled). Nothing is changed until you press the Apply button at the bottom."
 
 # which font and colour a piece of the details text gets
 function Ui-PartStyle {
@@ -12997,6 +12998,7 @@ function Ui-PartStyle {
         'mono'  { return @{ F = 'monoS'; C = $Th.Mute } }
         'good'   { return @{ F = 'uib'; C = $Th.Good } }
         'goodl'  { return @{ F = 'ui'; C = $Th.Good } }
+        'monogood' { return @{ F = 'monoS'; C = $Th.Good } }
     }
     return @{ F = 'ui'; C = $Th.Text }
 }
@@ -13026,6 +13028,8 @@ function Ui-FillRich {
 function Ui-ShowDetails {
     $d = $script:UI.detail
     if (-not $d) { return }
+    $dw = $script:UI.descForm
+    if ($dw -and $script:SelKey -and $script:Rows.Contains($script:SelKey)) { $dw.Text = 'Description: ' + [string]$script:Rows[$script:SelKey].T.Name }
     $row = $null
     if ($script:SelKey -and $script:Rows.Contains($script:SelKey)) { $row = $script:Rows[$script:SelKey] }
     if ($row) {
@@ -13043,6 +13047,59 @@ function Ui-ShowDetails {
     }
 }
 
+# Show a window that is made once and hidden when closed, over the middle of the main window the first time, and bring it to the front
+function Ui-ShowSideWindow {
+    param($f)
+    if (-not $f) { return }
+    $main = $script:UI.form
+    if (-not [bool]$f.Visible) {
+        if ($main -and -not [bool]$f.Tag) {
+            $x = [int]$main.Left + [int](([int]$main.Width - [int]$f.Width) / 2)
+            $y = [int]$main.Top + [int](([int]$main.Height - [int]$f.Height) / 2)
+            # kept on the screen the main window is on (a screen left of or above the main one has negative positions)
+            $wa = $null
+            try { $wa = [System.Windows.Forms.Screen]::FromControl($main).WorkingArea } catch { $wa = $null }
+            if (-not $wa) { $wa = Ui-WorkArea }
+            $x = [Math]::Max([int]$wa.Left, [Math]::Min($x, [int]$wa.Right - [int]$f.Width))
+            $y = [Math]::Max([int]$wa.Top, [Math]::Min($y, [int]$wa.Bottom - [int]$f.Height))
+            $f.Location = New-Object System.Drawing.Point($x, $y)
+            $f.Tag = $true                                  # placed once: after that it opens where the user left it
+        }
+        $f.Show()
+    }
+    $f.Activate()
+}
+
+# "View Description" on a card: the card is selected, and the description window shows its details
+function Ui-OpenDescription {
+    param($e)
+    if (-not $e -or $e.Kind -ne 'row') { return }
+    Ui-Select $e
+    $script:DDetail = $false
+    Ui-ShowDetails
+    Ui-ShowSideWindow $script:UI.descForm
+}
+
+# "</>" on a card: the values window, filled from what the last check read for that setting
+function Ui-ShowValues {
+    $v = $script:UI.vals
+    if (-not $v) { return }
+    $row = $null
+    $id = [string]$script:ValsKey
+    if ($id -and $script:Rows.Contains($id)) { $row = $script:Rows[$id] }
+    if (-not $row) { return }
+    $vf = $script:UI.valsForm
+    if ($vf) { $vf.Text = 'Registry values: ' + [string]$row.T.Name }
+    Ui-FillRich $v (Get-ValueParts $row)
+}
+function Ui-OpenValues {
+    param($e)
+    if (-not $e -or $e.Kind -ne 'row') { return }
+    $script:ValsKey = [string]$e.Id
+    Ui-ShowValues
+    Ui-ShowSideWindow $script:UI.valsForm
+}
+
 # ----------------------------------------------------------- keeping the screen up to date ----
 # A row changed: copy it into its line and remember what has to be redrawn
 function Ui-RefreshRow {
@@ -13054,6 +13111,7 @@ function Ui-RefreshRow {
     $script:DHead = $true
     $script:DCounts = $true
     if ($script:SelKey -eq $id) { $script:DDetail = $true }
+    if ([string]$script:ValsKey -eq $id) { $script:DVals = $true }
 }
 
 function Ui-RefreshAll {
@@ -13078,6 +13136,7 @@ function Ui-Flush {
     try { if ($script:DNav) { $script:DNav = $false; Ui-FillNav; Ui-UpdatePage } } catch { Ui-Fail $_ }
     try { if ($script:DCounts) { $script:DCounts = $false; Ui-Counts } } catch { Ui-Fail $_ }
     try { if ($script:DDetail) { $script:DDetail = $false; Ui-ShowDetails } } catch { Ui-Fail $_ }
+    try { if ($script:DVals) { $script:DVals = $false; if ($script:UI.valsForm -and [bool]$script:UI.valsForm.Visible) { Ui-ShowValues } } } catch { Ui-Fail $_ }
     try {
         if ($script:DProg) {
             $script:DProg = $false
@@ -13110,8 +13169,6 @@ function Ui-ToggleRow {
         $msg = Try-SetPick $id $next
     } else {
         $msg = Try-SetWant $id (-not [bool]$row.Want)
-        # Sync Registry Changes: the card's "Disable in registry" box (or the box's card) moves with it
-        if (-not $msg) { foreach ($x in @(Sync-Linked $id)) { Ui-RefreshRow ([string]$x) } }
     }
     Ui-RefreshRow $id          # also puts the switch back if the change was refused
     if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
@@ -13150,35 +13207,11 @@ function Ui-GroupTick {
     Ui-Flush
 }
 
-# "Put this one fully back (undo)" for the selected setting
-# The "Sync Registry Changes" switch at the top of the filters was clicked (the CheckBox has already changed Checked)
-function Ui-ToggleSync {
-    $b = $script:UI.sync
-    if (-not $b) { return }
-    $why = Get-BusyReason
-    if ($why) { $b.Checked = [bool]$script:SyncReg; Ui-Status $why; $b.Invalidate(); return }
-    $on = [bool]$b.Checked
-    $script:SyncReg = $on
-    Save-SyncPref $on
-    if ($on) {
-        $done = @(Sync-AllSubs)
-        foreach ($x in $done) { Ui-RefreshRow ([string]$x) }
-        $msg = 'Sync Registry Changes is on: each "Disable in registry" switch now moves with the card above it (card off = Disable in registry on).'
-        if ($done.Count -gt 0) { $msg += (' {0} switch(es) lined up to match; nothing is changed until you press Apply changes.' -f $done.Count) }
-        else { $msg += ' They already match.' }
-        Ui-Status $msg
-    } else {
-        Ui-Status 'Sync Registry Changes is off: a card and its "Disable in registry" switch are switched on their own again.'
-    }
-    $b.Invalidate()
-    Ui-Flush
-}
-
+# "Put this one fully back (undo)" for the selected setting (the button of the description window)
 function Ui-ForceUndo {
     $id = [string]$script:SelKey
     if (-not $id -or -not $script:Rows.Contains($id)) { Ui-Status 'Click a setting first.'; return }
     $msg = Try-ForceUndo $id
-    if (-not $msg) { foreach ($x in @(Sync-Linked $id)) { Ui-RefreshRow ([string]$x) } }
     Ui-RefreshRow $id
     if ($msg) { Ui-Status $msg } else { Ui-Status (Get-SummaryText) }
     Ui-Flush
@@ -14077,7 +14110,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '124'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '126'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
@@ -14294,6 +14327,15 @@ $script:NavIcons = @{
     'down'                = @(@('p', 12, 4, 12, 15), @('p', 7.5, 10.5, 12, 15, 16.5, 10.5), @('p', 5, 20, 19, 20))
     'box'                 = @(@('c', 12, 3, 20, 7.5, 20, 16.5, 12, 21, 4, 16.5, 4, 7.5), @('p', 4, 7.5, 12, 12, 20, 7.5), @('p', 12, 12, 12, 21))
     'copy'                = @(@('r', 8, 8, 12, 12, 2), @('p', 15.5, 4, 6, 4, 4, 6, 4, 15.5))
+    # the setting cards (build 126): the risk badge, the tags and the "</>" button
+    'shieldok'            = @(@('c', 12, 3, 20, 6, 20, 12, 12, 21, 4, 12, 4, 6), @('p', 8.5, 12, 11, 14.5, 15.5, 9.5))
+    'warn'                = @(@('c', 12, 3.5, 21.5, 20, 2.5, 20), @('p', 12, 9.5, 12, 14), @('d', 12, 17, 1.2))
+    'restart'             = @(@('a', 12, 12.5, 8, -50, 300), @('p', 17.5, 2.5, 17.5, 6.5, 13.5, 6.5))
+    'oneway'              = @(@('p', 4, 12, 19, 12), @('p', 14, 7, 19, 12, 14, 17))
+    'once'                = @(, @('c', 8, 5, 19, 12, 8, 19))
+    'ask'                 = @(@('a', 12, 9, 4.5, 180, 270), @('p', 12, 13.5, 12, 15.5), @('d', 12, 19, 1.2))
+    'star'                = @(, @('c', 12, 3, 14.6, 9, 21, 9.5, 16.2, 13.8, 17.6, 20.5, 12, 17, 6.4, 20.5, 7.8, 13.8, 3, 9.5, 9.4, 9))
+    'code'                = @(@('p', 8, 7, 3, 12, 8, 17), @('p', 16, 7, 21, 12, 16, 17), @('p', 14, 5, 10, 19))
 }
 # the points of one icon step (the numbers after its letter, in pairs), moved and scaled to the place the icon is drawn
 function Get-IconPts {
@@ -14585,8 +14627,8 @@ function Ui-UpdatePage {
     $showApplyAll = [bool](Test-ApplyAllPage ([string]$script:NavCat) $text)
     $b = $ui.applyAll
     if ($b -and [bool]$b.Visible -ne $showApplyAll) { $b.Visible = $showApplyAll }
-    # a page of read-outs has no filter buttons, no details card (the list takes the whole width) and no settings to turn on
-    foreach ($k in 'segBox', 'detCard', 'gap', 'sync') {
+    # a page of read-outs has no filter buttons and no settings to turn on
+    foreach ($k in 'segBox') {
         $c = $ui[$k]
         if ($c -and [bool]$c.Visible -eq $isInfo) { $c.Visible = (-not $isInfo) }
     }
@@ -14613,7 +14655,8 @@ function Ui-UpdatePage {
 # =============================================================================
 # THE WINDOW, part 4: building the form and showing it.
 # The form has two parts side by side: the side menu (docked left) and the main area (fills the rest). The main area holds
-# the header (title, search, filter buttons), the list and the details card, the log and the footer (status and buttons).
+# the header (title, search, filter buttons), the list of cards, the log and the footer (status and buttons). The description of a
+# setting and its registry values are two small windows of their own (build 126), opened from its card.
 # Docking rule used below: the control added FIRST fills what is left; each docked control added later is laid out before it.
 # Positions of things on the right-hand side are set in Ui-PlaceBars (not with Anchor), so they are right at every size.
 # =============================================================================
@@ -14681,7 +14724,6 @@ function Ui-PlaceBars {
     $ui.allOff.Left = $mw - $g - $ui.allOff.Width
     $ui.allOn.Left = $ui.allOff.Left - (Px 4) - $ui.allOn.Width
     $ui.applyAll.Left = $ui.allOn.Left - (Px 8) - $ui.applyAll.Width         # the three page buttons are one group on the tab row
-    if ($ui.sync) { $ui.sync.Left = $mw - $g - $ui.sync.Width }               # Sync Registry Changes: right-aligned with them, at the top of the filters
     Ui-PlacePageBtn
     $ui.barTrack.Width = $mw
     $ui.status.Width = $mw - 2 * $g
@@ -14710,10 +14752,87 @@ function Ui-PlacePageBtn {
         if ([bool]$pb.Visible) { $limit = $pb.Left }
     }
     $ui.title.Width = [Math]::Max((Px 100), ($limit - $M.Gutter - (Px 16)))
-    $subEdge = $edge
-    if ($ui.sync -and [bool]$ui.sync.Visible) { $subEdge = [int]$ui.sync.Left - (Px 8) }        # the line under the title stops before Sync Registry Changes
-    $ui.sub.Width = [Math]::Max((Px 100), ($subEdge - $M.Gutter - (Px 16)))
+    $ui.sub.Width = [Math]::Max((Px 100), ($edge - $M.Gutter - (Px 16)))
     Ui-FitTitle
+}
+
+# A small window of its own that belongs to the main window (build 126): made once, hidden instead of closed, a title bar in the dark,
+# a blue line at the top, a card with a text box, and a bar at the bottom for its buttons. Returns @{ Form; Card; Text; Bar }.
+function New-SideWindow {
+    param($owner, [string]$title, [int]$w, [int]$h)
+    $Th = $script:Th
+    $M = $script:M
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = $title
+    $f.Font = (Ui-Font 'ui')
+    $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::Sizable
+    $f.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $f.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $f.MaximizeBox = $false
+    $f.MinimizeBox = $false
+    $f.ShowInTaskbar = $false
+    $f.BackColor = $Th.Bg
+    $f.KeyPreview = $true
+    $wa = Ui-WorkArea
+    $cw = [Math]::Min($w, ([int]$wa.Width - (Px 40)))
+    $chh = [Math]::Min($h, ([int]$wa.Height - (Px 90)))
+    $f.ClientSize = New-Object System.Drawing.Size($cw, $chh)
+    $f.MinimumSize = New-Object System.Drawing.Size([Math]::Min((Px 380), $cw), [Math]::Min((Px 300), $chh))
+    $f.Visible = $false
+    $f.Tag = $false                           # (set once it has been placed over the main window)
+    if ($owner) { $f.Owner = $owner }
+    $strip = New-Object System.Windows.Forms.Panel
+    $strip.Dock = [System.Windows.Forms.DockStyle]::Top
+    $strip.Height = (Px 3)
+    $strip.BackColor = $Th.Accent
+    $body = New-Pnl 'Fill' 0 $Th.Bg
+    $body.Padding = New-Object System.Windows.Forms.Padding((Px 16), (Px 14), (Px 16), (Px 4))
+    $card = Ui-NewCard $Th.Card $Th.Card $M.Radius
+    $card.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $card.Padding = New-Object System.Windows.Forms.Padding((Px 22), (Px 18), (Px 12), (Px 16))
+    $text = New-Rich $Th.Card $Th.Text 'body'
+    $card.Controls.Add($text)
+    $body.Controls.Add($card)
+    $bar = New-Pnl 'Bottom' (Px 60) $Th.Bg
+    $close = New-Btn 'Close' 96 'secondary' 'Close this window.' 34
+    $close.Top = (Px 13)
+    $bar.Controls.Add($close)
+    $bar.Add_Resize({ param($s, $e) try { foreach ($c in @($s.Controls)) { if ([string]$c.Text -eq 'Close') { $c.Left = [int]$s.Width - (Px 16) - [int]$c.Width } } } catch { } })
+    $close.Add_Click({ param($s, $e) try { $s.FindForm().Hide() } catch { } })
+    # the one added first fills what is left; each one added later is laid out before it
+    $f.Controls.Add($body)
+    $f.Controls.Add($bar)
+    $f.Controls.Add($strip)
+    $f.CancelButton = $close
+    $f.Add_HandleCreated({ param($s, $e) try { Ui-DarkTitle $s } catch { } })
+    $text.Add_HandleCreated({ param($s, $e) try { Ui-DarkScroll $s } catch { } })
+    # closing only hides it (it is made once); it goes with the main window
+    $f.Add_FormClosing({ param($s, $e) try { if ([string]$e.CloseReason -eq 'UserClosing') { $e.Cancel = $true; $s.Hide() } } catch { } })
+    return @{ Form = $f; Card = $card; Text = $text; Bar = $bar; Close = $close }
+}
+
+# The description window: what the details panel beside the list held before build 126, with "Put this one fully back (undo)"
+function Ui-BuildDescWindow {
+    param($owner)
+    $sw = New-SideWindow $owner 'Description' (Px 600) (Px 680)
+    $forceBtn = New-Btn 'Put this one fully back (undo)' 220 'secondary' 'Turn this setting fully off and put the Windows default back.' 34
+    $forceBtn.Top = (Px 13)
+    $forceBtn.Left = (Px 16)
+    $forceBtn.Visible = $false
+    $forceBtn.Add_Click({ try { Ui-ForceUndo } catch { Ui-Fail $_ } })
+    $sw.Bar.Controls.Add($forceBtn)
+    $script:UI.descForm = $sw.Form
+    $script:UI.detCard = $sw.Card
+    $script:UI.detail = $sw.Text
+    $script:UI.forceBtn = $forceBtn
+}
+
+# The values window ("</>")
+function Ui-BuildValsWindow {
+    param($owner)
+    $sw = New-SideWindow $owner 'Registry values' (Px 760) (Px 520)
+    $script:UI.valsForm = $sw.Form
+    $script:UI.vals = $sw.Text
 }
 
 function Ui-Build {
@@ -14881,31 +15000,7 @@ function Ui-Build {
     $btnAllOff.Top = (Px 141)
     $btnAllOn.Visible = $false
     $btnAllOff.Visible = $false
-    # "Sync Registry Changes" (build 124): a switch at the top of the filters, at the right above the page buttons. While it is on a card and
-    # its "Disable in registry" box move together (see Sync-Linked).
-    $script:SyncReg = [bool](Read-SyncPref)
-    $sync = New-Object System.Windows.Forms.CheckBox
-    $sync.Appearance = [System.Windows.Forms.Appearance]::Button
-    $sync.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $sync.UseVisualStyleBackColor = $false
-    $sync.Text = 'Sync Registry Changes'
-    $sync.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
-    $sync.Font = (Ui-Font 'btn')
-    $sync.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $sync.Size = New-Object System.Drawing.Size((Px 236), (Px 34))
-    $sync.Location = New-Object System.Drawing.Point((Px 600), (Px 58))
-    $sync.FlatAppearance.BorderSize = 0
-    $sync.FlatAppearance.CheckedBackColor = $Th.Card
-    $sync.FlatAppearance.MouseOverBackColor = $Th.Card
-    $sync.FlatAppearance.MouseDownBackColor = $Th.Card
-    $sync.Checked = [bool]$script:SyncReg
-    $sync.Visible = $false
-    Ui-DoubleBuffer $sync
-    Ui-WireBtn $sync 'switch'
-    $script:UI.tip.SetToolTip($sync, 'When on, a card and its "Disable in registry" switch move together: switching a card off switches its "Disable in registry" on, and switching the card on switches it off (a click on the box moves the card the same way). Turning it on lines up every "Disable in registry" switch with its card. Nothing is changed until you press Apply changes; Reset all still puts the Windows defaults back.')
-    $sync.Add_Click({ param($s, $e) try { Ui-ToggleSync } catch { Ui-Fail $_ } })
-    $script:UI.sync = $sync
-    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff, $sync) { $header.Controls.Add($hc) }
+    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
     $script:UI.header = $header
     $script:UI.title = $title
     $script:UI.sub = $sub
@@ -14914,7 +15009,7 @@ function Ui-Build {
     $script:UI.allOn = $btnAllOn
     $script:UI.allOff = $btnAllOff
 
-    # --- middle: the list on the left, the details card on the right
+    # --- middle: the list of cards (build 126: the whole width; a setting's description is a window of its own)
     $mid = New-Pnl 'Fill' 0 $Th.Bg
     $mid.Padding = New-Object System.Windows.Forms.Padding($M.Gutter, (Px 4), $M.Gutter, (Px 10))
     $lst = New-Object System.Windows.Forms.Control
@@ -14922,25 +15017,8 @@ function Ui-Build {
     $lst.BackColor = $Th.Bg
     $lst.TabStop = $true
     Ui-DoubleBuffer $lst
-    $gap = New-Pnl 'Right' (Px 16) $Th.Bg
-    $detCard = Ui-NewCard $Th.Card $Th.Card $M.Radius
-    $detCard.Dock = [System.Windows.Forms.DockStyle]::Right
-    $detCard.Width = $M.Details
-    $detCard.Padding = New-Object System.Windows.Forms.Padding((Px 22), (Px 20), (Px 12), (Px 16))
-    $detail = New-Rich $Th.Card $Th.Text 'body'
-    $forceBtn = New-Btn 'Put this one fully back (undo)' 200 'secondary' 'Turn this setting fully off and put the Windows default back.' 38
-    $forceBtn.Dock = [System.Windows.Forms.DockStyle]::Bottom
-    $forceBtn.Visible = $false
-    $detCard.Controls.Add($detail)
-    $detCard.Controls.Add($forceBtn)
     $mid.Controls.Add($lst)
-    $mid.Controls.Add($gap)
-    $mid.Controls.Add($detCard)
     $script:UI.list = $lst
-    $script:UI.gap = $gap
-    $script:UI.detCard = $detCard
-    $script:UI.detail = $detail
-    $script:UI.forceBtn = $forceBtn
 
     # --- log
     $logCard = New-Pnl 'Bottom' (Px 176) $Th.Bg
@@ -15033,7 +15111,6 @@ function Ui-Build {
     $find.Add_Leave({ try { $script:UI.searchBox.Tag.Edge = $script:Th.Card; $script:UI.searchBox.Invalidate() } catch { } })
     $find.Add_HandleCreated({ param($s, $e) try { Ui-Cue $s 'Find a setting' } catch { } })
     $dry.Add_CheckedChanged({ try { Ui-StyleDry; Ui-Counts } catch { Ui-Fail $_ } })
-    $forceBtn.Add_Click({ try { Ui-ForceUndo } catch { Ui-Fail $_ } })
     $btnApply.Add_Click({ try { Ui-DoApply } catch { Ui-Fail $_ } })
     $btnStop.Add_Click({ try { Ui-DoStop } catch { Ui-Fail $_ } })
     $btnPresets.Add_Click({ try { Ui-ShowPresets } catch { Ui-Fail $_ } })
@@ -15061,6 +15138,9 @@ function Ui-Build {
         } catch { Ui-Fail $_ }
         $script:StartScanPending = $true       # the first check starts on the next tick, after the window has been painted
     })
+
+    Ui-BuildDescWindow $form
+    Ui-BuildValsWindow $form
 
     $timer = New-Object System.Windows.Forms.Timer
     $timer.Interval = 80
@@ -17684,7 +17764,8 @@ function Get-PresetSplit {
     $saved = $script:Personal.Picks
     $on = @(); $chg = @()
     foreach ($r in $avail) {
-        $isOn = ($r.State -eq 'On')
+        # (build 125: a switch Windows ships off that is off only for want of a value is a change too: Confirm changes writes that value)
+        $isOn = ($r.State -eq 'On' -and -not (Test-Unwritten $r.T))
         if ($isOn -and $key -eq 'personal' -and $r.T.Choices) {
             $pick = [string]$saved[[string]$r.T.Id]
             if ($pick -and [string]$r.Choice -ne $pick) { $isOn = $false }
@@ -17719,6 +17800,7 @@ function Get-PresetChangeMark {
     if ($r.T.OneWay) { $m += 'cannot be put back' }
     if (Get-NotRecReason $r.T) { $m += 'not recommended' }
     if ($r.T.Ask) { $m += 'asks first' }
+    if ([string]$r.State -eq 'On' -and (Test-Unwritten $r.T)) { $m += 'already off; the values that go with it are written' }          # (build 125; build 126 wording)
     if ($r.T.Choices -and $script:Personal.Picks.ContainsKey([string]$r.T.Id)) {
         $k = [string]$script:Personal.Picks[[string]$r.T.Id]
         $c = @($r.T.Choices | Where-Object { [string]$_.Key -eq $k } | Select-Object -First 1)
