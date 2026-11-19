@@ -11965,6 +11965,17 @@ function Ui-FillHeads {
     }
 }
 
+# A line of cards is finished: Home cards side by side line up what is under their heads (Info-LineUp, build 126 clean-up), then every
+# card on the line is as tall as the tallest. Returns that height.
+function Ui-EndLine {
+    param($line)
+    Info-LineUp $line
+    $h = 0
+    foreach ($e in @($line)) { if ([int]$e.H -gt $h) { $h = [int]$e.H } }
+    foreach ($e in @($line)) { $e.H = $h }
+    return $h
+}
+
 # Put the entries in order, top to bottom, and work out where each one is (X and W too: a line holds one card, or two in a grid).
 # A group has Info (read-out cards, on top) and Rows (settings). A read-out may take the whole width (Span 2); the cards of one line
 # all get the height of the tallest of them.
@@ -12013,7 +12024,7 @@ function Ui-Layout {
             # a line ends when the next entry is a read-out that wants the whole width, or the first settings card after read-outs
             $wide = (($r.Kind -eq 'info' -and ($cols -le 1 -or [int]$r.Span -ge 2)) -or ($r.Kind -ne 'info' -and $rowWide))
             if (($wide -or ($prev -eq 'info' -and $r.Kind -ne 'info')) -and $c -gt 0) {
-                foreach ($e in $line) { $e.H = $lineH }
+                $lineH = Ui-EndLine $line
                 $y += $lineH
                 $c = 0; $line = @(); $lineH = 0
             }
@@ -12041,7 +12052,7 @@ function Ui-Layout {
                 if ($r.H -gt $lineH) { $lineH = $r.H }
                 $c++
                 if ($c -ge $cols) {
-                    foreach ($e in $line) { $e.H = $lineH }
+                    $lineH = Ui-EndLine $line
                     $y += $lineH
                     $c = 0; $line = @(); $lineH = 0
                 }
@@ -12049,7 +12060,7 @@ function Ui-Layout {
             $prev = [string]$r.Kind
         }
         if ($c -gt 0) {                               # the last line of the group is only part full
-            foreach ($e in $line) { $e.H = $lineH }
+            $lineH = Ui-EndLine $line
             $y += $lineH
         }
     }
@@ -16160,13 +16171,15 @@ function Info-SensorCard {
     $sn = $lv.Sensors
     $lines = @()
     $g = $lv.Gpu
-    if ($g -and $g.Source -eq 'nvidia-smi') { $lines += , (Info-Line 'nvidia-smi' ('found: ' + [string]$lv.Smi) 'Good') }
-    else { $lines += , (Info-Line 'nvidia-smi' 'not found (GPU temperature, power and clock need it)' 'Dim') }
+    # (build 126 clean-up: a short value on each tile, the details after three spaces as its small note under it, so nothing is cut off)
+    $from = @()
+    if ($g -and $g.Source -eq 'nvidia-smi') { $lines += , (Info-Line 'nvidia-smi' ('Found   (' + [string]$lv.Smi + ')') 'Good'); $from += 'nvidia-smi' }
+    else { $lines += , (Info-Line 'nvidia-smi' 'Not found   (GPU temperature, power and clock need it)' 'Dim') }
     $hv = [string]$lv.HwiVia
-    if ($lv.Hwi -and $hv) { $lines += , (Info-Line 'HWiNFO' ('running, readings from its ' + $hv) 'Good') }
-    elseif ($lv.Hwi -and [string]$lv.HwiWhy -eq 'stale') { $lines += , (Info-Line 'HWiNFO' 'running, but its readings are frozen (its Sensors window is closed or paused)' 'Warn') }
-    elseif ($lv.Hwi) { $lines += , (Info-Line 'HWiNFO' 'running, but not sharing its readings' 'Warn') }
-    else { $lines += , (Info-Line 'HWiNFO' 'not running' 'Dim') }
+    if ($lv.Hwi -and $hv) { $lines += , (Info-Line 'HWiNFO' ('Running   (readings from its ' + $hv + ')') 'Good'); $from = @('HWiNFO') + $from }
+    elseif ($lv.Hwi -and [string]$lv.HwiWhy -eq 'stale') { $lines += , (Info-Line 'HWiNFO' 'Running   (its readings are frozen: its Sensors window is closed or paused)' 'Warn') }
+    elseif ($lv.Hwi) { $lines += , (Info-Line 'HWiNFO' 'Running   (not sharing its readings)' 'Warn') }
+    else { $lines += , (Info-Line 'HWiNFO' 'Not running' 'Dim') }
     # which HWiNFO / LibreHardwareMonitor rows the CPU numbers were taken from, so they can be compared with that program
     if ($sn -and [string]$sn.CpuTempFrom) { $lines += , (Info-Line 'CPU temperature' ('from the row "' + [string]$sn.CpuTempFrom + '"') 'Sub') }
     if ($sn -and [string]$sn.CpuPowerFrom) { $lines += , (Info-Line 'CPU power' ('from the row "' + [string]$sn.CpuPowerFrom + '"') 'Sub') }
@@ -16174,7 +16187,7 @@ function Info-SensorCard {
     elseif ($hv) { $lines += , (Info-Line 'Memory controller' 'no row named "Memory Controller Clock" in HWiNFO' 'Dim') }
     if ($sn -and [string]$sn.VdimmFrom) { $lines += , (Info-Line 'DRAM voltage' ('from the row "' + [string]$sn.VdimmFrom + '"') 'Sub') }
     elseif ($hv) { $lines += , (Info-Line 'DRAM voltage' 'no row named DRAM, DIMM, VDIMM or CPU VDDIO in HWiNFO' 'Dim') }
-    if ($lv.Lhm) { $lines += , (Info-Line 'LibreHardwareMonitor' 'running' 'Good') } else { $lines += , (Info-Line 'LibreHardwareMonitor' 'not running' 'Dim') }
+    if ($lv.Lhm) { $lines += , (Info-Line 'LibreHardwareMonitor' 'Running' 'Good'); $from += 'LibreHardwareMonitor' } else { $lines += , (Info-Line 'LibreHardwareMonitor' 'Not running' 'Dim') }
     $missing = ($null -eq $sn -or ($null -eq $sn.CpuTemp -or $null -eq $sn.CpuPower -or -not (Info-Timings $sn)))
     $note = ''
     if ($missing) {
@@ -16194,7 +16207,11 @@ function Info-SensorCard {
         }
     }
     # a section the whole width wide: a tile for each program that gives readings, the rows they were taken from under them
-    $e = Info-Card 'info:sensors' 'Sensors' '' $lines $note '' 'Sub' 2
+    # the name says where the readings come from (build 126 clean-up)
+    $who = 'Windows only'
+    if ($from.Count -eq 1) { $who = [string]$from[0] }
+    elseif ($from.Count -gt 1) { $who = (@($from[0..($from.Count - 2)]) -join ', ') + ' and ' + [string]$from[$from.Count - 1] }
+    $e = Info-Card 'info:sensors' 'Sensors' $who $lines $note '' 'Sub' 2
     $e.Look = 'grid'
     $e.Caps = 'Sensor sources'
     $e.TileMin = 200
@@ -16284,7 +16301,7 @@ function Info-HelpSize {
 # Work out where everything of a card goes when it is $w wide, and its height (the gap below it included). Positions are from the card's
 # top (Y) and from the left of its inside (X, the padding not counted).
 function Info-Prepare {
-    param($e, [int]$w)
+    param($e, [int]$w, [int]$MinTop = 0)
     $M = $script:M
     $iw = $w - 2 * $M.Pad
     $tw = $iw - 2 * (Px 14)
@@ -16316,6 +16333,8 @@ function Info-Prepare {
     # $y is where the next part starts, $gap the space that was left after the part before it (taken off again at the bottom)
     if (@($e.HeadTags).Count -gt 0) { $gap = Px 14; $y = [int]$e.TagY + $M.TagH + $gap }
     else { $gap = Px 12; $y = [int]$e.TitleY + $M.TitleH + $gap }
+    # (build 126 clean-up: a card beside one with tags starts what is under its head as low as that one does, so the two line up)
+    if ($MinTop -gt $y) { $y = $MinTop }
     $e.Top = $y
     # the meter
     if ($e.Meter) {
@@ -16436,8 +16455,19 @@ function Info-HeadLabel {
 }
 function Info-HeadName {
     param($e)
-    if ([string]$e.Sub) { return [string]$e.Sub }
+    # (a name that keeps a note after three spaces, "32 GB DDR5   (2 x 16 GB)", is shown with one space)
+    if ([string]$e.Sub) { return (([string]$e.Sub) -replace '\s{2,}', ' ').Trim() }
     return (Get-TitleCase ([string]$e.Title))
+}
+# Home cards side by side on one line (build 126 clean-up): what is under their heads starts at the same height, so their tiles and rows
+# line up across the line. A card whose head is shorter (no tags) is worked out again with the other one's start.
+function Info-LineUp {
+    param($line)
+    $info = @($line | Where-Object { $_ -and [string]$_.Kind -eq 'info' })
+    if ($info.Count -lt 2) { return }
+    $top = 0
+    foreach ($e in $info) { if ([int]$e.Top -gt $top) { $top = [int]$e.Top } }
+    foreach ($e in $info) { if ([int]$e.Top -lt $top) { Info-Prepare $e ([int]$e.W) $top } }
 }
 
 # The dot after a value: green for good, orange and red for a warning; in a section a value that is missing has a grey one. $null = no dot.
@@ -16479,9 +16509,10 @@ function Info-PaintHelp {
 }
 # A bar of how full something is: the track, then the part that is used (blue; orange from 85 %, red from 95 %)
 function Info-PaintBar {
-    param($g, [int]$x, [int]$y, [int]$w, [int]$h, $pct)
+    param($g, [int]$x, [int]$y, [int]$w, [int]$h, $pct, $track = $null)
     $Th = $script:Th
-    Ui-FillRound $g $Th.Tile $x $y $w $h ([int]($h / 2))
+    if (-not $track) { $track = $Th.Tile }                      # (on a tile the track is the card's colour, so it shows: build 126 clean-up)
+    Ui-FillRound $g $track $x $y $w $h ([int]($h / 2))
     if ($null -eq $pct) { return }
     $p = [Math]::Max(0.0, [Math]::Min(100.0, [double]$pct))
     if ($p -le 0) { return }
@@ -16584,7 +16615,7 @@ function Ui-PaintInfo {
         $vc = Info-ValColor ([string]$t.K)
         foreach ($vl in @($t.VLines)) { Ui-Text $g ([string]$vl) (Ui-Font ([string]$t.VFont)) $vc $px $vy $pw ([int]$t.VH) $TF.L; $vy += [int]$t.VH }
         if ($t.N) { Ui-Text $g ([string]$t.N) (Ui-Font 'small') $Th.Mute $px $vy $pw (Px 16) $TF.L; $vy += Px 16 }
-        if ($null -ne $t.Bar) { Info-PaintBar $g $px ($vy + (Px 4)) $pw (Px 4) $t.Bar }
+        if ($null -ne $t.Bar) { Info-PaintBar $g $px ($vy + (Px 4)) $pw (Px 4) $t.Bar $Th.Card }
         if ($open -and [int]$tl.HelpH -gt 0) { Info-PaintHelp $g $tl $ix ($y + [int]$tl.PanelTop) $iw }
     }
     # --- the rows: the label at the left; the value at the right, then its dot, then the arrow of a row that opens an explanation
