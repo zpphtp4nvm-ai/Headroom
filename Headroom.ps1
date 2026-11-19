@@ -11016,6 +11016,7 @@ function Ui-InitMetrics {
         Row = (Px 220); Gap = (Px 16); Head = (Px 46); Pad = (Px 22); TogW = (Px 46); TogH = (Px 24); ChoiceH = (Px 30)
         CardTop = (Px 16); CardBottom = (Px 16); IdH = (Px 18); TitleH = (Px 30); TagH = (Px 26); TagIcon = (Px 15); DescLH = (Px 20); DescN = 2
         BotH = (Px 32); BtnH = (Px 30); CodeW = (Px 40)
+        BadgeH = (Px 22); BadgeIcon = (Px 12); BadgeR = (Px 6)           # the risk badge and View Description (build 126: the size of the status chip)
         Sb = (Px 14); Top = (Px 2); Bottom = (Px 20); Radius = (Px 14); BtnR = (Px 8)
         ChipH = (Px 24); CountW = (Px 112)
         CardMin = (Px 470); RowMin = (Px 470); ColGap = (Px 18); Wheel = (Px 168)
@@ -11060,7 +11061,6 @@ function Ui-Font {
         'title'    { $f = Ui-NewFont 'Segoe UI Semibold' 22 }
         'titleS'   { $f = Ui-NewFont 'Segoe UI Semibold' 16 }       # the page title when the name is too long for the big size
         'cardName' { $f = Ui-NewFont 'Segoe UI Semibold' 11.5 }
-        'badge'    { $f = Ui-NewFont 'Segoe UI' 10.5 'Bold' }        # a maker's name on its box (Home)
         'meter'    { $f = Ui-NewFont 'Segoe UI Light' 21 }           # the big percentage of a meter (Home)
         'tileVal'  { $f = Ui-NewFont 'Segoe UI Semibold' 11 }        # the value on a tile (Home)
         'cardId'   { $f = Ui-NewFont 'Segoe UI' 8.5 }
@@ -12310,7 +12310,6 @@ function Ui-RowGeom {
     $o.TextEnd = $w - $pad
     $o.TextW = [Math]::Max(0, $o.TextEnd - $o.TextX)
     $tagFont = Ui-Font 'tag'
-    $btnFont = Ui-Font 'btn'
     # line 1: the id (small, grey), and the status chip at the right
     $o.IdY = $M.CardTop
     $o.IdH = $M.IdH
@@ -12359,13 +12358,15 @@ function Ui-RowGeom {
     $o.TogY = $o.BotY + [int](($o.BotH - $M.TogH) / 2)
     # the left end: the risk badge and "View Description"
     $o.RiskDot = $false
-    $o.RiskH = $M.BtnH
-    $o.RiskW = (Ui-TextWidth ([string]$e.Risk) $btnFont) + (Px 40)
+    # (build 126, Tyler: "22px works": the badge and View Description are as tall as the status chip, in its font)
+    $smallFont = Ui-Font 'smallb'
+    $o.RiskH = $M.BadgeH
+    $o.RiskW = (Ui-TextWidth ([string]$e.Risk) $smallFont) + $M.BadgeIcon + (Px 23)       # 8 before the icon, 5 after it, 10 after the words
     $o.RiskX = $o.TextX
     $o.RiskY = $o.BotY + [int](($o.BotH - $o.RiskH) / 2)
-    $o.ViewW = (Ui-TextWidth 'View Description' $btnFont) + (Px 26)
+    $o.ViewW = (Ui-TextWidth 'View Description' $smallFont) + (Px 22)
     $o.ViewX = $o.RiskX + $o.RiskW + (Px 8)
-    $o.ViewY = $o.RiskY; $o.ViewH = $M.BtnH
+    $o.ViewY = $o.RiskY; $o.ViewH = $M.BadgeH
     $bx = $o.ViewX + $o.ViewW + (Px 8)
     # a power plan's buttons: after "View Description" when they fit, else in the row of tags
     $o.MakeAct = $null
@@ -12376,11 +12377,12 @@ function Ui-RowGeom {
     # (both go to the same place: after "View Description" when both fit there, else both into the row of tags)
     $tagExtra = @()
     $need = 0
-    foreach ($it in $extra) { $need += (Ui-TextWidth ([string]$it[1]) $btnFont) + (Px 24) + (Px 8) }
+    # (build 126, Tyler: "Fix Make Active And Reinstall sizes to 22px": as small as View Description, wherever they go)
+    foreach ($it in $extra) { $need += (Ui-TextWidth ([string]$it[1]) $smallFont) + (Px 22) + (Px 8) }
     if (($bx + $need - (Px 8)) -le $right) {
         foreach ($it in $extra) {
-            $bw = (Ui-TextWidth ([string]$it[1]) $btnFont) + (Px 24)
-            $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $bx; Y = $o.RiskY; W = $bw; H = $M.BtnH }
+            $bw = (Ui-TextWidth ([string]$it[1]) $smallFont) + (Px 22)
+            $p = @{ Kind = [string]$it[0]; Text = [string]$it[1]; X = $bx; Y = $o.RiskY; W = $bw; H = $M.BadgeH; Bottom = $true }
             if ($p.Kind -eq 'makeact') { $o.MakeAct = $p } else { $o.Reinst = $p }
             $bx += $bw + (Px 8)
         }
@@ -12396,11 +12398,12 @@ function Ui-RowGeom {
     $room = $true
     foreach ($it in $items) {
         $isBtn = ($it.Kind -eq 'makeact' -or $it.Kind -eq 'reinst')
-        $f = $tagFont; if ($isBtn) { $f = $btnFont }
-        $pw = (Ui-TextWidth ([string]$it.Text) $f) + (Px 20)
+        $pw = (Ui-TextWidth ([string]$it.Text) $tagFont) + (Px 20)
+        if ($isBtn) { $pw = (Ui-TextWidth ([string]$it.Text) $smallFont) + (Px 22) }
         if ($it.Icon) { $pw += $M.TagIcon + (Px 6) }
         if ($room -and (($px + $pw) -le $o.TextEnd)) {
             $p = @{ Kind = [string]$it.Kind; Text = [string]$it.Text; Icon = [string]$it.Icon; X = $px; Y = $o.TagY; W = $pw; H = $o.TagH }
+            if ($isBtn) { $p.H = $M.BadgeH; $p.Y = $o.TagY + [int](($o.TagH - $M.BadgeH) / 2) }        # (22 tall, centred on the row of tags)
             $o.Pills += , $p
             if ($p.Kind -eq 'notrec') { $o.NotRec = $p }
             if ($p.Kind -eq 'makeact') { $o.MakeAct = $p }
@@ -12427,18 +12430,21 @@ function Ui-NotRecRect {
 
 # A small flat button on a card (View Description, </>, Make active, Reinstall): lighter under the pointer, dim while it cannot be used
 function Ui-CardBtn {
-    param($g, [int]$x, [int]$y, [int]$w, [int]$h, [string]$text, [string]$icon, [bool]$hot, [bool]$enabled)
+    param($g, [int]$x, [int]$y, [int]$w, [int]$h, [string]$text, [string]$icon, [bool]$hot, [bool]$enabled, [bool]$small = $false)
     $Th = $script:Th
     $fill = $Th.Raised
     if ($hot -and $enabled) { $fill = $Th.RaisedHot }
-    Ui-FillRound $g $fill $x $y $w $h $script:M.BtnR
+    $rad = $script:M.BtnR
+    $font = 'btn'
+    if ($small) { $rad = $script:M.BadgeR; $font = 'smallb' }       # View Description, Make active, Reinstall (build 126): the size of the status chip
+    Ui-FillRound $g $fill $x $y $w $h $rad
     $col = $Th.Text
     if (-not $enabled) { $col = $Th.Dim }
     if ($icon) {
         $s = $script:M.TagIcon + (Px 2)
         Ui-PaintIcon $g $icon ($x + ($w - $s) / 2.0) ($y + ($h - $s) / 2.0) $s $col
     } else {
-        Ui-Text $g $text (Ui-Font 'btn') $col $x $y $w $h $script:TF.C
+        Ui-Text $g $text (Ui-Font $font) $col $x $y $w $h $script:TF.C
     }
 }
 
@@ -12489,7 +12495,7 @@ function Ui-PaintRow {
     foreach ($p in @($o.Pills)) {
         $px = $x + $p.X; $py = $y + $p.Y
         if ($p.Kind -eq 'makeact' -or $p.Kind -eq 'reinst') {
-            Ui-CardBtn $g $px $py $p.W $p.H $p.Text '' ($hot -and $script:HotZone -eq [string]$p.Kind) ($on -and -not $busy)
+            Ui-CardBtn $g $px $py $p.W $p.H $p.Text '' ($hot -and $script:HotZone -eq [string]$p.Kind) ($on -and -not $busy) $true
             continue
         }
         $tc = $Th.TagText; $tagFill = $Th.Tag
@@ -12517,13 +12523,13 @@ function Ui-PaintRow {
     $rt = $Th.BadgeText; if ($rk -eq 'Bad') { $rt = $Th.KnobOn }
     if (-not $on) { $rt = $Th.Dim }
     $ricon = 'shieldok'; if ($rk -ne 'Good') { $ricon = 'warn' }
-    Ui-FillRound $g $rf ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH $M.BtnR
-    Ui-PaintIcon $g $ricon ($x + $o.RiskX + (Px 9)) ($y + $o.RiskY + ($o.RiskH - $M.TagIcon) / 2.0) $M.TagIcon $rt
-    Ui-Text $g ([string]$e.Risk) (Ui-Font 'btn') $rt ($x + $o.RiskX + (Px 9) + $M.TagIcon + (Px 6)) ($y + $o.RiskY) ($o.RiskW - (Px 15) - $M.TagIcon) $o.RiskH $TF.L
-    Ui-CardBtn $g ($x + $o.ViewX) ($y + $o.ViewY) $o.ViewW $o.ViewH 'View Description' '' ($hot -and $script:HotZone -eq 'viewdesc') $true
+    Ui-FillRound $g $rf ($x + $o.RiskX) ($y + $o.RiskY) $o.RiskW $o.RiskH $M.BadgeR
+    Ui-PaintIcon $g $ricon ($x + $o.RiskX + (Px 8)) ($y + $o.RiskY + ($o.RiskH - $M.BadgeIcon) / 2.0) $M.BadgeIcon $rt
+    Ui-Text $g ([string]$e.Risk) (Ui-Font 'smallb') $rt ($x + $o.RiskX + (Px 8) + $M.BadgeIcon + (Px 5)) ($y + $o.RiskY) ($o.RiskW - (Px 13) - $M.BadgeIcon) $o.RiskH $TF.L
+    Ui-CardBtn $g ($x + $o.ViewX) ($y + $o.ViewY) $o.ViewW $o.ViewH 'View Description' '' ($hot -and $script:HotZone -eq 'viewdesc') $true $true
     foreach ($b in @($o.MakeAct, $o.Reinst)) {
-        if (-not $b -or [int]$b.Y -ne [int]$o.RiskY) { continue }                # (one that went into the row of tags is drawn there)
-        Ui-CardBtn $g ($x + $b.X) ($y + $b.Y) $b.W $b.H $b.Text '' ($hot -and $script:HotZone -eq [string]$b.Kind) ($on -and -not $busy)
+        if (-not $b -or -not $b.Bottom) { continue }                            # (one that went into the row of tags is drawn there)
+        Ui-CardBtn $g ($x + $b.X) ($y + $b.Y) $b.W $b.H $b.Text '' ($hot -and $script:HotZone -eq [string]$b.Kind) ($on -and -not $busy) $true
     }
     if (-not $e.Choices) { Ui-DrawToggle $g ($x + $o.TogX) ($y + $o.TogY) ([bool]$e.Checked) $on }
     Ui-CardBtn $g ($x + $o.CodeX) ($y + $o.CodeY) $o.CodeW $o.CodeH '</>' 'code' ($hot -and $script:HotZone -eq 'code') $true
@@ -12624,7 +12630,7 @@ function Ui-OnPaint {
 }
 
 # ----------------------------------------------------------- the mouse ----------------
-# What is at (x, y) of the control?  Zone: sb | toggle | seg<n> | code | viewdesc | notrec | makeact | reinst | row | head | info | infolink | ''
+# What is at (x, y) of the control?  Zone: sb | toggle | seg<n> | code | viewdesc | notrec | makeact | reinst | row | head | info | ''
 function Ui-Zone {
     param([int]$x, [int]$y)
     $M = $script:M
@@ -12635,8 +12641,7 @@ function Ui-Zone {
     if ($i -lt 0) { return @{ Zone = ''; Entry = $null } }
     $e = $script:View[$i]
     if ($e.Kind -eq 'info') {
-        # a read-out: only a line that has an explanation can be clicked (it opens the explanation), and the link of the Windows card
-        if (Info-HitLink $e ($x - [int]$e.X) ($ly - [int]$e.Y)) { return @{ Zone = 'infolink'; Entry = $e; Line = '#link' } }
+        # a read-out: only a line that has an explanation can be clicked (it opens the explanation)
         $hl = Info-HitLine $e ($x - [int]$e.X) ($ly - [int]$e.Y)
         if ($hl) { return @{ Zone = 'info'; Entry = $e; Line = [string]$hl.Id } }
         return @{ Zone = ''; Entry = $null }
@@ -12698,7 +12703,7 @@ function Ui-UpdateHot {
     if ($new -and ($newKey -ne $oldKey -or $newLine -ne $oldLine)) { Ui-InvalidateEntry $new }
     if ($z.Zone -eq 'sb' -or $oldZone -eq 'sb') { Ui-InvalidateAll }
     $hand = 'arrow'
-    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'infolink' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst' -or $z.Zone -eq 'viewdesc' -or $z.Zone -eq 'code') { $hand = 'hand' }
+    if ($z.Zone -eq 'toggle' -or ([string]$z.Zone).StartsWith('seg') -or $z.Zone -eq 'head' -or $z.Zone -eq 'info' -or $z.Zone -eq 'makeact' -or $z.Zone -eq 'reinst' -or $z.Zone -eq 'viewdesc' -or $z.Zone -eq 'code') { $hand = 'hand' }
     Ui-SetCursor $hand
 }
 
@@ -12771,7 +12776,6 @@ function Ui-OnMouseDown {
     elseif ($zone -eq 'row' -or $zone -eq 'notrec') { Ui-Select $z.Entry }
     elseif ($zone -eq 'head') { Ui-Select $z.Entry; Ui-ToggleHead $z.Entry }
     elseif ($zone -eq 'info') { Ui-ToggleInfoLine $z.Entry ([string]$z.Line) }
-    elseif ($zone -eq 'infolink') { Ui-CopySysInfo }
     Ui-Flush
 }
 
@@ -14647,8 +14651,14 @@ function Ui-UpdatePage {
             if ([int]$pb.Width -ne $bw) { $pb.Width = $bw }
         }
         if ([bool]$pb.Visible -ne $want) { $pb.Visible = $want }
-        Ui-PlacePageBtn
     }
+    # "Copy system info" belongs to Home (build 126)
+    $cb = $ui.copyBtn
+    if ($cb) {
+        $wantC = [bool]($page -eq $script:PageHome)
+        if ([bool]$cb.Visible -ne $wantC) { $cb.Visible = $wantC }
+    }
+    if ($pb -or $cb) { Ui-PlacePageBtn }
     Ui-OnPageShown
 }
 
@@ -14750,6 +14760,13 @@ function Ui-PlacePageBtn {
     if ($pb) {
         $pb.Left = $edge - $pb.Width
         if ([bool]$pb.Visible) { $limit = $pb.Left }
+    }
+    # Home: "Copy system info" left of "Start HWiNFO" (build 126)
+    $cb = $ui.copyBtn
+    if ($cb) {
+        $cb.Left = $limit - (Px 8) - $cb.Width
+        if ($limit -eq $edge) { $cb.Left = $edge - $cb.Width }
+        if ([bool]$cb.Visible) { $limit = $cb.Left }
     }
     $ui.title.Width = [Math]::Max((Px 100), ($limit - $M.Gutter - (Px 16)))
     $ui.sub.Width = [Math]::Max((Px 100), ($edge - $M.Gutter - (Px 16)))
@@ -14936,6 +14953,11 @@ function Ui-Build {
     $btnPage = New-Btn 'Start HWiNFO' 140 'secondary' 'Do what this page is for: start HWiNFO with its sensors shared with this app (Home), open Windows display settings (Display), or compare the six power plans side by side (Power; it only reads).' 32
     $btnPage.Top = (Px 24)
     $btnPage.Visible = $false
+    # Home only (build 126; it was a link on the Windows card): every card of Home on the clipboard as text. It reads nothing new.
+    $btnCopy = New-Btn 'Copy system info' 140 'secondary' 'Put everything Home shows on the clipboard as text, to paste anywhere with Ctrl+V. It changes nothing.' 32
+    $btnCopy.Width = [Math]::Max((Px 140), ((Ui-TextWidth 'Copy system info' (Ui-Font 'btn')) + (Px 36)))
+    $btnCopy.Top = (Px 24)
+    $btnCopy.Visible = $false
     # the search box lives in the side menu, under the app name
     $searchBox = Ui-NewCard $Th.Card $Th.Card $M.Radius 'search'
     $searchBox.BackColor = $Th.Side
@@ -15000,12 +15022,13 @@ function Ui-Build {
     $btnAllOff.Top = (Px 141)
     $btnAllOn.Visible = $false
     $btnAllOff.Visible = $false
-    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
+    foreach ($hc in $title, $sub, $btnApplyAll, $btnPage, $btnCopy, $segBox, $btnAllOn, $btnAllOff) { $header.Controls.Add($hc) }
     $script:UI.header = $header
     $script:UI.title = $title
     $script:UI.sub = $sub
     $script:UI.applyAll = $btnApplyAll
     $script:UI.pageBtn = $btnPage
+    $script:UI.copyBtn = $btnCopy
     $script:UI.allOn = $btnAllOn
     $script:UI.allOff = $btnAllOff
 
@@ -15116,6 +15139,7 @@ function Ui-Build {
     $btnPresets.Add_Click({ try { Ui-ShowPresets } catch { Ui-Fail $_ } })
     $btnApplyAll.Add_Click({ try { Ui-DoApplyAll } catch { Ui-Fail $_ } })
     $btnPage.Add_Click({ try { Ui-DoPageButton } catch { Ui-Fail $_ } })
+    $btnCopy.Add_Click({ try { Ui-CopySysInfo } catch { Ui-Fail $_ } })
     $btnDiscard.Add_Click({ try { Ui-DoDiscard } catch { Ui-Fail $_ } })
     $btnRescan.Add_Click({ try { Ui-DoRescan } catch { Ui-Fail $_ } })
     $btnOpenLog.Add_Click({ try { Ui-DoOpenLog } catch { Ui-Fail $_ } })
@@ -15251,11 +15275,11 @@ function Info-NvDriver {
 
 # ----------------------------------------------------------- building cards ----
 # How a card looks (all set by the card's builder; nothing here reads the PC):
-#   Look     'list' (a head, then a meter, tiles and rows) or 'grid' (a section: a small title in capitals, then tiles and rows)
-#   Caps     the small title in capitals above the name ('' = the Title)
-#   Icon     the icon in the box at the left of the head; Badge = @{ T; C } a maker's name on a box in its colour instead of the icon
-#   Sub2     a quieter line under the name
-#   Link     a link at the right of the head ("Copy system info")
+#   Look     'list' or 'grid' (a section: its tiles can hold three lines, and a missing value gets a grey dot). Since build 126 both have the
+#            same head as a setting card: the label on the top line, the name, the tags
+#   Caps     what the label on the top line says, in small letters ('' = the Title)
+#   Badge    @{ T; C } the maker, the first tag, in its colour
+#   Sub2     facts about it, one tag each (", " and " / " part them)
 #   Meter    @{ L; Line } a big percentage with a bar (from a line that has a Bar)
 #   Tiles    the small boxes in a grid: @{ L; V; N; K; Icon; Line; Bar } (N = a small note under the value; Line = the line it shows, $null for one
 #            that is not a line); TileMin = the narrowest a tile may be (unscaled pixels)
@@ -15264,7 +15288,7 @@ function Info-Card {
     param([string]$Key, [string]$Title, [string]$Sub = '', $Lines = @(), [string]$Note = '', [string]$Chip = '', [string]$ChipKey = 'Sub', [int]$Span = 1)
     return @{ Kind = 'info'; Key = $Key; Id = $Key; Cat = ''; Title = $Title; Sub = $Sub; Lines = @($Lines); Note = $Note; NoteLines = @(); Chip = $Chip; ChipKey = $ChipKey
               Span = $Span; Top = 0; X = 0; W = 0; Y = 0; H = 0; Idx = 0
-              Look = 'list'; Caps = ''; Icon = ''; Badge = $null; Sub2 = ''; Link = ''; Meter = $null; Tiles = @(); TileMin = 150; BoxW = 0; LinkRect = $null }
+              Look = 'list'; Caps = ''; Badge = $null; Sub2 = ''; Meter = $null; Tiles = @(); TileMin = 150; IdY = 0; TitleY = 0; TagY = 0; HeadTags = @() }
 }
 function Info-Line {
     param([string]$L, [string]$V, [string]$K = 'Text', $Bar = $null)
@@ -15621,14 +15645,11 @@ function Info-Help {
     return $l
 }
 
-# The Windows card: the whole width at the top of Home, like a title bar for the page. Its name says the version, the line under it the build;
-# the other facts are tiles, and "Copy system info" at the right puts every card of Home on the clipboard as text.
+# The Windows card: the first card of Home. Its name says the version, its tags the build; the other facts are tiles. (Until build 126 it
+# was the whole width and carried "Copy system info"; that is a button in the header of Home now.)
 function Info-OsShape {
     param($e)
-    $e.Span = 2
     $e.Caps = 'Operating system'
-    $e.Icon = 'Windows'
-    $e.Link = 'Copy system info'
     $e.TileMin = 128
     return $e
 }
@@ -16196,22 +16217,21 @@ function Get-PageCards {
     $list = @()
     if ($cat -eq $script:PageHome) {
         $d = Info-Data
-        # Windows across the top; then two to a line, cards of about the same height side by side: the processor and the graphics card,
-        # the memory and the drives, the motherboard and the timer; the security section across; then the mouse and the screens; the
-        # sensor sources across at the bottom
+        # build 126: two to a line, every card the same width, like the cards of the other pages: Windows and the platform security, the
+        # processor and the graphics card, the memory and the drives, the motherboard and the timer, the mouse and the screens, then the
+        # sensor sources (a card left alone on its line keeps its width)
         $list += , (Info-OsCard $d)
+        $list += , (Info-SecCard $d)
         $list += , (Info-CpuCard $d)
         $list += , (Info-GpuCard $d)
         $list += , (Info-RamCard $d)
         $list += , (Info-StorageCard $d)
         $list += , (Info-BoardCard $d)
         $list += , (Info-TimerCard $d)
-        $list += , (Info-SecCard $d)
-        # the mouse and the screens pair up; when that leaves one alone, the last one takes the whole width
-        $pair = @((Info-MouseCard $d)) + @(Info-DisplayCards $d $true)
-        if (($pair.Count % 2) -eq 1) { $pair[$pair.Count - 1].Span = 2 }
-        foreach ($c in $pair) { $list += , $c }
+        $list += , (Info-MouseCard $d)
+        foreach ($c in @(Info-DisplayCards $d $true)) { $list += , $c }
         $list += , (Info-SensorCard $d)
+        foreach ($c in $list) { $c.Span = 1 }
     } elseif ($cat -eq $script:DisplayCat) {
         $d = Info-Data
         $cards = @(Info-DisplayCards $d $false)
@@ -16242,8 +16262,9 @@ function Info-Wrap {
 }
 
 # Sizes inside a Home card, in unscaled pixels (Px fits them to the screen):
-#   the head: a box 40 tall (64 wide, or wider for a long maker's name) 18 from the top; what is under the head starts 76 from the top
-#   (44 in a section, whose head is only its small title in capitals)
+#   the head (build 126, the same as a setting card's): the label (what the card is, small and grey) on the top line with the status chip
+#   at its right, the name under it in the title font, then a row of tags (the maker in its colour, then the facts that were the line
+#   under the name); what is under the head starts 14 below the tags (12 below the name when there are none)
 #   the meter: 46 tall (the big number, then a bar 6 tall)
 #   the tiles: 10 apart; inside them 12 at the sides and 10 at the top and bottom, the label 16, then the value (20 a line: at most two
 #   lines, three in a section), a note 16, a bar 10
@@ -16275,23 +16296,26 @@ function Info-Prepare {
         $l.HelpH = 0; $l.HelpLines = @(); $l.DefLines = @()
         $l.Open = [bool]($l.Id -and $script:InfoOpen.ContainsKey([string]$e.Key + '|' + [string]$l.Id))
     }
-    # the head: the box at the left (wider for a long maker's name) and the link at the right
-    $e.BoxW = Px 64
-    if ($e.Badge) {
-        $bw = (Ui-TextWidth ([string]$e.Badge.T) (Ui-Font 'badge')) + (Px 24)
-        if ($bw -gt $e.BoxW) { $e.BoxW = $bw }
-    }
-    $e.LinkRect = $null
-    if ($e.Link) {
-        $lw = (Ui-TextWidth ([string]$e.Link).ToUpperInvariant() (Ui-Font 'smallb')) + (Px 30)
-        $ly = Px 27
-        if ($grid) { $ly = Px 10 }
-        $e.LinkRect = @{ X = $M.Pad + $iw - $lw; Y = $ly; W = $lw; H = Px 22 }
+    # the head (build 126): the label and the chip, the name, the tags
+    $e.IdY = $M.CardTop
+    $e.TitleY = $M.CardTop + $M.IdH + (Px 2)
+    $e.TagY = [int]$e.TitleY + $M.TitleH + (Px 8)
+    # the tags, left to right, as many as fit
+    $e.HeadTags = @()
+    $px = 0
+    foreach ($tg0 in @(Info-HeadTags $e)) {
+        $f = Ui-Font 'tag'
+        if ($tg0.Brand) { $f = Ui-Font 'btn' }
+        $pw = (Ui-TextWidth ([string]$tg0.T) $f) + (Px 20)
+        if (($px + $pw) -gt $iw) { break }
+        $tg0.X = $px
+        $tg0.W = $pw
+        $e.HeadTags += , $tg0
+        $px += $pw + (Px 6)
     }
     # $y is where the next part starts, $gap the space that was left after the part before it (taken off again at the bottom)
-    $y = Px 76
-    $gap = Px 18
-    if ($grid) { $y = Px 44; $gap = Px 12 }
+    if (@($e.HeadTags).Count -gt 0) { $gap = Px 14; $y = [int]$e.TagY + $M.TagH + $gap }
+    else { $gap = Px 12; $y = [int]$e.TitleY + $M.TitleH + $gap }
     $e.Top = $y
     # the meter
     if ($e.Meter) {
@@ -16386,26 +16410,34 @@ function Info-Prepare {
         $gap = 0
     }
     $e.W = $w
-    $e.H = $y - $gap + $M.Pad + $M.Gap
+    $e.H = $y - $gap + $M.CardBottom + $M.Gap
 }
 
-# The icon on a Home card: by what the card shows
-function Info-IconKey {
+# The tags of a Home card (build 126): the maker in its colour first, then the facts of the line that was under the name ("8 cores / 16 threads",
+# "Build 26100.4946, 64-bit"), one tag each. @{ T; C (the theme colour of a maker); Brand }
+function Info-HeadTags {
     param($e)
-    if ($e.Icon) { return [string]$e.Icon }
-    $k = [string]$e.Key
-    if ($k -eq 'info:os') { return 'Windows' }
-    if ($k -eq 'info:cpu') { return 'Processor' }
-    if ($k -eq 'info:timer') { return 'Timer and clock' }
-    if ($k -eq 'info:sec') { return 'Security' }
-    if ($k -eq 'info:gpu') { return 'Graphics card' }
-    if ($k -eq 'info:ram') { return 'Memory' }
-    if ($k -eq 'info:storage') { return 'Storage' }
-    if ($k -eq 'info:mouse') { return 'Mouse' }
-    if ($k -eq 'info:board') { return 'Motherboard' }
-    if ($k -eq 'info:sensors') { return 'Sensors' }
-    if ($k.StartsWith('info:disp') -or $k -eq 'info:ratenote') { return 'Display' }
-    return '_'
+    $out = @()
+    if ($e.Badge -and [string]$e.Badge.T) { $out += , @{ T = [string]$e.Badge.T; C = [string]$e.Badge.C; Brand = $true; X = 0; W = 0 } }
+    if ($e.Sub2) {
+        foreach ($p in @(([string]$e.Sub2) -split ', | / ')) {
+            $t = ([string]$p).Trim()
+            if ($t) { $out += , @{ T = $t; C = ''; Brand = $false; X = 0; W = 0 } }
+        }
+    }
+    return $out
+}
+# What the label on the top line of a Home card says, and its name (build 126)
+function Info-HeadLabel {
+    param($e)
+    $caps = [string]$e.Caps
+    if (-not $caps) { $caps = [string]$e.Title }
+    return $caps.ToLowerInvariant()
+}
+function Info-HeadName {
+    param($e)
+    if ([string]$e.Sub) { return [string]$e.Sub }
+    return (Get-TitleCase ([string]$e.Title))
 }
 
 # The dot after a value: green for good, orange and red for a warning; in a section a value that is missing has a grey one. $null = no dot.
@@ -16473,67 +16505,32 @@ function Ui-PaintInfo {
     $grid = ([string]$e.Look -eq 'grid')
     $hotId = ''
     if ($script:HotEntry -and [string]$script:HotEntry.Key -eq [string]$e.Key) { $hotId = [string]$script:HotLine }
-    $caps = [string]$e.Caps
-    if (-not $caps) { $caps = [string]$e.Title }
-    # --- the head. At its right: the chip, or the link
+    # --- the head (build 126, as on a setting card): the label and the status chip on the top line, the name, the tags
     $right = $ix + $iw
-    $midY = $y + (Px 38)
-    if ($grid) { $midY = $y + (Px 21) }
+    $topY = $y + [int]$e.IdY
     if ($e.Chip) {
         $font = Ui-Font 'smallb'
         $chipW = (Ui-Measure $g ([string]$e.Chip) $font) + (Px 22)
         $cx = $right - $chipW
+        $cy = $topY + [int](($M.IdH - (Px 22)) / 2)
         $key = [string]$e.ChipKey
-        Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx ($midY - (Px 11)) $chipW (Px 22) (Px 6)
-        Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx ($midY - (Px 11)) $chipW (Px 22) $TF.C
+        Ui-FillRound $g $Th[(Ui-SoftKey $key)] $cx $cy $chipW (Px 22) (Px 6)
+        Ui-Text $g ([string]$e.Chip) $font $Th[$key] $cx $cy $chipW (Px 22) $TF.C
         $right = $cx - (Px 10)
     }
-    if ($e.LinkRect) {
-        $r = $e.LinkRect
-        $lc = $Th.AccentText
-        if ($hotId -eq '#link') { $lc = $Th.Text }
-        $lx = $x + [int]$r.X
-        $lyy = $y + [int]$r.Y
-        Ui-PaintIcon $g 'copy' ($lx + (Px 4)) ($lyy + (Px 4)) (Px 14) $lc
-        Ui-Text $g ([string]$e.Link).ToUpperInvariant() (Ui-Font 'smallb') $lc ($lx + (Px 24)) $lyy ([int]$r.W - (Px 24)) ([int]$r.H) $TF.L
-        $right = $lx - (Px 10)
-    }
-    if ($grid) {
-        # a section: its title in small capitals, what it sums up at the right in the quiet colour
-        $capW = (Ui-Measure $g $caps.ToUpperInvariant() (Ui-Font 'cap')) + (Px 8)
-        Ui-Text $g $caps.ToUpperInvariant() (Ui-Font 'cap') $Th.Sub $ix ($midY - (Px 8)) $capW (Px 16) $TF.L
-        if ($e.Sub) {
-            $sx = $ix + $capW + (Px 16)
-            if ($right -gt $sx) { Ui-Text $g ([string]$e.Sub) (Ui-Font 'small') $Th.Mute $sx ($midY - (Px 8)) ($right - $sx) (Px 16) $TF.R }
-        }
-    } else {
-        # the box: a maker's name on its colour, or the card's icon on a tile
-        $bw = [int]$e.BoxW
-        if ($bw -le 0) { $bw = Px 64 }
-        $by = $y + (Px 18)
-        $bh = Px 40
-        if ($e.Badge) {
-            $bc = $Th[[string]$e.Badge.C]
+    Ui-Text $g (Info-HeadLabel $e) (Ui-Font 'cardId') $Th.Dim $ix $topY ([Math]::Max(0, $right - $ix)) $M.IdH $TF.L
+    Ui-Text $g (Info-HeadName $e) (Ui-Font 'cardTitle') $Th.Text $ix ($y + [int]$e.TitleY) $iw $M.TitleH $TF.L
+    foreach ($p in @($e.HeadTags)) {
+        $tx = $ix + [int]$p.X
+        $ty = $y + [int]$e.TagY
+        if ($p.Brand) {
+            $bc = $Th[[string]$p.C]
             if (-not $bc) { $bc = $Th.Tile }
-            Ui-FillRound $g $bc $ix $by $bw $bh (Px 6)
-            Ui-Text $g ([string]$e.Badge.T) (Ui-Font 'badge') $Th.BrandText $ix $by $bw $bh $TF.C
+            Ui-FillRound $g $bc $tx $ty ([int]$p.W) $M.TagH (Px 6)
+            Ui-Text $g ([string]$p.T) (Ui-Font 'btn') $Th.BrandText $tx $ty ([int]$p.W) $M.TagH $TF.C
         } else {
-            Ui-FillRound $g $Th.Tile $ix $by $bw $bh (Px 6)
-            $isz = Px 22
-            Ui-PaintIcon $g (Info-IconKey $e) ($ix + [int](($bw - $isz) / 2)) ($by + [int](($bh - $isz) / 2)) $isz $Th.Mute
-        }
-        $tx0 = $ix + $bw + (Px 14)
-        $tw = [Math]::Max(0, $right - $tx0)
-        $nameW = [Math]::Max(0, $ix + $iw - $tx0)
-        if ($e.Sub) {
-            Ui-Text $g $caps.ToUpperInvariant() (Ui-Font 'cap') $Th.Sub $tx0 ($y + (Px 16)) $tw (Px 14) $TF.L
-            # the name may run under the chip's height only when there is no link (the chip sits higher than the name)
-            $nw = $tw
-            if (-not $e.LinkRect) { $nw = $nameW }
-            Ui-Text $g ([string]$e.Sub) (Ui-Font 'cardName') $Th.Text $tx0 ($y + (Px 30)) $nw (Px 22) $TF.L
-            if ($e.Sub2) { Ui-Text $g ([string]$e.Sub2) (Ui-Font 'small') $Th.Mute $tx0 ($y + (Px 52)) $nameW (Px 16) $TF.L }
-        } else {
-            Ui-Text $g (Get-TitleCase ([string]$e.Title)) (Ui-Font 'cardName') $Th.Text $tx0 $by $tw $bh $TF.L
+            Ui-FillRound $g $Th.Tag $tx $ty ([int]$p.W) $M.TagH (Px 6)
+            Ui-Text $g ([string]$p.T) (Ui-Font 'tag') $Th.TagText $tx $ty ([int]$p.W) $M.TagH $TF.C
         }
     }
     # --- the meter: its label at the left, the percentage big at the right, the bar under them
@@ -16748,13 +16745,6 @@ function Info-HitLine {
     }
     return $null
 }
-# $true when (rx, ry) inside the card is on its link ("Copy system info")
-function Info-HitLink {
-    param($e, [int]$rx, [int]$ry)
-    if (-not $e -or -not $e.LinkRect) { return $false }
-    $r = $e.LinkRect
-    return ($rx -ge [int]$r.X -and $rx -lt ([int]$r.X + [int]$r.W) -and $ry -ge [int]$r.Y -and $ry -lt ([int]$r.Y + [int]$r.H))
-}
 # Open or close the explanation of a line, and keep it in view when it opens
 function Ui-ToggleInfoLine {
     param($e, [string]$Id)
@@ -16778,7 +16768,8 @@ function Ui-ToggleInfoLine {
 }
 
 # ----------------------------------------------------------- copy system info (Home) ----
-# Every card of Home as plain text, line by line as the cards have it ("Copy system info" on the Windows card). It reads nothing new:
+# Every card of Home as plain text, line by line as the cards have it ("Copy system info" in the header of Home, build 126; it was on the
+# Windows card before). It reads nothing new:
 # it is what the background reader has already given the cards. The clipboard is the only thing it writes.
 function Info-CopyText {
     $out = New-Object System.Collections.ArrayList
