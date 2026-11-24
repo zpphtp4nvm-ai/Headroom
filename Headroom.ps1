@@ -31,7 +31,7 @@
 
     Where things are kept:
       undo record   %ProgramData%\Win11GamingDebloat\undo-record.xml
-      log           debloat-log.txt on the Desktop (or in %TEMP% if there is no Desktop)
+      log           debloat-log.txt on the Desktop (or in %TEMP% if there is no Desktop), written only while changes are made
 
 .NOTES
     Needs an administrator PowerShell, or double-click Start-Headroom.bat, which asks Windows for permission and opens the window.
@@ -111,8 +111,9 @@ try {
 function Say {
     param($msg, [string]$color = 'Gray')
     $text = ([string]$msg).TrimEnd()
-    # the check of the PC only reads: while it runs nothing is written, not even to the log file (the lines still show on screen)
-    if ($log -and -not $script:ScanMode) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    # the check of the PC only reads: while it runs nothing is written, not even to the log file (the lines still show on screen).
+    # Build 128: the same for Preview only (-DryRun), which changes nothing, so it does not create or add to the log file either.
+    if ($log -and -not $script:ScanMode -and -not $DryRun) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
     if ($null -ne $Q) {
         $Q.Enqueue([pscustomobject]@{ Kind = 'log'; Id = ''; State = ''; Detail = ''; Text = $text; Color = $color; A = 0; B = 0 })
     } else {
@@ -1440,9 +1441,11 @@ function pRegPrev { param($Path, $Name, $Value, [string]$Type = 'DWord', $Defaul
 function pRegDyn { param([scriptblock]$Gen, [string]$Info) @{ T = 'regdyn'; Gen = $Gen; Info = $Info } }
 # A value an earlier build of Headroom wrote that the setting no longer uses (build 122: the Group Policy values that settings with a switch
 # in Windows Settings used to write; Settings shows such a switch as "managed by your organization"). Apply removes it, or writes $Reset
-# when given, but only while it still has a value Headroom wrote ($Was, one value or a list; $null = any value). Undo leaves it alone.
-# It never makes a setting read as "not applied" on a PC that does not have it: it only counts while the old value is still there.
-function pRegOld { param($Path, $Name, $Was = $null, $Reset = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $null; Default = $null; Type = $Type; Old = $true; Was = $Was; Reset = $Reset } }
+# when given, but only while it still has a value Headroom wrote ($Was, one value or a list; $null = any value). Undo cleans it up the same
+# way (build 123). It never makes a setting read as "not applied" on a PC that does not have it: it only counts while the old value is still there.
+# $Why (build 128): for a value no Headroom build wrote, but that Settings also removes (Feedback frequency's PeriodInNanoSeconds), the reason
+# that the reading and the details show in place of "an earlier Headroom build wrote it".
+function pRegOld { param($Path, $Name, $Was = $null, $Reset = $null, [string]$Type = 'DWord', [string]$Why = '') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $null; Default = $null; Type = $Type; Old = $true; Was = $Was; Reset = $Reset; Why = $Why } }
 # whether an old value is still there with a value Headroom wrote
 function Old-Left {
     param($p, $c)
@@ -1718,7 +1721,8 @@ function Get-PartState {
                 if (-not (Old-Left $p $c)) { $script:Now = ''; $script:NowAt = ''; $script:NowIs = ''; $script:NowWant = ''; return 'Skip' }
                 $script:NowWant = 'removed'
                 if ($null -ne $p.Reset) { $script:NowWant = Now-RegText @{ Exists = $true; Value = $p.Reset; Kind = [string]$p.Type } }
-                $script:Now = ('{0}: {1}, wanted {2} (an earlier Headroom build wrote it)' -f $script:NowAt, $script:NowIs, $script:NowWant)
+                $why = 'an earlier Headroom build wrote it'; if ([string]$p.Why) { $why = [string]$p.Why }
+                $script:Now = ('{0}: {1}, wanted {2} ({3})' -f $script:NowAt, $script:NowIs, $script:NowWant, $why)
                 return 'Off'
             }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
@@ -2282,7 +2286,8 @@ function Describe-Tweak {
                 if ($p.Old) {
                     $was = 'any value'; if ($null -ne $p.Was) { $was = (@($p.Was) | ForEach-Object { [string]$_ }) -join ' or ' }
                     $to = 'removed'; if ($null -ne $p.Reset) { $to = 'set to ' + [string]$p.Reset }
-                    $lines += ("{0}\{1}: {2} while it has {3}, which an earlier Headroom build set    (undo: the same; it is never put back)" -f $p.Path, $p.Name, $to, $was)
+                    $why = ', which an earlier Headroom build set'; if ([string]$p.Why) { $why = ' (' + [string]$p.Why + ')' }
+                    $lines += ("{0}\{1}: {2} while it has {3}{4}    (undo: the same; it is never put back)" -f $p.Path, $p.Name, $to, $was, $why)
                     continue
                 }
                 $d = 'delete'; if ($null -ne $p.Default) { $d = [string]$p.Default }; if ($p.Prev) { $d = 'the value this PC had before Headroom changed it, or deleted when there was none'; if ($null -ne $p.Default) { $d = ('the value this PC had before Headroom changed it, or {0} when there was none' -f [string]$p.Default) } }; if ($p.HasBack) { $rd = $d; if ($rd -eq 'delete') { $rd = 'deleted' }; $d = ('{0}, what Windows Settings writes when you switch it there; Reset all: {1}, the Windows default' -f [string]$p.Back, $rd) }; $sf = ''; if ($p.Soft) { $sf = '    [tried; some Windows 11 builds protect this one]' }; $lines += ("{0}\{1} = {2}    (undo: {3}){4}" -f $p.Path, $p.Name, $p.Value, $d, $sf) }
@@ -2593,7 +2598,7 @@ function Invoke-Plan {
     $col = 'Green'; if ($bad) { $col = 'Yellow' }
     Say "`n$tail" $col
     if ($reboot.Count -and -not $DryRun) { Say ('Restart the PC for these to fully apply: ' + ((($reboot | Select-Object -Unique)) -join ', ')) 'Yellow' }
-    Say "Log: $log" 'DarkGray'
+    if (-not $DryRun) { Say "Log: $log" 'DarkGray' }      # (a preview writes no log file, build 128)
     Emit 'finished' '' '' $tail ((($reboot | Select-Object -Unique)) -join ', ') $col $good $bad
     return [pscustomobject]@{ Good = $good; Bad = $bad }
 }
@@ -5644,8 +5649,9 @@ Add-Tweak -Id 'feedback' -Cat $cPriv -Inv -Def 'On' -Preset -Name 'Feedback pop-
     -Desc 'On: Windows asks you for feedback now and then. Off: "Feedback frequency" in Settings > Privacy and security > Diagnostics & feedback is set to Never, so Windows no longer asks you for feedback. Off also sets the "Do not show feedback notifications" Group Policy (DoNotShowFeedbackNotifications = 1), so "Feedback frequency" in Settings shows as managed by your organization. Switching it back on, and Reset all, remove it again.' `
     -Parts @(
         pReg 'HKCU:\Software\Microsoft\Siuf\Rules' 'NumberOfSIUFInPeriod' 0
-        # "Never" in Settings also removes the period that "Once a day" / "Once a week" / "Always" set
-        pRegOld 'HKCU:\Software\Microsoft\Siuf\Rules' 'PeriodInNanoSeconds' $null $null 'QWord'
+        # "Never" in Settings also removes the period that "Once a day" / "Once a week" / "Always" set (no Headroom build ever wrote it;
+        # build 128: the reading and the details say why it is removed instead of "an earlier Headroom build wrote it")
+        pRegOld 'HKCU:\Software\Microsoft\Siuf\Rules' 'PeriodInNanoSeconds' $null $null 'QWord' 'Settings removes it when "Feedback frequency" is set to Never'
         # (build 126: was the "reg-feedback" box, "Disable in registry")
         pLock (pReg "$pol\DataCollection" 'DoNotShowFeedbackNotifications' 1)
     )
@@ -6923,7 +6929,7 @@ Add-Tweak -Id 'nav-gallery' -Cat $cExplorer -Inv -Def 'On' -Preset -Explorer -Na
 
 $cdm = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\ContentDeliveryManager'
 Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Tips and suggestions from Windows' `
-    -Desc 'On: Windows shows tips and suggestions on the lock screen, in Start and in Settings, the welcome experience after updates, ways to finish setting up the PC, account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders (the Windows default). Off: the switches for all of those are off, the same as in Settings (Personalization > Lock screen and Start, System > Notifications, Privacy and security > General, Bluetooth & devices > Mobile devices), and so is "Show sync provider notifications" in File Explorer''s options. Off also sets the content-delivery values that have no switch in Settings to 0, so Windows does not install sponsored and suggested apps by itself or deliver promoted content (content delivery, pre-installed, OEM and silently installed apps, the soft-landing tips, subscribed content, and the Start and timeline suggestions of older builds), and sets the "Allow Online Tips" Group Policy to off (AllowOnlineTips = 0), so the Settings app does not fetch online tips. On Enterprise and Education the consumer-features and "Do not show Windows tips" policies are set too; other editions ignore them, so they are left out there. Switching it back on, and Reset all, put all of that back as Windows has it. The Spotlight policy that earlier builds wrote is removed, because it also turned off Windows Spotlight pictures.' `
+    -Desc 'On: Windows shows tips and suggestions on the lock screen, in Start and in Settings, the welcome experience after updates, ways to finish setting up the PC, account notifications in Start and Settings, Phone Link suggestions, "Suggested" pop-ups and Windows Backup reminders (the Windows default). Off: the switches for all of those are off, the same as in Settings (Personalization > Lock screen and Start, System > Notifications, Privacy and security > General, Bluetooth & devices > Mobile devices), and so is "Show sync provider notifications" in File Explorer''s options. Off also sets the content-delivery values that have no switch in Settings to 0, so Windows does not install sponsored and suggested apps by itself or deliver promoted content (pre-installed, OEM and silently installed apps, the soft-landing tips, subscribed content, and the Start and timeline suggestions of older builds), and sets the "Allow Online Tips" Group Policy to off (AllowOnlineTips = 0), so the Settings app does not fetch online tips. On Enterprise and Education the consumer-features and "Do not show Windows tips" policies are set too; other editions ignore them, so they are left out there. Switching it back on, and Reset all, put all of that back as Windows has it. The Spotlight policy that earlier builds wrote is removed, and the content delivery switch they set to 0 (ContentDeliveryAllowed) is set back to 1, because both also turned off Windows Spotlight pictures.' `
     -Parts @(
         pReg $cdm 'SubscribedContent-310093Enabled' 0 1
         pReg $cdm 'SubscribedContent-338387Enabled' 0 1
@@ -6944,7 +6950,10 @@ Add-Tweak -Id 'suggestions' -Cat $cLook -Inv -Def 'On' -Preset -Name 'Tips and s
         pRegOld 'HKCU:\Software\Policies\Microsoft\Windows\CloudContent' 'DisableWindowsSpotlightFeatures' 1
         # (build 126: was the "reg-suggestions" box, "Disable in registry")
         pLock (pEd 'Ent' (pReg "$pol\CloudContent" 'DisableWindowsConsumerFeatures' 1))
-        pLock (pReg $cdm 'ContentDeliveryAllowed' 0 1)
+        # build 128: ContentDeliveryAllowed = 0 (written by earlier builds) also switches Windows Spotlight pictures off (Winaero:
+        # "ContentDeliveryAllowed = 0 will disable Spotlight"), which this setting says it does not do; the values below already stop the
+        # promoted content. Where an earlier build left 0 it is put back to 1, the Windows default
+        pRegOld $cdm 'ContentDeliveryAllowed' 0 1
         pLock (pReg $cdm 'OemPreInstalledAppsEnabled' 0 1)
         pLock (pReg $cdm 'PreInstalledAppsEnabled' 0 1)
         pLock (pReg $cdm 'PreInstalledAppsEverEnabled' 0 1)
@@ -8925,6 +8934,7 @@ $script:Rows = [ordered]@{}     # setting id -> row
 $script:Cats = @()              # category names, in catalog order
 $script:Scanning = $false       # the check of the PC is running
 $script:Applying = $false       # changes are being made
+$script:RunDry = $false         # the run that $script:Applying stands for is a Preview only (build 128: Ui-Note then writes no log file)
 $script:Building = $false       # the list is being filled in; ignore tick events
 # One page of the side menu is not a list of settings but a read-out (an "info page"): the Home page the app opens to. It takes the
 # place of a category name in $script:NavCat.
@@ -11541,10 +11551,11 @@ function Ui-FlushLog {
     $b.ScrollToCaret()
 }
 
-# A line from the window itself: into the log box and into the log file
+# A line from the window itself: into the log box, and into the log file while changes are being made (build 128: only then, so opening
+# the window, the check, a Preview and an error while nothing is being changed write no file; the line still shows in the log box)
 function Ui-Note {
     param([string]$text, [string]$color = 'Gray', [switch]$NoFile)
-    if ($log -and -not $NoFile) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
+    if ($log -and -not $NoFile -and $script:Applying -and -not $script:RunDry) { try { Add-Content -LiteralPath $log -Encoding UTF8 -Value $text } catch { } }
     Ui-Log $text $color
 }
 
@@ -14002,6 +14013,7 @@ function Ui-DoApply {
     }
     foreach ($p in $plan) { $r = $script:Rows[[string]$p.Id]; $r.Note = 'Waiting...'; $r.NoteDetail = '' }
     $script:Applying = $true
+    $script:RunDry = $dry
     Ui-ShowLog $true
     Ui-RefreshAll
     Ui-Progress 0 1
@@ -14033,6 +14045,7 @@ function Ui-MakeActive {
     $dry = [bool]$script:UI.dry.Checked
     $row.Note = 'Working...'; $row.NoteDetail = ''
     $script:Applying = $true
+    $script:RunDry = $dry
     Ui-ShowLog $true
     Ui-RefreshAll
     Ui-Progress 0 1
@@ -14071,6 +14084,7 @@ function Ui-Reinstall {
     }
     $row.Note = 'Working...'; $row.NoteDetail = ''
     $script:Applying = $true
+    $script:RunDry = $dry
     Ui-ShowLog $true
     Ui-RefreshAll
     Ui-Progress 0 1
@@ -14219,9 +14233,10 @@ function Finish-Job {
         Ui-ScanFinished
     }
     if ($j.Kind -eq 'apply' -and $script:Applying) {
-        $script:Applying = $false
+        # (the note first, while the run still counts as running, so a real run's log file gets it; build 128)
         if ($j.Stopping) { Ui-Note 'Stopped. Checking what state everything is in now...' 'Yellow' }
         else { Ui-Note ('The run ended unexpectedly: ' + $err) 'Red' }
+        $script:Applying = $false
         Ui-StartScan
     }
 }
@@ -14276,7 +14291,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '127'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '128'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {

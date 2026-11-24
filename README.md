@@ -123,6 +123,7 @@ A few settings are handled differently:
 
 - Settings that add or remove Windows components (optional features and capabilities, such as SMB1) use the record of what was installed when Headroom first changed them, because Windows has no single default for those. The same record is used for firewall rules if Windows' own list of default rules cannot be read.
 - Some defaults depend on the PC (for example hardware GPU scheduling, Memory Integrity and BitLocker). Those cards say "Depends on the PC" instead of On or Off. Where Windows keeps no value until a switch is first changed, the card goes by what Windows actually does (build 127): hardware-accelerated GPU scheduling asks the graphics driver whether it is on, the same place Settings gets it from, so a card whose driver has it on by default shows on; Memory Integrity asks Windows' own security report, so a PC where it was never switched on shows it off, as Windows Security does; Storage Sense with no value shows off, because Windows keeps it off until disk space runs low or you turn it on. Reset all leaves such a card alone, because that already is the Windows default. The Widgets and Chat card no longer reads "partly applied" because of the Chat value, which Windows 11 23H2 and later do not use.
+- Tips and suggestions from Windows (build 128) no longer sets ContentDeliveryAllowed to 0, because that also stops Windows Spotlight pictures on the lock screen; the other content-delivery values still stop the promoted content and silently installed apps. Where an earlier build left it at 0, applying or undoing the card sets it back to 1, the Windows default.
 - Settings that remove apps cannot be undone from Headroom.
 - The five keyboard shortcut settings (Sticky Keys, Filter Keys, Toggle Keys, Mouse Keys and High Contrast) do what turning the shortcut off in Settings does: only the shortcut's bit is taken out of the value your account has, and the feature and its other options stay as they are. From Windows' defaults that gives 506, 122, 58, 58 and 122. Switching one back on puts only that bit back. Headroom only writes that registry value and does nothing else, so the change works from your next sign-in.
 - The App permissions settings on the Privacy page (personal info, files, radios and other devices, passkeys) and on the AI features page (text and image generation) set the switches under Settings > Privacy and security > App permissions to Deny for every app, and switching them back on sets them to Allow, the Windows default. Camera and microphone are never touched. Normal desktop programs don't use these permissions; Store apps such as Mail, Calendar, Photos and Phone Link do.
@@ -143,7 +144,7 @@ A few settings are handled differently:
 | What | Where |
 | --- | --- |
 | Undo record | `%ProgramData%\Win11GamingDebloat\undo-record.xml` |
-| Log | `debloat-log.txt` on the Desktop (or in `%TEMP%` if there is no Desktop). Applying and undoing write to it; the check of the PC does not. |
+| Log | `debloat-log.txt` on the Desktop (or in `%TEMP%` if there is no Desktop). Applying and undoing write to it; opening the app, the check of the PC and Preview only do not. |
 
 ## Hardware readings
 
