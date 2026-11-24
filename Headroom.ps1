@@ -125,7 +125,7 @@ function Emit {
     # Mine:   'yes' = this app has an undo record for the setting (it changed it), 'no' = it was already like this, '' = not known / not applied
     # Diff:   the values that are not the way the setting sets them, one line each (see Get-DiffLine); '' when the setting is applied
     # Vals:   every value of the setting, one line each: kind, where, now, what the setting sets, and the part's state (build 126: "</>")
-    # AtDef:  the setting reads applied only because nothing is set and the graphics driver has it on (build 127, pMissing: HAGS)
+    # AtDef:  the setting reads applied only because nothing is set and Windows already has it so (build 127, pMissing: HAGS, Memory Integrity)
     param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '', [string]$Vals = '', [bool]$AtDef = $false)
     if ($null -eq $Q) { return }
     $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff; Vals = $Vals; AtDef = $AtDef })
@@ -1383,6 +1383,19 @@ public static class HrGpuSched {
 }
 "@
 }
+# Memory Integrity while its value (Scenarios\HypervisorEnforcedCodeIntegrity\Enabled) is missing (build 127, the HAGS check, Tyler:
+# "Recheck the entire script again for any issues such as the issue we had with HAGS"). On a PC where Memory Integrity was never switched on
+# the value is often not there at all, and Windows Security shows it off; the card read that as on. Asks Windows' own report
+# (Win32_DeviceGuard, read only): 2 in SecurityServicesRunning = Memory Integrity is running. Returns @{ On; Text } with On = the card's
+# value counts as applied (Memory Integrity is off), or $null when Windows could not be asked (the value alone decides, as before).
+function Get-HvciWindows {
+    $d = $null
+    try { $d = @(Get-CimInstance -Namespace 'root\Microsoft\Windows\DeviceGuard' -ClassName Win32_DeviceGuard -ErrorAction Stop)[0] } catch { return $null }
+    if (-not $d) { return $null }
+    $run = @(@($d.SecurityServicesRunning) | Where-Object { $null -ne $_ } | ForEach-Object { [int]$_ })
+    if ($run -contains 2) { return @{ On = $false; Text = 'not set; Windows reports Memory Integrity running' } }
+    return @{ On = $true; Text = 'not set; Windows reports Memory Integrity not running (off)' }
+}
 # What hardware-accelerated GPU scheduling is while HwSchMode has no value (build 127, Tyler: "HAGS shows it's off in the app even though
 # it's on in settings"). With no value Windows leaves it to the graphics driver, and many newer cards have it on then. Returns @{ On; Text }
 # for the reading, or $null when the driver could not be asked (the card then goes by the registry value alone, as before).
@@ -1494,10 +1507,11 @@ function pBack   { param($Value, $Part, [switch]$NoneApplied) $Part['Back'] = $V
 # written yet only means Apply all, Tweak all and the presets still write it (Test-Unwritten); while the switch values are not applied,
 # a value of this kind that is still set makes the card "partly applied" (the policy still holds the feature off).
 function pLock   { param($Part) $Part['Lock'] = $true; return $Part }
-# pMissing 'Function' (pReg ...): a registry value whose absence leaves the feature to the graphics driver (build 127: HAGS). While the value
-# is missing, the named function says what the driver does (@{ On; Text }), and that decides whether the setting reads applied; when the
-# driver cannot be asked ($null) the value alone decides, as for any other value. The card then reads applied "at its default" (AtDef):
-# Reset all leaves it alone, and a Reset that ends there counts as done.
+# pMissing 'Function' (pReg ...): a registry value whose absence leaves the feature to Windows or the driver (build 127: HAGS, Memory
+# Integrity). While the value is missing, the named function asks Windows what it does and returns @{ On; Text }: On = the value counts as
+# applied (HAGS: the driver has it on; Memory Integrity: it is not running), Text = the reading. When Windows cannot be asked ($null) the
+# value alone decides, as for any other value. A card that reads applied only this way is applied "at its default" (AtDef): Reset all
+# leaves it alone, and a Reset that ends there counts as done.
 function pMissing { param([string]$Fn, $Part) $Part['Missing'] = $Fn; return $Part }
 
 function Add-Tweak {
@@ -1602,8 +1616,8 @@ function Add-Tweak {
     }
     foreach ($p in @($t.Parts)) {
         if (-not $p.Missing) { continue }
-        # (build 127) a value whose absence leaves it to the driver: a plain registry value of a switch that is on while it is applied
-        if ([string]$p.T -ne 'reg' -or $p.Old -or $p.Lock -or $p.NoneApplied -or $Inv -or $Once -or $OneWay -or $Choices.Count -gt 0) { throw "setting ${Id}: pMissing is for a plain registry value of an on/off switch that is on while it is applied" }
+        # (build 127) a value whose absence leaves it to Windows or the driver: a plain registry value of an on/off switch
+        if ([string]$p.T -ne 'reg' -or $p.Old -or $p.Lock -or $p.NoneApplied -or $Once -or $OneWay -or $Choices.Count -gt 0) { throw "setting ${Id}: pMissing is for a plain registry value of an on/off switch" }
     }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
@@ -1690,7 +1704,7 @@ function Get-PartState {
     param($p)
     $script:Now = ''
     $script:NowAt = ''; $script:NowIs = ''; $script:NowWant = ''
-    $script:PartAtDef = $false          # (build 127) this value reads applied only because it is missing and the driver has it on
+    $script:PartAtDef = $false          # (build 127) this value reads applied only because it is missing and Windows already has it so
     switch ($p.T) {
         'reg' {
             $c = Reg-Read $p.Path $p.Name
@@ -1708,7 +1722,8 @@ function Get-PartState {
                 return 'Off'
             }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
-            # build 127: a value whose absence leaves it to the graphics driver (pMissing, HAGS): with no value, what the driver does decides
+            # build 127: a value whose absence leaves it to Windows or the driver (pMissing: HAGS, Memory Integrity): with no value, what
+            # Windows reports decides
             if ($p.Missing -and -not $c.Exists) {
                 $m = $null
                 try { $m = & ([string]$p.Missing) } catch { $m = $null }
@@ -1912,7 +1927,7 @@ function Get-PartsState {
     param($t)
     $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
     $lOn = 0; $lOff = 0; $lOnI = 0                  # the values that go with the switch (pLock, build 126), counted on their own
-    $defOn = 0                                       # values that read applied only because the driver has it on (pMissing, build 127)
+    $defOn = 0                                       # values that read applied only because Windows already has it so (pMissing, build 127)
     $reads = New-Object System.Collections.ArrayList
     $diff = New-Object System.Collections.ArrayList
     $vals = New-Object System.Collections.ArrayList          # every value as it is now and what the setting sets (build 126: the "</>" button)
@@ -1960,8 +1975,9 @@ function Get-PartsState {
     if ($off -eq 0)  {
         # the switch is applied; a value that goes with it and is not written yet is written by Apply all, Tweak all and the presets
         if ($lOff -gt 0) { $note = (' ({0} registry value{1} that go{2} with it not written yet; Apply all writes {3})' -f $lOff, $(if ($lOff -gt 1) { 's' } else { '' }), $(if ($lOff -gt 1) { '' } else { 'es' }), $(if ($lOff -gt 1) { 'them' } else { 'it' })) + $note }
-        # (build 127) on only because nothing is set and the graphics driver has it on: that is the Windows default for this PC
-        if ($defOn -gt 0 -and $defOn -eq $on -and $lOn + $lOff -eq 0) { return @{ State = 'On'; Read = $rd; Detail = 'On: nothing is set, the graphics driver has it on (the Windows default for this PC)' + $note; Vals = $vl; AtDef = $true } }
+        # (build 127) applied only because nothing is set and Windows already has it so: that is the Windows default for this PC. A value
+        # that goes with the switch (pLock) and is set keeps it an ordinary applied setting
+        if ($defOn -gt 0 -and $defOn -eq $on -and $lOn -eq 0) { return @{ State = 'On'; Read = $rd; Detail = 'Already so: nothing is set, and Windows has it this way on this PC (its default here)' + $note; Vals = $vl; AtDef = $true } }
         return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note; Vals = $vl }
     }
     if ($onI -eq 0 -and $lOnI -eq 0)  { return @{ State = 'Off'; Read = $rd; Diff = $df; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note; Vals = $vl } }
@@ -6330,7 +6346,8 @@ Add-Tweak -Id 'vbs' -Cat $cSec -Inv -Def 'Depends on the PC' -Reboot -Risk 'secu
     -Ask $acAsk -AskTitle $acTitle -AskGroup 'anticheat' `
     -Desc 'On: Memory Integrity (Windows Security > Device security > Core isolation) is left to Windows: new Windows 11 installs on capable hardware usually have it on. Off: it is off, the same as turning that switch off. That can give a few percent more FPS in some games, but it removes protection against kernel-level malware. Off also turns off Virtualization-Based Security and Credential Guard (EnableVirtualizationBasedSecurity = 0, LsaCfgFlags = 0; Windows Security has no switch for these). Anti-cheat warning: Riot Vanguard can ask for Memory Integrity and FACEIT requires Virtualization-Based Security, so leave this on if you play those games - you are asked about it before it is applied. Switching it back on puts back the value this PC had before Headroom changed it. It does not force Memory Integrity on the way the switch in Windows Security does: Windows Security first checks your drivers, and turning it on from the registry would skip that check, which can stop a PC with a driver that does not support it from starting. To turn it on yourself, use Windows Security > Device security > Core isolation. Switching it back on, and Reset all, put back the VBS and Credential Guard values this PC had before Headroom changed them; a value that was not there is removed again. Either way it needs a restart.' `
     -Parts @(
-        pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0
+        # build 127: with no value, what Windows reports decides (Get-HvciWindows): never switched on reads off, as in Windows Security
+        pMissing 'Get-HvciWindows' (pRegPrev "$dg\Scenarios\HypervisorEnforcedCodeIntegrity" 'Enabled' 0)
         # (build 126: was the "reg-vbs" box, "Disable in registry")
         # (build 124, Tyler: "Remove it": Memory Integrity's WasEnabledBy is no longer set to 0 here. Microsoft documents it as part of a
         # safety net that turns Memory Integrity off by itself when the PC fails to boot after it was turned on, not as a VBS switch. A 0
@@ -6719,10 +6736,11 @@ Add-Tweak -Id 'defender-core' -Cat $cPriv -Inv -Def 'On' -Preset -Risk 'note' -N
     )
 
 # ------------------------------------------------------- Storage and clean-up ---
-Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Depends on the PC' -Name 'Storage Sense' `
-    -Desc 'On: Storage Sense is on: it deletes temporary files and old Recycle Bin files on its own, and can be set up to clear your Downloads folder as well. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This is the Storage Sense switch in Settings > System > Storage, and it works the same way; only that one switch is written. Reset all removes the value, which is the Windows default: Windows then turns it on by itself when disk space runs low, and on many PCs it is off until then.' `
+Add-Tweak -Id 'storage-sense' -Cat $cStore -Inv -Def 'Off' -Name 'Storage Sense' `
+    -Desc 'On: Storage Sense is on: it deletes temporary files and old Recycle Bin files on its own, and can be set up to clear your Downloads folder as well. Off: Storage Sense is turned off, so Windows deletes nothing by itself: you decide when to clear space, for example with the two clean-up actions below. This is the Storage Sense switch in Settings > System > Storage, and it works the same way; only that one switch is written. Reset all removes the value, which is the Windows default: Storage Sense is off until you turn it on, or until Windows turns it on by itself when disk space runs low (it then writes the value). A PC where it was never switched on shows as off here too.' `
     -Parts @(
-        pBack 1 (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0)
+        # build 127: no value is off (Microsoft: Storage Sense is off by default until the disk runs low or you turn it on), as Settings shows it
+        pBack 1 (pReg 'HKCU:\Software\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy' '01' 0) -NoneApplied
     )
 
 Add-Tweak -Id 'disk-cleanup' -Cat $cStore -Once -Cleanup -Risk 'note' -Name 'Disk Cleanup (run once)' `
@@ -6769,7 +6787,9 @@ Add-Tweak -Id 'taskbar-clutter' -Cat $cLook -Inv -Def 'On' -Preset -Explorer -Na
     -Desc 'On: the Widgets and Chat / Teams buttons show on the taskbar (the Windows default). Off: both switches in Settings > Personalization > Taskbar are off, the same as in Settings. Windows protects the Widgets switch on newer Windows 11 builds and refuses a change from a script: so off also turns the Widgets feed off by Group Policy (AllowNewsAndInterests = 0): the Widgets button and board are gone even there, and Settings shows the Widgets switch as managed. It also sets the Chat icon policy to off (ChatIcon = 3; Chat is gone from Windows 11 23H2 and later, where it does nothing). Switching it back on, and Reset all, remove both policies.' `
     -Parts @(
         pRegSoft $adv 'TaskbarDa' 0 1
-        pReg $adv 'TaskbarMn' 0 1
+        # build 127: Chat is gone from Windows 11 23H2 and later, so TaskbarMn is usually not there: it is still written, but it never
+        # makes the card read partly applied (on a PC that has hidden Widgets in Settings the card read "partly applied" because of it)
+        pRegSoft $adv 'TaskbarMn' 0 1
         # (build 126: was the "reg-widgets" box, "Disable in registry")
         pLock (pReg 'HKLM:\SOFTWARE\Policies\Microsoft\Dsh' 'AllowNewsAndInterests' 0)
         # the "Configure the Chat icon on the taskbar" policy: 3 = off (1 shows the icon, 2 hides it but lets you change that)
@@ -9490,10 +9510,10 @@ function Set-RowState {
     $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
     $row.Diff = $diff          # the values that are not the way the setting sets them (see Get-DiffItems), '' when it is applied
     $row.Vals = $vals          # every value: kind, where, now, what the setting sets, state (build 126: the "</>" button; see Get-ValueItems)
-    $row.AtDef = $atDef        # (build 127) on only because nothing is set and the graphics driver has it on: the Windows default here
+    $row.AtDef = $atDef        # (build 127) applied only because nothing is set and Windows already has it so: the Windows default here
     $row.Force = ''
     if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row; $row.ToDefault = $false }
-    # (build 127) a Reset to the Windows default that ended with the driver's own default (on) leaves the switch where it now stands
+    # (build 127) a Reset to the Windows default that ended where Windows already has it leaves the switch where it now stands
     if ($atDef -and $state -eq 'On' -and [bool]$row.ToDefault) { $row.Want = $true; $row.ToDefault = $false }
 }
 
