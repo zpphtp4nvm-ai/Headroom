@@ -125,9 +125,10 @@ function Emit {
     # Mine:   'yes' = this app has an undo record for the setting (it changed it), 'no' = it was already like this, '' = not known / not applied
     # Diff:   the values that are not the way the setting sets them, one line each (see Get-DiffLine); '' when the setting is applied
     # Vals:   every value of the setting, one line each: kind, where, now, what the setting sets, and the part's state (build 126: "</>")
-    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '', [string]$Vals = '')
+    # AtDef:  the setting reads applied only because nothing is set and the graphics driver has it on (build 127, pMissing: HAGS)
+    param([string]$Kind, [string]$Id = '', [string]$State = '', [string]$Detail = '', [string]$Text = '', [string]$Color = 'Gray', [int]$A = 0, [int]$B = 0, [string]$Choice = '', [string]$Read = '', [string]$Mine = '', [string]$Diff = '', [string]$Vals = '', [bool]$AtDef = $false)
     if ($null -eq $Q) { return }
-    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff; Vals = $Vals })
+    $Q.Enqueue([pscustomobject]@{ Kind = $Kind; Id = $Id; State = $State; Detail = $Detail; Text = $Text; Color = $Color; A = $A; B = $B; Choice = $Choice; Read = $Read; Mine = $Mine; Diff = $Diff; Vals = $Vals; AtDef = $AtDef })
 }
 
 # --------------------------------------------------- the undo record (store) --
@@ -1312,6 +1313,105 @@ public static class Win32Ui {
 "@
 }
 
+# Hardware-accelerated GPU scheduling as the graphics driver reports it (build 127). Read only: it lists the graphics adapters
+# (D3DKMTEnumAdapters2) and asks each one for its WDDM 2.7 capabilities (D3DKMTQueryAdapterInfo, KMTQAITYPE_WDDM_2_7_CAPS = 70), where
+# Windows keeps three bits for this: 1 = the adapter supports it, 2 = it is on now, 4 = it is on by default. Every adapter handle that the
+# listing opened is closed again.
+function Ensure-GpuSched {
+    if ('HrGpuSched' -as [type]) { return }
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class HrGpuSched {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID { public uint LowPart; public int HighPart; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ADAPTERINFO { public uint hAdapter; public LUID AdapterLuid; public uint NumOfSources; public int bPrecisePresentRegionsPreferred; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct ENUMADAPTERS2 { public uint NumAdapters; public IntPtr pAdapters; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct QUERYADAPTERINFO { public uint hAdapter; public int Type; public IntPtr pPrivateDriverData; public uint PrivateDriverDataSize; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct CLOSEADAPTER { public uint hAdapter; }
+    [DllImport("gdi32.dll")]
+    private static extern int D3DKMTEnumAdapters2(ref ENUMADAPTERS2 p);
+    [DllImport("gdi32.dll")]
+    private static extern int D3DKMTQueryAdapterInfo(ref QUERYADAPTERINFO p);
+    [DllImport("gdi32.dll")]
+    private static extern int D3DKMTCloseAdapter(ref CLOSEADAPTER p);
+    // One value per adapter: its WDDM 2.7 capability bits, or -1 when it did not answer. null when the adapters could not be listed.
+    public static int[] Caps() {
+        ENUMADAPTERS2 e = new ENUMADAPTERS2();
+        e.NumAdapters = 0;
+        e.pAdapters = IntPtr.Zero;
+        if (D3DKMTEnumAdapters2(ref e) != 0) return null;
+        if (e.NumAdapters == 0) return new int[0];
+        if (e.NumAdapters > 64) return null;
+        int size = Marshal.SizeOf(typeof(ADAPTERINFO));
+        int count = (int)e.NumAdapters;
+        IntPtr list = Marshal.AllocHGlobal(size * count);
+        try {
+            e.pAdapters = list;
+            if (D3DKMTEnumAdapters2(ref e) != 0) return null;
+            int n = (int)e.NumAdapters;
+            if (n > count) n = count;
+            int[] r = new int[n];
+            for (int i = 0; i < n; i++) {
+                ADAPTERINFO a = (ADAPTERINFO)Marshal.PtrToStructure(new IntPtr(list.ToInt64() + (long)i * size), typeof(ADAPTERINFO));
+                r[i] = -1;
+                IntPtr buf = Marshal.AllocHGlobal(4);
+                try {
+                    Marshal.WriteInt32(buf, 0);
+                    QUERYADAPTERINFO q = new QUERYADAPTERINFO();
+                    q.hAdapter = a.hAdapter;
+                    q.Type = 70;
+                    q.pPrivateDriverData = buf;
+                    q.PrivateDriverDataSize = 4;
+                    if (D3DKMTQueryAdapterInfo(ref q) == 0) r[i] = Marshal.ReadInt32(buf);
+                } finally {
+                    Marshal.FreeHGlobal(buf);
+                    CLOSEADAPTER c = new CLOSEADAPTER();
+                    c.hAdapter = a.hAdapter;
+                    D3DKMTCloseAdapter(ref c);
+                }
+            }
+            return r;
+        } finally {
+            Marshal.FreeHGlobal(list);
+        }
+    }
+}
+"@
+}
+# What hardware-accelerated GPU scheduling is while HwSchMode has no value (build 127, Tyler: "HAGS shows it's off in the app even though
+# it's on in settings"). With no value Windows leaves it to the graphics driver, and many newer cards have it on then. Returns @{ On; Text }
+# for the reading, or $null when the driver could not be asked (the card then goes by the registry value alone, as before).
+function Get-HwSchDriver {
+    $caps = $null
+    try { Ensure-GpuSched; $caps = [HrGpuSched]::Caps() } catch { return $null }
+    if ($null -eq $caps) { return $null }
+    $ans = 0; $sup = 0; $on = 0; $def = 0
+    foreach ($v in @($caps)) {
+        $n = [int]$v
+        if ($n -lt 0) { continue }
+        $ans++
+        if (($n -band 1) -eq 0) { continue }
+        $sup++
+        if (($n -band 2) -ne 0) { $on++ }
+        if (($n -band 4) -ne 0) { $def++ }
+    }
+    if ($ans -eq 0) { return $null }
+    if ($sup -eq 0) { return @{ On = $false; Text = 'not set; the graphics card does not support it' } }
+    if ($on -gt 0) {
+        $tx = 'not set; the graphics driver has it on'
+        if ($def -gt 0) { $tx += ' (its default)' }
+        return @{ On = $true; Text = $tx }
+    }
+    $tx = 'not set; the graphics driver has it off'
+    if ($def -gt 0) { $tx += ' now (its default is on, from the next restart)' }
+    return @{ On = $false; Text = $tx }
+}
+
 # ------------------------------------------------------- catalog builders ----
 # A setting ("tweak") is made of parts. Each part knows how to be detected, applied and undone.
 function pReg    { param($Path, $Name, $Value, $Default = $null, [string]$Type = 'DWord') @{ T = 'reg'; Path = $Path; Name = $Name; Value = $Value; Default = $Default; Type = $Type } }
@@ -1394,6 +1494,11 @@ function pBack   { param($Value, $Part, [switch]$NoneApplied) $Part['Back'] = $V
 # written yet only means Apply all, Tweak all and the presets still write it (Test-Unwritten); while the switch values are not applied,
 # a value of this kind that is still set makes the card "partly applied" (the policy still holds the feature off).
 function pLock   { param($Part) $Part['Lock'] = $true; return $Part }
+# pMissing 'Function' (pReg ...): a registry value whose absence leaves the feature to the graphics driver (build 127: HAGS). While the value
+# is missing, the named function says what the driver does (@{ On; Text }), and that decides whether the setting reads applied; when the
+# driver cannot be asked ($null) the value alone decides, as for any other value. The card then reads applied "at its default" (AtDef):
+# Reset all leaves it alone, and a Reset that ends there counts as done.
+function pMissing { param([string]$Fn, $Part) $Part['Missing'] = $Fn; return $Part }
 
 function Add-Tweak {
     # -Ask: a question the window (and an interactive console) puts to the user before this is turned on; if the answer is no
@@ -1495,6 +1600,11 @@ function Add-Tweak {
         if ([string]$p.T -eq 'fw' -and [string]$p.Back -ne 'Enabled') { throw "setting ${Id}: a firewall group can only be switched back to Enabled" }
         if (@('reg', 'fw') -notcontains [string]$p.T) { throw "setting ${Id}: pBack is for a registry value or a firewall group" }
     }
+    foreach ($p in @($t.Parts)) {
+        if (-not $p.Missing) { continue }
+        # (build 127) a value whose absence leaves it to the driver: a plain registry value of a switch that is on while it is applied
+        if ([string]$p.T -ne 'reg' -or $p.Old -or $p.Lock -or $p.NoneApplied -or $Inv -or $Once -or $OneWay -or $Choices.Count -gt 0) { throw "setting ${Id}: pMissing is for a plain registry value of an on/off switch that is on while it is applied" }
+    }
     if ($At -ge 0 -and $At -le $script:Catalog.Count) { $script:Catalog.Insert($At, $t) } else { [void]$script:Catalog.Add($t) }
     $script:ById[$Id] = $t
 }
@@ -1580,6 +1690,7 @@ function Get-PartState {
     param($p)
     $script:Now = ''
     $script:NowAt = ''; $script:NowIs = ''; $script:NowWant = ''
+    $script:PartAtDef = $false          # (build 127) this value reads applied only because it is missing and the driver has it on
     switch ($p.T) {
         'reg' {
             $c = Reg-Read $p.Path $p.Name
@@ -1597,6 +1708,17 @@ function Get-PartState {
                 return 'Off'
             }
             if ($c.Exists -and $c.Kind -eq $p.Type -and (Reg-Equal $c.Value $p.Value $p.Type)) { return 'On' }
+            # build 127: a value whose absence leaves it to the graphics driver (pMissing, HAGS): with no value, what the driver does decides
+            if ($p.Missing -and -not $c.Exists) {
+                $m = $null
+                try { $m = & ([string]$p.Missing) } catch { $m = $null }
+                if ($m) {
+                    $script:NowIs = [string]$m.Text
+                    $script:Now = ('{0}: {1}; wanted {2}' -f $script:NowAt, $script:NowIs, $script:NowWant)
+                    if ($m.On) { $script:PartAtDef = $true; return 'On' }
+                    return 'Off'
+                }
+            }
             # build 126: a value that goes with the switch (pLock) and is not there yet: written with the switch, so say that, not "not set"
             if ($p.Lock -and -not $c.Exists) {
                 $script:NowIs = 'no value yet'
@@ -1790,12 +1912,14 @@ function Get-PartsState {
     param($t)
     $on = 0; $off = 0; $onI = 0; $na = 0; $why = @()
     $lOn = 0; $lOff = 0; $lOnI = 0                  # the values that go with the switch (pLock, build 126), counted on their own
+    $defOn = 0                                       # values that read applied only because the driver has it on (pMissing, build 127)
     $reads = New-Object System.Collections.ArrayList
     $diff = New-Object System.Collections.ArrayList
     $vals = New-Object System.Collections.ArrayList          # every value as it is now and what the setting sets (build 126: the "</>" button)
     foreach ($p in (Expand-Parts $t)) {
         $script:Why = ''
         $r = Get-PartState $p
+        if ($r -eq 'On' -and $script:PartAtDef -and -not $p.Lock) { $defOn++ }
         if ($script:Now) { [void]$reads.Add([string]$script:Now) }
         if ($r -eq 'Off' -or $r -eq 'Partial') { [void]$diff.Add((Get-DiffLine $p)) }
         if ($r -ne 'Skip' -and ($script:NowAt -or $script:Now)) { [void]$vals.Add((Get-DiffLine $p) + "`t" + $r) }
@@ -1836,6 +1960,8 @@ function Get-PartsState {
     if ($off -eq 0)  {
         # the switch is applied; a value that goes with it and is not written yet is written by Apply all, Tweak all and the presets
         if ($lOff -gt 0) { $note = (' ({0} registry value{1} that go{2} with it not written yet; Apply all writes {3})' -f $lOff, $(if ($lOff -gt 1) { 's' } else { '' }), $(if ($lOff -gt 1) { '' } else { 'es' }), $(if ($lOff -gt 1) { 'them' } else { 'it' })) + $note }
+        # (build 127) on only because nothing is set and the graphics driver has it on: that is the Windows default for this PC
+        if ($defOn -gt 0 -and $defOn -eq $on -and $lOn + $lOff -eq 0) { return @{ State = 'On'; Read = $rd; Detail = 'On: nothing is set, the graphics driver has it on (the Windows default for this PC)' + $note; Vals = $vl; AtDef = $true } }
         return @{ State = 'On';  Read = $rd; Detail = 'Applied' + $note; Vals = $vl }
     }
     if ($onI -eq 0 -and $lOnI -eq 0)  { return @{ State = 'Off'; Read = $rd; Diff = $df; Detail = $(if ($t.Once) { 'Ready to run' } else { 'Not applied' }) + $note; Vals = $vl } }
@@ -2280,7 +2406,7 @@ function Invoke-Scan {
             $i++
             $r = $null
             try { $r = Get-TweakState $t } catch { $r = @{ State = 'Unknown'; Detail = "Could not check: $($_.Exception.Message)" } }
-            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id) ([string]$r.Diff) ([string]$r.Vals)
+            Emit 'state' $t.Id $r.State $r.Detail '' 'Gray' $i $n ([string]$r.Choice) ([string]$r.Read) (Get-MineText $r.State $store $t.Id) ([string]$r.Diff) ([string]$r.Vals) ([bool]$r.AtDef)
             $moved = $clock.Elapsed.TotalSeconds
         }
         [void](Pre-Note)
@@ -2414,7 +2540,7 @@ function Invoke-Plan {
             if ($res) { Say ('  done: ' + $res) 'Green' } else { Say '  done' 'Green' }
             $good++
             Emit 'item' $t.Id 'done' $res '' 'Green' $i $total
-        } elseif ($after.State -eq 'NA' -or ($undo -and ($after.State -ne 'On' -or ([bool]$item.Default -and [bool]$t.DefApplied))) -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
+        } elseif ($after.State -eq 'NA' -or ($undo -and ($after.State -ne 'On' -or ([bool]$item.Default -and ([bool]$t.DefApplied -or [bool]$after.AtDef)))) -or (-not $undo -and $after.State -eq 'On' -and (-not $choiceKey -or [string]$after.Choice -eq $choiceKey))) {
             Say '  done' 'Green'; $good++
             if ($undo) { Remove-Snapshot $t.Id }
             if ($t.Reboot) { $reboot += $t.Name }
@@ -2425,13 +2551,13 @@ function Invoke-Plan {
             if ($t.Reboot) { $reboot += $t.Name }
             Emit 'item' $t.Id 'failed' ('Still shows as: ' + $after.Detail) '' 'Yellow' $i $total
         }
-        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id) ([string]$after.Diff) ([string]$after.Vals)
+        Emit 'state' $t.Id $after.State $after.Detail '' 'Gray' $i $total ([string]$after.Choice) ([string]$after.Read) (Get-MineText $after.State (Get-Store) $t.Id) ([string]$after.Diff) ([string]$after.Vals) ([bool]$after.AtDef)
         # a power plan was installed, deleted or made active: which plan is active may have changed, so every plan switch is read again
         if ($t.Plan) {
             foreach ($o in @($script:Catalog | Where-Object { $_.Plan -and $_.Id -ne $t.Id })) {
                 Clear-CacheFor $o
                 $oa = Get-TweakState $o
-                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id) ([string]$oa.Diff) ([string]$oa.Vals)
+                Emit 'state' $o.Id $oa.State $oa.Detail '' 'Gray' $i $total ([string]$oa.Choice) ([string]$oa.Read) (Get-MineText $oa.State (Get-Store) $o.Id) ([string]$oa.Diff) ([string]$oa.Vals) ([bool]$oa.AtDef)
             }
         }
     }
@@ -5994,9 +6120,10 @@ Add-Tweak -Id 'wpbt' -Cat $cGame -Inv -Def 'On' -Reboot -Risk 'note' -Name 'WPBT
     )
 
 Add-Tweak -Id 'hags' -Cat $cDisplay -Def 'Depends on the graphics card' -Preset -Reboot -Name 'Hardware-accelerated GPU scheduling (HAGS)' `
-    -Desc 'On: the graphics card manages its own memory scheduling, which can lower latency and CPU load in some games. Off: it is off. This is the "Hardware-accelerated GPU scheduling" switch in Settings > System > Display > Graphics, and it works the same way (2 is on, 1 is off). Reset all removes the value, so Windows and the driver decide again (the Windows default; many newer cards then have it on). With no value this card shows off, because Windows has nothing set: the driver may still have it on. It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch it off if yours do.' `
+    -Desc 'On: the graphics card manages its own memory scheduling, which can lower latency and CPU load in some games. Off: it is off. This is the "Hardware-accelerated GPU scheduling" switch in Settings > System > Display > Graphics, and it works the same way (2 is on, 1 is off). Reset all removes the value, so Windows and the driver decide again (the Windows default; many newer cards then have it on). With no value the card shows what the graphics driver is doing, read from the driver (the same place Settings gets it from), so it is on when the driver has it on. It only does anything on graphics cards and drivers that support it (roughly NVIDIA GTX 10-series and newer, AMD RX 5600 and newer, recent Intel graphics); if Settings > System > Display > Graphics does not show the switch, your card does not support it. A few games stutter with it on: switch it off if yours do.' `
     -Parts @(
-        pBack 1 (pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2)
+        # build 127: with no value, what the driver does decides (Get-HwSchDriver), as in Settings
+        pMissing 'Get-HwSchDriver' (pBack 1 (pReg 'HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers' 'HwSchMode' 2))
     )
 
 $mpoDwm = 'HKLM:\SOFTWARE\Microsoft\Windows\Dwm'
@@ -8794,7 +8921,7 @@ function New-Rows {
     $script:Cats = @()
     foreach ($t in $script:Catalog) {
         $script:Rows[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
-                                 Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = '' }
+                                 Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = ''; AtDef = $false }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
     Add-KeptPages
@@ -8828,7 +8955,7 @@ function Sync-StartupRows {
             # ToDefault: the row was lined up by Reset all (or Use default), which puts the Windows default back; a row switched on its own
             # card writes what Windows Settings writes (pBack, build 123)
             $fresh[$t.Id] = @{ T = $t; State = 'Checking'; Detail = 'Checking...'; Want = $false; Force = ''; Choice = ''; Pick = ''
-                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = ''; ToDefault = $false }
+                               Note = ''; NoteDetail = ''; Item = $null; Visible = $true; Read = ''; Mine = ''; Diff = ''; ToDefault = $false; AtDef = $false }
         }
         if ($script:Cats -notcontains $t.Cat) { $script:Cats += $t.Cat }
     }
@@ -8988,6 +9115,7 @@ function Set-GroupWant {
         # that means making sure it is on: its off position turns the feature off for real, so it is not the default
         $w = $want
         if ((-not $want) -and (Test-OffIsExplicit $row.T)) { $w = $true }
+        if ((-not $want) -and [bool]$row.AtDef -and $row.State -eq 'On') { $w = $true }          # (build 127) already at the Windows default
         $before = Get-Action $row
         if ((Try-SetWant $id $w) -eq '') {
             # Reset all: an undo puts the Windows default back (not what Settings writes when its switch is flipped)
@@ -9352,7 +9480,7 @@ function Get-RealPick {
 
 # The state of a row was (re)checked. During the first check the tick follows the real state.
 function Set-RowState {
-    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '', [string]$diff = '', [string]$vals = '')
+    param([string]$id, [string]$state, [string]$detail, [bool]$followReality, [string]$choice = '', [string]$read = '', [string]$mine = '', [string]$diff = '', [string]$vals = '', [bool]$atDef = $false)
     $row = $script:Rows[$id]
     if (-not $row) { return }
     $row.State = $state
@@ -9362,8 +9490,11 @@ function Set-RowState {
     $row.Mine = $mine          # 'yes' = this app changed it, 'no' = already like this (no undo record), '' = not known
     $row.Diff = $diff          # the values that are not the way the setting sets them (see Get-DiffItems), '' when it is applied
     $row.Vals = $vals          # every value: kind, where, now, what the setting sets, state (build 126: the "</>" button; see Get-ValueItems)
+    $row.AtDef = $atDef        # (build 127) on only because nothing is set and the graphics driver has it on: the Windows default here
     $row.Force = ''
     if ($followReality -or $state -eq 'NA') { $row.Want = ($state -eq 'On'); $row.Pick = Get-RealPick $row; $row.ToDefault = $false }
+    # (build 127) a Reset to the Windows default that ended with the driver's own default (on) leaves the switch where it now stands
+    if ($atDef -and $state -eq 'On' -and [bool]$row.ToDefault) { $row.Want = $true; $row.ToDefault = $false }
 }
 
 # The changes the user has queued, in catalog order:  @{ Id; Action = 'Apply'|'Undo' }  (+ Choice = the option to set, for a setting with options)
@@ -10188,7 +10319,7 @@ function Handle-Event {
     switch ([string]$ev.Kind) {
         'log' { Ui-Log ([string]$ev.Text) ([string]$ev.Color) }
         'state' {
-            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine) ([string]$ev.Diff) ([string]$ev.Vals)
+            Set-RowState ([string]$ev.Id) ([string]$ev.State) ([string]$ev.Detail) ([bool]$script:Scanning) ([string]$ev.Choice) ([string]$ev.Read) ([string]$ev.Mine) ([string]$ev.Diff) ([string]$ev.Vals) ([bool]$ev.AtDef)
             if ($script:Scanning) { Ui-Progress ([int]$ev.A) ([int]$ev.B) }
             Ui-RefreshRow ([string]$ev.Id)
         }
@@ -14125,7 +14256,7 @@ $script:NavSbHot = $false           # the pointer is on the scroll bar
 $script:NavMX = -1
 $script:NavMY = -1
 $script:NavReveal = $false          # the page that was just picked is scrolled into view the next time the menu is built
-$script:AppBuild = '126'           # the number in the small pill beside the name (the version of this file)
+$script:AppBuild = '127'           # the number in the small pill beside the name (the version of this file)
 $script:HoldFilter = $false         # true while the program itself clears the search box (no need to rebuild twice)
 
 function Ui-InvalidateNav {
